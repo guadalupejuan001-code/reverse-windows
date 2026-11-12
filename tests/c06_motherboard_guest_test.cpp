@@ -133,6 +133,16 @@ void pci_acpi_cmos_guest(){
        "guest did not discover ACPI RSDP signature via real MOV");
   need(board.evidence().powered_off,
        "guest ACPI PM1a S5 request not recognized");
+  // Reboot the SAME PcMachine while the motherboard remains attached:
+  // firmware ACPI must be restored after guest RAM is zeroed.
+  pc.boot_long_mode_demo();
+  std::array<std::uint8_t,8> rsdp_after_reset{};
+  pc.cpu.memory.read_block(AcpiC06::rsdp_address,rsdp_after_reset.data(),8);
+  need(std::memcmp("RSD PTR ",rsdp_after_reset.data(),8)==0 &&
+       checksum(pc.cpu,AcpiC06::rsdp_address,36)==0,
+       "reboot lost ACPI discovery in reserved firmware memory");
+  need(!board.evidence().powered_off && board.evidence().ticks==0,
+       "motherboard retained stale PM/timer state across reboot");
   std::cout<<"C06_PCI_ACPI_CMOS_REAL_GUEST_PASS pci=0x"<<std::hex
            <<pc.cpu.read32(0x9000)<<std::dec<<" tables=5\n";
 }
