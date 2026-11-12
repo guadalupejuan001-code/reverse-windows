@@ -126,6 +126,7 @@ void pci_acpi_cmos_guest(){
   run(pc,100);
   need(pc.cpu.read32(0x9000)==0x00011b36,
        "real x86 guest PCI CF8/CFC failed to read host bridge ID");
+  const auto guest_pci_id=pc.cpu.read32(0x9000);
   need(pc.cpu.read32(0x9004)==0xffffffffU,
        "nonexistent PCI device must read all ones");
   need(pc.cpu.memory[0x9008]==2,"guest CMOS status B does not indicate BCD 24-hour");
@@ -144,7 +145,7 @@ void pci_acpi_cmos_guest(){
   need(!board.evidence().powered_off && board.evidence().ticks==0,
        "motherboard retained stale PM/timer state across reboot");
   std::cout<<"C06_PCI_ACPI_CMOS_REAL_GUEST_PASS pci=0x"<<std::hex
-           <<pc.cpu.read32(0x9000)<<std::dec<<" tables=5\n";
+           <<guest_pci_id<<std::dec<<" tables=5 reboot=PASS\n";
 }
 void ioapic_lapic_guest(){
   PcMachine pc(16*1024*1024);boot32(pc);
