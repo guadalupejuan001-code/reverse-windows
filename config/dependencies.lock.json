@@ -6,7 +6,7 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "c3f6daf78a71be98cb9e9afe09d2849fa77ff0cd",
+      "commit": "49a90294087badf5a230709420ec96d8fe246245",
       "checkout": "deps/mundo-X",
       "role": "canonical-PcMachine-x86-x64-C05-CPL3-DPL-RPL-TSS-IRET-and-XI",
       "status": "candidate-C05-unmerged",
