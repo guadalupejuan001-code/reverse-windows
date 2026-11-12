@@ -10,12 +10,13 @@ if(NOT EXISTS "${REVERSE_MUNDO_X_ROOT}/pc-android/native/pc_machine.hpp")
 endif()
 
 find_package(Threads REQUIRED)
+find_package(ZLIB REQUIRED)
 add_library(reverse_windows_component_headers INTERFACE)
 target_include_directories(reverse_windows_component_headers INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${REVERSE_MUNDO_X_ROOT}/pc-android/native"
   "${REVERSE_MUNDO_X_ROOT}/native/include")
-target_link_libraries(reverse_windows_component_headers INTERFACE Threads::Threads)
+target_link_libraries(reverse_windows_component_headers INTERFACE Threads::Threads ZLIB::ZLIB)
 
 add_executable(reverse_windows_boot_probe src/reverse_windows_boot_probe.cpp)
 target_link_libraries(reverse_windows_boot_probe PRIVATE reverse_windows_component_headers)
