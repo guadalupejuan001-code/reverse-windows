@@ -1,4 +1,5 @@
 #include "pc_machine.hpp"
+#include "bios_hard_disk.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
@@ -9,8 +10,10 @@
 
 namespace {
 struct Options {
-    enum class Source { None, DemoX86, DemoX64, Iso } source = Source::None;
+    enum class Source { None, DemoX86, DemoX64, Iso, Disk } source = Source::None;
     std::string iso_path;
+    std::string disk_path;
+    std::uint64_t create_disk_gib = 0;
     std::string evidence_path;
     std::uint64_t steps = 200000;
     std::uint64_t ram_mib = 2048;
@@ -34,12 +37,15 @@ Options parse(int argc, char** argv) {
             if (i + 1 >= argc) throw std::invalid_argument("Missing argument after " + arg);
             return argv[++i];
         };
-        if (arg == "--demo-x86" || arg == "--demo-x64" || arg == "--iso") {
+        if (arg == "--demo-x86" || arg == "--demo-x64" || arg == "--iso" || arg == "--boot-hdd") {
             if (out.source != Options::Source::None) throw std::invalid_argument("One boot source only");
             if (arg == "--demo-x86") out.source = Options::Source::DemoX86;
             else if (arg == "--demo-x64") out.source = Options::Source::DemoX64;
+            else if (arg == "--boot-hdd") out.source = Options::Source::Disk;
             else { out.source = Options::Source::Iso; out.iso_path = next(); }
-        } else if (arg == "--steps") out.steps = positive(next(), 100000000, "steps");
+        } else if (arg == "--disk") out.disk_path = next();
+        else if (arg == "--create-disk-gib") out.create_disk_gib = positive(next(), 256, "create-disk-gib");
+        else if (arg == "--steps") out.steps = positive(next(), 100000000, "steps");
         else if (arg == "--ram-mib") out.ram_mib = positive(next(), 2048, "ram-mib");
         else if (arg == "--resident-mib") out.resident_mib = positive(next(), 2048, "resident-mib");
         else if (arg == "--evidence") out.evidence_path = next();
@@ -47,6 +53,8 @@ Options parse(int argc, char** argv) {
     }
     if (out.source == Options::Source::None) throw std::invalid_argument("Select --demo-x86, --demo-x64 or --iso FILE");
     if (out.ram_mib < 2) throw std::invalid_argument("Mundo X PC requires at least 2 MiB logical RAM");
+    if (out.create_disk_gib && out.disk_path.empty()) throw std::invalid_argument("--create-disk-gib requires --disk PATH.rvdisk");
+    if (out.source == Options::Source::Disk && out.disk_path.empty()) throw std::invalid_argument("--boot-hdd requires --disk PATH.rvdisk");
     return out;
 }
 }  // namespace
@@ -57,6 +65,11 @@ int main(int argc, char** argv) {
         cosmic_pc::PcMachine pc(
             static_cast<std::size_t>(opts.ram_mib * 1024ULL * 1024ULL),
             static_cast<std::size_t>(opts.resident_mib * 1024ULL * 1024ULL));
+        std::unique_ptr<reverse_windows::DiskImage> disk;
+        if (!opts.disk_path.empty()) {
+            if (opts.create_disk_gib) reverse_windows::DiskImage::create(opts.disk_path, opts.create_disk_gib);
+            disk = std::make_unique<reverse_windows::DiskImage>(opts.disk_path);
+        }
         std::shared_ptr<std::ifstream> medium;
         std::string kind;
         if (opts.source == Options::Source::DemoX86) {
@@ -65,6 +78,11 @@ int main(int argc, char** argv) {
         } else if (opts.source == Options::Source::DemoX64) {
             pc.boot_long_mode_demo();
             kind = "synthetic-x64";
+        } else if (opts.source == Options::Source::Disk) {
+            kind = "persistent-HDD-raw-boot";
+            pc.mount([&disk](std::uint64_t offset, std::uint8_t* target, std::size_t count) {
+                return disk->read_bytes(offset, target, count);
+            }, disk->bytes(), "raw");
         } else {
             kind = "user-ISO";
             medium = std::make_shared<std::ifstream>(opts.iso_path, std::ios::binary);
@@ -80,6 +98,9 @@ int main(int argc, char** argv) {
                     return static_cast<std::size_t>(medium->gcount()) == size;
                 }, static_cast<std::uint64_t>(end), "iso");
         }
+
+        std::unique_ptr<reverse_windows::BiosHardDisk> hdd;
+        if (disk) hdd = std::make_unique<reverse_windows::BiosHardDisk>(pc, *disk);
 
         while (pc.cpu.instructions < opts.steps && pc.status() != "fault" && !pc.cpu.halted) {
             if (pc.waiting_key) {
@@ -97,6 +118,8 @@ int main(int argc, char** argv) {
             "\"guest_kind\":" + cosmic_pc::PcMachine::quote(kind) +
             ",\"source\":\"original-Mundo-X-PcMachine\"" +
             ",\"windows10_boot_verified\":false" +
+            ",\"writable_hdd_attached\":" + std::string(disk ? "true" : "false") +
+            ",\"hdd_sectors\":" + std::to_string(disk ? disk->sectors() : 0) +
             ",\"machine\":" + final_json +
             ",\"vga_text\":" + cosmic_pc::PcMachine::quote(pc.screen()) + "}\n";
         std::cout << evidence;

@@ -12,3 +12,4 @@ evidence/local/
 *.pfx
 *.pem
 __pycache__/
+*.rvdisk
