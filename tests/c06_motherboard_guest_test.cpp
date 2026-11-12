@@ -1,5 +1,6 @@
 #include "c06_motherboard.hpp"
 #include "pc_machine.hpp"
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
@@ -83,19 +84,24 @@ void pci_acpi_cmos_guest(){
   PcMachine pc(16*1024*1024);boot32(pc);
   PcMotherboardC06 board(pc);
   // ACPI RSDP 2.0 + XSDT/RSDT/FADT/MADT/DSDT reside in E820 reserved BIOS ROM.
-  need(std::memcmp("RSD PTR ",&pc.cpu.memory[0xe0000],8)==0,
+  std::array<std::uint8_t,8> rsdp_signature{};
+  pc.cpu.memory.read_block(0xe0000,rsdp_signature.data(),rsdp_signature.size());
+  need(std::memcmp("RSD PTR ",rsdp_signature.data(),8)==0,
        "RSDP BIOS discovery signature missing");
   need(checksum(pc.cpu,AcpiC06::rsdp_address,20)==0 &&
        checksum(pc.cpu,AcpiC06::rsdp_address,36)==0,
        "RSDP 1.0/2.0 checksums do not match");
-  for(const auto entry:{{AcpiC06::rsdt_address,44U},{AcpiC06::xsdt_address,52U},
-                        {AcpiC06::fadt_address,244U},{AcpiC06::madt_address,64U},
-                        {AcpiC06::dsdt_address,49U}})
-    need(checksum(pc.cpu,entry[0],entry[1])==0,"ACPI table checksum invalid");
+  const std::array<std::pair<std::uint32_t,unsigned>,5> tables{{
+    {AcpiC06::rsdt_address,44U},{AcpiC06::xsdt_address,52U},
+    {AcpiC06::fadt_address,244U},{AcpiC06::madt_address,64U},
+    {AcpiC06::dsdt_address,49U}
+  }};
+  for(const auto& entry:tables)
+    need(checksum(pc.cpu,entry.first,entry.second)==0,"ACPI table checksum invalid");
   need(pc.cpu.read32(AcpiC06::rsdt_address+36)==AcpiC06::fadt_address &&
        pc.cpu.read64(AcpiC06::xsdt_address+44)==AcpiC06::madt_address,
        "ACPI table pointers do not describe the actual firmware");
-  need(pc.cpu.read32(AcpiC06::madt_address+36)==kLocalApicStatic(),
+  need(pc.cpu.read32(AcpiC06::madt_address+36)==0xfee00000U,
        "MADT LAPIC base does not match the mapped MMIO device");
 
   std::vector<std::uint8_t> p;
@@ -170,7 +176,6 @@ void ioapic_lapic_guest(){
   need(unsupported,"unsupported local APIC register must not fake value");
   std::cout<<"C06_IOAPIC_LAPIC_MMIO_IRQ_PASS delivered="<<board.evidence().apic_irqs<<"\n";
 }
-constexpr std::uint32_t kLocalApicStatic(){return 0xfee00000U;}
 }
 int main(){
   try{
