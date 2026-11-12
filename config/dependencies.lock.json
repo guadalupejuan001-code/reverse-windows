@@ -6,15 +6,16 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "fd66d20a4ef040d31d529300c5fd46a2d4ec57ed",
+      "commit": "59fca713b878820a2de934c6da045ae989007143",
       "checkout": "deps/mundo-X",
-      "role": "real-x86-x64-machine-and-XI-session",
-      "status": "candidate-PR85",
+      "role": "canonical-PcMachine-real-x86-x64-C04-guest-IDT-IRET-and-XI",
+      "status": "candidate-PR86",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/x86_cpu.hpp",
         "pc-android/native/tests/pc_group6_iso_test.cpp",
-        "native/include/mundo_x/autonomous_core_c02.hpp"
+        "native/include/mundo_x/autonomous_core_c02.hpp",
+        "pc-android/native/tests/x86_idt_c04_test.cpp"
       ]
     },
     {
