@@ -1,6 +1,6 @@
 #pragma once
 
-#include "virtual_disk.hpp"
+#include "block_disk.hpp"
 #include "pc_machine.hpp"
 #include <algorithm>
 #include <array>
@@ -17,7 +17,7 @@ namespace reverse_windows {
 // continues through the original PcMachine BIOS handler, unmodified.
 class BiosHardDisk {
  public:
-  BiosHardDisk(cosmic_pc::PcMachine& pc, DiskImage& disk)
+  BiosHardDisk(cosmic_pc::PcMachine& pc, BlockDisk& disk)
       : pc_(pc), disk_(disk), previous_(pc.cpu.interrupt_hook) {
     if (!previous_) throw std::invalid_argument("PcMachine BIOS handler is missing");
     pc_.cpu.interrupt_hook = [this](cosmic_pc::Cpu& cpu, std::uint8_t vector) {
@@ -56,7 +56,7 @@ class BiosHardDisk {
                 std::uint16_t count, std::uint64_t guest_physical) {
     if (count == 0 || count > kMaxTransferSectors ||
         lba > disk_.sectors() || count > disk_.sectors() - lba ||
-        !guest_span(cpu, guest_physical, std::uint64_t(count) * DiskImage::kSectorSize))
+        !guest_span(cpu, guest_physical, std::uint64_t(count) * 512))
       return false;
 
     std::vector<std::uint8_t> bytes(std::size_t(count) * DiskImage::kSectorSize);
@@ -180,7 +180,7 @@ class BiosHardDisk {
   }
 
   cosmic_pc::PcMachine& pc_;
-  DiskImage& disk_;
+  BlockDisk& disk_;
   std::function<bool(cosmic_pc::Cpu&, std::uint8_t)> previous_;
   std::uint8_t last_error_ = 0;
 };
