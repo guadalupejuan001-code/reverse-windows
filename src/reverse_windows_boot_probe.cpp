@@ -1,6 +1,7 @@
 #include "pc_machine.hpp"
 #include "bios_hard_disk.hpp"
 #include "qssd_disk.hpp"
+#include "virtual_disk.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
