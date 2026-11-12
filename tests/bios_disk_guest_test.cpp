@@ -1,3 +1,4 @@
+#include "virtual_disk.hpp"
 #include "bios_hard_disk.hpp"
 #include "pc_machine.hpp"
 
