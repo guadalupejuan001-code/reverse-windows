@@ -1,0 +1,90 @@
+name: REVERSE ISO Lab — lossless roundtrip and Android APK
+
+on:
+  push:
+    branches: ["feature/iso-lab-android-*"]
+    paths: ["iso-lab-android/**", ".github/workflows/iso-lab-android.yml"]
+  pull_request:
+    paths: ["iso-lab-android/**", ".github/workflows/iso-lab-android.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lossless-host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Compile real archive codec without Android dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p build/iso-host
+          javac -encoding UTF-8 -d build/iso-host \
+            iso-lab-android/app/src/main/java/com/reversewindows/isolab/IsoArchive.java \
+            iso-lab-android/host-tests/com/reversewindows/isolab/IsoArchiveTest.java
+      - name: Execute byte-for-byte reconstruction, corruption and cancellation tests
+        run: |
+          set -euo pipefail
+          java -Xmx256m -cp build/iso-host com.reversewindows.isolab.IsoArchiveTest | tee iso-lab-host-tests.txt
+          grep -q REVERSE_ISO_CORRUPTION_REJECTED iso-lab-host-tests.txt
+          grep -q REVERSE_ISO_CANCEL_PASS iso-lab-host-tests.txt
+      - name: Archive host test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reverse-iso-host-results
+          path: iso-lab-host-tests.txt
+          if-no-files-found: warn
+
+  build-android-apk:
+    needs: lossless-host
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Prepare Android 35 build environment
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" >/dev/null
+      - name: Build provisional APK (no network permission)
+        run: |
+          set -euo pipefail
+          gradle -p iso-lab-android --no-daemon :app:assembleDebug
+          mkdir -p dist
+          cp iso-lab-android/app/build/outputs/apk/debug/app-debug.apk dist/REVERSE-ISO-Lab-v0.1-debug.apk
+          test -s dist/REVERSE-ISO-Lab-v0.1-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose dist/REVERSE-ISO-Lab-v0.1-debug.apk
+          sha256sum dist/REVERSE-ISO-Lab-v0.1-debug.apk | tee dist/REVERSE-ISO-Lab-v0.1.sha256
+          python3 - <<'PY'
+          import zipfile
+          p='dist/REVERSE-ISO-Lab-v0.1-debug.apk'
+          with zipfile.ZipFile(p) as z:
+              assert 'classes.dex' in z.namelist()
+              assert 'AndroidManifest.xml' in z.namelist()
+          print('REVERSE_ISO_APK_PACKAGE_VALIDATED')
+          PY
+      - name: Publish installable APK and SHA256
+        uses: actions/upload-artifact@v4
+        with:
+          name: REVERSE-ISO-Lab-Android-v0.1-APK
+          path: |
+            dist/REVERSE-ISO-Lab-v0.1-debug.apk
+            dist/REVERSE-ISO-Lab-v0.1.sha256
+          if-no-files-found: error
