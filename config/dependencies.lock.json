@@ -1,0 +1,65 @@
+{
+  "schema": "reverse-windows-dependency-lock-v1",
+  "recorded_at": "2026-11-12",
+  "policy": "exact-commit-only-no-silent-fallback-no-automatic-merge",
+  "components": [
+    {
+      "key": "mundo_x",
+      "repository": "guadalupejuan001-code/mundo-X",
+      "commit": "fd66d20a4ef040d31d529300c5fd46a2d4ec57ed",
+      "checkout": "deps/mundo-X",
+      "role": "real-x86-x64-machine-and-XI-session",
+      "status": "candidate-PR85",
+      "required_paths": [
+        "pc-android/native/pc_machine.hpp",
+        "pc-android/native/x86_cpu.hpp",
+        "pc-android/native/tests/pc_group6_iso_test.cpp",
+        "native/include/mundo_x/autonomous_core_c02.hpp"
+      ]
+    },
+    {
+      "key": "gpu_virtual",
+      "repository": "guadalupejuan001-code/GPU-VIRTUAL",
+      "commit": "dd89b4c2ba8cb7908bb8f0bb9eb8f20b75ead7d9",
+      "checkout": "deps/GPU-VIRTUAL",
+      "role": "C12-plus-physical-work-authority-PR8",
+      "status": "candidate-unmerged-PR8",
+      "required_paths": [
+        "include/ejecucion_gpu.hpp",
+        "include/trabajo_fisico.hpp",
+        "tests/physical_work_authority.cpp"
+      ]
+    },
+    {
+      "key": "qssd",
+      "repository": "guadalupejuan001-code/Virtual-qSSD-",
+      "commit": "5555f1cfc95e50d60df5d7481317380a6c5891d8",
+      "checkout": "deps/Virtual-qSSD-",
+      "role": "complete-revisioned-state-and-graphics-work-PR8",
+      "status": "candidate-unmerged-PR8",
+      "required_paths": [
+        "include/qssd/state_bus.hpp",
+        "include/qssd/graphics_work_state.hpp",
+        "tests/graphics_work_memory.cpp"
+      ]
+    },
+    {
+      "key": "reverse_pc",
+      "repository": "guadalupejuan001-code/REVERSE-PC",
+      "commit": "6727d8a34fa722ee2a0662e98b8917ac4d53d4f5",
+      "checkout": "deps/REVERSE-PC",
+      "role": "C03-integrated-host-and-renderer",
+      "status": "candidate-unmerged-PR239",
+      "required_paths": [
+        "src/fabric/reverse_fabric.hpp",
+        "reverse-os-android/app/src/main/assets/workbench/reverse-gpu-physical.js",
+        "docs/reverse-pc-gpu-physical-c03.md"
+      ]
+    }
+  ],
+  "non_dependencies": [
+    "reverseAndroid is ARM64 methodology only",
+    "Do not import any old Win10 Lab APK or visual mocks"
+  ],
+  "guest_media_policy": "user-provided-local-read-only-ISO-no-redistribution"
+}
