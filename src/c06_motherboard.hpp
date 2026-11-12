@@ -111,6 +111,7 @@ class PcMotherboardC06 {
   std::function<std::optional<std::uint8_t>(std::uint64_t)> prior_mmio_read_;
   std::function<bool(std::uint64_t,std::uint8_t)> prior_mmio_write_;
   std::function<void()> prior_tick_;
+  std::function<void()> prior_reset_;
   Pic master_{},slave_{};
   Pit pit_{};
   std::uint32_t pci_selector_=0,clock_steps_=0;
@@ -141,6 +142,22 @@ class PcMotherboardC06 {
     config32(b,0,(std::uint32_t(device)<<16)|0x1b36U); // synthetic vendor
     b[8]=1;b[10]=type;b[11]=0x06; // host/ISA bridge class
     b[0x0e]=0; // multifunction=0; no storage devices declared before C07
+  }
+  void reset_devices(){
+    master_=Pic{};slave_=Pic{};slave_.vector=0x70;
+    pit_=Pit{};pci_selector_=0;clock_steps_=0;
+    cmos_index_=0;rtc_b_=2;pm_control_=0;powered_off_=false;
+    ticks_=irq_delivered_=pit_irqs_=apic_irqs_=0;
+    apic_tpr_=0;apic_svr_=0xff;apic_lvt_timer_=0x10000;
+    apic_timer_reload_=apic_timer_counter_=0;apic_divider_=3;
+    lapic_pending_.reset();lapic_in_service_=0;ioapic_select_=0;
+    io_redir_low_.fill(0x10000U);io_redir_high_.fill(0);
+    mmio_pending_={};
+    build_config(host_cfg_,0x0001,0x00);
+    build_config(isa_cfg_,0x0002,0x01);
+    // After a real PcMachine::reset, firmware RAM is new; republish the
+    // same discovered tables and keep their E820-reserved addresses.
+    AcpiC06::install(pc_.cpu);
   }
   bool owned_port(std::uint16_t p) const {
     return p==0x20||p==0x21||p==0xa0||p==0xa1||
@@ -386,11 +403,8 @@ class PcMotherboardC06 {
     prior_mmio_read_=pc_.cpu.mmio_read_hook;
     prior_mmio_write_=pc_.cpu.mmio_write_hook;
     prior_tick_=pc_.device_step_hook;
-    build_config(host_cfg_,0x0001,0x00);
-    build_config(isa_cfg_,0x0002,0x01);
-    slave_.vector=0x70;
-    io_redir_low_.fill(0x10000U);io_redir_high_.fill(0);
-    AcpiC06::install(pc_.cpu);
+    prior_reset_=pc_.device_reset_hook;
+    reset_devices();
     pc_.cpu.in_hook=[this](std::uint16_t p,unsigned w){
       if(owned_port(p))return io_read(p,w);
       return prior_in_?prior_in_(p,w):std::nullopt;
@@ -414,6 +428,10 @@ class PcMotherboardC06 {
       if(prior_tick_)prior_tick_();
       poll();
     };
+    pc_.device_reset_hook=[this](){
+      if(prior_reset_)prior_reset_();
+      reset_devices();
+    };
   }
   ~PcMotherboardC06(){
     // Never leave a hook pointing at a destroyed motherboard instance.
@@ -423,6 +441,7 @@ class PcMotherboardC06 {
     pc_.cpu.mmio_read_hook=std::move(prior_mmio_read_);
     pc_.cpu.mmio_write_hook=std::move(prior_mmio_write_);
     pc_.device_step_hook=std::move(prior_tick_);
+    pc_.device_reset_hook=std::move(prior_reset_);
   }
   PcMotherboardC06(const PcMotherboardC06&)=delete;
   PcMotherboardC06& operator=(const PcMotherboardC06&)=delete;
