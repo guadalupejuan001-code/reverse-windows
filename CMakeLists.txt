@@ -5,6 +5,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(REVERSE_MUNDO_X_ROOT "" CACHE PATH "Exact pinned mundo-X checkout containing PcMachine")
+set(REVERSE_QSSD_ROOT "" CACHE PATH "Exact pinned Virtual-qSSD- checkout containing StateBus")
+if(NOT EXISTS "${REVERSE_QSSD_ROOT}/include/qssd/state_bus.hpp")
+  message(FATAL_ERROR "Pinned qSSD StateBus required for REVERSE Quantum Disk")
+endif()
 if(NOT EXISTS "${REVERSE_MUNDO_X_ROOT}/pc-android/native/pc_machine.hpp")
   message(FATAL_ERROR "Missing real Mundo X PcMachine; no fake or fallback CPU is permitted")
 endif()
@@ -14,7 +18,8 @@ add_library(reverse_windows_component_headers INTERFACE)
 target_include_directories(reverse_windows_component_headers INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${REVERSE_MUNDO_X_ROOT}/pc-android/native"
-  "${REVERSE_MUNDO_X_ROOT}/native/include")
+  "${REVERSE_MUNDO_X_ROOT}/native/include"
+  "${REVERSE_QSSD_ROOT}/include")
 target_link_libraries(reverse_windows_component_headers INTERFACE Threads::Threads)
 
 add_executable(reverse_windows_boot_probe src/reverse_windows_boot_probe.cpp)
@@ -40,6 +45,11 @@ if(BUILD_TESTING)
     target_compile_options(reverse_windows_bios_disk_test PRIVATE -Wall -Wextra -Wpedantic)
   endif()
   add_test(NAME reverse_windows_x86_hdd_write_read_persist COMMAND reverse_windows_bios_disk_test)
+
+  add_executable(reverse_windows_qssd_disk_test tests/qssd_disk_guest_test.cpp)
+  target_link_libraries(reverse_windows_qssd_disk_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_qssd_sparse_atomic_reboot_x86 COMMAND reverse_windows_qssd_disk_test)
   set_tests_properties(reverse_windows_real_x86_demo reverse_windows_real_x64_demo
-                       reverse_windows_x86_hdd_write_read_persist PROPERTIES TIMEOUT 120)
+                       reverse_windows_x86_hdd_write_read_persist
+                       reverse_windows_qssd_sparse_atomic_reboot_x86 PROPERTIES TIMEOUT 120)
 endif()
