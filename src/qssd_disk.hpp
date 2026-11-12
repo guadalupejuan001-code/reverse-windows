@@ -217,7 +217,7 @@ class QssdDisk final : public BlockDisk {
        u64(head.data()+32)!=digest(head.data(),32))
       throw std::runtime_error("QSSD invalid volume header");
     capacity_=u64(head.data()+16);
-    if(capacity_<kGiB||capacity_>256*kGiB||capacity_%kBlockSize)
+    if(capacity_<kGiB||capacity_>16384*kGiB||capacity_%kBlockSize)
       throw std::runtime_error("QSSD volume logical size invalid");
     auto state=Epoch{};
     std::uint64_t pos=kHeader, last_commit=kHeader;
@@ -262,7 +262,7 @@ class QssdDisk final : public BlockDisk {
  public:
   static void create(const std::filesystem::path& path,std::uint64_t gib) {
     check_path(path);
-    if(gib<1||gib>256)throw std::invalid_argument("QSSD capacity is 1..256 GiB");
+    if(gib<1||gib>16384)throw std::invalid_argument("QSSD supported logical capacity is 1 GiB .. 16 TiB");
     const auto name=path.string();
     int fd=::open(name.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
     if(fd<0)throw std::system_error(errno,std::generic_category(),"QSSD create without overwrite");
@@ -390,7 +390,10 @@ class QssdDisk final : public BlockDisk {
       next.end=at;
       states_.publish(std::move(next),"guest-sector-commit",old);
       committed_end_=at;
-      for(const auto& entry:new_raw)remember(entry.first,entry.second);
+      // Dedup index is a disposable optimization; its allocation must never
+      // turn a committed guest write into an acknowledged failure or rollback.
+      try { for(const auto& entry:new_raw)remember(entry.first,entry.second); }
+      catch(const std::exception&) {dedup_.clear();dedup_fifo_.clear();}
       return true;
     }catch(const std::exception&){
       // Discard any uncommitted append. A failed write is never acknowledged.
