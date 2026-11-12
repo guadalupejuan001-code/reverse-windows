@@ -21,7 +21,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/mundo-X
-          ref: 99fdeb50db59b9e0d864ece8b9a68aa599cfac99
+          ref: 1ea8bf57fdba127c5b639388b2deb9d9c07436ea
           path: deps/mundo-X
           persist-credentials: false
       - name: Checkout GPU-VIRTUAL C12 plus physical work authority
