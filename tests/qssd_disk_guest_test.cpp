@@ -2,6 +2,8 @@
 #include "bios_hard_disk.hpp"
 #include "pc_machine.hpp"
 #include <array>
+#include <atomic>
+#include <thread>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -28,6 +30,7 @@ int main() {
       ("reverse-qssd-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   const auto path=root.string()+".rqvd";
   const auto corrupt=root.string()+"-corrupt.rqvd";
+  const auto enormous=root.string()+"-16tib.rqvd";
   try {
     reverse_windows::QssdDisk::create(path,64);
     need(std::filesystem::file_size(path)==64,"sparse disk allocated physical capacity at creation");
@@ -136,6 +139,40 @@ int main() {
            pc.cpu.memory[0x9100]==0x34&&pc.cpu.memory[0x9101]==0x12,
            "real x86 QSSD persistent MBR boot failed");
     }
+    // Simultaneous readers must observe an entire committed two-block revision,
+    // never a mixture of the two sides of an in-flight guest transaction.
+    {
+      reverse_windows::QssdDisk volume(path);
+      std::array<std::uint8_t,8192> a{},b{},seen{};
+      a.fill(0x15);b.fill(0xe7);
+      need(volume.write(2048,16,a.data()),"cannot seed atomic multi-block transaction");
+      std::atomic<bool> failed{false};
+      std::thread reader([&]{
+        for(unsigned i=0;i<500;++i){
+          if(!volume.read(2048,16,seen.data())||(seen!=a&&seen!=b)){
+            failed=true;break;
+          }
+        }
+      });
+      bool written=true;
+      for(unsigned i=0;i<32;++i)
+        if(!volume.write(2048,16,(i%2)?a.data():b.data())){written=false;break;}
+      reader.join();
+      need(written&&!failed,"QSSD concurrent reader saw a torn transaction");
+      std::cout<<"REVERSE_QSSD_CONCURRENT_SNAPSHOT_PASS commits="<<volume.stats().commits<<"\n";
+    }
+    // Logical capacity is backed by a sparse journal, NOT by 16TiB of flash.
+    reverse_windows::QssdDisk::create(enormous,16384);
+    {
+      reverse_windows::QssdDisk huge(enormous);
+      std::array<std::uint8_t,4096> data{},check{};
+      data.fill(0x5a);
+      need(huge.bytes()==16384*reverse_windows::QssdDisk::kGiB,"16TiB logical address invalid");
+      need(huge.write(huge.sectors()-8,8,data.data()),"16TiB last block write failed");
+      need(huge.read(huge.sectors()-8,8,check.data())&&check==data,"16TiB tail data incorrect");
+      need(huge.stats().physical_bytes<4096,"sparse logical disk inflated backing file");
+    }
+    std::filesystem::remove(enormous);
     // Full journal corruption MUST be rejected, not silently reinterpreted.
     reverse_windows::QssdDisk::create(corrupt,1);
     {
@@ -155,12 +192,14 @@ int main() {
             "tampered complete QSSD record was accepted");
     std::filesystem::remove(path);
     std::filesystem::remove(corrupt);
+    std::filesystem::remove(enormous);
     std::cout<<"REVERSE_QSSD_X86_DISK_REBOOT_PASS Windows10_installed=false\n";
     return 0;
   }catch(const std::exception& error){
     std::error_code ignored;
     std::filesystem::remove(path,ignored);
     std::filesystem::remove(corrupt,ignored);
+    std::filesystem::remove(enormous,ignored);
     std::cerr<<"REVERSE_QSSD_TEST_FAIL: "<<error.what()<<"\n";
     return 1;
   }
