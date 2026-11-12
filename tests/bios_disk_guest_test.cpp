@@ -37,7 +37,7 @@ int main() {
 
       // Real x86 machine code: write 0xBEEF to RAM; issue INT 13h AH=43;
       // clear RAM; issue INT 13h AH=42; halt. No test double calls the API.
-      const std::array<std::uint8_t, 33> guest{
+      const std::array<std::uint8_t, 35> guest{
           0xb8,0xef,0xbe,       // MOV AX,BEEF
           0xa3,0x00,0x90,       // MOV [9000],AX
           0xbe,0x00,0x81,       // MOV SI,8100

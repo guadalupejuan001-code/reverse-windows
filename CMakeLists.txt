@@ -10,11 +10,15 @@ if(NOT EXISTS "${REVERSE_MUNDO_X_ROOT}/pc-android/native/pc_machine.hpp")
 endif()
 
 find_package(Threads REQUIRED)
-add_executable(reverse_windows_boot_probe src/reverse_windows_boot_probe.cpp)
-target_include_directories(reverse_windows_boot_probe PRIVATE
+add_library(reverse_windows_component_headers INTERFACE)
+target_include_directories(reverse_windows_component_headers INTERFACE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${REVERSE_MUNDO_X_ROOT}/pc-android/native"
   "${REVERSE_MUNDO_X_ROOT}/native/include")
-target_link_libraries(reverse_windows_boot_probe PRIVATE Threads::Threads)
+target_link_libraries(reverse_windows_component_headers INTERFACE Threads::Threads)
+
+add_executable(reverse_windows_boot_probe src/reverse_windows_boot_probe.cpp)
+target_link_libraries(reverse_windows_boot_probe PRIVATE reverse_windows_component_headers)
 if(MSVC)
   target_compile_options(reverse_windows_boot_probe PRIVATE /W4)
 else()
@@ -27,5 +31,15 @@ if(BUILD_TESTING)
     COMMAND reverse_windows_boot_probe --demo-x86 --steps 200000 --ram-mib 2048 --resident-mib 256)
   add_test(NAME reverse_windows_real_x64_demo
     COMMAND reverse_windows_boot_probe --demo-x64 --steps 200000 --ram-mib 2048 --resident-mib 256)
-  set_tests_properties(reverse_windows_real_x86_demo reverse_windows_real_x64_demo PROPERTIES TIMEOUT 120)
+
+  add_executable(reverse_windows_bios_disk_test tests/bios_disk_guest_test.cpp)
+  target_link_libraries(reverse_windows_bios_disk_test PRIVATE reverse_windows_component_headers)
+  if(MSVC)
+    target_compile_options(reverse_windows_bios_disk_test PRIVATE /W4)
+  else()
+    target_compile_options(reverse_windows_bios_disk_test PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+  add_test(NAME reverse_windows_x86_hdd_write_read_persist COMMAND reverse_windows_bios_disk_test)
+  set_tests_properties(reverse_windows_real_x86_demo reverse_windows_real_x64_demo
+                       reverse_windows_x86_hdd_write_read_persist PROPERTIES TIMEOUT 120)
 endif()
