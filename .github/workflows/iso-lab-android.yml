@@ -2,7 +2,7 @@ name: REVERSE ISO Lab — lossless roundtrip and Android APK
 
 on:
   push:
-    branches: ["feature/iso-lab-android-*"]
+    branches: ["feature/iso-lab-*"]
     paths: ["iso-lab-android/**", ".github/workflows/iso-lab-android.yml"]
   pull_request:
     paths: ["iso-lab-android/**", ".github/workflows/iso-lab-android.yml"]
@@ -68,13 +68,13 @@ jobs:
           set -euo pipefail
           gradle -p iso-lab-android --no-daemon :app:assembleDebug
           mkdir -p dist
-          cp iso-lab-android/app/build/outputs/apk/debug/app-debug.apk dist/REVERSE-ISO-Lab-v0.1-debug.apk
-          test -s dist/REVERSE-ISO-Lab-v0.1-debug.apk
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose dist/REVERSE-ISO-Lab-v0.1-debug.apk
-          sha256sum dist/REVERSE-ISO-Lab-v0.1-debug.apk | tee dist/REVERSE-ISO-Lab-v0.1.sha256
+          cp iso-lab-android/app/build/outputs/apk/debug/app-debug.apk dist/REVERSE-ISO-Lab-v0.2-debug.apk
+          test -s dist/REVERSE-ISO-Lab-v0.2-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose dist/REVERSE-ISO-Lab-v0.2-debug.apk
+          sha256sum dist/REVERSE-ISO-Lab-v0.2-debug.apk | tee dist/REVERSE-ISO-Lab-v0.2.sha256
           python3 - <<'PY'
           import zipfile
-          p='dist/REVERSE-ISO-Lab-v0.1-debug.apk'
+          p='dist/REVERSE-ISO-Lab-v0.2-debug.apk'
           with zipfile.ZipFile(p) as z:
               assert 'classes.dex' in z.namelist()
               assert 'AndroidManifest.xml' in z.namelist()
@@ -83,8 +83,8 @@ jobs:
       - name: Publish installable APK and SHA256
         uses: actions/upload-artifact@v4
         with:
-          name: REVERSE-ISO-Lab-Android-v0.1-APK
+          name: REVERSE-ISO-Lab-Android-v0.2-APK
           path: |
-            dist/REVERSE-ISO-Lab-v0.1-debug.apk
-            dist/REVERSE-ISO-Lab-v0.1.sha256
+            dist/REVERSE-ISO-Lab-v0.2-debug.apk
+            dist/REVERSE-ISO-Lab-v0.2.sha256
           if-no-files-found: error
