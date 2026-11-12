@@ -41,6 +41,9 @@ public final class IsoArchiveTest {
             Files.write(path,archive.toByteArray());
             ByteArrayOutputStream original=new ByteArrayOutputStream();
             try(FileChannel input=FileChannel.open(path,StandardOpenOption.READ)){
+                IsoArchive.Result verified=IsoArchive.verify(input,null,()->false);
+                require(verified.originalBytes==source.length && verified.sha256.equals(packed.sha256),
+                        "Freshly packed archive failed automatic full verification");
                 IsoArchive.Result restored=IsoArchive.restore(input,original,Files.size(path),
                         (done,total)->{},()->false);
                 require(restored.originalBytes==source.length,"Output size mismatch");

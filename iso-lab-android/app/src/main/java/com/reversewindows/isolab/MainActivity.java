@@ -274,6 +274,9 @@ public final class MainActivity extends Activity {
         try{DocumentsContract.deleteDocument(getContentResolver(),output);}
         catch(Exception ignored){}
     }
+    private void progressLabelSafe(String label){
+        runOnUiThread(()->{if(busy)progressLabel.setText(label);});
+    }
     private void perform(boolean packing,Uri inputUri,Uri outputUri,long expectedSize){
         if(busy)return;
         busy=true;cancel.set(false);
@@ -319,9 +322,27 @@ public final class MainActivity extends Activity {
                         }
                     }
                 }
+                // A successful write is not enough: re-open the actual .riso and
+                // decode/hash its complete contents before reporting that it is safe.
+                if(packing){
+                    progressLabelSafe("Verificando archivo compacto completo con SHA-256...");
+                    try(ParcelFileDescriptor proof=getContentResolver().openFileDescriptor(outputUri,"r")){
+                        if(proof==null)throw new IllegalStateException("No se puede verificar la salida");
+                        try(FileInputStream verifiedInput=new FileInputStream(proof.getFileDescriptor())){
+                            FileChannel proofChannel=verifiedInput.getChannel();
+                            if(proofChannel.size()==0)throw new IllegalStateException(
+                                "La ubicación elegida no permite verificar el .riso. Usa almacenamiento local.");
+                            IsoArchive.Result validated=IsoArchive.verify(proofChannel,onProgress,cancel::get);
+                            if(validated.originalBytes!=result.originalBytes ||
+                                !validated.sha256.equals(result.sha256) ||
+                                validated.archiveBytes!=result.archiveBytes)
+                                throw new IllegalStateException("Compactación no válida: reconstrucción distinta");
+                        }
+                    }
+                }
                 if(cancel.get())throw new IllegalStateException("Operación cancelada");
                 String details=(packing?
-                    "Archivo compacto creado.\nISO: "+format(result.originalBytes)+
+                    "Archivo compacto creado y verificado.\nISO: "+format(result.originalBytes)+
                     "\nRISO: "+format(result.archiveBytes)+
                     String.format(Locale.US,"\nReducción: %.2f%%",result.reductionPercent())+
                     "\nBloques duplicados: "+result.duplicate+

@@ -207,6 +207,15 @@ public final class IsoArchive {
         }
     }
 
+    /** Verify every block and the full digest without materializing another ISO file. */
+    public static Result verify(FileChannel channel, Progress progress, Cancel cancel) throws IOException {
+        OutputStream discard=new OutputStream() {
+            @Override public void write(int b) {}
+            @Override public void write(byte[] b,int off,int len) {}
+        };
+        return restore(channel, discard, channel.size(), progress, cancel);
+    }
+
     private static int length(DataInputStream in) throws IOException {
         int n=in.readInt();
         if(n<1 || n>BLOCK)throw new IOException("Longitud de bloque inválida");

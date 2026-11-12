@@ -2,6 +2,8 @@
 
 **Objetivo:** descomponer una ISO normal en bloques, descubrir repeticiones/relaciones simples, producir un contenedor compacto autodescriptivo `.riso` y **reconstruir los bytes originales** sin necesidad de cargar todo el fichero a memoria.
 
+Desde v0.2 la APK **abre de nuevo el .riso recién escrito, lo reconstruye contra un sumidero sin crear otra ISO y verifica tamaño y SHA-256 completo antes de declarar éxito**. Si el proveedor Android no permite verificar, se rechaza la operación en lugar de informar un éxito falso.
+
 Esta aplicación es **software de laboratorio funcional de base convencional**, no una integración ya lograda con Ether o QSSD. El algoritmo es un patrón de comparación reproducible para futuros adaptadores nativos.
 
 ## Flujo en el teléfono
@@ -61,3 +63,7 @@ java -cp /tmp/reiso-test com.reversewindows.isolab.IsoArchiveTest
 ## Desarrollo futuro
 
 Usar esta referencia medible para ensayar una verdadera representación de reglas de Ether y la deduplicación/versionado de qSSD; añadir acceso aleatorio a los bloques para montar un `.riso` como unidad óptica sin reconstruir un archivo .iso entero, siempre con comparación SHA-256 y de bytes contra el original.
+
+## v0.2 — lectura directa para REVERSE Windows
+
+El objetivo es que el emulador pueda tratar `.riso` como **medio óptico virtual en lectura**, proporcionando sectores originales bajo demanda sin crear un segundo archivo `.iso`. El lector C++ del emulador se valida en una rama propia y no es la APK de laboratorio. El ISO original continúa siendo la referencia; no debe cambiarse la extensión de un contenedor comprimido a `.iso`, porque Windows no entiende el contenedor.
