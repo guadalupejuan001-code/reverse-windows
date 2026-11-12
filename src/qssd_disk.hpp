@@ -44,7 +44,7 @@ class QssdDisk final : public BlockDisk {
   using NodePtr=std::shared_ptr<const Node>;
   struct Epoch {
     NodePtr root;
-    std::uint64_t commits=0, raw=0, zeros=0, patterns=0, refs=0;
+    std::uint64_t commits=0, raw=0, zeros=0, patterns=0, refs=0, end=kHeader;
   };
   enum Kind : std::uint32_t { Raw=1, Zero=2, Pattern=3, Reference=4, Commit=5 };
   struct Record {
@@ -255,6 +255,7 @@ class QssdDisk final : public BlockDisk {
         throw std::runtime_error("QSSD cannot discard incomplete transaction tail");
     }
     committed_end_=last_commit;
+    state.end=last_commit;
     if(state.commits)states_.publish(std::move(state),"replay");
   }
 
@@ -298,7 +299,7 @@ class QssdDisk final : public BlockDisk {
   std::uint64_t sectors() const noexcept override {return capacity_/kSectorSize;}
   Stats stats() const {
     const auto v=states_.snapshot();
-    return {capacity_,committed_end_,v->value->commits,v->value->raw,
+    return {capacity_,v->value->end,v->value->commits,v->value->raw,
             v->value->zeros,v->value->patterns,v->value->refs,v->serial};
   }
   bool read_bytes(std::uint64_t offset,std::uint8_t* target,std::size_t size) override {
@@ -313,7 +314,7 @@ class QssdDisk final : public BlockDisk {
         const auto ref=locate(view->value->root,block);
         if(!ref.offset)std::memset(target+done,0,n);
         else {
-          const auto data=decode(ref.offset,committed_end_);
+          const auto data=decode(ref.offset,view->value->end);
           std::memcpy(target+done,data.data()+start,n);
         }
         done+=n;
@@ -386,6 +387,7 @@ class QssdDisk final : public BlockDisk {
         else if(c.kind==Reference)++next.refs;
       }
       ++next.commits;
+      next.end=at;
       states_.publish(std::move(next),"guest-sector-commit",old);
       committed_end_=at;
       for(const auto& entry:new_raw)remember(entry.first,entry.second);
