@@ -1,4 +1,4 @@
-name: C00 Real x86/x64 guest and modern dependency contract
+name: C06 Real motherboard and C00-C05 guest regressions
 on:
   push:
     branches: [main, "feature/**"]
@@ -53,6 +53,14 @@ jobs:
           cmake --build build --parallel 2
       - name: Execute real x86 and long-mode x64 guest demos
         run: ctest --test-dir build --output-on-failure
+      - name: Capture authentic C06 PCI PIC PIT APIC ACPI guest evidence
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_c06_motherboard_guest_test | tee build/reverse-windows-c06-motherboard.log
+          grep -q 'C06_PIC_PIT_GUEST_IRQ_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'C06_PCI_ACPI_CMOS_REAL_GUEST_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'C06_IOAPIC_LAPIC_MMIO_IRQ_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'REVERSE_WINDOWS_C06_MOTHERBOARD_PASS' build/reverse-windows-c06-motherboard.log
       - name: Replay protected16 group-6 through real El Torito synthetic ISO
         run: |
           g++ -std=c++17 -O0 -pthread -Ideps/mundo-X/native/include deps/mundo-X/pc-android/native/tests/pc_group6_iso_test.cpp -o build/iso-protected16-group6
@@ -66,5 +74,7 @@ jobs:
         if: always()
         with:
           name: reverse-windows-c00-x64-evidence
-          path: build/reverse-windows-x64.json
+          path: |
+            build/reverse-windows-x64.json
+            build/reverse-windows-c06-motherboard.log
           if-no-files-found: warn
