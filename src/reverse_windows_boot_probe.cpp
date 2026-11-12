@@ -49,7 +49,7 @@ Options parse(int argc, char** argv) {
             else { out.source = Options::Source::Iso; out.iso_path = next(); }
         } else if (arg == "--disk") out.disk_path = next();
         else if (arg == "--qssd-disk") out.qssd_path = next();
-        else if (arg == "--create-qssd-gib") out.create_qssd_gib = positive(next(), 256, "create-qssd-gib");
+        else if (arg == "--create-qssd-gib") out.create_qssd_gib = positive(next(), 16384, "create-qssd-gib");
         else if (arg == "--create-disk-gib") out.create_disk_gib = positive(next(), 256, "create-disk-gib");
         else if (arg == "--steps") out.steps = positive(next(), 100000000, "steps");
         else if (arg == "--ram-mib") out.ram_mib = positive(next(), 2048, "ram-mib");
