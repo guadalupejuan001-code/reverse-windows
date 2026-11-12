@@ -1,4 +1,5 @@
 #pragma once
+#include "block_disk.hpp"
 
 // REVERSE Windows: a real, independent, writable raw HDD image.
 // Never writes to the boot ISO, any host block device, or an unselected path.
@@ -11,7 +12,7 @@
 #include <string>
 
 namespace reverse_windows {
-class DiskImage {
+class DiskImage final : public BlockDisk {
  public:
   static constexpr std::uint64_t kSectorSize = 512;
   static constexpr std::uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
@@ -50,11 +51,11 @@ class DiskImage {
 
   DiskImage(const DiskImage&) = delete;
   DiskImage& operator=(const DiskImage&) = delete;
-  std::uint64_t bytes() const noexcept { return bytes_; }
-  std::uint64_t sectors() const noexcept { return bytes_ / kSectorSize; }
+  std::uint64_t bytes() const noexcept override { return bytes_; }
+  std::uint64_t sectors() const noexcept override { return bytes_ / kSectorSize; }
 
   // Byte-addressed read of a raw boot sector (BootMedia requires offset/count).
-  bool read_bytes(std::uint64_t offset, std::uint8_t* target, std::size_t count) {
+  bool read_bytes(std::uint64_t offset, std::uint8_t* target, std::size_t count) override {
     if ((!target && count) || offset > bytes_ || count > bytes_ - offset) return false;
     if (count == 0) return true;
     std::lock_guard<std::mutex> lock(mutex_);
@@ -65,7 +66,7 @@ class DiskImage {
     return file_.gcount() == static_cast<std::streamsize>(count) && static_cast<bool>(file_);
   }
 
-  bool read(std::uint64_t lba, std::uint16_t sectors, std::uint8_t* target) {
+  bool read(std::uint64_t lba, std::uint16_t sectors, std::uint8_t* target) override {
     if (!target || !within(lba, sectors)) return false;
     std::lock_guard<std::mutex> lock(mutex_);
     const auto offset = static_cast<std::streamoff>(lba * kSectorSize);
@@ -77,7 +78,7 @@ class DiskImage {
     return file_.gcount() == size && static_cast<bool>(file_);
   }
 
-  bool write(std::uint64_t lba, std::uint16_t sectors, const std::uint8_t* source) {
+  bool write(std::uint64_t lba, std::uint16_t sectors, const std::uint8_t* source) override {
     if (!source || !within(lba, sectors)) return false;
     std::lock_guard<std::mutex> lock(mutex_);
     const auto offset = static_cast<std::streamoff>(lba * kSectorSize);
