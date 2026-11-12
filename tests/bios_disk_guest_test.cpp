@@ -80,6 +80,32 @@ int main() {
               "Out-of-bounds sector write accepted");
     }
 
+    // Simulate the reboot phase after installation: an MBR written into the
+    // persistent HDD is fetched through the SAME original PcMachine raw
+    // boot path, and actual x86 executes it rather than displaying fake UI.
+    {
+      reverse_windows::DiskImage image(path);
+      std::array<std::uint8_t,512> mbr{};
+      mbr[0] = 0xb8; mbr[1] = 0x34; mbr[2] = 0x12; // MOV AX,1234
+      mbr[3] = 0xa3; mbr[4] = 0x00; mbr[5] = 0x91; // MOV [9100],AX
+      mbr[6] = 0xf4;                              // HLT
+      mbr[510] = 0x55; mbr[511] = 0xaa;
+      require(image.write(0, 1, mbr.data()), "Cannot persist MBR boot sector");
+
+      cosmic_pc::PcMachine pc(2048ULL*1024*1024, 256ULL*1024*1024);
+      pc.mount([&image](std::uint64_t offset, std::uint8_t* out, std::size_t length) {
+        return image.read_bytes(offset, out, length);
+      }, image.bytes(), "raw");
+      reverse_windows::BiosHardDisk bridge(pc, image);
+      pc.run(100);
+      require(!pc.cpu.fault && pc.cpu.halted && pc.boot_kind == "raw",
+              "HDD did not boot original x86 PC in real mode");
+      require(pc.cpu.memory[0x9100] == 0x34 && pc.cpu.memory[0x9101] == 0x12,
+              "Guest MBR machine code did not execute from persistent HDD");
+      std::cout << "REVERSE_WINDOWS_HDD_REBOOT_REAL_X86_PASS"
+                << " instructions=" << pc.cpu.instructions << '\n';
+    }
+
     std::filesystem::remove(path);
     std::cout << "REVERSE_WINDOWS_DISK_PERSISTENCE_PASS isowrites=0\n";
     return 0;

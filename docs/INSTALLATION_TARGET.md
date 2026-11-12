@@ -24,7 +24,18 @@ ctest --test-dir build --output-on-failure
   --evidence /ruta/local/trace-boot.json
 ```
 
-Reutilizar el disco después: **omitir** `--create-disk-gib`. No subir ISO, disco o registros con información privada a GitHub. Los comandos de host todavía no equivalen a una APK Android.
+Reutilizar el disco después: **omitir** `--create-disk-gib`. No subir ISO, disco o registros con información privada a GitHub.
+
+Para **arrancar desde el HDD** después de instalar un sistema con un sector de arranque válido:
+
+```sh
+./build/reverse_windows_boot_probe --boot-hdd \
+  --disk /ruta/local/Windows10.rvdisk \
+  --ram-mib 2048 --resident-mib 1024 --steps 100000000 \
+  --evidence /ruta/local/hdd-reboot.json
+```
+
+La regresión C01 utiliza un MBR de prueba con bytes x86 auténticos, no un Windows instalado. La vía HDD es real pero Windows Setup todavía necesita más dispositivos e instrucciones. Los comandos de host todavía no equivalen a una APK Android.
 
 ## Lo que queda y no se debe fingir
 

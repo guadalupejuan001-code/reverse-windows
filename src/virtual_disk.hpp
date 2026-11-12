@@ -53,6 +53,18 @@ class DiskImage {
   std::uint64_t bytes() const noexcept { return bytes_; }
   std::uint64_t sectors() const noexcept { return bytes_ / kSectorSize; }
 
+  // Byte-addressed read of a raw boot sector (BootMedia requires offset/count).
+  bool read_bytes(std::uint64_t offset, std::uint8_t* target, std::size_t count) {
+    if ((!target && count) || offset > bytes_ || count > bytes_ - offset) return false;
+    if (count == 0) return true;
+    std::lock_guard<std::mutex> lock(mutex_);
+    file_.clear();
+    file_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!file_) return false;
+    file_.read(reinterpret_cast<char*>(target), static_cast<std::streamsize>(count));
+    return file_.gcount() == static_cast<std::streamsize>(count) && static_cast<bool>(file_);
+  }
+
   bool read(std::uint64_t lba, std::uint16_t sectors, std::uint8_t* target) {
     if (!target || !within(lba, sectors)) return false;
     std::lock_guard<std::mutex> lock(mutex_);
