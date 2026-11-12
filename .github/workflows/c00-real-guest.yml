@@ -45,12 +45,27 @@ jobs:
           ref: 6727d8a34fa722ee2a0662e98b8917ac4d53d4f5
           path: deps/REVERSE-PC
           persist-credentials: false
+      - name: Checkout exact Java REISO01 codec from ISO Lab v0.2
+        uses: actions/checkout@v4
+        with:
+          repository: guadalupejuan001-code/reverse-windows
+          ref: 6dc4976d170c27f19799300214848887f482e21f
+          path: deps/iso-lab-codec
+          persist-credentials: false
       - name: Enforce exact component SHAs and real source files
         run: python3 scripts/verify_deps.py
       - name: Compile native boot probe against actual x86/x64 CPU
         run: |
           cmake -S . -B build -DREVERSE_MUNDO_X_ROOT="$PWD/deps/mundo-X" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
           cmake --build build --parallel 2
+      - name: Generate real bootable El Torito ISO and compact with Android Java codec
+        run: |
+          set -euo pipefail
+          mkdir -p build/interop-java
+          javac -encoding UTF-8 -d build/interop-java \
+            deps/iso-lab-codec/iso-lab-android/app/src/main/java/com/reversewindows/isolab/IsoArchive.java \
+            tests/RisoInteropFixture.java
+          java -cp build/interop-java com.reversewindows.isolab.RisoInteropFixture build/interop.iso build/interop.riso
       - name: Execute real x86 and long-mode x64 guest demos
         run: ctest --test-dir build --output-on-failure
       - name: Replay protected16 group-6 through real El Torito synthetic ISO
