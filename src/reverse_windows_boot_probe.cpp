@@ -1,6 +1,7 @@
 #include "pc_machine.hpp"
 #include "bios_hard_disk.hpp"
 #include "qssd_disk.hpp"
+#include "c06_motherboard.hpp"
 #include "virtual_disk.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -115,6 +116,9 @@ int main(int argc, char** argv) {
 
         std::unique_ptr<reverse_windows::BiosHardDisk> hdd;
         if (disk) hdd = std::make_unique<reverse_windows::BiosHardDisk>(pc, *disk);
+        // One canonical guest CPU. The motherboard wraps its existing I/O hooks
+        // after boot firmware and QSSD are mounted, and stays alive until exit.
+        reverse_windows::PcMotherboardC06 motherboard(pc);
 
         while (pc.cpu.instructions < opts.steps && pc.status() != "fault" && !pc.cpu.halted) {
             if (pc.waiting_key) {
@@ -128,6 +132,7 @@ int main(int argc, char** argv) {
             if (pc.cpu.instructions == before && !pc.waiting_key) break;
         }
         const auto final_json = pc.json();
+        const auto platform = motherboard.evidence();
         const std::string evidence = std::string("{\"schema\":\"reverse-windows-boot-evidence-v1\",") +
             "\"guest_kind\":" + cosmic_pc::PcMachine::quote(kind) +
             ",\"source\":\"original-Mundo-X-PcMachine\"" +
@@ -137,6 +142,11 @@ int main(int argc, char** argv) {
             ",\"qssd_commits\":" + std::to_string(qdisk ? qdisk->stats().commits : 0) +
             ",\"qssd_physical_bytes\":" + std::to_string(qdisk ? qdisk->stats().physical_bytes : 0) +
             ",\"hdd_sectors\":" + std::to_string(disk ? disk->sectors() : 0) +
+            ",\"motherboard_c06\":{\"pci_config\":true,\"acpi_tables\":true,\"apic_full\":false,\"irq_delivered\":" +
+               std::to_string(platform.irq_delivered) + ",\"pit_irqs\":" +
+               std::to_string(platform.pit_irqs) + ",\"apic_irqs\":" +
+               std::to_string(platform.apic_irqs) + ",\"ticks\":" +
+               std::to_string(platform.ticks) + "}" +
             ",\"machine\":" + final_json +
             ",\"vga_text\":" + cosmic_pc::PcMachine::quote(pc.screen()) + "}\n";
         std::cout << evidence;
