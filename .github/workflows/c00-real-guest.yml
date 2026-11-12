@@ -17,11 +17,11 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Checkout C04 real x86/x64 guest IDT/IRET (pinned PR86)
+      - name: Checkout C05 real CPL3/TSS guest CPU (exact candidate SHA)
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/mundo-X
-          ref: 59fca713b878820a2de934c6da045ae989007143
+          ref: 49a90294087badf5a230709420ec96d8fe246245
           path: deps/mundo-X
           persist-credentials: false
       - name: Checkout GPU-VIRTUAL C12 plus physical work authority
