@@ -55,8 +55,14 @@ if(BUILD_TESTING)
     "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_idt_c04_test.cpp")
   target_link_libraries(reverse_windows_c04_guest_idt PRIVATE reverse_windows_component_headers)
   add_test(NAME reverse_windows_c04_real_guest_idt COMMAND reverse_windows_c04_guest_idt)
+  add_executable(reverse_windows_c05_guest_cpl3
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_cpl_c05_test.cpp")
+  target_link_libraries(reverse_windows_c05_guest_cpl3 PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c05_real_cpl3_tss COMMAND reverse_windows_c05_guest_cpl3)
+
   set_tests_properties(reverse_windows_real_x86_demo reverse_windows_real_x64_demo
                        reverse_windows_x86_hdd_write_read_persist
                        reverse_windows_qssd_sparse_atomic_reboot_x86
-                       reverse_windows_c04_real_guest_idt PROPERTIES TIMEOUT 120)
+                       reverse_windows_c04_real_guest_idt
+                       reverse_windows_c05_real_cpl3_tss PROPERTIES TIMEOUT 120)
 endif()
