@@ -1,0 +1,14 @@
+build/
+cmake-build*/
+deps/
+evidence/local/
+*.iso
+*.img
+*.vhd
+*.vhdx
+*.qcow2
+*.vmdk
+*.key
+*.pfx
+*.pem
+__pycache__/

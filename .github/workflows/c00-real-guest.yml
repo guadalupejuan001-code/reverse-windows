@@ -1,0 +1,70 @@
+name: C00 Real x86/x64 guest and modern dependency contract
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-real-guest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout REVERSE Windows
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Checkout latest inspected Mundo X C03 (pinned PR85)
+        uses: actions/checkout@v7
+        with:
+          repository: guadalupejuan001-code/mundo-X
+          ref: fd66d20a4ef040d31d529300c5fd46a2d4ec57ed
+          path: deps/mundo-X
+          persist-credentials: false
+      - name: Checkout GPU-VIRTUAL C12 plus physical work authority
+        uses: actions/checkout@v7
+        with:
+          repository: guadalupejuan001-code/GPU-VIRTUAL
+          ref: dd89b4c2ba8cb7908bb8f0bb9eb8f20b75ead7d9
+          path: deps/GPU-VIRTUAL
+          persist-credentials: false
+      - name: Checkout QSSD current StateBus plus graphics revisions
+        uses: actions/checkout@v7
+        with:
+          repository: guadalupejuan001-code/Virtual-qSSD-
+          ref: 5555f1cfc95e50d60df5d7481317380a6c5891d8
+          path: deps/Virtual-qSSD-
+          persist-credentials: false
+      - name: Checkout REVERSE-PC C03 integrated host candidate
+        uses: actions/checkout@v7
+        with:
+          repository: guadalupejuan001-code/REVERSE-PC
+          ref: 6727d8a34fa722ee2a0662e98b8917ac4d53d4f5
+          path: deps/REVERSE-PC
+          persist-credentials: false
+      - name: Enforce exact component SHAs and real source files
+        run: python3 scripts/verify_deps.py
+      - name: Compile native boot probe against actual x86/x64 CPU
+        run: |
+          cmake -S . -B build -DREVERSE_MUNDO_X_ROOT="$PWD/deps/mundo-X" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+          cmake --build build --parallel 2
+      - name: Execute real x86 and long-mode x64 guest demos
+        run: ctest --test-dir build --output-on-failure
+      - name: Replay protected16 group-6 through real El Torito synthetic ISO
+        run: |
+          g++ -std=c++17 -O0 -pthread -Ideps/mundo-X/native/include deps/mundo-X/pc-android/native/tests/pc_group6_iso_test.cpp -o build/iso-protected16-group6
+          ./build/iso-protected16-group6
+      - name: Generate machine-state evidence from actual x64 interpreter
+        run: |
+          ./build/reverse_windows_boot_probe --demo-x64 --steps 200000 --ram-mib 2048 --resident-mib 256 --evidence build/reverse-windows-x64.json
+          python3 tests/check_evidence.py build/reverse-windows-x64.json
+      - name: Preserve execution evidence
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: reverse-windows-c00-x64-evidence
+          path: build/reverse-windows-x64.json
+          if-no-files-found: warn
