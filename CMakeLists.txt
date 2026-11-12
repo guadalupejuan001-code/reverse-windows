@@ -40,6 +40,16 @@ if(BUILD_TESTING)
     target_compile_options(reverse_windows_bios_disk_test PRIVATE -Wall -Wextra -Wpedantic)
   endif()
   add_test(NAME reverse_windows_x86_hdd_write_read_persist COMMAND reverse_windows_bios_disk_test)
+  add_executable(reverse_windows_riso_native_test tests/riso_native_test.cpp)
+  target_link_libraries(reverse_windows_riso_native_test PRIVATE reverse_windows_component_headers)
+  if(MSVC)
+    target_compile_options(reverse_windows_riso_native_test PRIVATE /W4)
+  else()
+    target_compile_options(reverse_windows_riso_native_test PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+  add_test(NAME reverse_windows_riso_real_iso_boot
+    COMMAND reverse_windows_riso_native_test "${CMAKE_CURRENT_BINARY_DIR}/interop.iso"
+                                           "${CMAKE_CURRENT_BINARY_DIR}/interop.riso")
   set_tests_properties(reverse_windows_real_x86_demo reverse_windows_real_x64_demo
-                       reverse_windows_x86_hdd_write_read_persist PROPERTIES TIMEOUT 120)
+                       reverse_windows_x86_hdd_write_read_persist reverse_windows_riso_real_iso_boot PROPERTIES TIMEOUT 120)
 endif()

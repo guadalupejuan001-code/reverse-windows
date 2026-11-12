@@ -1,5 +1,6 @@
 #include "pc_machine.hpp"
 #include "bios_hard_disk.hpp"
+#include "riso_reader.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
@@ -10,8 +11,10 @@
 
 namespace {
 struct Options {
-    enum class Source { None, DemoX86, DemoX64, Iso, Disk } source = Source::None;
+    enum class Source { None, DemoX86, DemoX64, Iso, Disk, Riso } source = Source::None;
     std::string iso_path;
+    std::string riso_path;
+    bool verify_riso=false;
     std::string disk_path;
     std::uint64_t create_disk_gib = 0;
     std::string evidence_path;
@@ -37,13 +40,15 @@ Options parse(int argc, char** argv) {
             if (i + 1 >= argc) throw std::invalid_argument("Missing argument after " + arg);
             return argv[++i];
         };
-        if (arg == "--demo-x86" || arg == "--demo-x64" || arg == "--iso" || arg == "--boot-hdd") {
+        if (arg == "--demo-x86" || arg == "--demo-x64" || arg == "--iso" || arg == "--riso" || arg == "--boot-hdd") {
             if (out.source != Options::Source::None) throw std::invalid_argument("One boot source only");
             if (arg == "--demo-x86") out.source = Options::Source::DemoX86;
             else if (arg == "--demo-x64") out.source = Options::Source::DemoX64;
             else if (arg == "--boot-hdd") out.source = Options::Source::Disk;
+            else if (arg == "--riso") { out.source = Options::Source::Riso; out.riso_path = next(); }
             else { out.source = Options::Source::Iso; out.iso_path = next(); }
-        } else if (arg == "--disk") out.disk_path = next();
+        } else if (arg == "--verify-riso") out.verify_riso = true;
+        else if (arg == "--disk") out.disk_path = next();
         else if (arg == "--create-disk-gib") out.create_disk_gib = positive(next(), 256, "create-disk-gib");
         else if (arg == "--steps") out.steps = positive(next(), 100000000, "steps");
         else if (arg == "--ram-mib") out.ram_mib = positive(next(), 2048, "ram-mib");
@@ -55,6 +60,7 @@ Options parse(int argc, char** argv) {
     if (out.ram_mib < 2) throw std::invalid_argument("Mundo X PC requires at least 2 MiB logical RAM");
     if (out.create_disk_gib && out.disk_path.empty()) throw std::invalid_argument("--create-disk-gib requires --disk PATH.rvdisk");
     if (out.source == Options::Source::Disk && out.disk_path.empty()) throw std::invalid_argument("--boot-hdd requires --disk PATH.rvdisk");
+    if (out.verify_riso && out.source != Options::Source::Riso) throw std::invalid_argument("--verify-riso requires --riso FILE");
     return out;
 }
 }  // namespace
@@ -71,6 +77,7 @@ int main(int argc, char** argv) {
             disk = std::make_unique<reverse_windows::DiskImage>(opts.disk_path);
         }
         std::shared_ptr<std::ifstream> medium;
+        std::unique_ptr<reverse_windows::RisoReader> compact_media;
         std::string kind;
         if (opts.source == Options::Source::DemoX86) {
             pc.boot_demo();
@@ -78,6 +85,14 @@ int main(int argc, char** argv) {
         } else if (opts.source == Options::Source::DemoX64) {
             pc.boot_long_mode_demo();
             kind = "synthetic-x64";
+        } else if (opts.source == Options::Source::Riso) {
+            kind = "user-ISO-from-REISO01";
+            compact_media = std::make_unique<reverse_windows::RisoReader>(opts.riso_path);
+            if(opts.verify_riso && !compact_media->verify_all())
+                throw std::runtime_error("RISO complete SHA-256 mismatch");
+            pc.mount([&compact_media](std::uint64_t offset, std::uint8_t* target, std::size_t count) {
+                return compact_media->read(offset, target, count);
+            }, compact_media->size(), "iso");
         } else if (opts.source == Options::Source::Disk) {
             kind = "persistent-HDD-raw-boot";
             pc.mount([&disk](std::uint64_t offset, std::uint8_t* target, std::size_t count) {
@@ -118,6 +133,7 @@ int main(int argc, char** argv) {
             "\"guest_kind\":" + cosmic_pc::PcMachine::quote(kind) +
             ",\"source\":\"original-Mundo-X-PcMachine\"" +
             ",\"windows10_boot_verified\":false" +
+            ",\"compressed_media_mounted\":" + std::string(compact_media ? "true" : "false") +
             ",\"writable_hdd_attached\":" + std::string(disk ? "true" : "false") +
             ",\"hdd_sectors\":" + std::to_string(disk ? disk->sectors() : 0) +
             ",\"machine\":" + final_json +
