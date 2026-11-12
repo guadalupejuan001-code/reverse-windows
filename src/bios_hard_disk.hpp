@@ -59,7 +59,7 @@ class BiosHardDisk {
         !guest_span(cpu, guest_physical, std::uint64_t(count) * 512))
       return false;
 
-    std::vector<std::uint8_t> bytes(std::size_t(count) * DiskImage::kSectorSize);
+    std::vector<std::uint8_t> bytes(std::size_t(count) * 512);
     if (is_write) {
       for (std::size_t i = 0; i < bytes.size(); ++i)
         bytes[i] = cpu.read8(guest_physical + i);
