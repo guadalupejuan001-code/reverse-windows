@@ -11,6 +11,7 @@
 #include <vector>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 using reverse_windows::QssdDisk;
@@ -81,6 +82,7 @@ void benchmark(){
     double raw_open=0,qssd_full_open=0,qssd_index_open=0;
     double index_build=0,compact_time=0;
     std::uint64_t qssd_journal_before=0,qssd_journal_after=0,index_bytes=0;
+    QssdDisk::CacheStats cache_data{};
     {
       DiskImage raw(raw_file);
       QssdDisk qssd(qssd_file);
@@ -92,6 +94,7 @@ void benchmark(){
       qssd_write=writes(qssd,ops);
       verify(raw,ops);verify(qssd,ops);
       raw_read=reads(raw,ops);qssd_read=reads(qssd,ops);
+      cache_data=qssd.cache_stats();
       qssd_journal_before=qssd.stats().physical_bytes;
     }
     {
@@ -129,6 +132,9 @@ void benchmark(){
         throw std::runtime_error("compacted checkpoint not loaded");
       verify(disk,ops);
     }
+    struct rusage memory{};
+    if(::getrusage(RUSAGE_SELF,&memory)!=0)
+      throw std::runtime_error("cannot measure host benchmark peak RSS");
     std::cout<<std::fixed<<std::setprecision(3)
       <<"{\"schema\":\"reverse-windows-c08-benchmark-v1\","
       <<"\"host\":\"GitHub-Actions-x86_64-or-native-not-Android\","
@@ -148,6 +154,11 @@ void benchmark(){
       <<",\"qssd_journal_before\":"<<qssd_journal_before
       <<",\"qssd_journal_after\":"<<qssd_journal_after
       <<",\"qssd_sidecar_index_bytes\":"<<index_bytes
+      <<",\"qssd_cache_hits\":"<<cache_data.hits
+      <<",\"qssd_cache_misses\":"<<cache_data.misses
+      <<",\"qssd_cache_resident_bytes\":"<<cache_data.resident_bytes
+      <<",\"host_process_peak_rss_kib\":"<<memory.ru_maxrss
+      <<",\"single_run_not_a_speed_claim\":true"
       <<",\"windows_booted\":false}\n";
     std::cout<<"REVERSE_WINDOWS_C08_BENCHMARK_PASS performance_not_guaranteed=1\n";
   }catch(...){
