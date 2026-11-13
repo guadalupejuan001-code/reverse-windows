@@ -63,6 +63,11 @@ if(BUILD_TESTING)
   target_link_libraries(reverse_windows_protected_entry_test PRIVATE reverse_windows_component_headers)
   add_test(NAME reverse_windows_protected_entry_stack COMMAND reverse_windows_protected_entry_test)
   set_tests_properties(reverse_windows_protected_entry_stack PROPERTIES TIMEOUT 60)
+  add_executable(reverse_windows_protected_real_transition_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_protected_real_transition_test.cpp")
+  target_link_libraries(reverse_windows_protected_real_transition_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_protected_real_transition COMMAND reverse_windows_protected_real_transition_test)
+  set_tests_properties(reverse_windows_protected_real_transition PROPERTIES TIMEOUT 60)
 
   add_test(NAME reverse_windows_real_x86_demo
     COMMAND reverse_windows_boot_probe --demo-x86 --steps 200000 --ram-mib 2048 --resident-mib 256)

@@ -43,12 +43,13 @@ void require(bool condition, const char* message) {
   if (!condition) throw std::runtime_error(message);
 }
 
-Session::Step run(Session& session) {
+void run_until(Session& session, Session::Step expected, const char* message) {
   for (unsigned chunk = 0; chunk < 10; ++chunk) {
     const auto status = session.step(64);
-    if (status != Session::Step::Running) return status;
+    if (status == expected) return;
+    if (status != Session::Step::Running) break;
   }
-  throw std::runtime_error("Guest did not reach expected stop: " + session.diagnostic());
+  throw std::runtime_error(std::string(message) + ": " + session.diagnostic());
 }
 
 std::string screen(Session& session) {
@@ -93,14 +94,16 @@ int main(int argc, char** argv) {
         FileDescriptor iso(fixture, O_RDONLY);
         return Session(disk, 1, Session::BootSource::Iso, iso.value, original.size());
       }();
-      require(run(session) == Session::Step::WaitingKey,
-              "El Torito guest did not wait for BIOS keyboard input");
+      run_until(session, Session::Step::WaitingKey,
+                "El Torito guest did not return from protected16 and reach the BIOS prompt");
+      require(session.diagnostic().find("\"cpu_mode\":\"real16\"") != std::string::npos,
+              "Guest BIOS prompt was reached outside real mode");
       require(screen(session).find("ISO -> QSSD") != std::string::npos,
               "Guest-generated VGA prompt missing");
       session.key(0x0d, 0x1c, false);
       require(session.step(10) == Session::Step::WaitingKey, "Key release advanced BIOS prompt");
       session.key(0x0d, 0x1c, true);
-      require(run(session) == Session::Step::Halted, "Guest did not complete the BIOS write");
+      run_until(session, Session::Step::Halted, "Guest did not complete the BIOS write");
       require(screen(session).find("MBR SAVED") != std::string::npos,
               "Guest did not confirm the QSSD MBR write");
       require(session.diagnostic().find("\"commits\":1") != std::string::npos,
@@ -110,14 +113,15 @@ int main(int argc, char** argv) {
     require(bytes(fixture) == original, "Guest changed the read-only ISO");
     {
       Session reboot(disk, 0, Session::BootSource::Disk);
-      require(run(reboot) == Session::Step::Halted, "QSSD guest did not complete its boot");
+      run_until(reboot, Session::Step::Halted, "QSSD guest did not complete its boot");
       require(screen(reboot).find("QSSD REBOOT OK") != std::string::npos,
               "QSSD did not boot the MBR installed by the ISO guest");
       require(reboot.diagnostic().find("\"source\":\"qssd\"") != std::string::npos,
               "Reboot diagnostic did not identify QSSD");
     }
     std::cout << "REVERSE_WINDOWS_ANDROID_BIOS_ISO_QSSD_PASS "
-                 "synthetic_iso=true bios_key=true guest_vga=true persistent_reboot=true\n";
+                 "synthetic_iso=true protected16_to_real16=true bios_key=true guest_vga=true "
+                 "persistent_reboot=true\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "REVERSE_WINDOWS_ANDROID_BIOS_ISO_QSSD_FAIL " << error.what() << '\n';

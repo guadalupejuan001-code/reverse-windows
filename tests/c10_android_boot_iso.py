@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Build an El Torito fixture that installs a test MBR through BIOS."""
+"""Build an El Torito fixture that returns to real mode and installs a test MBR."""
 
 import pathlib
 import sys
 
-from c09_synthetic_iso import BOOT, SECTOR, generate, u16, u32
+from c09_synthetic_iso import BOOT, SECTOR, desc, generate, u16, u32, u64
 
 
 def show(message: bytes) -> bytes:
@@ -15,8 +15,30 @@ def image() -> bytearray:
     iso = generate()
     start = BOOT * SECTOR
     iso[start : start + 4 * SECTOR] = bytes(4 * SECTOR)
+    enter_protected = bytes((
+        0xFA,                             # CLI
+        0x0E, 0x1F,                       # PUSH CS; POP DS
+        0x0F, 0x01, 0x16, 0x00, 0x02,     # LGDT [0200]
+        0x66, 0xB8, 0x11, 0, 0, 0,        # MOV EAX,00000011 (PE=1)
+        0x0F, 0x22, 0xC0,                 # MOV CR0,EAX
+        0xEA, 0x92, 0x08, 0x50, 0x00,     # JMP FAR 0050:0892 (protected16)
+    ))
+    iso[start : start + len(enter_protected)] = enter_protected
+    u16(iso, start + 0x200, 0x5F)
+    u32(iso, start + 0x202, 0x20280)
+    u64(iso, start + 0x280 + 0x50, desc(0x20800, 0xFFFF, 0x9A))
+    u64(iso, start + 0x280 + 0x58, desc(0x20000, 0xFFFF, 0x92))
+
+    exit_protected = bytes((
+        0xB8, 0x58, 0, 0x8E, 0xD8,       # MOV DS,0058 (cached base 0x20000)
+        0x66, 0xB8, 0x10, 0, 0, 0,        # MOV EAX,00000010 (PE=0)
+        0x0F, 0x22, 0xC0,                 # MOV CR0,EAX at 0050:089D
+        0xEA, 0x40, 0x00, 0x00, 0x20,     # JMP FAR 2000:0040 (real16)
+    ))
+    protected = start + 0x800 + 0x892  # Protected CS has base 0x20800.
+    iso[protected : protected + len(exit_protected)] = exit_protected
+
     code = bytes((
-        0x0E, 0x1F,                   # PUSH CS; POP DS
         0xBE, 0x00, 0x01,             # MOV SI,0100 (optical DAP)
         0xB4, 0x42, 0xCD, 0x13,       # Read MBR from CD sector 29.
         0x72, 0x00,                   # JC failure (patched below)
@@ -30,16 +52,17 @@ def image() -> bytearray:
         0xB4, 0x43, 0xCD, 0x13,       # Persist MBR to QSSD sector zero.
         0x72, 0x00,                   # JC failure (patched below)
     ))
-    keyboard_jump = 11 + 5 * len(b"ISO -> QSSD") + 7
+    keyboard_jump = 9 + 5 * len(b"ISO -> QSSD") + 7
     write_jump = len(code) - 1
     code += show(b" MBR SAVED") + b"\xfa\xf4"
     failure = len(code)
     code += show(b" | FAILED") + b"\xfa\xf4"
     program = bytearray(code)
-    for jump in (10, keyboard_jump, write_jump):
+    for jump in (8, keyboard_jump, write_jump):
         assert 0 <= failure - jump - 1 < 128
         program[jump] = failure - jump - 1
-    iso[start : start + len(program)] = program
+    assert 0x40 + len(program) <= 0x100  # Keep the boot code clear of the DAPs.
+    iso[start + 0x40 : start + 0x40 + len(program)] = program
     for pointer, lba in ((0x100, 29), (0x110, 0)):
         dap = start + pointer
         iso[dap] = 0x10

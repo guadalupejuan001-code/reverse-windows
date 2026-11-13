@@ -6,10 +6,10 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "78091b93dcc8995f8902ba703342f34a5f0458d8",
+      "commit": "00645e66ee064f93cef0873d642ccec6f2765eb7",
       "checkout": "deps/mundo-X",
-      "role": "canonical-Mundo-X-Ether-Next-ARM64-and-protected-entry-stack",
-      "status": "candidate-Ether-Next-boot-stack-unmerged",
+      "role": "canonical-Mundo-X-Ether-Next-ARM64-and-protected-real-transition",
+      "status": "candidate-Ether-Next-protected-real-transition-unmerged",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/x86_cpu.hpp",
@@ -37,6 +37,7 @@
         "native/src/ether_transform.cpp",
         "native/src/ether_neon.cpp",
         "pc-android/native/tests/x86_group6_0f00_test.cpp",
+        "pc-android/native/tests/x86_protected_real_transition_test.cpp",
         "pc-android/native/tests/x86_ether_next_guest_test.cpp"
       ]
     },

@@ -79,7 +79,7 @@ class BiosHardDisk {
         ((unsigned(cpu.reg8(cosmic_pc::Cpu::ECX)) & 0xc0U) << 2U);
     const auto head = unsigned(cpu.reg8(6));
     const auto count = cpu.reg8(cosmic_pc::Cpu::EAX);
-    const auto address = seg_off(cpu.segments[cosmic_pc::Cpu::ES], cpu.reg16(cosmic_pc::Cpu::EBX));
+    const auto address = cpu.real_mode_segment_address(cosmic_pc::Cpu::ES, cpu.reg16(cosmic_pc::Cpu::EBX));
     if (sector == 0 || head >= kHeads || cylinder >= 1024) {
       error(cpu, 4); cpu.set_reg8(cosmic_pc::Cpu::EAX, 0); return;
     }
@@ -94,7 +94,7 @@ class BiosHardDisk {
   }
 
   void extended(cosmic_pc::Cpu& cpu, bool is_write) {
-    const auto dap = seg_off(cpu.segments[cosmic_pc::Cpu::DS], cpu.reg16(cosmic_pc::Cpu::ESI));
+    const auto dap = cpu.real_mode_segment_address(cosmic_pc::Cpu::DS, cpu.reg16(cosmic_pc::Cpu::ESI));
     if (!guest_span(cpu, dap, 16) || cpu.read8(dap) < 16 || cpu.read8(dap+1) != 0) {
       error(cpu, 1); return;
     }
@@ -114,7 +114,7 @@ class BiosHardDisk {
   }
 
   void drive_parameters(cosmic_pc::Cpu& cpu) {
-    const auto physical = seg_off(cpu.segments[cosmic_pc::Cpu::DS], cpu.reg16(cosmic_pc::Cpu::ESI));
+    const auto physical = cpu.real_mode_segment_address(cosmic_pc::Cpu::DS, cpu.reg16(cosmic_pc::Cpu::ESI));
     if (!guest_span(cpu, physical, 26) || cpu.read16(physical) < 26) {
       error(cpu, 1); return;
     }

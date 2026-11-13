@@ -12,6 +12,10 @@ La app conecta el selector de archivos de Android, el arranque BIOS de Mundo X y
 
 Desinstalar la app borra su disco privado. Para conservar la instalación, actualiza con un APK firmado con la misma clave.
 
+## Actualización 0.1.2
+
+La prueba con la ISO en el Samsung superó `2000:083F` y se detuvo al ejecutar `0F 22 C0` (`MOV CR0,EAX`) en `0050:089D`. El cargador quería volver de modo protegido de 16 bits a modo real. La CPU admite esa transición y conserva los descriptores de segmento en caché. Una regresión de El Torito comprueba el regreso a modo real, las lecturas de BIOS y la persistencia del QSSD con un huésped sintético.
+
 ## Actualización 0.1.1
 
 La CPU conserva el descriptor de pila heredado del modo real hasta que el cargador vuelve a cargar `SS`. La prueba reproduce el `PUSH 0x50` en `2000:083F` del diagnóstico en Samsung y comprueba que el invitado continúa. Los cambios de selector posteriores siguen sujetos a las comprobaciones de privilegio.

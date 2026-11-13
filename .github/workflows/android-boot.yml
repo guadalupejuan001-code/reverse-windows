@@ -61,7 +61,7 @@ jobs:
               subprocess.run(["git", "-C", target, "checkout", "--quiet", "--detach", "FETCH_HEAD"], check=True)
           PY
           python3 scripts/verify_deps.py
-      - name: Verify synthetic ISO boot, keyboard, QSSD write and disk reboot
+      - name: Verify synthetic ISO boot, CPU mode transitions, keyboard and QSSD reboot
         if: matrix.abi == 'arm64-v8a'
         run: |
           cmake -S . -B build \
@@ -71,9 +71,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
           cmake --build build --target reverse_windows_android_boot_session_test \
             reverse_windows_atapi_cdrom_guest_test reverse_windows_c06_motherboard_guest_test \
-            reverse_windows_protected_entry_test --parallel 2
+            reverse_windows_protected_entry_test reverse_windows_protected_real_transition_test --parallel 2
           ctest --test-dir build --output-on-failure \
-            -R '^(reverse_windows_android_|reverse_windows_c06_real_motherboard$|reverse_windows_protected_entry_stack$)'
+            -R '^(reverse_windows_android_|reverse_windows_c06_real_motherboard$|reverse_windows_protected_entry_stack$|reverse_windows_protected_real_transition$)'
       - name: Install Android command-line tools and pinned packages
         uses: android-actions/setup-android@v3
         with:
