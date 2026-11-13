@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
         if (disk) hdd = std::make_unique<reverse_windows::BiosHardDisk>(pc, *disk);
         // One canonical guest CPU. The motherboard wraps its existing I/O hooks
         // after boot firmware and QSSD are mounted, and stays alive until exit.
-        reverse_windows::PcMotherboardC06 motherboard(pc);
+        reverse_windows::PcMotherboardC06 motherboard(pc,disk.get());
 
         while (pc.cpu.instructions < opts.steps && pc.status() != "fault" && !pc.cpu.halted) {
             if (pc.waiting_key) {
@@ -133,6 +133,8 @@ int main(int argc, char** argv) {
         }
         const auto final_json = pc.json();
         const auto platform = motherboard.evidence();
+        const auto* ata = motherboard.attached_ata();
+        const auto ata_stats = ata ? ata->counters() : reverse_windows::AtaC07::Counters{};
         const std::string evidence = std::string("{\"schema\":\"reverse-windows-boot-evidence-v1\",") +
             "\"guest_kind\":" + cosmic_pc::PcMachine::quote(kind) +
             ",\"source\":\"original-Mundo-X-PcMachine\"" +
@@ -142,6 +144,13 @@ int main(int argc, char** argv) {
             ",\"qssd_commits\":" + std::to_string(qdisk ? qdisk->stats().commits : 0) +
             ",\"qssd_physical_bytes\":" + std::to_string(qdisk ? qdisk->stats().physical_bytes : 0) +
             ",\"hdd_sectors\":" + std::to_string(disk ? disk->sectors() : 0) +
+            ",\"ide_c07\":{\"attached\":" + std::string(ata?"true":"false") +
+               ",\"pci_class\":\"0101\",\"mode\":\"legacy-PIO\",\"dma_supported\":false,\"ata_commands\":" +
+               std::to_string(ata_stats.commands) + ",\"read_sectors\":" +
+               std::to_string(ata_stats.read_sectors) + ",\"write_sectors\":" +
+               std::to_string(ata_stats.write_sectors) + ",\"flushes\":" +
+               std::to_string(ata_stats.flushes) + ",\"irq14_delivered\":" +
+               std::to_string(platform.ata_irqs) + "}" +
             ",\"motherboard_c06\":{\"pci_config\":true,\"acpi_tables\":true,\"apic_full\":false,\"irq_delivered\":" +
                std::to_string(platform.irq_delivered) + ",\"pit_irqs\":" +
                std::to_string(platform.pit_irqs) + ",\"apic_irqs\":" +
