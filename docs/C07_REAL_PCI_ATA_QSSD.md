@@ -49,7 +49,9 @@ QssdDisk .rqvd (journal, commit, fsync, Estado QSSD)
 - Una dirección fuera de la capacidad y comando desconocido generan IDNF/ABRT.
 - Una imagen QSSD copiada y corrompida se rechaza al recuperar; una cola de transacción incompleta se poda sin admitir la escritura.
 - Una nueva máquina BIOS usa INT 13h DL80 para leer bytes escritos por ATA en la **misma** unidad.
-- Se conservan las 7 pruebas C00–C06; suite total **8/8** hasta este momento.
+- Se conservan las 7 pruebas C00–C06, más dos pruebas independientes de C07 (ATA/QSSD y CPU REP PIO); suite total **9/9** en GitHub Actions. 
+- Prueba C07 ATA/QSSD: **1.068 comprobaciones**; prueba de CPU Mundo X: **527 comprobaciones**. Los contadores no son mediciones de rendimiento.
+- En el disco QSSD de prueba de 256 GiB lógicos, cuatro escrituras sectoriales originadas por instrucciones x86 se recuperaron tras reabrir el registro, con **16.896 bytes de archivo físico** en esa ejecución. Esto no implica compresión universal ni un SSD de 256 GiB físicamente disponible.
 
 Archivo CI: `.github/workflows/c00-real-guest.yml`, con log y artefactos de ATA real. Pin SHA de Mundo X incluido en `config/dependencies.lock.json`; toda la compilación usa el intérprete original, no una CPU alternativa. El repositorio Mundo X amplía sus tests nativos para `REP INSW/OUTSW` y el contrato de ancho/uno por paso.
 
