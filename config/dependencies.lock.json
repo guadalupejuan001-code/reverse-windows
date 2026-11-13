@@ -6,10 +6,10 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "497846c633a03955fd75d71c7871ade90d60b8ce",
+      "commit": "7546446a40b318c8b969fc76faef39336a28e1b5",
       "checkout": "deps/mundo-X",
-      "role": "canonical-PcMachine-C09R1-RAW80-FPU-XMM-FXSTATE-partial-SSE2-not-CPUID-advertised",
-      "status": "candidate-C09R1-unmerged",
+      "role": "canonical-PcMachine-C09R1-x87-FXSTATE-XMM-SSE2-subset-CPUID-flags-unadvertised",
+      "status": "candidate-C09R1-unmerged-PR92",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/x86_cpu.hpp",
@@ -21,7 +21,8 @@
         "pc-android/native/tests/x86_port_pio_c07_test.cpp",
         "pc-android/native/tests/x86_trace_c09_test.cpp",
         "pc-android/native/tests/x86_windows10_c09r_cpu_readiness_test.cpp",
-        "pc-android/native/tests/x86_c09r1_extended_state_test.cpp"
+        "pc-android/native/tests/x86_c09r1_extended_state_test.cpp",
+        "pc-android/native/docs/reverse-windows-c09r1-fpu-xmm-state.md"
       ]
     },
     {
