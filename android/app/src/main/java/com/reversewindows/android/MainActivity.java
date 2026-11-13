@@ -21,6 +21,7 @@ import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.WindowInsets;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -35,6 +36,7 @@ import java.util.Locale;
 
 public final class MainActivity extends Activity implements VmWorker.Listener, GuestMonitor.Input {
     private static final int ISO_PICKER = 21;
+    private static final int DIAGNOSTIC_PICKER = 22;
     private static final long MIB = 1024L * 1024L;
     private static final int BG = 0xff0c111a;
     private static final int PANEL = 0xff151e2a;
@@ -86,6 +88,10 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private boolean checkingHardware;
     private boolean blankTextFrame;
     private String lastJson = "";
+    private String diagnosticToExport = "";
+    private long previousElapsedMs = -1;
+    private long previousSteps;
+    private long stepsPerSecond = -1;
 
     @Override
     public void onCreate(Bundle savedState) {
@@ -99,9 +105,12 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             iso = Uri.parse(savedIso);
             isoName = prefs.getString("iso_name", "ISO");
         }
+        if (savedState != null)
+            diagnosticToExport = savedState.getString("diagnosticToExport", "");
         worker = new VmWorker(this, disk, this);
         buildScreen();
         updateControls();
+        worker.loadDiagnostic();
         if (BuildConfig.DEBUG && getIntent().getBooleanExtra(
                 "com.reversewindows.android.SELF_TEST", false)) {
             start(NativeMachine.BOOT_SELF_TEST, true);
@@ -143,7 +152,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         stats = label("", 13, MUTED);
         stats.setTextIsSelectable(true);
         add(display, stats, 5);
-        evidence = action("Copiar diagnóstico", false, this::copyEvidence);
+        evidence = action("Diagnóstico", false, this::showDiagnostic);
         evidence.setId(R.id.vm_copy_diagnostic);
         add(display, evidence, 8);
 
@@ -241,6 +250,13 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == DIAGNOSTIC_PICKER) {
+            if (result == RESULT_OK && data != null && data.getData() != null &&
+                    !diagnosticToExport.isEmpty())
+                worker.exportDiagnostic(data.getData(), diagnosticToExport);
+            diagnosticToExport = "";
+            return;
+        }
         if (request != ISO_PICKER || result != RESULT_OK || data == null || data.getData() == null) return;
         Uri chosen = data.getData();
         boolean persisted = false;
@@ -310,7 +326,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         fault = false;
         terminal = false;
         blankTextFrame = false;
-        lastJson = "";
+        previousElapsedMs = -1;
+        stepsPerSecond = -1;
         monitor.reset();
         monitor.requestFocus();
         source.setText(switch (bootSource) {
@@ -475,6 +492,16 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         JSONObject ether = diagnostic.optJSONObject("ether_next");
         JSONObject ram = diagnostic.optJSONObject("ram_profile");
         long steps = machine.optLong("instructions");
+        long sessionSteps = boot == null ? steps : boot.optLong("session_steps", steps);
+        long elapsedMs = diagnostic.optLong("elapsed_ms", -1);
+        if (!running || previousElapsedMs < 0 || sessionSteps < previousSteps) {
+            stepsPerSecond = -1;
+        } else if (elapsedMs > previousElapsedMs) {
+            stepsPerSecond = Math.round((sessionSteps - previousSteps) * 1000.0 /
+                    (elapsedMs - previousElapsedMs));
+        }
+        previousElapsedMs = running ? elapsedMs : -1;
+        previousSteps = sessionSteps;
         long reads = machine.optLong("disk_reads");
         long readSectors = ata == null ? 0 : ata.optLong("read_sectors");
         long identifyTransfers = ata == null ? 0 : ata.optLong("identify_data_transfers");
@@ -486,7 +513,10 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         StringBuilder progress = new StringBuilder(handedOff ? "BIOS entregó el control al invitado"
                 : "BIOS preparando el arranque");
         progress.append("\nModo ").append(modeName(machine.optString("cpu_mode")));
-        progress.append(String.format(Locale.getDefault(), " · %,d instrucciones", steps));
+        progress.append(String.format(Locale.getDefault(), "\n%,d pasos x86 en esta sesión", sessionSteps));
+        if (stepsPerSecond >= 0) {
+            progress.append(String.format(Locale.getDefault(), " · %,d pasos/s", stepsPerSecond));
+        }
         if (ram != null) {
             progress.append(String.format(Locale.getDefault(), "\nRAM residente: %,d / %,d MiB",
                     ram.optLong("resident_bytes") / MIB, ram.optLong("backing_budget_bytes") / MIB));
@@ -515,7 +545,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         }
         long restarts = boot == null ? 0 : boot.optLong("restarts");
         if (restarts > 0) {
-            progress.append(String.format(Locale.getDefault(), "\nReinicios automáticos: %,d", restarts));
+            progress.append(String.format(Locale.getDefault(),
+                    "\nReinicios automáticos: %,d · %,d pasos desde el último", restarts, steps));
         }
         if ("iso".equals(diagnostic.optString("source"))) {
             progress.append(String.format(Locale.getDefault(), "\nLecturas de la ISO por BIOS: %,d", reads));
@@ -543,6 +574,10 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             progress.append("\nÚltimo bloqueo: ").append(detail);
         } else if (session && handedOff && blankTextFrame) {
             progress.append("\nLa pantalla VGA todavía está en blanco.");
+        }
+        String ip = machine.optString("rip_hex");
+        if (!ip.isEmpty()) {
+            progress.append("\nDirección de CPU · 0x").append(ip);
         }
         stats.setText(progress);
     }
@@ -612,6 +647,10 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     }
 
     private void updateControls() {
+        if (session && running && !fault && !terminal)
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         boolean diskReady = disk.isFile();
         media.setText(iso == null ? "CD/DVD · sin ISO" : "CD/DVD · " + isoName);
         storage.setText(diskReady ? "QSSD · 64 GiB lógicos" : "QSSD · sin disco");
@@ -631,10 +670,62 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         evidence.setVisibility(lastJson.isEmpty() ? View.GONE : View.VISIBLE);
     }
 
-    private void copyEvidence() {
+    private void showDiagnostic() {
+        String json = lastJson;
+        if (json.isEmpty()) return;
+        new AlertDialog.Builder(this)
+                .setTitle("Último diagnóstico")
+                .setItems(new String[]{"Copiar texto", "Guardar archivo JSON"}, (dialog, choice) -> {
+                    if (choice == 0) copyEvidence(json);
+                    else saveEvidence(json);
+                })
+                .setNegativeButton("Cerrar", null)
+                .show();
+    }
+
+    private void copyEvidence(String json) {
         ClipboardManager clipboard = getSystemService(ClipboardManager.class);
-        clipboard.setPrimaryClip(ClipData.newPlainText("REVERSE Windows", lastJson));
-        if (Build.VERSION.SDK_INT < 33) Toast.makeText(this, "Diagnóstico copiado", Toast.LENGTH_SHORT).show();
+        try {
+            clipboard.setPrimaryClip(ClipData.newPlainText("REVERSE Windows", json));
+            if (Build.VERSION.SDK_INT < 33)
+                Toast.makeText(this, "Diagnóstico copiado", Toast.LENGTH_SHORT).show();
+        } catch (RuntimeException error) {
+            Toast.makeText(this, "No se pudo copiar el diagnóstico.", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void saveEvidence(String json) {
+        diagnosticToExport = json;
+        Intent picker = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        picker.addCategory(Intent.CATEGORY_OPENABLE);
+        picker.setType("application/json");
+        picker.putExtra(Intent.EXTRA_TITLE, "reverse-windows-diagnostico.json");
+        try {
+            startActivityForResult(picker, DIAGNOSTIC_PICKER);
+        } catch (android.content.ActivityNotFoundException error) {
+            diagnosticToExport = "";
+            Toast.makeText(this, "Android no encontró dónde guardar el archivo.",
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override
+    public void onSavedDiagnostic(String json) {
+        if (json.isEmpty()) return;
+        lastJson = json;
+        updateControls();
+    }
+
+    @Override
+    public void onDiagnosticExported(boolean saved) {
+        Toast.makeText(this, saved ? "Diagnóstico guardado" : "No se pudo guardar el diagnóstico.",
+                Toast.LENGTH_LONG).show();
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle state) {
+        super.onSaveInstanceState(state);
+        state.putString("diagnosticToExport", diagnosticToExport);
     }
 
     private void sendGuestKey(int ascii, int scan) {

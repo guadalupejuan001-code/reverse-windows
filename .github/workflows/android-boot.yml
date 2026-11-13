@@ -35,9 +35,9 @@ jobs:
         abi: [arm64-v8a, x86_64]
     env:
       ANDROID_ABI: ${{ matrix.abi }}
-      ANDROID_APP_ID: com.reversewindows.android.ether.r022
-      ANDROID_VERSION: "0.1.12"
-      ANDROID_VERSION_CODE: "13"
+      ANDROID_APP_ID: com.reversewindows.android.ether.r023
+      ANDROID_VERSION: "0.1.13"
+      ANDROID_VERSION_CODE: "14"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -213,8 +213,35 @@ jobs:
           elif ram["spill_mode"] == "unavailable":
               assert ram["spill_limit_bytes"] == 0 and ram["spill_error"], ram
           PY
+          adb shell input keyevent KEYCODE_HOME
+          adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity"
           adb shell input keyevent KEYCODE_ENTER
           wait_for_state halted
+          snapshot="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ultimo-diagnostico.json"
+          adb shell am force-stop "$ANDROID_APP_ID"
+          adb exec-out run-as "$ANDROID_APP_ID" cat files/ultimo-diagnostico.json > "$snapshot"
+          python3 - "$snapshot" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          snapshot = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert snapshot["status"] == "halted" and snapshot["source"] == "self-test", snapshot
+          assert snapshot["machine"]["instructions"] > 0 and snapshot["elapsed_ms"] >= 0, snapshot
+          assert snapshot["boot_progress"]["session_steps"] == snapshot["machine"]["instructions"]
+          assert snapshot["iso_read_us"] == 0
+          assert snapshot["ram_profile"]["spill_read_us"] == snapshot["ram_profile"]["spill_write_us"] == 0
+          PY
+          adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity"
+          for attempt in {1..8}; do
+            adb shell uiautomator dump /sdcard/reverse-windows-window.xml >/dev/null
+            adb exec-out cat /sdcard/reverse-windows-window.xml > "$RUNNER_TEMP/reverse-windows-window.xml"
+            if grep -Fq "resource-id=\"$ANDROID_APP_ID:id/vm_copy_diagnostic\"" "$RUNNER_TEMP/reverse-windows-window.xml"; then
+              exit 0
+            fi
+          done
+          echo "Saved diagnostic was unavailable after relaunch" >&2
+          exit 1
           BASH
       - name: Run synthetic BIOS and keyboard on Android
         if: matrix.abi == 'x86_64' && steps.kvm.outputs.available == 'true'
