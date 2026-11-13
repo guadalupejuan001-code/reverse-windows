@@ -17,6 +17,10 @@ class AtapiCdrom {
  public:
   using Reader = std::function<bool(std::uint64_t, std::uint8_t*, std::size_t)>;
   static constexpr std::size_t sector_bytes = 2048;
+  struct Activity {
+    std::uint64_t packets=0, read_sectors=0, rejected_packets=0;
+    std::uint8_t last_packet=0, last_rejected_packet=0, last_sense=0, last_asc=0;
+  };
 
   AtapiCdrom(Reader read, std::uint64_t bytes, std::function<void()> irq)
       : read_(std::move(read)), irq_(std::move(irq)), blocks_(bytes / sector_bytes) {
@@ -31,8 +35,11 @@ class AtapiCdrom {
 
   void reset() {
     control_ = drive_ = features_ = sense_ = asc_ = 0;
+    activity_ = {};
     reset_task_file();
   }
+
+  const Activity& activity() const noexcept { return activity_; }
 
   std::uint32_t input(std::uint16_t port, unsigned width) {
     if (drive_ & 0x10U) return 0; // No secondary slave.
@@ -99,6 +106,7 @@ class AtapiCdrom {
   std::size_t packet_pos_=0, position_=0, phase_end_=0;
   std::vector<std::uint8_t> data_;
   std::uint32_t next_lba_=0, sectors_left_=0;
+  Activity activity_;
 
   void reset_task_file() {
     phase_ = Phase::Idle;
@@ -130,6 +138,14 @@ class AtapiCdrom {
     error_ = static_cast<std::uint8_t>((key << 4U) | 4U);
     status_ = ready | 1U;
     irq();
+  }
+
+  void fail_packet(std::uint8_t key, std::uint8_t asc) {
+    ++activity_.rejected_packets;
+    activity_.last_rejected_packet = activity_.last_packet;
+    activity_.last_sense = key;
+    activity_.last_asc = asc;
+    fail(key, asc);
   }
 
   static std::uint32_t be32(const std::uint8_t* p) {
@@ -164,10 +180,11 @@ class AtapiCdrom {
   void read_sector() {
     data_.resize(sector_bytes);
     if (!read_(std::uint64_t(next_lba_) * sector_bytes, data_.data(), data_.size())) {
-      fail(3, 0x11); // MEDIUM ERROR, unrecovered read error.
+      fail_packet(3, 0x11); // MEDIUM ERROR, unrecovered read error.
       return;
     }
     ++next_lba_;
+    ++activity_.read_sectors;
     --sectors_left_;
     position_ = 0;
     data_phase();
@@ -175,7 +192,7 @@ class AtapiCdrom {
 
   void begin_read(std::uint32_t lba, std::uint32_t count) {
     if (!count) { finish(); return; }
-    if (lba >= blocks_ || count > blocks_ - lba) { fail(5, 0x21); return; }
+    if (lba >= blocks_ || count > blocks_ - lba) { fail_packet(5, 0x21); return; }
     next_lba_ = lba;
     sectors_left_ = count;
     read_sector();
@@ -258,7 +275,42 @@ class AtapiCdrom {
     if (phase_ != Phase::Packet) return;
     packet_[packet_pos_++] = static_cast<std::uint8_t>(value);
     packet_[packet_pos_++] = static_cast<std::uint8_t>(value >> 8U);
-    if (packet_pos_ == packet_.size()) execute_packet();
+    if (packet_pos_ == packet_.size()) {
+      ++activity_.packets;
+      activity_.last_packet = packet_[0];
+      execute_packet();
+    }
+  }
+
+  void mode_sense() {
+    const auto page = packet_[2] & 0x3fU;
+    const auto control = packet_[2] >> 6;
+    if (packet_[3] || (page != 0x01 && page != 0x2a && page != 0x3f)) {
+      fail_packet(5, 0x24); // INVALID FIELD IN CDB.
+      return;
+    }
+    if (control == 3) {
+      fail_packet(5, 0x39); // SAVING PARAMETERS NOT SUPPORTED.
+      return;
+    }
+    // MODE SENSE (10) header, data-only disc and zero block descriptors.
+    std::vector<std::uint8_t> result{0,0,1,0,0,0,0,0};
+    if (page == 0x01 || page == 0x3f) {
+      // Read error recovery parameters are fixed. Failed reads report MEDIUM ERROR.
+      result.insert(result.end(), {0x01,0x06,0,0,0,0,0,0});
+    }
+    if (page == 0x2a || page == 0x3f) {
+      // Read-only capabilities. No writable media, audio, eject or changer.
+      const auto start = result.size();
+      result.resize(start + 20);
+      result[start] = 0x2a;
+      result[start + 1] = 18;
+      if (control != 1) result[start + 13] = sector_bytes / 1024;
+    }
+    const auto length = result.size() - 2;
+    result[0] = std::uint8_t(length >> 8);
+    result[1] = std::uint8_t(length);
+    response(std::move(result), be16(packet_.data() + 7));
   }
 
   void execute_packet() {
@@ -275,7 +327,7 @@ class AtapiCdrom {
         return;
       }
       case 0x12: { // Standard INQUIRY
-        if (packet_[1] & 1U) { fail(5, 0x24); return; }
+        if (packet_[1] & 1U) { fail_packet(5, 0x24); return; }
         std::vector<std::uint8_t> result(36, 0);
         result[0] = 5; result[1] = 0x80; result[2] = 2; result[3] = 2; result[4] = 31;
         std::copy_n("REVERSE ", 8, result.begin() + 8);
@@ -295,11 +347,11 @@ class AtapiCdrom {
       case 0xa8: begin_read(be32(packet_.data()+2), be32(packet_.data()+6)); return;
       case 0x2b: // SEEK (10)
         if (be32(packet_.data()+2) < blocks_) finish();
-        else fail(5, 0x21);
+        else fail_packet(5, 0x21);
         return;
       case 0x43: { // READ TOC, format 0, one data track and lead-out.
         if ((packet_[2] & 15U) || packet_[6] > 1 || (packet_[1] & 2U)) {
-          fail(5, 0x24);
+          fail_packet(5, 0x24);
           return;
         }
         std::vector<std::uint8_t> result{0,18,1,1,0,0x14,1,0,0,0,0,0,
@@ -313,8 +365,9 @@ class AtapiCdrom {
         response(std::move(result), be16(packet_.data()+7));
         return;
       }
-      case 0x2a: case 0xaa: fail(7, 0x27); return; // DATA PROTECT: read-only ISO.
-      default: fail(5, 0x20);
+      case 0x5a: mode_sense(); return;
+      case 0x2a: case 0xaa: fail_packet(7, 0x27); return; // DATA PROTECT: read-only ISO.
+      default: fail_packet(5, 0x20);
     }
   }
 };
