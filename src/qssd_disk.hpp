@@ -474,6 +474,117 @@ class QssdDisk final : public BlockDisk {
   }
 
  public:
+  // Offline maintenance. The original descriptor stays open and locked until
+  // the independently verified new .rqvd has been fsynced and atomically
+  // renamed on the SAME filesystem. Only live guest blocks are retained.
+  // The temporary image has a new generation; stale .rqix indexes cannot
+  // claim its address space. Optional fault injection is strictly for tests.
+  static CompactResult compact(const std::filesystem::path& path,
+                               bool inject_abort_before_rename=false) {
+    check_path(path);
+    CompactResult result{};
+    const auto temp=std::filesystem::path(temp_name(path,".c08-staging").string()+".rqvd");
+    bool renamed=false;
+    try {
+      {
+        QssdDisk original(path);
+        const auto original_view=original.states_.snapshot();
+        const auto root=original_view->value->root;
+        const auto old_end=original_view->value->end;
+        result.before_bytes=old_end;
+        result.old_commits=original_view->value->commits;
+        if(original.generation_==UINT64_MAX)
+          throw std::runtime_error("QSSD generation exhausted");
+        result.generation=original.generation_+1;
+        int out=::open(temp.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
+        if(out<0)throw std::system_error(errno,std::generic_category(),"QSSD compact temp create");
+        try {
+          std::array<std::uint8_t,kHeader> head{};
+          read_all(original.fd_,0,head.data(),head.size());
+          put64(head.data()+40,result.generation);
+          write_all(out,0,head.data(),head.size());
+          std::uint64_t position=kHeader, committed=0;
+          unsigned staged=0;
+          auto finish_batch=[&](){
+            if(!staged)return;
+            position=append_to(out,position,Commit,committed+1,0,staged,{});
+            ++committed;staged=0;
+          };
+          auto transfer=[&](std::uint64_t block,std::uint64_t offset){
+            const auto data=original.decode(offset,old_end);
+            // An all-zero block is indistinguishable from an absent block and
+            // can be safely removed from the compacted sparse map.
+            if(std::all_of(data.begin(),data.end(),[](auto v){return v==0;}))
+              return;
+            std::vector<std::uint8_t> payload;
+            Kind kind=Raw;
+            for(unsigned period=1;period<=32;++period) {
+              bool repeating=true;
+              for(std::size_t i=period;i<kBlockSize;++i)
+                if(data[i]!=data[i%period]) {repeating=false;break;}
+              if(repeating) {
+                kind=Pattern;payload.assign(data.begin(),data.begin()+period);
+                break;
+              }
+            }
+            if(kind==Raw)payload.assign(data.begin(),data.end());
+            position=append_to(out,position,kind,block,digest(data.data(),data.size()),0,payload);
+            ++result.live_blocks;
+            if(++staged==128)finish_batch(); // replay bound: <=128 per commit
+          };
+          each_live(root,8,0,transfer);
+          finish_batch();
+          result.compact_commits=committed;
+          result.after_bytes=position;
+          if(::fsync(out)!=0)
+            throw std::system_error(errno,std::generic_category(),"QSSD compact file fsync");
+          ::close(out);out=-1;
+        }catch(...){
+          ::close(out);
+          throw;
+        }
+        // Independently re-open, replay every new commit and compare the
+        // complete decoded bytes of every previously live block before rename.
+        {
+          QssdDisk candidate(temp);
+          if(candidate.capacity_!=original.capacity_ ||
+             candidate.generation_!=result.generation ||
+             candidate.file_size()!=result.after_bytes)
+            throw std::runtime_error("QSSD compact candidate metadata mismatch");
+          std::array<std::uint8_t,kBlockSize> actual{};
+          auto verify=[&](std::uint64_t block,std::uint64_t offset) {
+            const auto expected=original.decode(offset,old_end);
+            if(!candidate.read_bytes(block*kBlockSize,actual.data(),actual.size()) ||
+               actual!=expected)
+              throw std::runtime_error("QSSD compact candidate differs from guest block state");
+          };
+          each_live(root,8,0,verify);
+        }
+        if(inject_abort_before_rename)
+          throw std::runtime_error("C08 injected crash point: before atomic compact rename");
+        // Detect unexpected replacement of the original path since open.
+        struct stat handle{},name{};
+        if(::fstat(original.fd_,&handle)!=0||
+           ::lstat(path.c_str(),&name)!=0||
+           handle.st_dev!=name.st_dev||handle.st_ino!=name.st_ino)
+          throw std::runtime_error("QSSD source image changed during offline compact");
+        if(::rename(temp.c_str(),path.c_str())!=0)
+          throw std::system_error(errno,std::generic_category(),"QSSD compact rename");
+        renamed=true;
+        fsync_parent(path); // durable name publication; old/new are each valid
+        result.replaced=true;
+      }
+      // The obsolete checkpoint has a DIFFERENT generation. Generating a new
+      // checkpoint is optional: failure cannot invalidate a verified image.
+      QssdDisk after(path);
+      result.checkpoint_saved=after.checkpoint();
+      return result;
+    }catch(...){
+      if(!renamed)(void)::unlink(temp.c_str());
+      throw;
+    }
+  }
+
   static void create(const std::filesystem::path& path,std::uint64_t gib) {
     check_path(path);
     if(gib<1||gib>16384)throw std::invalid_argument("QSSD supported logical capacity is 1 GiB .. 16 TiB");
