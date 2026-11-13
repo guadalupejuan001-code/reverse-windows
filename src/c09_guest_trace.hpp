@@ -197,7 +197,7 @@ class C09GuestTrace final {
     };
     pc_.cpu.interrupt_hook=[this](Cpu& cpu,std::uint8_t vector){
       const auto ah=cpu.reg8(4);
-      const auto drive=cpu.reg8(6);
+      const auto drive=cpu.reg8(Cpu::EDX); // DL, not DH (legacy reg8 index 6)
       const auto reads_before=pc_.disk_reads;
       bool handled=false;
       try{handled=previous_bios_&&previous_bios_(cpu,vector);}
