@@ -12,6 +12,12 @@ La app conecta el selector de archivos de Android, el arranque BIOS de Mundo X y
 
 Desinstalar la app borra su disco privado. Para conservar la instalación, actualiza con un APK firmado con la misma clave.
 
+## C01 · Cobertura de CPU SSE/SSE2
+
+La CPU integra aritmética SSE de precisión simple, comparaciones, movimientos, conversiones SSE2 entre datos de 32 y 64 bits, y operaciones enteras empaquetadas. Las pruebas comprueban resultados y excepciones contra x86 y ejecutan los mismos casos en ARM64. `FXSAVE` y `FXRSTOR` preservan el acceso a x87 con `CR4.OSFXSR=0`. La integración prueba también el recorrido sintético BIOS, ISO, teclado, QSSD y reinicio del huésped.
+
+Las capacidades SSE, SSE2, FXSR y x87 siguen sin anunciarse mientras falten formas MMX, `MASKMOVDQU`, aproximaciones SSE y casos verificados de estado y redondeo x87. El instalador de Windows queda por verificar con la ISO del usuario.
+
 ## Actualización 0.1.4
 
 **Comprobar equipo virtual** ejecuta una prueba de RAM, VGA y detección PCI IDE, consulta CPUID y revisa la entrada BIOS de la ISO y el QSSD en modo de solo lectura. El panel muestra la entrega al cargador, cambios de modo de CPU, lecturas, escrituras confirmadas y el motivo de un fallo aunque VGA esté en negro. La ausencia de SSE2, x87 y FXSR en el perfil anunciado se muestra como comprobación pendiente.

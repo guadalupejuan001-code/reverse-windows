@@ -6,10 +6,10 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "b698a7e3b8ae9a8c257c252a7ed8b0993231bae4",
+      "commit": "9e3ae834c3daefa9bb9b45e1d3a25fc11311d59b",
       "checkout": "deps/mundo-X",
-      "role": "canonical-Mundo-X-Ether-Next-ARM64-and-locked-memory-boot",
-      "status": "candidate-Ether-Next-locked-memory-boot-unmerged",
+      "role": "canonical-Mundo-X-Ether-Next-ARM64-and-SSE-conformance",
+      "status": "candidate-Ether-Next-SSE-conformance-unmerged",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/x86_cpu.hpp",
@@ -40,6 +40,9 @@
         "pc-android/native/tests/x86_protected_real_transition_test.cpp",
         "pc-android/native/tests/x86_cpu_profile_test.cpp",
         "pc-android/native/tests/x86_lock_rmw_test.cpp",
+        "pc-android/native/tests/x86_sse_fp32_test.cpp",
+        "pc-android/native/tests/x86_sse2_packed_oracle_test.cpp",
+        "pc-android/native/tests/x86_c09r1_stage5_cvt_fxsr_test.cpp",
         "pc-android/native/tests/x86_ether_next_guest_test.cpp"
       ]
     },
