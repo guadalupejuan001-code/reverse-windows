@@ -64,10 +64,15 @@ if(BUILD_TESTING)
   target_link_libraries(reverse_windows_c06_motherboard_guest_test PRIVATE reverse_windows_component_headers)
   add_test(NAME reverse_windows_c06_real_motherboard COMMAND reverse_windows_c06_motherboard_guest_test)
 
+  add_executable(reverse_windows_c07_ata_guest_test tests/c07_ata_guest_test.cpp)
+  target_link_libraries(reverse_windows_c07_ata_guest_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c07_pci_ata_qssd_pio_irq COMMAND reverse_windows_c07_ata_guest_test)
+
   set_tests_properties(reverse_windows_real_x86_demo reverse_windows_real_x64_demo
                        reverse_windows_x86_hdd_write_read_persist
                        reverse_windows_qssd_sparse_atomic_reboot_x86
                        reverse_windows_c04_real_guest_idt
                        reverse_windows_c05_real_cpl3_tss
-                       reverse_windows_c06_real_motherboard PROPERTIES TIMEOUT 120)
+                       reverse_windows_c06_real_motherboard
+                       reverse_windows_c07_pci_ata_qssd_pio_irq PROPERTIES TIMEOUT 120)
 endif()
