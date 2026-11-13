@@ -105,10 +105,12 @@ class AcpiC06 {
     aml.insert(aml.end(),{0x08,'_','P','R','T',0x12,0x02,0x00});
     // The configuration ports belong to the root bridge, not its children.
     aml.insert(aml.end(),{
-      0x5b,0x82,0x1e,'R','E','S','0',
+      0x5b,0x82,0x22,'R','E','S','0',
       0x08,'_','H','I','D',0x0c,0x41,0xd0,0x0c,0x02, // EISAID("PNP0C02")
-      0x08,'_','C','R','S',0x11,0x09,0x0a,6,
-      0x4b,std::uint8_t(pci_config_ports),std::uint8_t(pci_config_ports>>8),8,
+      0x08,'_','C','R','S',0x11,0x0d,0x0a,10,
+      0x47,0x01, // 16-bit I/O decode, same minimum and maximum port.
+      std::uint8_t(pci_config_ports),std::uint8_t(pci_config_ports>>8),
+      std::uint8_t(pci_config_ports),std::uint8_t(pci_config_ports>>8),1,8,
       0x79,0x00
     });
     finish_large_package(root_length);

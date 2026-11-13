@@ -343,8 +343,9 @@ void pci_acpi_cmos_guest(){
        pc.cpu.read16(reserved)==0x825b && pc.cpu.read32(reserved+3)==0x30534552U &&
        package_end(reserved+2)==package_end(root+2) &&
        pc.cpu.read32(reserved+13)==0x020cd041U &&
-       pc.cpu.read32(reserved+26)==0x080cf84bU &&
-       pc.cpu.read16(reserved+30)==0x0079,
+       pc.cpu.read32(reserved+26)==0x0cf80147U &&
+       pc.cpu.read32(reserved+30)==0x08010cf8U &&
+       pc.cpu.read16(reserved+34)==0x0079,
        "DSDT incorrectly routes PCI INTx or does not reserve PCI config ports");
 
   std::vector<std::uint8_t> p;
