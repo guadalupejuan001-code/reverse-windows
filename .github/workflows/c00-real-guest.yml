@@ -125,6 +125,26 @@ jobs:
           grep -q '"qssd_maintenance":"compact"' build/c08-cli-compact.json
           test -f build/c08-cli-smoke.rqvd.rqix
           echo C08_CLI_OFFLINE_MAINTENANCE_PASS
+      - name: Verify real C09R-1 stage4 SSE2 DAZ FTZ and x87 oracles (NO Windows)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in \
+            reverse_windows_c09r1_stage4_mxcsr_test \
+            reverse_windows_c09r1_stage4_x87_test \
+            reverse_windows_c09r1_stage4_sse2_misc_test \
+            reverse_windows_c09r1_stage4_packed_cvt_test; do
+            ./build/"$target" | tee "build/${target}.log"
+          done
+          grep -q 'C09R1_STAGE4_DAZ_X86_ORACLE_PASS' \
+            build/reverse_windows_c09r1_stage4_mxcsr_test.log
+          grep -q 'C09R1_STAGE4_X87_PC_RC_HW_ORACLE_PASS' \
+            build/reverse_windows_c09r1_stage4_x87_test.log
+          grep -q 'C09R1_STAGE4_CMPPD_CMPSD_NAN_X86_PASS' \
+            build/reverse_windows_c09r1_stage4_sse2_misc_test.log
+          grep -q 'C09R1_STAGE4_PACKED_CVT_X86_ORACLE_PASS' \
+            build/reverse_windows_c09r1_stage4_packed_cvt_test.log
+          echo C09R1_STAGE4_CPU_SUBSET_AND_ORACLES_PASS
       - name: Prove C09R-1 stage3 XMM/x87/SSE2/IDT and Ring3 context without Windows
         shell: bash
         run: |
@@ -144,6 +164,10 @@ jobs:
             build/reverse_windows_c09r1_exact_x87_test.log
           grep -q 'C09R1_X87_DEFERRED_MF_FNCLEX_CONTEXT_PASS' \
             build/reverse_windows_c09r1_x87_mf_test.log
+            build/reverse_windows_c09r1_stage4_mxcsr_test.log
+            build/reverse_windows_c09r1_stage4_x87_test.log
+            build/reverse_windows_c09r1_stage4_sse2_misc_test.log
+            build/reverse_windows_c09r1_stage4_packed_cvt_test.log
           echo C09R1_STAGE3_REAL_GUEST_CONTEXT_AND_EXCEPTION_PASS
       - name: Audit REAL owner-connected hardware without ISO or Windows
         shell: bash
