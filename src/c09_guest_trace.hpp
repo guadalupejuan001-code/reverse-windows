@@ -22,6 +22,8 @@ class C09GuestTrace final {
   QssdDisk* qssd_;
   std::ofstream output_;
   std::uint64_t cap_=0,emitted_=0,dropped_=0,steps_=0;
+  std::uint64_t critical_emitted_=0;
+  static constexpr std::uint64_t kCriticalEventLimit=256;
   std::uint64_t delivered_exceptions_=0,terminal_faults_=0;
   std::uint64_t io_reads_=0,io_writes_=0,mmio_reads_=0,mmio_writes_=0;
   std::uint64_t bios_calls_=0,hardware_irqs_=0,mode_changes_=0;
@@ -45,13 +47,21 @@ class C09GuestTrace final {
     for(const auto b:data)s<<std::setw(2)<<unsigned(b);
     return s.str();
   }
-  void record(const std::string& json,bool essential=false) noexcept {
+  void record(const std::string& json,bool essential=false,bool final_or_fault=false) noexcept {
     if(failed_)return;
-    if(!essential&&emitted_>=cap_){++dropped_;return;}
+    // Untrusted guests can switch modes repeatedly. Important milestones are
+    // separately bounded; only one terminal fault and finish bypass quotas.
+    if(essential && !final_or_fault && critical_emitted_>=kCriticalEventLimit) {
+      ++dropped_;return;
+    }
+    if(!essential && emitted_>=cap_) {++dropped_;return;}
     try {
       output_<<json<<'\n';
       if(!output_) {failed_=true;last_error_="Trace file write failed";}
-      else ++emitted_;
+      else {
+        ++emitted_;
+        if(essential && !final_or_fault) ++critical_emitted_;
+      }
     }catch(...) {failed_=true;last_error_="Trace output exception";}
   }
   void step(const Cpu::StepTrace& t) {
@@ -108,7 +118,7 @@ class C09GuestTrace final {
        <<",\"rip\":"<<quote(address(t.rip_before))
        <<",\"decoded\":"<<quote(bytes(t.decoded_bytes))
        <<",\"reason\":"<<quote(t.terminal_fault->reason)<<"}";
-      record(v.str(),true);
+      record(v.str(),true,true);
     }
   }
   void hardware(const Cpu::IrqTrace& t) {
@@ -279,7 +289,7 @@ class C09GuestTrace final {
     if(pc_.cpu.fault)
       o<<",\"fault_reason\":"<<quote(pc_.cpu.fault->describe());
     o<<"}";
-    record(o.str(),true);
+    record(o.str(),true,true);
     output_.flush();
     if(failed_||!output_)throw std::runtime_error("C09 trace file could not be fully persisted");
   }
