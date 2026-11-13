@@ -466,6 +466,8 @@ class QssdDisk final : public BlockDisk {
       throw std::runtime_error("QSSD invalid volume header");
     capacity_=u64(head.data()+16);
     generation_=u64(head.data()+40); // old C03 images have zero generation
+    if(generation_ && u64(head.data()+48)!=digest(head.data(),48))
+      throw std::runtime_error("QSSD compacted generation/header checksum mismatch");
     if(capacity_<kGiB||capacity_>16384*kGiB||capacity_%kBlockSize)
       throw std::runtime_error("QSSD volume logical size invalid");
     recovery_={};
@@ -541,6 +543,7 @@ class QssdDisk final : public BlockDisk {
           std::array<std::uint8_t,kHeader> head{};
           read_all(original.fd_,0,head.data(),head.size());
           put64(head.data()+40,result.generation);
+          put64(head.data()+48,digest(head.data(),48));
           write_all(out,0,head.data(),head.size());
           std::uint64_t position=kHeader, committed=0;
           unsigned staged=0;
