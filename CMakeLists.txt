@@ -109,6 +109,32 @@ if(BUILD_TESTING)
 
   # Always compile guest FPU/FXSAVE/SSE2 tests from the exact Mundo X
   # CPU checkout. REVERSE Windows never adds a second SSE interpreter.
+  # C09R-1 stage3. Compile genuine guest x86 tests from exact Mundo X
+  # dependency. No SIMD/x87 implementation is duplicated in REVERSE Windows.
+  add_executable(reverse_windows_c09r1_sse2_fp_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_c09r1_stage3_fp_test.cpp")
+  target_link_libraries(reverse_windows_c09r1_sse2_fp_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c09r1_binary64_mxcsr_xm_ud
+    COMMAND reverse_windows_c09r1_sse2_fp_test)
+
+  add_executable(reverse_windows_c09r1_ring3_fpu_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_c09r1_stage3_ring3_test.cpp")
+  target_link_libraries(reverse_windows_c09r1_ring3_fpu_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c09r1_cpl3_tss_fpu_fxsave
+    COMMAND reverse_windows_c09r1_ring3_fpu_test)
+
+  add_executable(reverse_windows_c09r1_exact_x87_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_c09r1_stage3_x87_precision_test.cpp")
+  target_link_libraries(reverse_windows_c09r1_exact_x87_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c09r1_x87_ieee_to_ext80_oracle
+    COMMAND reverse_windows_c09r1_exact_x87_test)
+
+  add_executable(reverse_windows_c09r1_x87_mf_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_c09r1_stage3_x87_mf_test.cpp")
+  target_link_libraries(reverse_windows_c09r1_x87_mf_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c09r1_x87_deferred_mf
+    COMMAND reverse_windows_c09r1_x87_mf_test)
+
   add_executable(reverse_windows_c09r1_fxstate_test
     "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_c09r1_fxstate_test.cpp")
   target_link_libraries(reverse_windows_c09r1_fxstate_test PRIVATE reverse_windows_component_headers)
@@ -152,5 +178,9 @@ if(BUILD_TESTING)
                        reverse_windows_c09r_real_cpu_cx16_prefetchw
                        reverse_windows_c09r1_xmm_mxcsr_subset
                        reverse_windows_c09r1_x87_fxsave_context
-                       reverse_windows_c09r1_sse2_integer_packed PROPERTIES TIMEOUT 120)
+                       reverse_windows_c09r1_sse2_integer_packed
+                       reverse_windows_c09r1_binary64_mxcsr_xm_ud
+                       reverse_windows_c09r1_cpl3_tss_fpu_fxsave
+                       reverse_windows_c09r1_x87_ieee_to_ext80_oracle
+                       reverse_windows_c09r1_x87_deferred_mf PROPERTIES TIMEOUT 120)
 endif()
