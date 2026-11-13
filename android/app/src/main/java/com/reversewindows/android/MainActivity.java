@@ -48,7 +48,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             {"cpu_pae", "PAE"}, {"cpu_nx", "NX"}, {"cpu_cx16", "CMPXCHG16B"},
             {"cpu_lahf_sahf", "LAHF/SAHF"}, {"cpu_prefetchw", "PREFETCHW"}, {"cpu_fxsr", "FXSR"},
             {"ram", "RAM"}, {"pci_ide", "Controlador PCI IDE"}, {"vga", "Video VGA"},
-            {"iso_boot", "Arranque desde ISO"}, {"qssd", "Disco QSSD"},
+            {"iso_boot", "Arranque desde ISO"}, {"qssd", "Archivo QSSD"},
+            {"qssd_ata", "Capacidad QSSD por ATA"},
     };
 
     private File disk;
@@ -363,6 +364,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
                 else if (checks.isNull(key)) {
                     checkResult = switch (key) {
                         case "qssd" -> "sin disco creado";
+                        case "qssd_ata" -> "requiere un disco legible";
                         case "iso_boot" -> "sin ISO elegida";
                         default -> "sin resultado";
                     };
@@ -452,6 +454,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         long steps = machine.optLong("instructions");
         long reads = machine.optLong("disk_reads");
         long readSectors = ata == null ? 0 : ata.optLong("read_sectors");
+        long identifyTransfers = ata == null ? 0 : ata.optLong("identify_data_transfers");
         long commits = volume == null ? 0 : volume.optLong("commits");
         boolean handedOff = boot == null ? steps > 0 : boot.optBoolean("handed_off");
         StringBuilder progress = new StringBuilder(handedOff ? "BIOS entregó el control al invitado"
@@ -472,6 +475,9 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             progress.append(String.format(Locale.getDefault(), "\nLecturas del disco por BIOS: %,d", reads));
         }
         if (volume != null) {
+            if (identifyTransfers > 0) {
+                progress.append("\nEl invitado leyó la identificación ATA del QSSD.");
+            }
             progress.append(String.format(Locale.getDefault(),
                     "\nSectores leídos por ATA: %,d · Operaciones guardadas en QSSD: %,d", readSectors, commits));
         }

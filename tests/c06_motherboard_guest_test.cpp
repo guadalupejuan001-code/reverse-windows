@@ -100,12 +100,16 @@ void pic_legacy_x87_guest(){
       0xd9,0x2d,4,0x91,0,0, // FLDCW [9104]
       0xd9,0xe8,0xd9,0xee, // FLD1, FLDZ
       0xde,0xf9,           // FDIVP ST(1), ST(0): 1/0
+      0xe4,0x20,0xa2,2,0x91,0,0, // Master IRR while IF is clear.
+      0xe4,0xa0,0xa2,3,0x91,0,0, // Slave IRR while IF is clear.
       0x9b,0xf4};          // FWAIT, HLT
   code(cpu,0xa000,program);
   cpu.eip=0xa000;
   run(pc,40);
   const auto wait_ip=0xa000+program.size()-2;
   const auto wait_insns=cpu.instructions;
+  need((cpu.read16(0x9102)&0x2004U)==0x2004U,
+       "Both PICs must expose the pending IRQ13 cascade while CPU IF is clear");
   need(cpu.eip==wait_ip && cpu.x87_ferr_asserted() && !cpu.halted,
        "FWAIT did not hold at the same IP with FERR# pending");
   need(cpu.step()==cosmic_pc::StepResult::WaitingForX87 && cpu.instructions==wait_insns &&
@@ -128,6 +132,47 @@ void pic_legacy_x87_guest(){
   need(cpu.halted && board.evidence().irq_delivered==2 && !cpu.x87_ferr_asserted(),
        "A second independent FERR# edge did not deliver IRQ13");
   std::cout<<"C02_X87_LEGACY_FERR_PASS IRQ13=2 FWAIT=hold-and-retry IGNNE=cleared\n";
+}
+void optical_irq_wakes_sti_hlt(){
+  PcMachine pc(16*1024*1024);boot32(pc);
+  std::array<std::uint8_t,2048> optical_sector{};
+  PcMotherboardC06 board(pc,nullptr,
+      [&optical_sector](auto offset,auto* data,auto count){
+        if(offset>optical_sector.size()||count>optical_sector.size()-offset)return false;
+        std::copy_n(optical_sector.data()+offset,count,data);
+        return true;
+      },optical_sector.size());
+  auto& cpu=pc.cpu;
+  cpu.idtr={0x1000,0x15000};
+  cpu.regs[Cpu::ESP]=0x190000;
+  gate(cpu,0x77,0x13000);
+  code(cpu,0x13000,{
+      0x50,0x52,                         // PUSH EAX, EDX
+      0x66,0xba,0x77,0x01,0xec,           // Sample ATAPI command status.
+      0xa2,0x00,0x91,0x00,0x00,           // Save sampled status.
+      0x8b,0x44,0x24,0x08,                // Record saved EIP from IRQ frame.
+      0xa3,0x04,0x91,0x00,0x00,
+      0xb0,0x20,0xe6,0xa0,0xe6,0x20,       // EOI to slave and master.
+      0x5a,0x58,0xcf});                    // POP EDX, EAX; IRETD
+  const std::vector<std::uint8_t> program={
+      0xfa,                               // Queue IRQ15 with CPU IRQs disabled.
+      0xb0,0xfb,0xe6,0x21,                 // Unmask PIC cascade.
+      0xb0,0x7f,0xe6,0xa1,                 // Unmask IRQ15.
+      0x66,0xba,0x77,0x01,0xb0,0xa1,0xee, // IDENTIFY PACKET DEVICE.
+      0xfb,0xf4,                          // STI; HLT before pending IRQ delivery.
+      0xc6,0x05,0x01,0x91,0x00,0x00,0x01, // Reached code after the wait.
+      0xfa,0xf4};
+  constexpr auto start=0xa000U;
+  constexpr auto after_hlt=start+18;
+  code(cpu,start,program);
+  cpu.eip=start;
+  run(pc,70);
+  need(cpu.halted&&cpu.read8(0x9101)==1,
+       "ATAPI IRQ15 must wake the first HLT and resume its next instruction");
+  need(cpu.read32(0x9104)==after_hlt&&(cpu.read8(0x9100)&0x48U)==0x48U&&
+       board.evidence().irq_delivered==1&&cpu.regs[Cpu::ESP]==0x190000,
+       "ATAPI IRQ15 must see DRQ, stack the instruction after HLT, and balance IRET");
+  std::cout<<"C03_ATAPI_IRQ15_STI_HLT_PASS irq15=1 wake=1 resume_ip="<<after_hlt<<"\n";
 }
 unsigned checksum(Cpu& cpu,std::uint32_t addr,std::uint32_t size){
   unsigned total=0;for(unsigned i=0;i<size;++i)total+=cpu.memory[addr+i];
@@ -329,6 +374,7 @@ void queued_lapic_requests_guest(){
 int main(){
   try{
     pic_pit_guest();
+    optical_irq_wakes_sti_hlt();
     pic_legacy_x87_guest();
     pci_acpi_cmos_guest();
     ioapic_lapic_guest();

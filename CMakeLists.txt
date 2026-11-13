@@ -50,13 +50,14 @@ if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_executable(reverse_windows_android_boot_session_test tests/android_boot_session_test.cpp)
   target_link_libraries(reverse_windows_android_boot_session_test PRIVATE reverse_windows_component_headers)
-  set(android_boot_fixture "${CMAKE_CURRENT_BINARY_DIR}/android-synthetic-boot.iso")
+  set(android_boot_fixture "${CMAKE_CURRENT_BINARY_DIR}/android-c03-boot.iso")
   add_test(NAME reverse_windows_android_synthetic_iso
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/c10_android_boot_iso.py"
       "${android_boot_fixture}")
   set_tests_properties(reverse_windows_android_synthetic_iso PROPERTIES FIXTURES_SETUP android_boot_iso)
   add_test(NAME reverse_windows_android_bios_iso_qssd
-    COMMAND reverse_windows_android_boot_session_test "${android_boot_fixture}")
+    COMMAND reverse_windows_android_boot_session_test "${android_boot_fixture}"
+      "${CMAKE_CURRENT_BINARY_DIR}/c03-boot-evidence.json")
   set_tests_properties(reverse_windows_android_bios_iso_qssd PROPERTIES
     FIXTURES_REQUIRED android_boot_iso TIMEOUT 60)
   add_executable(reverse_windows_atapi_cdrom_guest_test tests/atapi_cdrom_guest_test.cpp)

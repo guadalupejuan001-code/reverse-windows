@@ -57,7 +57,6 @@ class AndroidBootSession final {
     }
     if (disk_) {
       bios_disk_ = std::make_unique<BiosHardDisk>(pc_, *disk_);
-      pc_.cpu.write8(0x475, 1); // BIOS data area hard-disk count even when booted from CD.
     }
     if (iso_) {
       board_ = std::make_unique<PcMotherboardC06>(pc_, disk_.get(),
@@ -103,25 +102,28 @@ class AndroidBootSession final {
     const bool ram = pc.waiting_key && text.find("ALU + RAM + lectura de disco: OK") != std::string::npos;
     const bool vga = pc.waiting_key && text.find("Pulsa una tecla:") != std::string::npos;
     pc.reset();
-    const std::array<std::uint8_t,2048> optical_sector{};
-    PcMotherboardC06 board(pc, nullptr,
-        [&](auto offset, auto* data, auto count) {
-          if (offset > optical_sector.size() || count > optical_sector.size() - offset) return false;
-          std::copy_n(optical_sector.data()+offset, count, data);
-          return true;
-        }, optical_sector.size());
-    // Exercise guest I/O against the same motherboard used for ISO boots.
-    constexpr std::array<std::uint8_t,16> pci_probe{{
-        0x66,0xb8,0x08,0x10,0x00,0x80,0xba,0xf8,0x0c,0x66,0xef,
-        0xba,0xfc,0x0c,0x66,0xed}};
-    cpu.reset(0, 0x1000);
-    cpu.memory.write_block(0x1000, pci_probe.data(), pci_probe.size());
-    bool pci_ide = true;
-    for (unsigned i=0;i<5 && pci_ide;++i) pci_ide = cpu.step() == cosmic_pc::StepResult::Executed;
-    pci_ide = pci_ide && (cpu.regs[cosmic_pc::Cpu::EAX] >> 16) == 0x0101;
+    bool pci_ide = false;
+    {
+      const std::array<std::uint8_t,2048> optical_sector{};
+      PcMotherboardC06 board(pc, nullptr,
+          [&](auto offset, auto* data, auto count) {
+            if (offset > optical_sector.size() || count > optical_sector.size() - offset) return false;
+            std::copy_n(optical_sector.data()+offset, count, data);
+            return true;
+          }, optical_sector.size());
+      // Exercise guest I/O against the same motherboard used for ISO boots.
+      constexpr std::array<std::uint8_t,16> pci_probe{{
+          0x66,0xb8,0x08,0x10,0x00,0x80,0xba,0xf8,0x0c,0x66,0xef,
+          0xba,0xfc,0x0c,0x66,0xed}};
+      cpu.reset(0, 0x1000);
+      cpu.memory.write_block(0x1000, pci_probe.data(), pci_probe.size());
+      pci_ide = true;
+      for (unsigned i=0;i<5 && pci_ide;++i) pci_ide = cpu.step() == cosmic_pc::StepResult::Executed;
+      pci_ide = pci_ide && (cpu.regs[cosmic_pc::Cpu::EAX] >> 16) == 0x0101;
+    }
 
     auto optical_issue = iso_error;
-    std::string disk_issue;
+    std::string disk_issue, ata_issue;
     const bool has_iso = iso_fd>=0 || !optical_issue.empty();
     const bool has_disk = !disk.empty();
     if (iso_fd>=0) {
@@ -140,6 +142,9 @@ class AndroidBootSession final {
         QssdDisk volume(disk,QssdDisk::Access::ReadOnly);
         std::array<std::uint8_t,512> first{};
         if (!volume.read(0,1,first.data())) throw std::runtime_error("No se pudo leer el sector inicial.");
+        try {
+          check_ata_identify(pc, volume);
+        } catch (const std::exception& error) { ata_issue = error.what(); }
       } catch (const std::exception& error) { disk_issue = error.what(); }
     }
     std::ostringstream out;
@@ -159,9 +164,12 @@ class AndroidBootSession final {
     if (has_iso) out << optical_issue.empty(); else out << "null";
     out << ",\"qssd\":";
     if (has_disk) out << disk_issue.empty(); else out << "null";
+    out << ",\"qssd_ata\":";
+    if (!has_disk || !disk_issue.empty()) out << "null"; else out << ata_issue.empty();
     out << "},\"ready_for_windows10_install\":false,\"errors\":{"
         << "\"iso_boot\":" << cosmic_pc::PcMachine::quote(optical_issue)
-        << ",\"qssd\":" << cosmic_pc::PcMachine::quote(disk_issue) << "}}";
+        << ",\"qssd\":" << cosmic_pc::PcMachine::quote(disk_issue)
+        << ",\"qssd_ata\":" << cosmic_pc::PcMachine::quote(ata_issue) << "}}";
     return out.str();
   }
 
@@ -171,7 +179,7 @@ class AndroidBootSession final {
         pc_.guest_restart() != cosmic_pc::PcMachine::GuestRestart::None) restart_guest();
     if (pc_.cpu.fault || !pc_.host_error.empty()) return Step::Fault;
     if (pc_.waiting_key) return Step::WaitingKey;
-    if (pc_.cpu.halted || board_->evidence().powered_off) return Step::Halted;
+    if (is_stopped()) return Step::Halted;
     return Step::Running;
   }
 
@@ -283,6 +291,7 @@ class AndroidBootSession final {
         << ",\"restarts\":" << restarts_ << ",\"last_restart\":\"" << last_restart_ << "\"}";
     out << ",\"atapi_cdrom\":" << (board_->optical_attached() ? "true" : "false")
         << ",\"ata\":{\"commands\":" << counts.commands
+        << ",\"identify_data_transfers\":" << counts.identify_data_transfers
         << ",\"read_sectors\":" << counts.read_sectors
         << ",\"write_sectors\":" << counts.write_sectors << ",\"flushes\":" << counts.flushes
         << "},\"irq\":{\"ticks\":" << platform.ticks << ",\"delivered\":" << platform.irq_delivered
@@ -295,6 +304,29 @@ class AndroidBootSession final {
  private:
   static constexpr std::uint64_t kRamBytes = 2048ULL*1024*1024;
   static constexpr std::uint64_t kRamBudgetBytes = 256ULL*1024*1024;
+
+  static void check_ata_identify(cosmic_pc::PcMachine& pc, QssdDisk& volume) {
+    constexpr std::uint16_t code = 0x1000, data = 0x1800;
+    constexpr std::uint8_t identify_probe[]{
+        0xfa, 0xfc,                        // CLI; CLD
+        0xba,0xf6,0x01, 0xb0,0xe0, 0xee, // Select primary master.
+        0x42, 0xb0,0xec, 0xee, 0xec,      // Issue IDENTIFY DEVICE and read status.
+        0x24,0x89, 0x3c,0x08, 0x75,0x0b, // Require DRQ, no BSY or ERR.
+        0xba,0xf0,0x01,                   // DX = ATA data register.
+        0xbf,0x00,0x18, 0xb9,0x00,0x01, // DI = data; CX = 256 words.
+        0xf3,0x6d,                       // REP INSW from the real ATA device.
+        0xf4};                            // Halt; only the full response counts.
+    PcMotherboardC06 board(pc, &volume);
+    auto& cpu = pc.cpu;
+    cpu.reset(0, code);
+    cpu.memory.write_block(code, identify_probe, sizeof(identify_probe));
+    pc.run(300);
+    const auto counts = board.attached_ata()->counters();
+    if (cpu.fault || !cpu.halted || counts.identify_data_transfers != 1 ||
+        (cpu.read16(data + 83 * 2) & 0xc400U) != 0x4400U ||
+        cpu.read64(data + 100 * 2) != volume.sectors())
+      throw std::runtime_error("El invitado de prueba no confirmó la capacidad ATA del QSSD.");
+  }
 
   void restart_guest() {
     using Restart = cosmic_pc::PcMachine::GuestRestart;
@@ -327,7 +359,6 @@ class AndroidBootSession final {
           return reader->read(off,into,count);
         },iso_->size(),"iso");
       }
-      pc_.cpu.write8(0x475,1);
       source_=next;
       ++restarts_;
       text_visible_=false;

@@ -1,4 +1,4 @@
-name: C02 CPU conformance and virtual hardware regressions
+name: C03 BIOS, guest VGA and QSSD recognition
 on:
   push:
     branches: [main, "feature/**"]
@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/mundo-X
-          ref: 5f3d88ff38de48b95a277e4acaf843a434cb17d4
+          ref: 1d267e830f6acecc491bd46565df5669b8062b2a
           path: deps/mundo-X
           persist-credentials: false
       - name: Checkout GPU-VIRTUAL C12 plus physical work authority
@@ -65,6 +65,12 @@ jobs:
           cmake --build build --parallel 2
       - name: Execute real x86 and long-mode x64 guest demos
         run: ctest --test-dir build --output-on-failure
+      - name: Capture C03 boot and guest VGA evidence
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_bios_disk_test | tee build/c03-bios-disk.log
+          grep -q C03_BIOS_CD_QSSD_DISCOVERY_PASS build/c03-bios-disk.log
+          python3 tests/c03_render_vga.py build/c03-boot-evidence.json build/c03-qssd-vga.svg
       - name: Capture C02 MMX, SSE, x87 and FXSR conformance evidence
         shell: bash
         run: |
@@ -81,6 +87,7 @@ jobs:
           ./build/reverse_windows_c06_motherboard_guest_test | tee build/reverse-windows-c06-motherboard.log
           grep -q 'C06_PIC_PIT_GUEST_IRQ_PASS' build/reverse-windows-c06-motherboard.log
           grep -q 'C02_X87_LEGACY_FERR_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'C03_ATAPI_IRQ15_STI_HLT_PASS' build/reverse-windows-c06-motherboard.log
           grep -q 'C06_PCI_ACPI_CMOS_REAL_GUEST_PASS' build/reverse-windows-c06-motherboard.log
           grep -q 'C06_IOAPIC_LAPIC_MMIO_IRQ_PASS' build/reverse-windows-c06-motherboard.log
           grep -q 'REVERSE_WINDOWS_C06_MOTHERBOARD_PASS' build/reverse-windows-c06-motherboard.log
@@ -90,6 +97,7 @@ jobs:
           set -euo pipefail
           ./build/reverse_windows_c07_ata_guest_test | tee build/reverse-windows-c07-ata.log
           for marker in C07_REAL_GUEST_PCI_ATA_PIO_IRQ_PASS \
+            C03_QSSD_IDENTIFY_DEVICE_PASS \
             C07_LBA48_HIGH_SPARSE_GUEST_PASS \
             C07_ATA_PIO_MULTI_SECTOR_PASS \
             C07_ATA_COMMAND_ERRORS_PASS \
@@ -231,6 +239,7 @@ jobs:
           assert not report["c09_trace"]["windows_pe_verified"]
           assert report["ide_c07"]["attached"]
           assert report["ide_c07"]["ata_commands"]>=1
+          assert report["bios_fixed_disks"]==1 and report["atapi_cdrom"]
           assert report["machine"]["cpu_mode"]=="protected16"
           assert report["machine"]["status"]=="halted"
           print("C09_PROBE_COHERENT_WITH_TRACE_PASS windows_pe=false")
@@ -328,7 +337,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: reverse-windows-c02-${{ matrix.architecture }}-evidence
+          name: reverse-windows-c03-${{ matrix.architecture }}-evidence
           path: |
             build/reverse-windows-x64.json
             build/reverse-windows-c06-motherboard.log
@@ -350,6 +359,9 @@ jobs:
             build/c09-hardware-trace.log
             build/c09r-hardware-audit.jsonl
             build/c02-cpu-conformance.log
+            build/c03-boot-evidence.json
+            build/c03-bios-disk.log
+            build/c03-qssd-vga.svg
             build/reverse_windows_c09r1_sse2_fp_test.log
             build/reverse_windows_c09r1_ring3_fpu_test.log
             build/reverse_windows_c09r1_exact_x87_test.log

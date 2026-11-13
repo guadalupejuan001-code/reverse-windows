@@ -1,7 +1,9 @@
 #include "virtual_disk.hpp"
 #include "bios_hard_disk.hpp"
 #include "pc_machine.hpp"
+#include "qssd_disk.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -13,6 +15,93 @@ namespace {
 void require(bool value, const char* message) {
   if (!value) throw std::runtime_error(message);
 }
+
+void verify_fixed_disk_during_cd_boot(const std::filesystem::path& raw_path) {
+  auto path = raw_path;
+  path.replace_extension(".rqvd");
+  struct RemoveDisk {
+    const std::filesystem::path& path;
+    ~RemoveDisk() { std::error_code ignored; std::filesystem::remove(path, ignored); }
+  } cleanup{path};
+  reverse_windows::QssdDisk::create(path, 64);
+  reverse_windows::QssdDisk disk(path);
+
+  constexpr unsigned cd_sector = cosmic_pc::BootMedia::kCdSectorSize;
+  constexpr unsigned catalog = 20 * cd_sector, boot = 21 * cd_sector;
+  std::array<std::uint8_t,22 * cd_sector> iso{};
+  const std::string cd_id = "CD001", el_torito = "EL TORITO SPECIFICATION";
+  for (unsigned sector : {16U,17U,18U}) {
+    std::copy(cd_id.begin(), cd_id.end(), iso.begin() + sector * cd_sector + 1);
+    iso[sector * cd_sector + 6] = 1;
+  }
+  iso[16 * cd_sector] = 1;
+  iso[18 * cd_sector] = 255;
+  std::copy(el_torito.begin(), el_torito.end(), iso.begin() + 17 * cd_sector + 7);
+  iso[17 * cd_sector + 0x47] = 20;
+  iso[catalog] = 1;
+  iso[catalog + 28] = 0xaa; iso[catalog + 29] = 0x55;
+  iso[catalog + 30] = 0x55; iso[catalog + 31] = 0xaa;
+  iso[catalog + 32] = 0x88;
+  iso[catalog + 38] = 1;
+  iso[catalog + 40] = 21;
+  iso[boot] = 0xcd; iso[boot + 1] = 0x13; // INT 13h
+  iso[boot + 2] = 0xf4; // HLT
+
+  cosmic_pc::PcMachine pc(16ULL * 1024 * 1024);
+  pc.mount([&](auto off, auto* dest, auto count) {
+    std::copy_n(iso.data() + off, count, dest);
+    return true;
+  }, iso.size(), "iso");
+  auto& cpu = pc.cpu;
+  require(cpu.read8(0x475) == 0, "CD alone must leave BDA fixed-disk count zero");
+  using Cpu = cosmic_pc::Cpu;
+  auto call = [&](std::uint8_t drive, std::uint8_t fn) {
+    cpu.eip = 0x7c00;
+    cpu.set_reg16(Cpu::EDX, drive);
+    cpu.set_reg8(4, fn);
+    require(cpu.step() == cosmic_pc::StepResult::Executed && !cpu.fault,
+            "BIOS disk request failed to return to the guest");
+  };
+  {
+    reverse_windows::BiosHardDisk bridge(pc, disk);
+    require(cpu.read8(0x475) == 1 && cpu.reg8(Cpu::EDX) == 0xe0,
+            "Fixed disk registration changed the optical boot drive or missed the BDA");
+    constexpr unsigned params = 0x8300;
+    cpu.set_reg16(Cpu::ESI, params);
+    cpu.set_reg16(Cpu::EBX, 0x55aa);
+    call(0x80, 0x41);
+    require(!cpu.flag(Cpu::CF) && cpu.reg8(4) == 0x30 &&
+            cpu.reg16(Cpu::EBX) == 0xaa55 && cpu.reg16(Cpu::ECX) == 1,
+            "EDD discovery of the fixed QSSD returned an invalid signature");
+    cpu.write16(params, 25);
+    call(0x80, 0x48);
+    require(cpu.flag(Cpu::CF) && cpu.read16(params) == 25 && cpu.read8(0x474) == 1,
+            "Short EDD parameter buffer did not fail atomically");
+    call(0x80, 0x01);
+    require(cpu.flag(Cpu::CF) && cpu.reg8(4) == 1, "Fixed disk lost its last BIOS status");
+    call(0xe0, 0x08);
+    require(cpu.flag(Cpu::CF) && cpu.reg8(4) == 1, "Optical CD must reject legacy CHS query");
+    call(0xe0, 0x15);
+    require(!cpu.flag(Cpu::CF) && cpu.reg8(4) == 1 && cpu.reg8(Cpu::EDX) == 0xe0 &&
+            cpu.read8(0x474) == 1, "Optical probe changed fixed-disk BIOS status");
+    cpu.write16(params, 26);
+    call(0x80, 0x48);
+    require(!cpu.flag(Cpu::CF) && cpu.read16(params) == 26 && cpu.read16(params+2) == 2 &&
+            cpu.read64(params+16) == 134217728 && cpu.read16(params+24) == 512,
+            "BIOS did not enumerate 64 GiB of 512-byte QSSD sectors");
+    call(0x80, 0x7f);
+    require(cpu.flag(Cpu::CF) && cpu.read8(0x474) == 1, "Expected a pending fixed-disk error");
+    pc.reset();
+    require(cpu.read8(0x475) == 1 && cpu.reg8(Cpu::EDX) == 0xe0,
+            "Reset lost the registered fixed disk or optical boot drive");
+    call(0x80, 0x01);
+    require(!cpu.flag(Cpu::CF) && cpu.reg8(4) == 0, "Reset retained fixed-disk BIOS error");
+  }
+  require(cpu.read8(0x475) == 0, "Removing the bridge left stale BIOS fixed-disk count");
+  require(disk.stats().commits == 0, "BIOS disk discovery wrote to the QSSD");
+  std::cout << "C03_BIOS_CD_QSSD_DISCOVERY_PASS boot_drive=e0 fixed_drive=80 sectors=134217728"
+               " sector_bytes=512 reset_preserved=1 commits=0\n";
+}
 }
 
 int main() {
@@ -20,6 +109,7 @@ int main() {
       ("reverse-windows-c01-" + std::to_string(
           std::chrono::steady_clock::now().time_since_epoch().count()) + ".rvdisk");
   try {
+    verify_fixed_disk_during_cd_boot(path);
     reverse_windows::DiskImage::create(path, 1);
     require(std::filesystem::file_size(path) == reverse_windows::DiskImage::kGiB,
             "Disk has wrong logical capacity");

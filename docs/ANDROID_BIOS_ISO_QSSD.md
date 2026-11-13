@@ -12,6 +12,12 @@ La app conecta el selector de archivos de Android, el arranque BIOS de Mundo X y
 
 Desinstalar la app borra su disco privado. Para conservar la instalación, actualiza con un APK firmado con la misma clave.
 
+## C03 · De BIOS al QSSD
+
+La prueba arranca un CD El Torito de solo lectura. El huésped valida la unidad de arranque del BIOS, cambia a modo protegido, encuentra el controlador PCI IDE y lee `IDENTIFY DEVICE` tras recibir IRQ14. Comprueba los **64 GiB** y escribe la confirmación en VGA. Después de Enter, escribe un MBR de prueba por BIOS, compara sus 512 bytes por ATA y arranca desde el mismo QSSD. El MBR vuelve a arrancar al abrir el disco en una sesión nueva.
+
+**Comprobar equipo virtual** ahora prueba el archivo y la capacidad ATA por separado. El registro de la sesión cuenta las respuestas IDENTIFY que el invitado leyó enteras. Ese contador permite saber si la sesión alcanzó ATA aunque la pantalla siga en negro. La detección por Windows requiere la prueba con su instalador.
+
 ## C02 · Conformidad de CPU
 
 MMX comparte los registros físicos de x87. `EMMS` marca vacías sus etiquetas. Las pruebas cubren operaciones empaquetadas, transferencias MMX/XMM y conversiones. SSE/SSE2 incorpora `RCP`, `RSQRT`, `MASKMOVDQU` y `MOVNTI`, además de comprobar la prioridad de excepciones con subnormales y el redondeo cerca del umbral FTZ.

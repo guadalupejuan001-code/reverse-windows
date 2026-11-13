@@ -459,6 +459,11 @@ class PcMotherboardC06 {
         if(apic_lvt_timer_&0x20000U)apic_timer_counter_=apic_timer_reload_;
       }
     }
+    // The slave's INT output reaches the master independently of CPU IF or
+    // LAPIC acceptance. The guest can read both IRRs with interrupts disabled.
+    const auto slave_irq=slave_.pending();
+    if(slave_irq)master_.irr|=std::uint8_t(1U<<2);
+    else if(!(master_.isr&(1U<<2)))master_.irr&=std::uint8_t(~(1U<<2));
     if(cpu.fault||!cpu.flag(cosmic_pc::Cpu::IF))return;
     if(lapic_on()&&!lapic_in_service_){
       const auto request=highest_lapic_request();
@@ -472,9 +477,6 @@ class PcMotherboardC06 {
     }
     // 8259 cascade: a pending slave IRQ presents IRQ2 at the master PIC.
     // Deliver the SLAVE vector, not master IRQ2's vector. Both PICs must EOI.
-    const auto slave_irq=slave_.pending();
-    if(slave_irq)master_.irr|=std::uint8_t(1U<<2);
-    else if(!(master_.isr&(1U<<2)))master_.irr&=std::uint8_t(~(1U<<2));
     const auto master_irq=master_.pending();
     if(master_irq){
       const unsigned n=master_irq-1;

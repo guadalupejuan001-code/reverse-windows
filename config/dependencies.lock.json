@@ -6,12 +6,15 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "5f3d88ff38de48b95a277e4acaf843a434cb17d4",
+      "commit": "1d267e830f6acecc491bd46565df5669b8062b2a",
       "checkout": "deps/mundo-X",
-      "role": "canonical-Mundo-X-Ether-Next-C02-CPU-conformance",
-      "status": "candidate-C02-CPU-conformance-unmerged",
+      "role": "canonical-Mundo-X-Ether-Next-C03-virtual-firmware",
+      "status": "candidate-C03-virtual-firmware-unmerged",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
+        "pc-android/native/boot_media.hpp",
+        "pc-android/native/tests/pc_iso_test.cpp",
+        "pc-android/native/tests/pc_video_test.cpp",
         "pc-android/native/x86_cpu.hpp",
         "pc-android/native/tests/pc_group6_iso_test.cpp",
         "native/include/mundo_x/autonomous_core_c02.hpp",

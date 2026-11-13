@@ -21,6 +21,7 @@ class AtaC07 {
   struct Counters {
     std::uint64_t commands=0,read_sectors=0,write_sectors=0,identifies=0;
     std::uint64_t flushes=0,aborts=0,irqs_signaled=0;
+    std::uint64_t identify_data_transfers=0;
   };
 
  private:
@@ -28,7 +29,7 @@ class AtaC07 {
   std::function<void()> irq14_;
   std::array<std::uint8_t,512> sector_{};
   enum class Transfer {Idle,Identify,Read,Write} transfer_=Transfer::Idle;
-  std::uint8_t error_=0,features_=0,sector_count_=1,sector_number_=1;
+  std::uint8_t error_=1,features_=0,sector_count_=1,sector_number_=1;
   std::uint8_t cylinder_low_=0,cylinder_high_=0,drive_=0xe0,control_=0;
   std::uint8_t prev_count_=0,prev_sector_=0,prev_cyl_low_=0,prev_cyl_high_=0;
   std::uint8_t status_=0x50; // DRDY | DSC
@@ -42,9 +43,12 @@ class AtaC07 {
   bool selected_master() const {return (drive_&0x10U)==0;}
   bool lba_mode() const {return (drive_&0x40U)!=0;}
   bool irq_enabled() const {return (control_&2U)==0;}
+  void signal_irq() {
+    if(irq14_){irq14_();++stats_.irqs_signaled;}
+  }
   void irq() {
     interrupt_pending_=true;
-    if(irq_enabled()&&irq14_){irq14_();++stats_.irqs_signaled;}
+    if(irq_enabled())signal_irq();
   }
   void fail(std::uint8_t error) {
     transfer_=Transfer::Idle;remaining_=0;pos_=0;
@@ -65,21 +69,25 @@ class AtaC07 {
   void identify() {
     sector_.fill(0);
     word(sector_,0,0x0040); // ATA fixed disk, not ATAPI
-    word(sector_,1,16383);word(sector_,3,16);word(sector_,6,63);
     ata_text(sector_,10,10,"REVERSE-C07-00000001");
     ata_text(sector_,23,4,"C07");
     ata_text(sector_,27,20,"REVERSE QSSD VIRTUAL ATA DISK");
-    word(sector_,47,0x8001); // one sector per interrupt, not multi-sector DMA
-    word(sector_,49,1u<<9); // ATA LBA; no DMA advertised
-    word(sector_,53,1);     // words 54-58 valid, nothing about UDMA
-    word(sector_,54,16383);word(sector_,55,16);word(sector_,56,63);
-    const std::uint64_t cap28=std::min<std::uint64_t>(disk_.sectors(),0x0fffffffULL);
-    word(sector_,60,std::uint16_t(cap28));word(sector_,61,std::uint16_t(cap28>>16));
-    word(sector_,80,0x007e); // ATA revisions 1..6, do not invent UDMA
-    word(sector_,83,1u<<10);word(sector_,86,1u<<10); // LBA48 supported/enabled
+    word(sector_,47,0x8000); // No READ/WRITE MULTIPLE command support.
+    word(sector_,49,1u<<9); // LBA, using the PIO data port.
+    word(sector_,50,0x4000); // Valid capabilities; no extra capabilities.
     const auto capacity=disk_.sectors();
+    const auto cap28=std::min<std::uint64_t>(capacity,0x0fffffffULL);
+    word(sector_,60,std::uint16_t(cap28));word(sector_,61,std::uint16_t(cap28>>16));
+    word(sector_,80,1u<<6); // ATA/ATAPI-6 introduced the LBA48 commands.
+    constexpr std::uint16_t commands=(1u<<13)|(1u<<12)|(1u<<10); // FLUSH EXT, FLUSH, LBA48
+    word(sector_,83,0x4000|commands);word(sector_,84,0x4000);
+    word(sector_,86,commands);word(sector_,87,0x4000);
     for(unsigned i=0;i<4;++i)word(sector_,100+i,std::uint16_t(capacity>>(i*16)));
-    // Logical sectors are exactly 512 bytes and backed by BlockDisk.
+    word(sector_,106,0x4000); // Valid 512-byte logical and physical geometry.
+    sector_[510]=0xa5; // ATA integrity word signature in the low byte.
+    std::uint8_t sum=0;
+    for(const auto byte:sector_)sum=std::uint8_t(sum+byte);
+    sector_[511]=std::uint8_t(-sum);
     transfer_=Transfer::Identify;pos_=0;
     error_=0;status_=kReady|kDsc|kDrq;remaining_=1;
     ++stats_.identifies;
@@ -121,6 +129,7 @@ class AtaC07 {
         irq();
       }
     }else{
+      if(transfer_==Transfer::Identify)++stats_.identify_data_transfers;
       transfer_=Transfer::Idle;
       status_=kReady|kDsc;sector_count_=0;
       // WRITE completion is an interrupt. READ/IDENTIFY signal DRQ ready.
@@ -143,7 +152,6 @@ class AtaC07 {
     interrupt_pending_=false;
     transfer_=Transfer::Idle;pos_=0;remaining_=0;
     transfer_finished_write_=false;
-    if(!selected_master()){error_=0x04;status_=0;return;}
     if(cmd==0xec){identify();return;}
     if(cmd==0xe7||cmd==0xea) {
       bool ok=false;
@@ -152,8 +160,10 @@ class AtaC07 {
       ++stats_.flushes;error_=0;status_=kReady|kDsc;irq();return;
     }
     if(cmd==0xef) {
-      // Conservative no-op feature negotiation: no DMA/UDMA claims.
-      if(features_==0x82||features_==0x02) {
+      // Default or explicit PIO 0–2 require the same virtual data path.
+      const bool pio=features_==0x03 &&
+          (sector_count_<=1 || (sector_count_>=0x08 && sector_count_<=0x0a));
+      if(pio||features_==0x82||features_==0x02) {
         error_=0;status_=kReady|kDsc;irq();return;
       }
       fail(0x04);return;
@@ -202,7 +212,7 @@ class AtaC07 {
   AtaC07& operator=(const AtaC07&)=delete;
   void reset() {
     transfer_=Transfer::Idle;sector_.fill(0);pos_=0;remaining_=0;
-    error_=features_=0;sector_count_=1;sector_number_=1;
+    error_=1;features_=0;sector_count_=1;sector_number_=1;
     cylinder_low_=cylinder_high_=prev_count_=prev_sector_=prev_cyl_low_=prev_cyl_high_=0;
     drive_=0xe0;control_=0;status_=kReady|kDsc;
     lba_=0;ext_=false;interrupt_pending_=false;transfer_finished_write_=false;
@@ -212,7 +222,7 @@ class AtaC07 {
   }
   std::optional<std::uint32_t> input(std::uint16_t p,unsigned width) {
     if(!handles(p))return std::nullopt;
-    if(!selected_master()&&(p==0x1f7||p==0x3f6))return 0;
+    if(!selected_master())return 0; // The empty slave has no task-file registers.
     if(p==kData)return read_data(width);
     if(width!=1)return std::nullopt;
     switch(p) {
@@ -229,26 +239,25 @@ class AtaC07 {
   }
   bool output(std::uint16_t p,unsigned width,std::uint32_t value) {
     if(!handles(p))return false;
-    if(p==kData)return write_data(width,value);
+    if(p==kData)return selected_master() ? write_data(width,value) : (width==2||width==4);
     if(width!=1)return false;
     const auto v=std::uint8_t(value);
+    if(p==0x1f6){drive_=v;return true;}
+    if(p!=kControl&&(!selected_master()||(control_&4U)))return true;
     switch(p) {
       case 0x1f1:features_=v;return true;
       case 0x1f2:prev_count_=sector_count_;sector_count_=v;return true;
       case 0x1f3:prev_sector_=sector_number_;sector_number_=v;return true;
       case 0x1f4:prev_cyl_low_=cylinder_low_;cylinder_low_=v;return true;
       case 0x1f5:prev_cyl_high_=cylinder_high_;cylinder_high_=v;return true;
-      case 0x1f6:
-        drive_=v;
-        if(!selected_master())status_=0;
-        else if(status_==0)status_=kReady|kDsc;
-        return true;
       case 0x1f7:execute(v);return true;
       case 0x3f6:{
         const auto was_reset=(control_&4U)!=0;
+        const auto was_enabled=irq_enabled();
         control_=v;
         if(control_&4U){reset();control_=v;status_=0x80;return true;}
         if(was_reset){reset();control_=v;}
+        else if(!was_enabled&&irq_enabled()&&interrupt_pending_)signal_irq();
         return true;
       }
       default:return false;
@@ -257,7 +266,7 @@ class AtaC07 {
   Counters counters()const{return stats_;}
   bool irq_pending()const{return interrupt_pending_;}
   bool ready()const{return selected_master() && (status_&kReady)!=0;}
-  std::uint8_t status()const{return status_;}
-  std::uint8_t error()const{return error_;}
+  std::uint8_t status()const{return selected_master()?status_:0;}
+  std::uint8_t error()const{return selected_master()?error_:0;}
 };
 } // namespace reverse_windows
