@@ -99,6 +99,8 @@ void verify(const std::string& path){
   std::filesystem::remove(damaged);
   std::filesystem::remove(damaged+".rqix");
 
+  const auto old_index=path+".stale-index";
+  std::filesystem::copy_file(path+".rqix",old_index);
   rejects([&]{(void)QssdDisk::compact(path,true);},
           "pre-rename compact fault injection was not triggered");
   need(std::filesystem::file_size(path)==before,
@@ -120,6 +122,12 @@ void verify(const std::string& path){
          "new-generation compacted volume index did not open");
     need(disk.read(first,8,readback.data())&&readback==recent,
          "compaction changed latest guest data");
+    need(disk.read(first,8,readback.data())&&readback==recent,
+         "C08 cached read changed guest data");
+    const auto cache=disk.cache_stats();
+    need(cache.hits>=1 && cache.resident_blocks<=128 &&
+         cache.resident_bytes<=512*1024,
+         "C08 immutable block cache must be used and bounded to 512 KiB");
     need(disk.read(distant,8,readback.data())&&readback==far,
          "compaction changed distant guest data");
     need(disk.read(cleared,8,readback.data())&&readback==zero,
@@ -136,6 +144,27 @@ void verify(const std::string& path){
       need(ata.input(0x1f0,2).has_value(),"ATA PIO after compact failed");
     need(ata.counters().read_sectors==1,"ATA did not read from compacted disk");
   }
+  // An index from the prior generation must NEVER address compacted offsets:
+  // fall back to journal replay, then regenerate the correct sidecar.
+  std::filesystem::copy_file(old_index,path+".rqix",
+                             std::filesystem::copy_options::overwrite_existing);
+  {
+    QssdDisk disk(path);
+    need(!disk.recovery_stats().used_checkpoint,
+         "C08 stale pre-compaction generation was accepted as current index");
+    need(disk.read(first,8,readback.data())&&readback==recent,
+         "C08 stale index fallback changed guest data");
+    need(disk.checkpoint(),"C08 could not replace obsolete index after compact");
+  }
+  std::filesystem::remove(old_index);
+  // Generation is protected by a new checksum but old C03 headers remain
+  // compatible (generation=0 has no extended checksum requirement).
+  const auto bad_generation=path+".bad-gen.rqvd";
+  std::filesystem::copy_file(path,bad_generation);
+  write_xor(bad_generation,40);
+  rejects([&]{QssdDisk invalid(bad_generation);},
+          "C08 compacted volume generation corruption was not detected");
+  std::filesystem::remove(bad_generation);
   // Interrupted guest append: truncate incomplete bytes, keep validated image.
   {
     const int fd=::open(path.c_str(),O_WRONLY|O_APPEND|O_CLOEXEC);
