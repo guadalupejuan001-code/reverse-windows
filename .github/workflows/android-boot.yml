@@ -70,12 +70,14 @@ jobs:
             -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" \
             -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
           cmake --build build --target reverse_windows_android_boot_session_test \
-            reverse_windows_atapi_cdrom_guest_test --parallel 2
-          ctest --test-dir build --output-on-failure -R '^reverse_windows_android_'
-      - name: Install pinned Android build packages
-        run: |
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" \
-            "ndk;27.2.12479018" "cmake;3.22.1" "platform-tools"
+            reverse_windows_atapi_cdrom_guest_test reverse_windows_c06_motherboard_guest_test --parallel 2
+          ctest --test-dir build --output-on-failure \
+            -R '^(reverse_windows_android_|reverse_windows_c06_real_motherboard$)'
+      - name: Install Android command-line tools and pinned packages
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: "11076708"
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018 cmake;3.22.1"
       - uses: gradle/actions/setup-gradle@v4
       - name: Build signed debug APK
         working-directory: android
@@ -124,14 +126,22 @@ jobs:
           path: ${{ runner.temp }}/reverse-windows-arm64-v8a
           if-no-files-found: error
       - name: Enable KVM for Android runtime smoke test
+        id: kvm
         if: matrix.abi == 'x86_64'
         run: |
+          if [[ ! -c /dev/kvm ]]; then
+            printf 'Android emulator smoke skipped because this runner lacks /dev/kvm.\n' | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          echo "available=true" >> "$GITHUB_OUTPUT"
       - name: Prepare Android runtime check
-        if: matrix.abi == 'x86_64'
+        if: matrix.abi == 'x86_64' && steps.kvm.outputs.available == 'true'
         run: |
           cat > "$RUNNER_TEMP/reverse-windows-adb-smoke.sh" <<'BASH'
           set -euo pipefail
@@ -158,7 +168,7 @@ jobs:
           wait_for_state halted
           BASH
       - name: Run synthetic BIOS and keyboard on Android
-        if: matrix.abi == 'x86_64'
+        if: matrix.abi == 'x86_64' && steps.kvm.outputs.available == 'true'
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
