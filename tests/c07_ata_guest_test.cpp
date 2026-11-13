@@ -120,12 +120,13 @@ void run_device(const std::string& path) {
     PcMotherboardC06 board(pc,&disk);
     need(board.attached_ata()!=nullptr,"board failed to own ATA controller");
     gate(pc.cpu,0x2e,0x13000);
-    const std::array<std::uint8_t,24> irq_code{
-      0xff,0x05,0x00,0x97,0,0,     // INC DWORD PTR [9700]
+    const std::array<std::uint8_t,23> irq_code{
+      0x52,0x50,                  // PUSH EDX / PUSH EAX (preserve PIO DX)
+      0xff,0x05,0x00,0x97,0,0,   // INC DWORD PTR [9700]
       0xb0,0x20,
-      0x66,0xba,0xa0,0x00,0xee,   // OUT A0,AL -> EOI slave
-      0x66,0xba,0x20,0x00,0xee,   // OUT 20,AL -> EOI master
-      0xcf, 0x90,0x90,0x90,0x90,0x90
+      0x66,0xba,0xa0,0x00,0xee, // OUT A0,AL -> EOI slave
+      0x66,0xba,0x20,0x00,0xee, // OUT 20,AL -> EOI master
+      0x58,0x5a,0xcf             // POP EAX / POP EDX / IRETD
     };
     pc.cpu.memory.write_block(0x13000,irq_code.data(),irq_code.size());
     pc.cpu.memory.write_block(0xb000,payload.data(),512);
