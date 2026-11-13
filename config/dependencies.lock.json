@@ -6,14 +6,15 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "9141fd2f35cd1ce8778e3bbbd1307cffaf991dee",
+      "commit": "116e3c51244ef0c72702fcae5c19ada8d6da571f",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
-      "status": "candidate-Ether-shift-loops-and-bit-scan-unmerged",
+      "status": "candidate-Ether-bounded-guest-RAM-backing-unmerged",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/boot_hotspots.hpp",
         "pc-android/native/sparse_ram.hpp",
+        "pc-android/native/memory_fabric.hpp",
         "pc-android/native/x86_wide_integer.hpp",
         "pc-android/native/x86_shift_loop.inc",
         "native/include/mundo_x/experimental/ether_memory_block.hpp",

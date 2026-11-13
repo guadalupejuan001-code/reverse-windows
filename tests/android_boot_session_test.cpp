@@ -51,6 +51,8 @@ void verify_ram_profile() {
           "RAM budget must leave headroom for Android");
   const auto ample = Session::ram_profile(2304 * mib, 256 * mib, false);
   require(ample.backing_bytes == 1024 * mib, "Available RAM must raise the backing budget");
+  const auto abundant = Session::ram_profile(8192 * mib, 256 * mib, false);
+  require(abundant.backing_bytes == 1024 * mib, "Resident budget must leave room for other host work");
   if (cosmic_pc::PcMachine::max_ram_mib() >= 4096) {
     require(ample.physical_bytes == 4096 * mib, "A device with sufficient RAM budget should select 4 GiB");
     const auto report = Session::check_hardware({}, -1, 0, {}, ample);
@@ -62,6 +64,94 @@ void verify_ram_profile() {
     (void)Session::ram_profile(300 * mib, 256 * mib, true);
   } catch (const std::runtime_error&) { return; }
   throw std::runtime_error("Starting a VM with Android memory pressure must be rejected");
+}
+
+void verify_ram_spill(const std::filesystem::path& directory) {
+  using Backing = reverse_windows::AndroidRamBacking;
+  constexpr auto page = Backing::kPageSize;
+  constexpr auto mib = 1024 * 1024;
+  const auto cache = directory / "cache";
+  std::filesystem::create_directory(cache);
+  const auto fallback = Session::check_hardware({}, -1, 0, {}, Session::kDefaultRamProfile,
+                                               cache / "does-not-exist");
+  require(fallback.find("\"spill_mode\":\"unavailable\"") != std::string::npos &&
+              fallback.find("\"spill_limit_bytes\":0") != std::string::npos,
+          "Hardware preflight must explain fallback when app cache is unavailable");
+  // These large free-space requirements are for production hosts. Skip the
+  // file-backed section only when the test runner's cache cannot support it.
+  if (Backing::spill_budget(cache) < page) return;
+  {
+    Backing backing(cache, 4 * page, page);
+    require(std::filesystem::is_empty(cache), "Guest RAM spill must not leave directory entries");
+    std::array<std::uint8_t, page> original{}, restored{};
+    original[0] = 0x81;
+    original[page - 1] = 0x7e;
+    backing.write(3, original.data());
+    backing.read(3, restored.data());
+    require(original == restored && backing.file_payload_bytes() == page,
+            "RAM spill must restore both boundaries of the exact page");
+    original[1] = 0xf2;
+    backing.write(3, original.data());
+    bool limit_reached = false;
+    try {
+      backing.write(2, original.data());
+    } catch (const std::runtime_error&) {
+      limit_reached = true;
+    }
+    backing.read(3, restored.data());
+    require(limit_reached && original == restored && backing.file_payload_bytes() == page,
+            "New slots must obey the spill budget without corrupting existing slots");
+    backing.reset();
+    bool old_page_released = false;
+    try {
+      backing.read(3, restored.data());
+    } catch (const std::runtime_error&) {
+      old_page_released = true;
+    }
+    require(old_page_released && backing.file_payload_bytes() == 0,
+            "Guest reset must release the previous RAM contents");
+    backing.write(2, original.data());
+    backing.read(2, restored.data());
+    require(original == restored, "Reset must allow fresh RAM slots");
+  }
+  {
+    const Session::RamProfile small{2 * mib, 64 * page};
+    Session demo({}, 0, Session::BootSource::SelfTest, -1, 0, small, cache);
+    require(demo.diagnostic().find("\"spill_mode\":\"file\"") != std::string::npos &&
+                demo.diagnostic().find("\"backing_budget_bytes\":262144") != std::string::npos,
+            "The actual BIOS session must attach the optional spill without inflating its resident limit");
+    require(std::filesystem::is_empty(cache), "Session history must not retain temporary RAM files");
+  }
+  {
+    constexpr std::uint64_t address = 0x100000;
+    constexpr std::size_t resident = 8 * page;
+    cosmic_pc::PcMachine pc(2 * mib, resident);
+    auto file = std::make_unique<Backing>(cache, pc.cpu.memory.size(), 32 * page);
+    auto* file_stats = file.get();
+    pc.cpu.memory.attach_page_backing(std::move(file));
+    // Non-repeating writes to 20 distinct guest pages cross the real limit.
+    for (unsigned index = 0; index < 20; ++index) {
+      pc.cpu.write32(address + index * page, 0x50580000U + index);
+      pc.cpu.write32(address + index * page + page - 4, 0xdeadc0deU - index);
+    }
+    const auto before = pc.cpu.memory.metrics();
+    require(before.allocated_bytes <= resident && before.spilled_pages >= 12 &&
+                before.backing_writes >= 12 && file_stats->file_payload_bytes() >= 12 * page,
+            "PcMachine must cross the resident limit by evicting pages to the real file");
+    for (unsigned index = 0; index < 20; ++index) {
+      require(pc.cpu.read32(address + index * page) == 0x50580000U + index &&
+                  pc.cpu.read32(address + index * page + page - 4) == 0xdeadc0deU - index,
+              "Guest bytes must survive real-file eviction and reload");
+    }
+    require(pc.cpu.memory.metrics().backing_reads >= 12, "Guest reads must reach the real spill file");
+    pc.cpu.memory.reset_zero();
+    require(pc.cpu.memory.metrics().spilled_pages == 0 && file_stats->file_payload_bytes() == 0 &&
+                pc.cpu.read32(address) == 0,
+            "Guest RAM reset must discard the old file-backed image");
+  }
+  std::cout << "REVERSE_WINDOWS_ANDROID_RAM_SPILL_PASS anonymous_file=true resident_cap=true"
+               " limit_failure_preserves_data=true reset_releases_slots=true\n";
+  require(std::filesystem::is_empty(cache), "Temporary RAM must disappear on session close");
 }
 
 void run_until(Session& session, Session::Step expected, const char* message, unsigned budget = 64) {
@@ -115,6 +205,7 @@ int main(int argc, char** argv) {
     verify_ram_profile();
     require(argc == 2 || argc == 3, "Pass the synthetic BIOS fixture and optional evidence path");
     const TestDiskDirectory dir;
+    verify_ram_spill(dir.path);
     const auto disk = dir.path / "android-test.rqvd";
     const auto fixture = dir.path / "boot.iso";
     std::filesystem::copy_file(argv[1], fixture);

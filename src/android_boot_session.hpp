@@ -1,5 +1,6 @@
 #pragma once
 
+#include "android_ram_backing.hpp"
 #include "bios_hard_disk.hpp"
 #include "c06_motherboard.hpp"
 #include "c09r_guest_vga_fabric.hpp"
@@ -12,6 +13,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <ostream>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -28,6 +30,7 @@ class AndroidBootSession final {
     std::size_t backing_bytes;
   };
   static constexpr RamProfile kDefaultRamProfile{2048ULL * 1024 * 1024, 256ULL * 1024 * 1024};
+  static constexpr std::uint64_t kMaxResidentBytes = 1024ULL * 1024 * 1024;
 
   static RamProfile ram_profile(std::uint64_t available_bytes, std::uint64_t low_threshold,
                                 bool low_memory) {
@@ -41,15 +44,18 @@ class AndroidBootSession final {
     // 4 GiB address space is selected only when more backing is available.
     const auto physical = backing >= 768 * MiB && cosmic_pc::PcMachine::max_ram_mib() >= 4096
         ? cosmic_pc::PcMachine::kMaxPhysicalBytes : kDefaultRamProfile.physical_bytes;
-    return {static_cast<std::size_t>(physical), static_cast<std::size_t>(std::min(backing, physical))};
+    return {static_cast<std::size_t>(physical),
+            static_cast<std::size_t>(std::min({backing, physical, kMaxResidentBytes}))};
   }
 
   AndroidBootSession(std::filesystem::path disk, unsigned create_gib,
                      BootSource source, int iso_fd=-1, std::uint64_t iso_bytes=0,
-                     RamProfile profile=kDefaultRamProfile)
+                     RamProfile profile=kDefaultRamProfile,
+                     const std::filesystem::path& ram_cache={})
       : source_(source), pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_) {
     if (disk.empty() && (create_gib || source != BootSource::SelfTest))
       throw std::invalid_argument("Selecciona o crea un disco QSSD para iniciar.");
+    spill_ = configure_spill(pc_, ram_cache);
     switch (source) {
       case BootSource::Iso:
         iso_ = std::make_shared<OpticalReader>(iso_fd, iso_bytes);
@@ -102,8 +108,10 @@ class AndroidBootSession final {
 
   static std::string check_hardware(const std::filesystem::path& disk, int iso_fd=-1,
                                     std::uint64_t iso_bytes=0, const std::string& iso_error={},
-                                    RamProfile profile=kDefaultRamProfile) {
+                                    RamProfile profile=kDefaultRamProfile,
+                                    const std::filesystem::path& ram_cache={}) {
     cosmic_pc::PcMachine pc(profile.physical_bytes, profile.backing_bytes);
+    const auto spill = configure_spill(pc, ram_cache);
     pc.boot_demo();
     auto& cpu = pc.cpu;
     const auto cpuid = [&](std::uint32_t leaf) {
@@ -190,10 +198,9 @@ class AndroidBootSession final {
     if (has_disk) out << disk_issue.empty(); else out << "null";
     out << ",\"qssd_ata\":";
     if (!has_disk || !disk_issue.empty()) out << "null"; else out << ata_issue.empty();
-    out << "},\"ram_profile\":{\"address_space_bytes\":" << pc.cpu.memory.size()
-        << ",\"usable_bytes\":" << pc.usable_ram_bytes()
-        << ",\"backing_budget_bytes\":" << pc.cpu.memory.budget_bytes()
-        << "},\"ready_for_windows10_install\":false,\"errors\":{"
+    out << "},\"ram_profile\":";
+    write_ram_profile(out, pc, spill);
+    out << ",\"ready_for_windows10_install\":false,\"errors\":{"
         << "\"iso_boot\":" << cosmic_pc::PcMachine::quote(optical_issue)
         << ",\"qssd\":" << cosmic_pc::PcMachine::quote(disk_issue)
         << ",\"qssd_ata\":" << cosmic_pc::PcMachine::quote(ata_issue) << "}}";
@@ -297,6 +304,8 @@ class AndroidBootSession final {
     } else {
       out << "null";
     }
+    out << ",\"ram_profile\":";
+    write_ram_profile(out, pc_, spill_);
     const auto gate_work = pc_.quantum_session->gate_work_stats();
     const auto& boot_work = pc_.boot_acceleration();
     out << ",\"ether_next\":{\"quantum_gates_in\":" << gate_work.input_gates
@@ -339,6 +348,54 @@ class AndroidBootSession final {
   }
 
  private:
+  struct SpillInfo {
+    AndroidRamBacking* file = nullptr; // Owned by the same PcMachine's MemoryFabric.
+    std::uint64_t limit = 0;
+    std::string state = "disabled";
+    std::string detail;
+  };
+
+  static SpillInfo configure_spill(cosmic_pc::PcMachine& pc, const std::filesystem::path& directory) {
+    SpillInfo info;
+    if (directory.empty()) return info;
+    auto& memory = pc.cpu.memory;
+    if (memory.budget_bytes() >= memory.size()) return info;
+    info.limit = std::min(AndroidRamBacking::spill_budget(directory), memory.size());
+    if (!info.limit) {
+      info.state = "unavailable";
+      info.detail = "No hay espacio disponible para el respaldo temporal de RAM.";
+      return info;
+    }
+    try {
+      auto file = std::make_unique<AndroidRamBacking>(directory, memory.size(), info.limit);
+      auto* file_stats = file.get();
+      memory.attach_page_backing(std::move(file));
+      info.file = file_stats;
+      info.state = "file";
+    } catch (const std::exception& error) {
+      info.state = "unavailable";
+      info.detail = error.what();
+      info.limit = 0;
+    }
+    return info;
+  }
+
+  static void write_ram_profile(std::ostream& out, const cosmic_pc::PcMachine& pc,
+                                const SpillInfo& spill) {
+    const auto metrics = pc.cpu.memory.metrics();
+    out << "{\"address_space_bytes\":" << pc.cpu.memory.size()
+        << ",\"usable_bytes\":" << pc.usable_ram_bytes()
+        << ",\"backing_budget_bytes\":" << pc.cpu.memory.budget_bytes()
+        << ",\"resident_bytes\":" << metrics.allocated_bytes
+        << ",\"spill_mode\":" << cosmic_pc::PcMachine::quote(spill.state)
+        << ",\"spill_error\":" << cosmic_pc::PcMachine::quote(spill.detail)
+        << ",\"spill_limit_bytes\":" << spill.limit
+        << ",\"spilled_bytes\":" << metrics.backing_bytes
+        << ",\"spill_file_payload_bytes\":" << (spill.file ? spill.file->file_payload_bytes() : 0)
+        << ",\"spill_reads\":" << metrics.backing_reads
+        << ",\"spill_writes\":" << metrics.backing_writes << '}';
+  }
+
   static void check_ata_identify(cosmic_pc::PcMachine& pc, QssdDisk& volume) {
     constexpr std::uint16_t code = 0x1000, data = 0x1800;
     constexpr std::uint8_t identify_probe[]{
@@ -457,6 +514,7 @@ class AndroidBootSession final {
 
   BootSource source_;
   cosmic_pc::PcMachine pc_;
+  SpillInfo spill_;
   std::shared_ptr<OpticalReader> iso_;
   std::unique_ptr<QssdDisk> disk_;
   std::unique_ptr<BiosHardDisk> bios_disk_;

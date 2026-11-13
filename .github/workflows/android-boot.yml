@@ -35,9 +35,9 @@ jobs:
         abi: [arm64-v8a, x86_64]
     env:
       ANDROID_ABI: ${{ matrix.abi }}
-      ANDROID_APP_ID: com.reversewindows.android.ether.r016
-      ANDROID_VERSION: "0.1.6"
-      ANDROID_VERSION_CODE: "7"
+      ANDROID_APP_ID: com.reversewindows.android.ether.r017
+      ANDROID_VERSION: "0.1.7"
+      ANDROID_VERSION_CODE: "8"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -186,6 +186,25 @@ jobs:
             return 1
           }
           wait_for_state waiting_key
+          python3 - "$log" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          sessions = [
+              json.loads(line[line.index('{"app_version"'):])
+              for line in pathlib.Path(sys.argv[1]).read_text().splitlines()
+              if '{"app_version"' in line and 'reverse-windows-android-session-v1' in line
+          ]
+          ram = sessions[-1]["ram_profile"]
+          assert ram["resident_bytes"] <= ram["backing_budget_bytes"], ram
+          assert ram["spilled_bytes"] == 0 and ram["spill_writes"] == 0, ram
+          assert ram["spill_mode"] in {"file", "disabled", "unavailable"}, ram
+          if ram["spill_mode"] == "file":
+              assert ram["spill_limit_bytes"] > 0 and not ram["spill_error"], ram
+          elif ram["spill_mode"] == "unavailable":
+              assert ram["spill_limit_bytes"] == 0 and ram["spill_error"], ram
+          PY
           adb shell input keyevent KEYCODE_ENTER
           wait_for_state halted
           BASH

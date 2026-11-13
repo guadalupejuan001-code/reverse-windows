@@ -83,26 +83,27 @@ extern "C" {
 
 JNIEXPORT jstring JNICALL Java_com_reversewindows_android_NativeMachine_checkHardwareWithRam(
         JNIEnv* env, jclass, jstring disk, jint iso_fd, jlong iso_bytes, jstring iso_error,
-        jlong available, jlong threshold, jboolean low_memory) {
+        jlong available, jlong threshold, jboolean low_memory, jstring ram_cache) {
     return call<jstring>(env, nullptr, [&] {
         if (iso_bytes < 0) throw std::invalid_argument("Tamaño de medio inválido.");
         const auto result = Session::check_hardware(string_from(env, disk), iso_fd,
                 static_cast<std::uint64_t>(iso_bytes), string_from(env, iso_error),
-                ram_profile(available, threshold, low_memory));
+                ram_profile(available, threshold, low_memory), string_from(env, ram_cache));
         return env->NewStringUTF(result.c_str());
     });
 }
 
 JNIEXPORT jlong JNICALL Java_com_reversewindows_android_NativeMachine_openWithRam(
         JNIEnv* env, jclass, jstring disk, jint capacity, jint iso_fd, jlong iso_bytes, jint source,
-        jlong available, jlong threshold, jboolean low_memory) {
+        jlong available, jlong threshold, jboolean low_memory, jstring ram_cache) {
     return call<jlong>(env, 0, [&] {
         if (capacity < 0 || iso_bytes < 0)
             throw std::invalid_argument("Tamaño de medio inválido.");
         auto machine = std::make_unique<Session>(
             string_from(env, disk), static_cast<unsigned>(capacity),
             static_cast<Session::BootSource>(source), iso_fd,
-            static_cast<std::uint64_t>(iso_bytes), ram_profile(available, threshold, low_memory));
+            static_cast<std::uint64_t>(iso_bytes), ram_profile(available, threshold, low_memory),
+            string_from(env, ram_cache));
         auto instance = std::make_shared<Instance>(std::move(machine));
         std::lock_guard<std::mutex> lock(registry_mutex);
         if (next_handle == std::numeric_limits<jlong>::max())
