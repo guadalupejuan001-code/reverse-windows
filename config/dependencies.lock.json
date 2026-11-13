@@ -6,7 +6,7 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "943d267d25ecfd2d43936124de5fd0ffbea27421",
+      "commit": "0327844f4b1caf90bf71d9364b0eb467f14aa5c6",
       "checkout": "deps/mundo-X",
       "role": "canonical-PcMachine-C09R-tested-CMPXCHG16B-8B-PREFETCHW-and-CPU-trace",
       "status": "candidate-C09R-unmerged",
