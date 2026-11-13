@@ -193,6 +193,45 @@ jobs:
           grep -q 'refuse overwrite' build/c09-trace-refused.err
           sha256sum --check build/c09-iso-before.sha256
           echo C09_UNMODIFIED_ISO_AND_NO_FALSE_BOOT_PASS
+      - name: Diagnose trace and retain first observable blocker without inventing WinPE
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/c09_diagnose_trace.py build/c09-iso-trace.jsonl \
+            --output build/c09-iso-diagnosis.json > build/c09-iso-diagnosis.pretty
+          python3 scripts/c09_diagnose_trace.py build/c09-fault-trace.jsonl \
+            --output build/c09-fault-diagnosis.json > build/c09-fault-diagnosis.pretty
+          python3 scripts/c09_diagnose_trace.py build/c09-quota-trace.jsonl \
+            --output build/c09-quota-diagnosis.json > build/c09-quota-diagnosis.pretty
+          python3 - <<'PY'
+          import json,pathlib
+          root=pathlib.Path("build")
+          iso=json.loads((root/"c09-iso-diagnosis.json").read_text())
+          fault=json.loads((root/"c09-fault-diagnosis.json").read_text())
+          quota=json.loads((root/"c09-quota-diagnosis.json").read_text())
+          assert iso["reached_cs_0050_ip_0854"]
+          assert iso["checkpoint_opcode_bytes"]=="0f00d8"
+          assert iso["bios_int13_ah42_reads"]==1
+          assert iso["ata_identify_commands"]==1
+          assert iso["pci_cfg_out_cf8"]>=1 and iso["pci_cfg_in_cfc"]>=1
+          assert iso["first_terminal_blocker"]["type"]=="guest_halt"
+          assert fault["first_terminal_blocker"]["type"]=="terminal_instruction_fault"
+          assert fault["first_terminal_blocker"]["first_observed"]["decoded"]=="f0"
+          assert fault["truncated"] and quota["truncated"]
+          assert quota["first_terminal_blocker"]["type"]=="no_terminal_fault_observed_with_truncated_trace"
+          for report in (iso,fault,quota):
+              assert not report["windows_10_boot_verified"]
+              assert not report["winpe_boot_verified"]
+              assert not report["guest_image_identity_verified"]
+          print("C09_FIRST_OBSERVABLE_BLOCKER_DIAGNOSIS_PASS identity_unverified=1")
+          PY
+      - name: Capture actual guest APIC MMIO and ATA IRQ14 trace integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_c09_hardware_trace_test | tee build/c09-hardware-trace.log
+          grep -q 'C09_HARDWARE_IRQ14_MMIO_QSSD_TRACE_PASS' build/c09-hardware-trace.log
+          grep -q 'REVERSE_WINDOWS_C09_HARDWARE_TRACE_PASS' build/c09-hardware-trace.log
       - name: Replay protected16 group-6 through real El Torito synthetic ISO
         run: |
           g++ -std=c++17 -O0 -pthread -Ideps/mundo-X/native/include deps/mundo-X/pc-android/native/tests/pc_group6_iso_test.cpp -o build/iso-protected16-group6
@@ -221,4 +260,8 @@ jobs:
             build/c09-fault-trace.jsonl
             build/c09-quota-trace.jsonl
             build/c09-bad-catalog.err
+            build/c09-iso-diagnosis.json
+            build/c09-fault-diagnosis.json
+            build/c09-quota-diagnosis.json
+            build/c09-hardware-trace.log
           if-no-files-found: warn
