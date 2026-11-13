@@ -2,10 +2,13 @@
 #include "bios_hard_disk.hpp"
 #include "qssd_disk.hpp"
 #include "c06_motherboard.hpp"
+#include "c09_guest_trace.hpp"
 #include "virtual_disk.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
+#include <filesystem>
+#include <optional>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -20,6 +23,8 @@ struct Options {
     std::uint64_t create_qssd_gib = 0;
     std::uint64_t create_disk_gib = 0;
     std::string evidence_path;
+    std::string trace_path;
+    std::uint64_t trace_max_events=25000;
     std::uint64_t steps = 200000;
     std::uint64_t ram_mib = 2048;
     std::uint64_t resident_mib = 256;
@@ -60,6 +65,9 @@ Options parse(int argc, char** argv) {
         else if (arg == "--ram-mib") out.ram_mib = positive(next(), 2048, "ram-mib");
         else if (arg == "--resident-mib") out.resident_mib = positive(next(), 2048, "resident-mib");
         else if (arg == "--evidence") out.evidence_path = next();
+        else if (arg == "--trace") out.trace_path = next();
+        else if (arg == "--trace-max-events")
+            out.trace_max_events = positive(next(), 2000000, "trace-max-events");
         else throw std::invalid_argument("Unknown option: " + arg);
     }
     if (out.source == Options::Source::None) throw std::invalid_argument("Select a boot source or --qssd-checkpoint/--qssd-compact");
@@ -70,6 +78,17 @@ Options parse(int argc, char** argv) {
             throw std::invalid_argument("QSSD maintenance requires only --qssd-disk PATH.rqvd");
     }
     if (out.ram_mib < 2) throw std::invalid_argument("Mundo X PC requires at least 2 MiB logical RAM");
+    if (!out.trace_path.empty()) {
+        if (out.source==Options::Source::QssdCompact ||
+            out.source==Options::Source::QssdCheckpoint)
+            throw std::invalid_argument("--trace needs a boot source, not offline QSSD maintenance");
+        // Refuse to clobber an existing trace, especially an ISO or disk image.
+        const auto trace = std::filesystem::weakly_canonical(out.trace_path);
+        if (std::filesystem::exists(trace) || trace==std::filesystem::weakly_canonical(out.iso_path) ||
+            (!out.disk_path.empty() && trace==std::filesystem::weakly_canonical(out.disk_path)) ||
+            (!out.qssd_path.empty() && trace==std::filesystem::weakly_canonical(out.qssd_path)))
+            throw std::invalid_argument("Trace path exists or aliases a guest ISO/disk; refuse overwrite");
+    }
     if (out.create_disk_gib && out.disk_path.empty()) throw std::invalid_argument("--create-disk-gib requires --disk PATH.rvdisk");
     if (out.create_qssd_gib && out.qssd_path.empty()) throw std::invalid_argument("--create-qssd-gib requires --qssd-disk PATH.rqvd");
     if (!out.disk_path.empty() && !out.qssd_path.empty()) throw std::invalid_argument("Select one writable disk backend");
@@ -116,6 +135,8 @@ int main(int argc, char** argv) {
             disk = std::move(candidate);
         }
         std::shared_ptr<std::ifstream> medium;
+        std::optional<cosmic_pc::BootPlan> optical_plan;
+        std::uint64_t optical_bytes=0;
         std::string kind;
         if (opts.source == Options::Source::DemoX86) {
             pc.boot_demo();
@@ -135,13 +156,18 @@ int main(int argc, char** argv) {
             medium->seekg(0, std::ios::end);
             const auto end = medium->tellg();
             if (end <= 0) throw std::runtime_error("Invalid ISO size");
-            pc.mount(
-                [medium](std::uint64_t offset, std::uint8_t* data, std::size_t size) {
-                    medium->clear();
-                    medium->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-                    medium->read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(size));
-                    return static_cast<std::size_t>(medium->gcount()) == size;
-                }, static_cast<std::uint64_t>(end), "iso");
+            optical_bytes=static_cast<std::uint64_t>(end);
+            auto read_iso=[medium](std::uint64_t offset, std::uint8_t* data, std::size_t size) {
+                medium->clear();
+                medium->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+                medium->read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(size));
+                return static_cast<std::size_t>(medium->gcount()) == size;
+            };
+            // Independently audit El Torito metadata only when tracing.
+            // Both passes read the same immutable local ISO; no rewrite/RISO.
+            if (!opts.trace_path.empty())
+                optical_plan=cosmic_pc::BootMedia(optical_bytes,read_iso).plan("iso");
+            pc.mount(read_iso,optical_bytes,"iso");
         }
 
         std::unique_ptr<reverse_windows::BiosHardDisk> hdd;
@@ -149,6 +175,12 @@ int main(int argc, char** argv) {
         // One canonical guest CPU. The motherboard wraps its existing I/O hooks
         // after boot firmware and QSSD are mounted, and stays alive until exit.
         reverse_windows::PcMotherboardC06 motherboard(pc,disk.get());
+        std::unique_ptr<reverse_windows::C09GuestTrace> trace;
+        if (!opts.trace_path.empty()) {
+            trace=std::make_unique<reverse_windows::C09GuestTrace>(
+                pc,motherboard,qdisk,opts.trace_path,opts.trace_max_events);
+            if (optical_plan) trace->note_boot_plan(*optical_plan,optical_bytes);
+        }
 
         while (pc.cpu.instructions < opts.steps && pc.status() != "fault" && !pc.cpu.halted) {
             if (pc.waiting_key) {
@@ -161,6 +193,7 @@ int main(int argc, char** argv) {
             pc.run(chunk);
             if (pc.cpu.instructions == before && !pc.waiting_key) break;
         }
+        if (trace) trace->finish();
         const auto final_json = pc.json();
         const auto platform = motherboard.evidence();
         const auto* ata = motherboard.attached_ata();
@@ -169,6 +202,8 @@ int main(int argc, char** argv) {
             "\"guest_kind\":" + cosmic_pc::PcMachine::quote(kind) +
             ",\"source\":\"original-Mundo-X-PcMachine\"" +
             ",\"windows10_boot_verified\":false" +
+            ",\"c09_trace\":{\"enabled\":" + std::string(trace?"true":"false") +
+            ",\"schema\":\"reverse-windows-c09-trace-v1\",\"windows_pe_verified\":false}" +
             ",\"writable_hdd_attached\":" + std::string(disk ? "true" : "false") +
             ",\"storage_backend\":" + cosmic_pc::PcMachine::quote(qdisk ? "QSSD-journaled" : disk ? "raw" : "none") +
             ",\"qssd_commits\":" + std::to_string(qdisk ? qdisk->stats().commits : 0) +

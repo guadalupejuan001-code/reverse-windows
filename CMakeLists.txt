@@ -84,6 +84,19 @@ if(BUILD_TESTING)
   add_test(NAME reverse_windows_c08_raw_vs_qssd_benchmark
     COMMAND reverse_windows_c08_benchmark)
 
+  # Source is taken from the exact pinned Mundo X authority, not a duplicate
+  # CPU decoder. C09 traces are opt-in and cannot change x86 semantics.
+  add_executable(reverse_windows_c09_cpu_trace
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_trace_c09_test.cpp")
+  target_link_libraries(reverse_windows_c09_cpu_trace PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c09_cpu_precise_step_trace
+    COMMAND reverse_windows_c09_cpu_trace)
+
+  add_executable(reverse_windows_c09_hardware_trace_test tests/c09_hardware_trace_test.cpp)
+  target_link_libraries(reverse_windows_c09_hardware_trace_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c09_real_hardware_trace
+    COMMAND reverse_windows_c09_hardware_trace_test)
+
   set_tests_properties(reverse_windows_real_x86_demo reverse_windows_real_x64_demo
                        reverse_windows_x86_hdd_write_read_persist
                        reverse_windows_qssd_sparse_atomic_reboot_x86
@@ -93,5 +106,7 @@ if(BUILD_TESTING)
                        reverse_windows_c07_pci_ata_qssd_pio_irq
                        reverse_windows_c07_cpu_real_rep_pio
                        reverse_windows_c08_verified_checkpoint_compaction
-                       reverse_windows_c08_raw_vs_qssd_benchmark PROPERTIES TIMEOUT 120)
+                       reverse_windows_c08_raw_vs_qssd_benchmark
+                       reverse_windows_c09_cpu_precise_step_trace
+                       reverse_windows_c09_real_hardware_trace PROPERTIES TIMEOUT 120)
 endif()

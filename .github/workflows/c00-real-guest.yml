@@ -1,4 +1,4 @@
-name: C08 QSSD checkpoints and C00-C07 guest regressions
+name: C09 Original ISO tracing and C00-C08 regressions
 on:
   push:
     branches: [main, "feature/**"]
@@ -17,11 +17,11 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Checkout C06 real MMIO/IRQ guest CPU (exact candidate SHA)
+      - name: Checkout C09 guest trace CPU (exact SHA, C07 preserved)
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/mundo-X
-          ref: 562f4d9e2e699de6d879f25eb0feb38d1114525a
+          ref: 680afd0d42c1f3a5a88260d5d038eb92c2794c7e
           path: deps/mundo-X
           persist-credentials: false
       - name: Checkout GPU-VIRTUAL C12 plus physical work authority
@@ -125,6 +125,113 @@ jobs:
           grep -q '"qssd_maintenance":"compact"' build/c08-cli-compact.json
           test -f build/c08-cli-smoke.rqvd.rqix
           echo C08_CLI_OFFLINE_MAINTENANCE_PASS
+      - name: Trace authentic CPU and BIOS execution from a SYNTHETIC El Torito ISO
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/c09_synthetic_iso.py build/c09-synthetic.iso
+          ./build/reverse_windows_boot_probe --iso build/c09-synthetic.iso \
+            --qssd-disk build/c09-trace.rqvd --create-qssd-gib 1 \
+            --steps 1000 --ram-mib 16 --resident-mib 16 \
+            --trace build/c09-iso-trace.jsonl --trace-max-events 15000 \
+            --evidence build/c09-iso-boot-evidence.json \
+            > build/c09-iso-probe.stdout.json
+          python3 tests/c09_assert_trace.py build/c09-iso-trace.jsonl iso
+          python3 - <<'PY'
+          import json,pathlib
+          report=json.loads(pathlib.Path("build/c09-iso-boot-evidence.json").read_text())
+          assert report["source"]=="original-Mundo-X-PcMachine"
+          assert report["guest_kind"]=="user-ISO"
+          assert report["c09_trace"]["enabled"]
+          assert not report["windows10_boot_verified"]
+          assert not report["c09_trace"]["windows_pe_verified"]
+          assert report["ide_c07"]["attached"]
+          assert report["ide_c07"]["ata_commands"]>=1
+          assert report["machine"]["cpu_mode"]=="protected16"
+          assert report["machine"]["status"]=="halted"
+          print("C09_PROBE_COHERENT_WITH_TRACE_PASS windows_pe=false")
+          PY
+      - name: Exercise terminal fault, truncated quota and invalid ISO rejection
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/c09_synthetic_iso.py --fault-disk build/c09-unsupported.rvdisk
+          set +e
+          ./build/reverse_windows_boot_probe --boot-hdd \
+            --disk build/c09-unsupported.rvdisk \
+            --steps 128 --ram-mib 16 --resident-mib 16 \
+            --trace build/c09-fault-trace.jsonl --trace-max-events 3 \
+            > build/c09-fault-probe.stdout.json
+          actual=$?
+          set -e
+          test "$actual" -eq 2
+          python3 tests/c09_assert_trace.py build/c09-fault-trace.jsonl fault
+          ./build/reverse_windows_boot_probe --iso build/c09-synthetic.iso \
+            --qssd-disk build/c09-trace.rqvd \
+            --steps 1000 --ram-mib 16 --resident-mib 16 \
+            --trace build/c09-quota-trace.jsonl --trace-max-events 3 \
+            > build/c09-quota-probe.stdout.json
+          python3 tests/c09_assert_trace.py build/c09-quota-trace.jsonl quota
+          python3 tests/c09_synthetic_iso.py --bad-catalog build/c09-bad-catalog.iso
+          set +e
+          ./build/reverse_windows_boot_probe --iso build/c09-bad-catalog.iso \
+            --ram-mib 16 --resident-mib 16 \
+            > build/c09-bad-catalog.out 2> build/c09-bad-catalog.err
+          actual=$?
+          set -e
+          test "$actual" -eq 2
+          grep -q 'El Torito validation checksum' build/c09-bad-catalog.err
+          sha256sum build/c09-synthetic.iso > build/c09-iso-before.sha256
+          set +e
+          ./build/reverse_windows_boot_probe --iso build/c09-synthetic.iso \
+            --trace build/c09-synthetic.iso --steps 20 \
+            --ram-mib 16 --resident-mib 16 \
+            > build/c09-trace-refused.out 2> build/c09-trace-refused.err
+          actual=$?
+          set -e
+          test "$actual" -eq 2
+          grep -q 'refuse overwrite' build/c09-trace-refused.err
+          sha256sum --check build/c09-iso-before.sha256
+          echo C09_UNMODIFIED_ISO_AND_NO_FALSE_BOOT_PASS
+      - name: Diagnose trace and retain first observable blocker without inventing WinPE
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/c09_diagnose_trace.py build/c09-iso-trace.jsonl \
+            --output build/c09-iso-diagnosis.json > build/c09-iso-diagnosis.pretty
+          python3 scripts/c09_diagnose_trace.py build/c09-fault-trace.jsonl \
+            --output build/c09-fault-diagnosis.json > build/c09-fault-diagnosis.pretty
+          python3 scripts/c09_diagnose_trace.py build/c09-quota-trace.jsonl \
+            --output build/c09-quota-diagnosis.json > build/c09-quota-diagnosis.pretty
+          python3 - <<'PY'
+          import json,pathlib
+          root=pathlib.Path("build")
+          iso=json.loads((root/"c09-iso-diagnosis.json").read_text())
+          fault=json.loads((root/"c09-fault-diagnosis.json").read_text())
+          quota=json.loads((root/"c09-quota-diagnosis.json").read_text())
+          assert iso["reached_cs_0050_ip_0854"]
+          assert iso["checkpoint_opcode_bytes"]=="0f00d8"
+          assert iso["bios_int13_ah42_reads"]==1
+          assert iso["ata_identify_commands"]==1
+          assert iso["pci_cfg_out_cf8"]>=1 and iso["pci_cfg_in_cfc"]>=1
+          assert iso["first_terminal_blocker"]["type"]=="guest_halt"
+          assert fault["first_terminal_blocker"]["type"]=="terminal_instruction_fault"
+          assert fault["first_terminal_blocker"]["first_observed"]["decoded"]=="f0"
+          assert fault["truncated"] and quota["truncated"]
+          assert quota["first_terminal_blocker"]["type"]=="no_terminal_fault_observed_with_truncated_trace"
+          for report in (iso,fault,quota):
+              assert not report["windows_10_boot_verified"]
+              assert not report["winpe_boot_verified"]
+              assert not report["guest_image_identity_verified"]
+          print("C09_FIRST_OBSERVABLE_BLOCKER_DIAGNOSIS_PASS identity_unverified=1")
+          PY
+      - name: Capture actual guest APIC MMIO and ATA IRQ14 trace integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_c09_hardware_trace_test | tee build/c09-hardware-trace.log
+          grep -q 'C09_HARDWARE_IRQ14_MMIO_QSSD_TRACE_PASS' build/c09-hardware-trace.log
+          grep -q 'REVERSE_WINDOWS_C09_HARDWARE_TRACE_PASS' build/c09-hardware-trace.log
       - name: Replay protected16 group-6 through real El Torito synthetic ISO
         run: |
           g++ -std=c++17 -O0 -pthread -Ideps/mundo-X/native/include deps/mundo-X/pc-android/native/tests/pc_group6_iso_test.cpp -o build/iso-protected16-group6
@@ -147,4 +254,14 @@ jobs:
             build/c08-measured-results.json
             build/c08-cli-checkpoint.json
             build/c08-cli-compact.json
+            build/c09-iso-trace.jsonl
+            build/c09-iso-boot-evidence.json
+            build/c09-iso-probe.stdout.json
+            build/c09-fault-trace.jsonl
+            build/c09-quota-trace.jsonl
+            build/c09-bad-catalog.err
+            build/c09-iso-diagnosis.json
+            build/c09-fault-diagnosis.json
+            build/c09-quota-diagnosis.json
+            build/c09-hardware-trace.log
           if-no-files-found: warn
