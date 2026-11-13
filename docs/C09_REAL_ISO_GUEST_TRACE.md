@@ -49,7 +49,7 @@ La ejecución con ISO auténtica puede terminar con código 2 por un opcode, MMU
 - `start`: CPU, modo, CS:RIP inicial, procedencia y cuota.
 - `el-torito-boot-plan`: entrada x86, segmento inicial, origen de la imagen, tamaño en sectores y unidad.
 - `instruction`: secuencia exacta desde `Cpu::step`; CS:IP/RIP/opcode/bytes/mode/CPL/MMU/excepción/flags/CR2/CR3.
-- `mode-transition`: cambios reales a protected16/protected32/long64, preservados incluso al agotarse la cuota.
+- `mode-transition`: cambios reales a protected16/protected32/long64. Los primeros 256 eventos críticos se conservan aunque se agote la cuota de detalle; el resto se contabiliza como descartado para impedir archivos ilimitados.
 - `bios-interrupt`: vector, AH y DL (corregido en C09), resultado Carry y lecturas del medio.
 - `io-in`, `io-out`, `mmio-read`, `mmio-write`: puerto/dirección/ancho/valor y si el dispositivo aceptó la operación.
 - `hardware-irq`: vector realmente entregado por la CPU y CS:RIP origen/destino.
