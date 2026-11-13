@@ -216,7 +216,7 @@ jobs:
           assert iso["pci_cfg_out_cf8"]>=1 and iso["pci_cfg_in_cfc"]>=1
           assert iso["first_terminal_blocker"]["type"]=="guest_halt"
           assert fault["first_terminal_blocker"]["type"]=="terminal_instruction_fault"
-          assert fault["first_terminal_blocker"]["first_observed"]["decoded"]=="f0"
+          assert fault["first_terminal_blocker"]["first_observed"]["decoded"]=="f000"
           assert fault["truncated"] and quota["truncated"]
           assert quota["first_terminal_blocker"]["type"]=="no_terminal_fault_observed_with_truncated_trace"
           for report in (iso,fault,quota):
