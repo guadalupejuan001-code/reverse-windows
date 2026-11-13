@@ -1,4 +1,4 @@
-name: C06 Real motherboard and C00-C05 guest regressions
+name: C07 Real PCI ATA QSSD and C00-C06 guest regressions
 on:
   push:
     branches: [main, "feature/**"]
@@ -61,6 +61,23 @@ jobs:
           grep -q 'C06_PCI_ACPI_CMOS_REAL_GUEST_PASS' build/reverse-windows-c06-motherboard.log
           grep -q 'C06_IOAPIC_LAPIC_MMIO_IRQ_PASS' build/reverse-windows-c06-motherboard.log
           grep -q 'REVERSE_WINDOWS_C06_MOTHERBOARD_PASS' build/reverse-windows-c06-motherboard.log
+      - name: Verify real C07 guest PCI ATA PIO IRQ14 and durable QSSD replay
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_c07_ata_guest_test | tee build/reverse-windows-c07-ata.log
+          for marker in C07_REAL_GUEST_PCI_ATA_PIO_IRQ_PASS \
+            C07_LBA48_HIGH_SPARSE_GUEST_PASS \
+            C07_ATA_PIO_MULTI_SECTOR_PASS \
+            C07_ATA_COMMAND_ERRORS_PASS \
+            C07_ATA_PARTIAL_RESET_PASS \
+            C07_SAME_MACHINE_REBOOT_PASS \
+            C07_QSSD_DURABILITY_REOPEN_PASS \
+            C07_BIOS_ATA_SINGLE_QSSD_PASS \
+            C07_QSSD_CORRUPT_REJECT_TORN_RECOVER_PASS \
+            REVERSE_WINDOWS_C07_REAL_ATA_PASS; do
+            grep -q "$marker" build/reverse-windows-c07-ata.log
+          done
       - name: Replay protected16 group-6 through real El Torito synthetic ISO
         run: |
           g++ -std=c++17 -O0 -pthread -Ideps/mundo-X/native/include deps/mundo-X/pc-android/native/tests/pc_group6_iso_test.cpp -o build/iso-protected16-group6
@@ -77,4 +94,5 @@ jobs:
           path: |
             build/reverse-windows-x64.json
             build/reverse-windows-c06-motherboard.log
+            build/reverse-windows-c07-ata.log
           if-no-files-found: warn
