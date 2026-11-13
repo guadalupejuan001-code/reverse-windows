@@ -97,7 +97,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             iso = Uri.parse(savedIso);
             isoName = prefs.getString("iso_name", "ISO");
         }
-        worker = new VmWorker(getContentResolver(), disk, this);
+        worker = new VmWorker(this, disk, this);
         buildScreen();
         updateControls();
         if (BuildConfig.DEBUG && getIntent().getBooleanExtra(
@@ -357,6 +357,14 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             StringBuilder result = new StringBuilder(ready
                     ? "Requisitos comprobados para Windows 10"
                     : "Requisitos pendientes para Windows 10");
+            JSONObject ram = preflight.optJSONObject("ram_profile");
+            if (ram != null) {
+                long mib = 1024L * 1024L;
+                result.append("\nRAM utilizable por el invitado: ")
+                        .append(ram.getLong("usable_bytes") / mib).append(" MiB")
+                        .append("\nPresupuesto de respaldo en Android: ")
+                        .append(ram.getLong("backing_budget_bytes") / mib).append(" MiB");
+            }
             for (String[] check : HARDWARE_CHECKS) {
                 String key = check[0];
                 String checkResult;
@@ -451,16 +459,22 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         if (machine == null) machine = diagnostic;
         JSONObject ata = diagnostic.optJSONObject("ata");
         JSONObject volume = diagnostic.optJSONObject("disk");
+        JSONObject ether = diagnostic.optJSONObject("ether_next");
         long steps = machine.optLong("instructions");
         long reads = machine.optLong("disk_reads");
         long readSectors = ata == null ? 0 : ata.optLong("read_sectors");
         long identifyTransfers = ata == null ? 0 : ata.optLong("identify_data_transfers");
+        long batchedElements = ether == null ? 0 : ether.optLong("boot_rep_elements");
         long commits = volume == null ? 0 : volume.optLong("commits");
         boolean handedOff = boot == null ? steps > 0 : boot.optBoolean("handed_off");
         StringBuilder progress = new StringBuilder(handedOff ? "BIOS entregó el control al invitado"
                 : "BIOS preparando el arranque");
         progress.append("\nModo ").append(modeName(machine.optString("cpu_mode")));
         progress.append(String.format(Locale.getDefault(), " · %,d instrucciones", steps));
+        if (batchedElements > 0) {
+            progress.append(String.format(Locale.getDefault(),
+                    "\nEther · %,d elementos de copia o relleno en bloque", batchedElements));
+        }
         if (boot != null && boot.optLong("mode_changes") > 0) {
             progress.append("\nÚltimo cambio: ").append(modeName(boot.optString("last_mode_from")))
                     .append(" → ").append(modeName(boot.optString("last_mode_to")));

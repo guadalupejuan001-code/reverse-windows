@@ -12,6 +12,16 @@ La app conecta el selector de archivos de Android, el arranque BIOS de Mundo X y
 
 Desinstalar la app borra su disco privado. Para conservar la instalación, actualiza con un APK firmado con la misma clave.
 
+## Prueba de arranque con Ether
+
+Ether ejecuta por bloques las copias y rellenos `REP MOVS` y `REP STOS` admitidos. Conserva el número de pasos del reloj invitado y vuelve al intérprete para los accesos que requieren las comprobaciones completas, incluida la E/S. La prueba de placa compara el punto exacto de entrega de IRQ del PIT y del LAPIC. Android encadena las tandas activas sin el retraso fijo de 2 ms.
+
+La RAM puede guardar una página con patrón repetido como un motivo de 8 bytes. Una escritura que rompe el patrón vuelve a respaldar la página completa. Android selecciona el respaldo al abrir la máquina con la mitad del margen sobre su umbral de memoria baja. Con al menos 768 MiB de respaldo puede presentar un espacio físico de 4 GiB, con 3.947,625 MiB de RAM utilizable en el mapa del BIOS.
+
+**Copiar diagnóstico** incluye los elementos acelerados, el número de páginas con patrón y las direcciones que más se repiten en el arranque de una ISO. Son mediciones del huésped y de la memoria virtual. La prueba de esta revisión usa un medio sintético.
+
+La APK **REVERSE Windows Ether** se instala como app separada y crea su propio QSSD. El QSSD privado de REVERSE Windows sigue disponible en la app original.
+
 ## C03 · De BIOS al QSSD
 
 La prueba arranca un CD El Torito de solo lectura. El huésped valida la unidad de arranque del BIOS, cambia a modo protegido, encuentra el controlador PCI IDE y lee `IDENTIFY DEVICE` tras recibir IRQ14. Comprueba los **64 GiB** y escribe la confirmación en VGA. Después de Enter, escribe un MBR de prueba por BIOS, compara sus 512 bytes por ATA y arranca desde el mismo QSSD. El MBR vuelve a arrancar al abrir el disco en una sesión nueva.
@@ -64,4 +74,4 @@ Se verificó el flujo con huéspedes sintéticos. IDE/ATAPI y PS/2 tienen cobert
 
 ## Compilar
 
-Con los componentes fijados, JDK 17 y el SDK de Android, ejecuta `python3 scripts/verify_deps.py` desde la raíz y luego `./gradlew :app:assembleDebug` desde `android/`. El workflow `.github/workflows/android-boot.yml` prepara las versiones del SDK, verifica la firma y ABI y publica el APK ARM64.
+Con los componentes fijados, JDK 17 y el SDK de Android, ejecuta `python3 scripts/verify_deps.py` desde la raíz y luego `./gradlew :app:assembleDebug` desde `android/`. Para compilar la app de prueba separada, añade `-PetherPreview=true`. El workflow `.github/workflows/android-boot.yml` verifica la firma y ABI y publica la APK ARM64 de prueba.

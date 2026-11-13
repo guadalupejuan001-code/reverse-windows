@@ -23,10 +23,31 @@ class AndroidBootSession final {
  public:
   enum class BootSource { Iso=1, Disk=2, SelfTest=3 };
   enum class Step { Running=0, WaitingKey=1, Halted=2, Fault=3 };
+  struct RamProfile {
+    std::size_t physical_bytes;
+    std::size_t backing_bytes;
+  };
+  static constexpr RamProfile kDefaultRamProfile{2048ULL * 1024 * 1024, 256ULL * 1024 * 1024};
+
+  static RamProfile ram_profile(std::uint64_t available_bytes, std::uint64_t low_threshold,
+                                bool low_memory) {
+    constexpr std::uint64_t MiB = 1024 * 1024;
+    const auto headroom = available_bytes > low_threshold ? available_bytes - low_threshold : 0;
+    const auto backing = (headroom / 2) / cosmic_pc::MemoryFabric::kPageSize *
+                         cosmic_pc::MemoryFabric::kPageSize;
+    if (low_memory || backing < 16 * MiB)
+      throw std::runtime_error("Android tiene poca RAM disponible para iniciar el equipo virtual.");
+    // Keep room above Android's low-memory threshold for the handset. The
+    // 4 GiB address space is selected only when more backing is available.
+    const auto physical = backing >= 768 * MiB && cosmic_pc::PcMachine::max_ram_mib() >= 4096
+        ? cosmic_pc::PcMachine::kMaxPhysicalBytes : kDefaultRamProfile.physical_bytes;
+    return {static_cast<std::size_t>(physical), static_cast<std::size_t>(std::min(backing, physical))};
+  }
 
   AndroidBootSession(std::filesystem::path disk, unsigned create_gib,
-                     BootSource source, int iso_fd=-1, std::uint64_t iso_bytes=0)
-      : source_(source), vga_(pc_) {
+                     BootSource source, int iso_fd=-1, std::uint64_t iso_bytes=0,
+                     RamProfile profile=kDefaultRamProfile)
+      : source_(source), pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_) {
     if (disk.empty() && (create_gib || source != BootSource::SelfTest))
       throw std::invalid_argument("Selecciona o crea un disco QSSD para iniciar.");
     switch (source) {
@@ -68,6 +89,8 @@ class AndroidBootSession final {
     }
     board_->enable_ps2_keyboard();
     if (source != BootSource::SelfTest) pc_.enable_guest_restart();
+    pc_.enable_boot_acceleration();
+    if (source == BootSource::Iso) pc_.enable_boot_hotspots();
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     pc_.cpu.enable_ether_next();
 #endif
@@ -78,8 +101,9 @@ class AndroidBootSession final {
   }
 
   static std::string check_hardware(const std::filesystem::path& disk, int iso_fd=-1,
-                                    std::uint64_t iso_bytes=0, const std::string& iso_error={}) {
-    cosmic_pc::PcMachine pc(kRamBytes, kRamBudgetBytes);
+                                    std::uint64_t iso_bytes=0, const std::string& iso_error={},
+                                    RamProfile profile=kDefaultRamProfile) {
+    cosmic_pc::PcMachine pc(profile.physical_bytes, profile.backing_bytes);
     pc.boot_demo();
     auto& cpu = pc.cpu;
     const auto cpuid = [&](std::uint32_t leaf) {
@@ -133,7 +157,7 @@ class AndroidBootSession final {
           return reader.read(off,into,len);
         }).plan("iso");
         const auto address = std::uint64_t(plan.load_segment)*16;
-        if (address>kRamBytes || plan.image.size()>kRamBytes-address)
+        if (address>pc.cpu.memory.size() || plan.image.size()>pc.cpu.memory.size()-address)
           throw std::runtime_error("La imagen de arranque excede la RAM.");
       } catch (const std::exception& error) { optical_issue = error.what(); }
     }
@@ -166,7 +190,10 @@ class AndroidBootSession final {
     if (has_disk) out << disk_issue.empty(); else out << "null";
     out << ",\"qssd_ata\":";
     if (!has_disk || !disk_issue.empty()) out << "null"; else out << ata_issue.empty();
-    out << "},\"ready_for_windows10_install\":false,\"errors\":{"
+    out << "},\"ram_profile\":{\"address_space_bytes\":" << pc.cpu.memory.size()
+        << ",\"usable_bytes\":" << pc.usable_ram_bytes()
+        << ",\"backing_budget_bytes\":" << pc.cpu.memory.budget_bytes()
+        << "},\"ready_for_windows10_install\":false,\"errors\":{"
         << "\"iso_boot\":" << cosmic_pc::PcMachine::quote(optical_issue)
         << ",\"qssd\":" << cosmic_pc::PcMachine::quote(disk_issue)
         << ",\"qssd_ata\":" << cosmic_pc::PcMachine::quote(ata_issue) << "}}";
@@ -271,10 +298,14 @@ class AndroidBootSession final {
       out << "null";
     }
     const auto gate_work = pc_.quantum_session->gate_work_stats();
+    const auto& boot_work = pc_.boot_acceleration();
     out << ",\"ether_next\":{\"quantum_gates_in\":" << gate_work.input_gates
         << ",\"quantum_gates_run\":" << gate_work.executed_gates
         << ",\"quantum_gates_cancelled\":" << gate_work.cancelled_gates
-        << ",\"pullback_cache_hits\":" << gate_work.pullback_hits;
+        << ",\"pullback_cache_hits\":" << gate_work.pullback_hits
+        << ",\"boot_rep_batches\":" << boot_work.batches
+        << ",\"boot_rep_elements\":" << boot_work.rep_elements
+        << ",\"boot_rep_bytes\":" << boot_work.bytes;
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     const auto ether = pc_.cpu.ether_next_stats();
     out << ",\"neon_requested\":" << (pc_.cpu.ether_next_enabled() ? "true" : "false")
@@ -284,6 +315,10 @@ class AndroidBootSession final {
         << ",\"cache_fallbacks\":" << ether.cache.fallbacks;
 #endif
     out << '}';
+    if (const auto& hotspots = pc_.boot_hotspots()) {
+      out << ",\"boot_hotspots\":";
+      hotspots->write_json(out);
+    }
     const auto& mode = pc_.boot_mode_progress();
     out << ",\"boot_progress\":{\"handed_off\":" << (pc_.cpu.instructions ? "true" : "false")
         << ",\"mode_changes\":" << mode.changes << ",\"last_mode_from\":\"" << mode.from
@@ -302,9 +337,6 @@ class AndroidBootSession final {
   }
 
  private:
-  static constexpr std::uint64_t kRamBytes = 2048ULL*1024*1024;
-  static constexpr std::uint64_t kRamBudgetBytes = 256ULL*1024*1024;
-
   static void check_ata_identify(cosmic_pc::PcMachine& pc, QssdDisk& volume) {
     constexpr std::uint16_t code = 0x1000, data = 0x1800;
     constexpr std::uint8_t identify_probe[]{
@@ -422,7 +454,7 @@ class AndroidBootSession final {
   }
 
   BootSource source_;
-  cosmic_pc::PcMachine pc_{kRamBytes,kRamBudgetBytes};
+  cosmic_pc::PcMachine pc_;
   std::shared_ptr<OpticalReader> iso_;
   std::unique_ptr<QssdDisk> disk_;
   std::unique_ptr<BiosHardDisk> bios_disk_;

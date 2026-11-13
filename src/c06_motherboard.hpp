@@ -23,7 +23,8 @@
 namespace reverse_windows {
 class PcMotherboardC06 {
  public:
-  static constexpr std::uint64_t kLocalApic=0xfee00000ULL,kIoApic=0xfec00000ULL;
+  static constexpr std::uint64_t kLocalApic=cosmic_pc::PcMachine::kLocalApicAddress,
+      kIoApic=cosmic_pc::PcMachine::kIoApicAddress;
   struct Evidence {
     std::uint64_t ticks,irq_delivered,pit_irqs,apic_irqs;
     bool pci_present,acpi_installed,powered_off;
@@ -115,9 +116,12 @@ class PcMotherboardC06 {
   std::function<std::optional<std::uint32_t>(std::uint16_t,unsigned)> prior_in_;
   std::function<bool(std::uint16_t,unsigned,std::uint32_t)> prior_out_;
   std::function<bool(std::uint64_t)> prior_mmio_claim_;
+  std::function<bool(std::uint64_t,std::size_t)> prior_mmio_range_claim_;
   std::function<std::optional<std::uint8_t>(std::uint64_t)> prior_mmio_read_;
   std::function<bool(std::uint64_t,std::uint8_t)> prior_mmio_write_;
   std::function<void()> prior_tick_;
+  std::function<unsigned(unsigned)> prior_batch_limit_;
+  std::function<void(unsigned)> prior_batch_advance_;
   std::function<void()> prior_reset_;
   Pic master_{},slave_{};
   std::unique_ptr<AtaC07> ata_;
@@ -334,6 +338,13 @@ class PcMotherboardC06 {
     return (a>=kLocalApic&&a<kLocalApic+4096)||
            (a>=kIoApic&&a<kIoApic+4096);
   }
+  bool mmio_range_claim(std::uint64_t start,std::size_t length) const {
+    const auto overlaps=[&](std::uint64_t base){
+      return start<base+4096U && (start>=base || length>base-start);
+    };
+    return length && (overlaps(kLocalApic) || overlaps(kIoApic) ||
+        (prior_mmio_claim_ && (!prior_mmio_range_claim_ || prior_mmio_range_claim_(start,length))));
+  }
   std::optional<std::uint32_t> mmio_register(std::uint64_t base) const {
     if(base>=kLocalApic&&base<kLocalApic+4096) {
       const auto r=unsigned(base-kLocalApic);
@@ -492,6 +503,23 @@ class PcMotherboardC06 {
     }
   }
 
+  // The current step has already polled the board. Stop the batch before
+  // another tick could change the interrupt or timer state visible to the CPU.
+  unsigned batch_limit(unsigned steps) const {
+    if(prior_tick_ || powered_off_ || pc_.cpu.x87_ferr_asserted()!=ferr_was_asserted_ ||
+       (keyboard_&&keyboard_->needs_irq()) ||
+       (pc_.cpu.flag(cosmic_pc::Cpu::IF) && (master_.pending() ||
+          (lapic_on() && !lapic_in_service_ && highest_lapic_request())))) return 1;
+    if(pit_.enabled) steps=std::min(steps,std::max(1U,pit_.counter));
+    if(lapic_on()&&apic_timer_counter_) steps=std::min(steps,apic_timer_counter_);
+    return steps;
+  }
+  void advance_batch(unsigned extra_steps) {
+    ticks_+=extra_steps;
+    if(pit_.enabled) pit_.counter-=extra_steps;
+    if(lapic_on()&&apic_timer_counter_) apic_timer_counter_-=extra_steps;
+  }
+
  public:
   explicit PcMotherboardC06(cosmic_pc::PcMachine& machine, BlockDisk* disk=nullptr,
                             AtapiCdrom::Reader optical={}, std::uint64_t optical_bytes=0):pc_(machine){
@@ -502,9 +530,12 @@ class PcMotherboardC06 {
     // memory and is never presented by E820 as allocatable guest RAM.
     prior_in_=pc_.cpu.in_hook;prior_out_=pc_.cpu.out_hook;
     prior_mmio_claim_=pc_.cpu.mmio_claim_hook;
+    prior_mmio_range_claim_=pc_.cpu.mmio_range_claim_hook;
     prior_mmio_read_=pc_.cpu.mmio_read_hook;
     prior_mmio_write_=pc_.cpu.mmio_write_hook;
     prior_tick_=pc_.device_step_hook;
+    prior_batch_limit_=pc_.device_batch_limit_hook;
+    prior_batch_advance_=pc_.device_batch_advance_hook;
     prior_reset_=pc_.device_reset_hook;
     reset_devices();
     pc_.cpu.in_hook=[this](std::uint16_t p,unsigned w){
@@ -520,6 +551,9 @@ class PcMotherboardC06 {
     pc_.cpu.mmio_claim_hook=[this](std::uint64_t a){
       return mmio_claim(a)||(prior_mmio_claim_&&prior_mmio_claim_(a));
     };
+    pc_.cpu.mmio_range_claim_hook=[this](std::uint64_t start,std::size_t length){
+      return mmio_range_claim(start,length);
+    };
     pc_.cpu.mmio_read_hook=[this](std::uint64_t a){
       if(mmio_claim(a))return mmio_byte(a);
       return prior_mmio_read_?prior_mmio_read_(a):std::nullopt;
@@ -532,6 +566,8 @@ class PcMotherboardC06 {
       if(prior_tick_)prior_tick_();
       poll();
     };
+    pc_.device_batch_limit_hook=[this](unsigned steps){return batch_limit(steps);};
+    pc_.device_batch_advance_hook=[this](unsigned steps){advance_batch(steps);};
     pc_.device_reset_hook=[this](){
       if(prior_reset_)prior_reset_();
       reset_devices();
@@ -543,9 +579,12 @@ class PcMotherboardC06 {
     pc_.cpu.in_hook=std::move(prior_in_);
     pc_.cpu.out_hook=std::move(prior_out_);
     pc_.cpu.mmio_claim_hook=std::move(prior_mmio_claim_);
+    pc_.cpu.mmio_range_claim_hook=std::move(prior_mmio_range_claim_);
     pc_.cpu.mmio_read_hook=std::move(prior_mmio_read_);
     pc_.cpu.mmio_write_hook=std::move(prior_mmio_write_);
     pc_.device_step_hook=std::move(prior_tick_);
+    pc_.device_batch_limit_hook=std::move(prior_batch_limit_);
+    pc_.device_batch_advance_hook=std::move(prior_batch_advance_);
     pc_.device_reset_hook=std::move(prior_reset_);
   }
   PcMotherboardC06(const PcMotherboardC06&)=delete;

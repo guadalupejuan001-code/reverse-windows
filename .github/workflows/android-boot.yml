@@ -35,6 +35,7 @@ jobs:
         abi: [arm64-v8a, x86_64]
     env:
       ANDROID_ABI: ${{ matrix.abi }}
+      ANDROID_APP_ID: com.reversewindows.android.ether
     steps:
       - uses: actions/checkout@v4
         with:
@@ -88,19 +89,19 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Build signed debug APK
         working-directory: android
-        run: ./gradlew --no-daemon --stacktrace -PandroidAbi="$ANDROID_ABI" :app:assembleDebug
+        run: ./gradlew --no-daemon --stacktrace -PandroidAbi="$ANDROID_ABI" -PetherPreview=true :app:assembleDebug
       - name: Verify APK signature, manifest and native ABI
         run: |
           apk=android/app/build/outputs/apk/debug/app-debug.apk
           tools="$ANDROID_HOME/build-tools/35.0.0"
           out="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI"
           mkdir -p "$out"
-          apk_name="REVERSE-Windows-Android-$ANDROID_ABI-debug.apk"
+          apk_name="REVERSE-Windows-Ether-$ANDROID_ABI-debug.apk"
           cp "$apk" "$out/$apk_name"
           "$tools/apksigner" verify --verbose --print-certs "$apk" | tee "$out/signature.txt"
           "$tools/zipalign" -c -P 16 -v 4 "$apk" > "$out/alignment.txt"
           "$tools/aapt" dump badging "$apk" > "$out/manifest.txt"
-          grep -Fq "package: name='com.reversewindows.android'" "$out/manifest.txt"
+          grep -Fq "package: name='$ANDROID_APP_ID'" "$out/manifest.txt"
           grep -Fxq "native-code: '$ANDROID_ABI'" "$out/manifest.txt"
           entry="lib/$ANDROID_ABI/libreverse_windows_android.so"
           unzip -p "$apk" "$entry" > "$RUNNER_TEMP/reverse-windows-android.so"
@@ -129,7 +130,7 @@ jobs:
         if: matrix.abi == 'arm64-v8a'
         uses: actions/upload-artifact@v4
         with:
-          name: REVERSE-Windows-Android-arm64-v8a-debug
+          name: REVERSE-Windows-Ether-arm64-v8a-debug
           path: ${{ runner.temp }}/reverse-windows-arm64-v8a
           if-no-files-found: error
       - name: Enable KVM for Android runtime smoke test
@@ -157,7 +158,7 @@ jobs:
           trap 'adb logcat -d > "$log"' EXIT
           adb install -r "$apk"
           adb logcat -c
-          adb shell am start -W -n com.reversewindows.android/.MainActivity --ez com.reversewindows.android.SELF_TEST true
+          adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity" --ez com.reversewindows.android.SELF_TEST true
           wait_for_state() {
             local expected="$1"
             for attempt in {1..50}; do

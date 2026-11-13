@@ -2,17 +2,20 @@ plugins {
     id 'com.android.application'
 }
 
+def etherPreview = providers.gradleProperty('etherPreview').map { it == 'true' }.getOrElse(false)
+
 android {
     namespace 'com.reversewindows.android'
     compileSdk 35
     ndkVersion '27.2.12479018'
 
     defaultConfig {
-        applicationId 'com.reversewindows.android'
+        applicationId(etherPreview ? 'com.reversewindows.android.ether' : 'com.reversewindows.android')
         minSdk 26
         targetSdk 35
-        versionCode 5
-        versionName '0.1.4'
+        versionCode 6
+        versionName '0.1.5'
+        manifestPlaceholders = [appLabel: etherPreview ? 'REVERSE Windows Ether' : 'REVERSE Windows']
 
         externalNativeBuild {
             cmake { arguments '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON' }

@@ -63,8 +63,8 @@ Options parse(int argc, char** argv) {
         else if (arg == "--create-qssd-gib") out.create_qssd_gib = positive(next(), 16384, "create-qssd-gib");
         else if (arg == "--create-disk-gib") out.create_disk_gib = positive(next(), 256, "create-disk-gib");
         else if (arg == "--steps") out.steps = positive(next(), 100000000, "steps");
-        else if (arg == "--ram-mib") out.ram_mib = positive(next(), 2048, "ram-mib");
-        else if (arg == "--resident-mib") out.resident_mib = positive(next(), 2048, "resident-mib");
+        else if (arg == "--ram-mib") out.ram_mib = positive(next(), cosmic_pc::PcMachine::max_ram_mib(), "ram-mib");
+        else if (arg == "--resident-mib") out.resident_mib = positive(next(), cosmic_pc::PcMachine::max_ram_mib(), "resident-mib");
         else if (arg == "--evidence") out.evidence_path = next();
         else if (arg == "--trace") out.trace_path = next();
         else if (arg == "--trace-max-events")

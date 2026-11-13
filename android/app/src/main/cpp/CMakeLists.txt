@@ -29,4 +29,5 @@ target_include_directories(reverse_windows_android PRIVATE
     "${REVERSE_QSSD_ROOT}/include"
     "${REVERSE_GPU_VIRTUAL_ROOT}/include")
 target_link_libraries(reverse_windows_android PRIVATE Threads::Threads)
-target_compile_options(reverse_windows_android PRIVATE -fvisibility=hidden -frounding-math)
+target_compile_options(reverse_windows_android PRIVATE -fvisibility=hidden -frounding-math
+    $<$<CONFIG:Debug>:-O2>)

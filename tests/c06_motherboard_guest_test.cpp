@@ -76,6 +76,55 @@ void pic_pit_guest(){
   std::cout<<"C06_PIC_PIT_GUEST_IRQ_PASS ticks="<<board.evidence().ticks
            <<" pit="<<board.evidence().pit_irqs<<"\n";
 }
+void rep_boot_with_pit_guest(bool local_apic){
+  const auto check=[&](bool accelerate){
+    PcMachine pc(16*1024*1024);boot32(pc);
+    PcMotherboardC06 board(pc);
+    auto& cpu=pc.cpu;
+    pc.enable_boot_acceleration(accelerate);
+    pc.enable_boot_hotspots();
+    cpu.idtr={0x1000,0x15000};
+    cpu.regs[Cpu::ESP]=0x190000;
+    gate(cpu,0x42,0x13000);
+    std::vector<std::uint8_t> handler{
+        0x89,0x0d,0x04,0x91,0,0,             // Record interrupted ECX.
+        0x50,0x8b,0x44,0x24,0x04,
+        0xa3,0x08,0x91,0,0};                 // Record interrupted EIP.
+    if(local_apic)emit(handler,{0xc7,0x05,0xb0,0,0xe0,0xfe,0,0,0,0});
+    else emit(handler,{0xb0,0xff,0xe6,0x21,0xb0,0x20,0xe6,0x20});
+    emit(handler,{0x58,0xcf});
+    code(cpu,0x13000,handler);
+    std::vector<std::uint8_t> program{0xfa,0xfc};
+    const auto out=[&](std::uint8_t value,std::uint8_t port){emit(program,{0xb0,value,0xe6,port});};
+    if(local_apic){
+      const auto write_reg=[&](std::uint32_t address,std::uint32_t value){
+        emit(program,{0xc7,0x05});
+        for(unsigned i=0;i<4;++i)program.push_back(std::uint8_t(address>>(8*i)));
+        for(unsigned i=0;i<4;++i)program.push_back(std::uint8_t(value>>(8*i)));
+      };
+      write_reg(0xfee000f0,0x1ff);write_reg(0xfee00320,0x42);write_reg(0xfee00380,300);
+    }else{
+      gate(cpu,0x40,0x13000);
+      out(0x11,0x20);out(0x40,0x21);out(0x04,0x21);out(0x01,0x21);out(0xfe,0x21);
+      out(0x34,0x43);out(0x2c,0x40);out(0x01,0x40); // PIT period of 300 ticks.
+    }
+    emit(program,{0xb9,0x00,0x80,0,0,0xbf,0,0,0x20,0,0xb0,0x5a,0xfb});
+    const auto rep_ip=0xa000+program.size();
+    emit(program,{0xf3,0xaa,0xfa,0xf4});
+    code(cpu,0xa000,program);cpu.eip=0xa000;
+    run(pc,34000);
+    const auto ecx=cpu.read32(0x9104);
+    need(cpu.halted&&cpu.read8(0x200000)==0x5a&&cpu.read8(0x207fff)==0x5a&&
+         cpu.read8(0x208000)==0&&cpu.regs[Cpu::ECX]==0&&cpu.regs[Cpu::ESP]==0x190000,
+         "batched guest must retain REP result, register and interrupt stack semantics");
+    need(board.evidence().irq_delivered==1&&ecx>0&&ecx<32768&&cpu.read32(0x9108)==rep_ip,
+         "timer IRQ must interrupt REP at a restartable guest element boundary");
+    need(!accelerate||pc.boot_acceleration().rep_elements>32000,
+         "board never granted large REP batches");
+    return std::array<std::uint64_t,4>{ecx,cpu.instructions,board.evidence().ticks,board.evidence().pit_irqs};
+  };
+  need(check(false)==check(true),"batched timer delivery crossed a guest interrupt deadline");
+}
 void pic_legacy_x87_guest(){
   PcMachine pc(16*1024*1024);boot32(pc);
   PcMotherboardC06 board(pc);
@@ -374,6 +423,9 @@ void queued_lapic_requests_guest(){
 int main(){
   try{
     pic_pit_guest();
+    rep_boot_with_pit_guest(false);
+    rep_boot_with_pit_guest(true);
+    std::cout<<"ETHER_BOOT_IRQ_TIMING_PASS pit=1 lapic=1\n";
     optical_irq_wakes_sti_hlt();
     pic_legacy_x87_guest();
     pci_acpi_cmos_guest();

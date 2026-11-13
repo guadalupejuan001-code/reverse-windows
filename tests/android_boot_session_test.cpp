@@ -44,6 +44,26 @@ void require(bool condition, const char* message) {
   if (!condition) throw std::runtime_error(message);
 }
 
+void verify_ram_profile() {
+  constexpr std::uint64_t mib = 1024 * 1024;
+  const auto modest = Session::ram_profile(768 * mib, 256 * mib, false);
+  require(modest.physical_bytes == 2048 * mib && modest.backing_bytes == 256 * mib,
+          "RAM budget must leave headroom for Android");
+  const auto ample = Session::ram_profile(2304 * mib, 256 * mib, false);
+  require(ample.backing_bytes == 1024 * mib, "Available RAM must raise the backing budget");
+  if (cosmic_pc::PcMachine::max_ram_mib() >= 4096) {
+    require(ample.physical_bytes == 4096 * mib, "A device with sufficient RAM budget should select 4 GiB");
+    const auto report = Session::check_hardware({}, -1, 0, {}, ample);
+    require(report.find("\"ram_profile\":{\"address_space_bytes\":4294967296,") != std::string::npos &&
+                report.find("\"backing_budget_bytes\":1073741824") != std::string::npos,
+            "Hardware preflight must report its selected RAM profile and backing budget");
+  }
+  try {
+    (void)Session::ram_profile(300 * mib, 256 * mib, true);
+  } catch (const std::runtime_error&) { return; }
+  throw std::runtime_error("Starting a VM with Android memory pressure must be rejected");
+}
+
 void run_until(Session& session, Session::Step expected, const char* message, unsigned budget = 64) {
   for (unsigned steps = 0; steps < 1024; steps += budget) {
     const auto status = session.step(budget);
@@ -92,6 +112,7 @@ std::string bytes(const std::filesystem::path& path) {
 
 int main(int argc, char** argv) {
   try {
+    verify_ram_profile();
     require(argc == 2 || argc == 3, "Pass the synthetic BIOS fixture and optional evidence path");
     const TestDiskDirectory dir;
     const auto disk = dir.path / "android-test.rqvd";
