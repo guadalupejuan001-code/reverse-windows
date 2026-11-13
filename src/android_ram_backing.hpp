@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -74,6 +75,7 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
   void read(std::uint64_t page_index, std::uint8_t* page) override {
     check_index(page_index);
     if (!contains(page_index)) throw std::runtime_error("Página ausente en el respaldo de RAM.");
+    const auto started = std::chrono::steady_clock::now();
     std::size_t done = 0;
     while (done < kPageSize) {
       const auto bytes = ::pread(fd_, page + done, kPageSize - done, offset(page_index, done));
@@ -82,10 +84,12 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
       if (bytes == 0) throw std::runtime_error("Lectura incompleta del respaldo de RAM.");
       done += static_cast<std::size_t>(bytes);
     }
+    read_time_ += std::chrono::steady_clock::now() - started;
   }
 
   void write(std::uint64_t page_index, const std::uint8_t* page) override {
     check_index(page_index);
+    const auto started = std::chrono::steady_clock::now();
     const bool new_slot = !contains(page_index);
     if (new_slot && committed_slots_ >= slot_limit_)
       throw std::runtime_error("Se agotó el espacio asignado al respaldo temporal de RAM.");
@@ -103,6 +107,7 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
       written_[page_index / 64] |= 1ULL << (page_index % 64);
       ++committed_slots_;
     }
+    write_time_ += std::chrono::steady_clock::now() - started;
   }
 
   void reset() noexcept override {
@@ -116,9 +121,16 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
       std::fill(written_.begin(), written_.end(), 0);
       committed_slots_ = 0;
     }
+    read_time_ = write_time_ = {};
   }
 
   std::uint64_t file_payload_bytes() const noexcept { return committed_slots_ * kPageSize; }
+  std::uint64_t read_us() const noexcept {
+    return std::chrono::duration_cast<std::chrono::microseconds>(read_time_).count();
+  }
+  std::uint64_t write_us() const noexcept {
+    return std::chrono::duration_cast<std::chrono::microseconds>(write_time_).count();
+  }
 
  private:
   // Keep the free-space check off the eviction hot path and leave room for
@@ -173,6 +185,7 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
   const std::uint64_t slot_limit_;
   std::vector<std::uint64_t> written_;
   std::uint64_t committed_slots_ = 0;
+  std::chrono::steady_clock::duration read_time_{}, write_time_{};
   int fd_ = -1;
 };
 

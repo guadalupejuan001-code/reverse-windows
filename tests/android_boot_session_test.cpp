@@ -44,6 +44,13 @@ void require(bool condition, const char* message) {
   if (!condition) throw std::runtime_error(message);
 }
 
+std::uint64_t counter(const std::string& json, const char* name) {
+  const auto key = std::string("\"") + name + "\":";
+  const auto pos = json.find(key);
+  require(pos != std::string::npos, name);
+  return std::stoull(json.substr(pos + key.size()));
+}
+
 void verify_ram_profile() {
   constexpr std::uint64_t mib = 1024 * 1024;
   const auto modest = Session::ram_profile(768 * mib, 256 * mib, false);
@@ -102,6 +109,8 @@ void verify_ram_spill(const std::filesystem::path& directory) {
     require(limit_reached && original == restored && backing.file_payload_bytes() == page,
             "New slots must obey the spill budget without corrupting existing slots");
     backing.reset();
+    require(backing.read_us() == 0 && backing.write_us() == 0,
+            "Guest reset must clear spill timing along with its counters");
     bool old_page_released = false;
     try {
       backing.read(3, restored.data());
@@ -239,6 +248,9 @@ int main(int argc, char** argv) {
                 "El Torito guest did not detect QSSD and return to the real-mode BIOS prompt", 1);
       frame = capture_cells(session);
       progress = session.diagnostic();
+      require(counter(progress, "session_steps") == counter(progress, "instructions") &&
+                  counter(progress, "session_steps") > 0,
+              "Before the first restart, session and CPU steps must match");
       require(progress.find("\"cpu_mode\":\"real16\"") != std::string::npos,
               "Guest BIOS prompt was reached outside real mode");
       require(progress.find("\"last_mode_from\":\"protected16\",\"last_mode_to\":\"real16\"") != std::string::npos,
@@ -267,6 +279,11 @@ int main(int argc, char** argv) {
       require(screen(capture_cells(session)).find("QSSD REBOOT OK") != std::string::npos,
               "Guest-requested restart did not execute QSSD boot code");
       restarted = session.diagnostic();
+      require(counter(restarted, "session_steps") >=
+                  counter(progress, "session_steps") + counter(restarted, "instructions"),
+              "Guest reboot must preserve the accumulated session steps");
+      require(counter(restarted, "iso_read_us") >= counter(progress, "iso_read_us"),
+              "Optical read timing must cover the session across the guest reboot");
       for (const auto* marker : {"\"commits\":1", "\"source\":\"qssd\"", "\"restarts\":1",
                                  "\"last_restart\":\"port92\"", "\"atapi_cdrom\":true",
                                  "\"read_sectors\":1", "\"write_sectors\":0"})

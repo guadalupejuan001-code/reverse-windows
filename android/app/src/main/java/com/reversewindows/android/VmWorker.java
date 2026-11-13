@@ -8,12 +8,17 @@ import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
+import android.util.AtomicFile;
 import android.util.Log;
 
 import org.json.JSONObject;
 
 import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class VmWorker {
@@ -23,6 +28,8 @@ final class VmWorker {
         void onError(String message, boolean hasSession);
         void onDiskCreated();
         void onHardwareChecked(String json);
+        void onSavedDiagnostic(String json);
+        void onDiagnosticExported(boolean saved);
     }
 
     static final class Frame {
@@ -53,12 +60,15 @@ final class VmWorker {
     private static final long HALTED_POLL_DELAY_MS = 35;
     private static final long FRAME_INTERVAL_MS = 100;
     private static final long STATUS_INTERVAL_MS = 350;
+    private static final long DIAGNOSTIC_INTERVAL_MS = 5_000;
+    private static final String DIAGNOSTIC_FILE = "ultimo-diagnostico.json";
     private static final int MAX_FRAME_WIDTH = 960;
     private static final int MAX_FRAME_HEIGHT = 720;
 
     private final Context context;
     private final ContentResolver resolver;
     private final File disk;
+    private final AtomicFile diagnosticFile;
     private final Listener listener;
     private final HandlerThread thread = new HandlerThread("reverse-windows-vm");
     private final Handler worker;
@@ -75,21 +85,54 @@ final class VmWorker {
     private boolean debugSelfTest;
     private long lastFrame;
     private long lastStatus;
+    private long lastDiagnosticSave;
+    private long sessionStarted;
     private int[] graphics;
     private int graphicsWidth;
     private int graphicsHeight;
     private boolean forceFrame;
     private boolean retryFrame;
     private String lastLoggedStatus = "";
+    private String lastDiagnostic = "";
+    private String persistedDiagnostic = "";
     private final Runnable slice = this::runSlice;
 
     VmWorker(Context context, File disk, Listener listener) {
         this.context = context.getApplicationContext();
         this.resolver = this.context.getContentResolver();
         this.disk = disk;
+        this.diagnosticFile = new AtomicFile(new File(this.context.getFilesDir(), DIAGNOSTIC_FILE));
         this.listener = listener;
         thread.start();
         worker = new Handler(thread.getLooper());
+    }
+
+    void loadDiagnostic() {
+        worker.post(() -> {
+            try {
+                String json = new String(diagnosticFile.readFully(), StandardCharsets.UTF_8);
+                persistedDiagnostic = json;
+                send(() -> listener.onSavedDiagnostic(json));
+            } catch (FileNotFoundException ignored) {
+                // The app has not recorded a VM session yet.
+            } catch (IOException error) {
+                Log.w(TAG, "No se pudo leer el último diagnóstico", error);
+            }
+        });
+    }
+
+    void exportDiagnostic(Uri destination, String json) {
+        worker.post(() -> {
+            try (OutputStream stream = resolver.openOutputStream(destination, "wt")) {
+                if (stream == null) throw new IOException("El destino no se pudo abrir.");
+                stream.write(json.getBytes(StandardCharsets.UTF_8));
+            } catch (IOException | RuntimeException error) {
+                Log.w(TAG, "No se pudo guardar el diagnóstico", error);
+                send(() -> listener.onDiagnosticExported(false));
+                return;
+            }
+            send(() -> listener.onDiagnosticExported(true));
+        });
     }
 
     void createDisk() {
@@ -142,6 +185,7 @@ final class VmWorker {
             try {
                 debugSelfTest = debug;
                 lastLoggedStatus = "";
+                lastDiagnostic = "";
                 retryFrame = false;
                 String path = source == NativeMachine.BOOT_SELF_TEST ? "" : disk.getAbsolutePath();
                 if (source == NativeMachine.BOOT_ISO) {
@@ -158,10 +202,12 @@ final class VmWorker {
                 outcome = NativeMachine.RUNNING;
                 sliceSteps = INITIAL_SLICE_STEPS;
                 lastStatus = 0;
+                lastDiagnosticSave = 0;
+                sessionStarted = SystemClock.elapsedRealtime();
                 lastFrame = 0;
                 forceFrame = true;
                 running = true;
-                publishState();
+                publishState(true);
                 schedule(0);
             } catch (IOException | RuntimeException | LinkageError error) {
                 report(error);
@@ -173,7 +219,16 @@ final class VmWorker {
         worker.post(() -> {
             foreground = visible;
             if (visible) schedule(0);
-            else worker.removeCallbacks(slice);
+            else {
+                worker.removeCallbacks(slice);
+                if (running && handle != 0) {
+                    try {
+                        publishState(true);
+                    } catch (RuntimeException | LinkageError error) {
+                        report(error);
+                    }
+                }
+            }
         });
     }
 
@@ -184,7 +239,7 @@ final class VmWorker {
             worker.removeCallbacks(slice);
             if (running) schedule(0);
             try {
-                publishState();
+                publishState(true);
             } catch (RuntimeException | LinkageError error) {
                 report(error);
             }
@@ -209,8 +264,8 @@ final class VmWorker {
     void stop() {
         worker.post(() -> {
             try {
-                String diagnostic = handle == 0 ? "" :
-                        withBuildMetadata(NativeMachine.diagnostic(handle));
+                String diagnostic = handle == 0 ? "" : currentDiagnostic();
+                saveDiagnostic(diagnostic);
                 closeMachine();
                 send(() -> listener.onState(diagnostic, false, false, false));
             } catch (RuntimeException | LinkageError error) {
@@ -259,7 +314,8 @@ final class VmWorker {
                 publishFrame();
                 lastFrame = now;
             }
-            if (now - lastStatus >= STATUS_INTERVAL_MS || outcome != previous) publishState();
+            if (now - lastStatus >= STATUS_INTERVAL_MS || outcome != previous)
+                publishState(isTerminal());
             if (isTerminal()) running = false;
             schedule(outcome == NativeMachine.HALTED ? HALTED_POLL_DELAY_MS : 0);
         } catch (RuntimeException | LinkageError error) {
@@ -312,11 +368,19 @@ final class VmWorker {
         }
     }
 
-    private void publishState() {
+    private String currentDiagnostic() {
+        return withBuildMetadata(NativeMachine.diagnostic(handle),
+                SystemClock.elapsedRealtime() - sessionStarted);
+    }
+
+    private void publishState(boolean saveNow) {
         lastStatus = SystemClock.uptimeMillis();
-        String json = withBuildMetadata(NativeMachine.diagnostic(handle));
+        String json = currentDiagnostic();
+        lastDiagnostic = json;
+        if (saveNow || lastStatus - lastDiagnosticSave >= DIAGNOSTIC_INTERVAL_MS)
+            saveDiagnostic(json);
         boolean stopped = outcome == NativeMachine.STOPPED;
-        boolean active = running && !isTerminal();
+        boolean active = running && foreground && !isTerminal();
         if (debugSelfTest) {
             String state = Integer.toString(outcome);
             if (!state.equals(lastLoggedStatus)) {
@@ -328,11 +392,31 @@ final class VmWorker {
     }
 
     private static String withBuildMetadata(String json) {
+        return withBuildMetadata(json, -1);
+    }
+
+    private static String withBuildMetadata(String json, long elapsedMs) {
         if (json == null || !json.startsWith("{\"")) {
             throw new IllegalStateException("El diagnóstico de la máquina virtual no es válido.");
         }
         // Preserve the native JSON's full 64-bit register values.
-        return "{" + BUILD_METADATA + "," + json.substring(1);
+        String tail = elapsedMs >= 0 ? ",\"elapsed_ms\":" + elapsedMs + "}" : "}";
+        return "{" + BUILD_METADATA + "," + json.substring(1, json.length() - 1) + tail;
+    }
+
+    private void saveDiagnostic(String json) {
+        if (json.isEmpty() || json.equals(persistedDiagnostic)) return;
+        lastDiagnosticSave = SystemClock.uptimeMillis();
+        FileOutputStream stream = null;
+        try {
+            stream = diagnosticFile.startWrite();
+            stream.write(json.getBytes(StandardCharsets.UTF_8));
+            diagnosticFile.finishWrite(stream);
+            persistedDiagnostic = json;
+        } catch (IOException error) {
+            if (stream != null) diagnosticFile.failWrite(stream);
+            Log.w(TAG, "No se pudo conservar el último diagnóstico", error);
+        }
     }
 
     private boolean isTerminal() {
@@ -360,7 +444,19 @@ final class VmWorker {
         String message = detail == null || detail.isEmpty() ? error.getClass().getSimpleName() : detail;
         boolean hasSession = handle != 0;
         if (hasSession) outcome = NativeMachine.FAULT;
+        String snapshot = hasSession ? lastDiagnostic : "";
+        try {
+            if (hasSession) snapshot = currentDiagnostic();
+        } catch (RuntimeException | LinkageError ignored) {
+            // Retain the most recent successful native snapshot.
+        }
+        lastDiagnostic = withBuildMetadata("{\"schema\":\"reverse-windows-android-error-v1\","
+                + "\"status\":\"fault\",\"message\":" + JSONObject.quote(message)
+                + ",\"last_machine_diagnostic\":" + (snapshot.isEmpty() ? "null" : snapshot) + "}");
+        saveDiagnostic(lastDiagnostic);
+        String diagnostic = lastDiagnostic;
         send(() -> listener.onError(message, hasSession));
+        send(() -> listener.onSavedDiagnostic(diagnostic));
     }
 
     private void send(Runnable action) {

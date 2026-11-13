@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -224,7 +225,11 @@ class AndroidBootSession final {
   Step step(unsigned budget) {
     if (!is_stopped()) pc_.run(budget);
     if (!pc_.cpu.fault && pc_.host_error.empty() &&
-        pc_.guest_restart() != cosmic_pc::PcMachine::GuestRestart::None) restart_guest();
+        pc_.guest_restart() != cosmic_pc::PcMachine::GuestRestart::None) {
+      const auto steps = pc_.cpu.instructions;
+      restart_guest();
+      if (pc_.cpu.instructions < steps) previous_boot_steps_ += steps;
+    }
     if (pc_.cpu.fault || !pc_.host_error.empty()) return Step::Fault;
     if (pc_.waiting_key) return Step::WaitingKey;
     if (is_stopped()) return Step::Halted;
@@ -310,7 +315,9 @@ class AndroidBootSession final {
     std::ostringstream out;
     out << "{\"schema\":\"reverse-windows-android-session-v1\",\"source\":\""
         << source_name() << "\",\"status\":\"" << status << "\",\"iso_bytes\":"
-        << (iso_ ? iso_->size() : 0) << ",\"input\":\"bios-int16+ps2-irq1\",\"disk\":";
+        << (iso_ ? iso_->size() : 0)
+        << ",\"iso_read_us\":" << (iso_ ? iso_->read_us() : 0)
+        << ",\"input\":\"bios-int16+ps2-irq1\",\"disk\":";
     if (disk_) {
       const auto stats = disk_->stats();
       out << "{\"logical_bytes\":" << stats.logical_bytes
@@ -349,6 +356,7 @@ class AndroidBootSession final {
     }
     const auto& mode = pc_.boot_mode_progress();
     out << ",\"boot_progress\":{\"handed_off\":" << (pc_.cpu.instructions ? "true" : "false")
+        << ",\"session_steps\":" << previous_boot_steps_ + pc_.cpu.instructions
         << ",\"mode_changes\":" << mode.changes << ",\"last_mode_from\":\"" << mode.from
         << "\",\"last_mode_to\":\"" << mode.to << "\",\"last_mode_step\":" << mode.step
         << ",\"restarts\":" << restarts_ << ",\"last_restart\":\"" << last_restart_ << "\"}";
@@ -428,7 +436,9 @@ class AndroidBootSession final {
         << ",\"spilled_bytes\":" << metrics.backing_bytes
         << ",\"spill_file_payload_bytes\":" << (spill.file ? spill.file->file_payload_bytes() : 0)
         << ",\"spill_reads\":" << metrics.backing_reads
-        << ",\"spill_writes\":" << metrics.backing_writes << '}';
+        << ",\"spill_writes\":" << metrics.backing_writes
+        << ",\"spill_read_us\":" << (spill.file ? spill.file->read_us() : 0)
+        << ",\"spill_write_us\":" << (spill.file ? spill.file->write_us() : 0) << '}';
   }
 
   static void check_ata_identify(cosmic_pc::PcMachine& pc, QssdDisk& volume) {
@@ -520,8 +530,12 @@ class AndroidBootSession final {
     OpticalReader& operator=(const OpticalReader&) = delete;
     ~OpticalReader() { ::close(fd_); }
     std::uint64_t size() const noexcept { return size_; }
+    std::uint64_t read_us() const noexcept {
+      return std::chrono::duration_cast<std::chrono::microseconds>(read_time_).count();
+    }
     bool read(std::uint64_t offset, std::uint8_t* target, std::size_t count) const {
       if (offset > size_ || count > size_ - offset) return false;
+      const auto started = std::chrono::steady_clock::now();
       while (count) {
         const auto n = ::pread(fd_, target, count, static_cast<off_t>(offset));
         if (n < 0 && errno == EINTR) continue;
@@ -531,11 +545,13 @@ class AndroidBootSession final {
         count -= got;
         offset += got;
       }
+      read_time_ += std::chrono::steady_clock::now() - started;
       return true;
     }
    private:
     int fd_ = -1;
     std::uint64_t size_ = 0;
+    mutable std::chrono::steady_clock::duration read_time_{};
   };
 
   const char* source_name() const noexcept {
@@ -561,6 +577,7 @@ class AndroidBootSession final {
   std::uint64_t vga_serial_ = 0;
   std::uint64_t vga_transfer_bytes_ = 0;
   std::uint64_t restarts_ = 0;
+  std::uint64_t previous_boot_steps_ = 0;
   unsigned rapid_restarts_ = 0;
   const char* last_restart_ = "";
 };
