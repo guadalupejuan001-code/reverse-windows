@@ -33,6 +33,7 @@
 namespace reverse_windows {
 class QssdDisk final : public BlockDisk {
  public:
+  enum class Access { ReadWrite, ReadOnly };
   static constexpr std::uint64_t kSectorSize = 512, kBlockSize = 4096;
   static constexpr std::uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
   struct Stats {
@@ -82,6 +83,7 @@ class QssdDisk final : public BlockDisk {
   static constexpr std::size_t kDedupWindow=4096;
   static constexpr std::size_t kReadCacheBlocks=128; // 512 KiB bounded data
   int fd_=-1;
+  const Access access_;
   std::filesystem::path path_;
   std::uint64_t capacity_=0, committed_end_=kHeader, generation_=0;
   RecoveryStats recovery_{};
@@ -505,7 +507,7 @@ class QssdDisk final : public BlockDisk {
       }
       pos=record->next;
     }
-    if(sz!=last_commit){
+    if(sz!=last_commit && access_==Access::ReadWrite){
       if(::ftruncate(fd_,static_cast<off_t>(last_commit))!=0||::fsync(fd_)!=0)
         throw std::runtime_error("QSSD cannot discard incomplete transaction tail");
     }
@@ -648,12 +650,14 @@ class QssdDisk final : public BlockDisk {
     ::close(fd);
     (void)complete;
   }
-  explicit QssdDisk(const std::filesystem::path& path) : path_(path) {
+  explicit QssdDisk(const std::filesystem::path& path,Access access=Access::ReadWrite)
+      : access_(access),path_(path) {
     check_path(path);
-    fd_=::open(path.c_str(),O_RDWR|O_CLOEXEC|O_NOFOLLOW);
+    const bool writable=access_==Access::ReadWrite;
+    fd_=::open(path.c_str(),(writable?O_RDWR:O_RDONLY)|O_CLOEXEC|O_NOFOLLOW);
     if(fd_<0)throw std::system_error(errno,std::generic_category(),"QSSD open");
     try{
-      if(::flock(fd_,LOCK_EX|LOCK_NB)!=0)
+      if(::flock(fd_,(writable?LOCK_EX:LOCK_SH)|LOCK_NB)!=0)
         throw std::runtime_error("QSSD volume already mounted for writing or maintenance");
       struct stat st{};
       if(::fstat(fd_,&st)!=0||!S_ISREG(st.st_mode))
@@ -681,6 +685,7 @@ class QssdDisk final : public BlockDisk {
             blocks*kBlockSize};
   }
   bool checkpoint() {
+    if(access_==Access::ReadOnly)return false;
     std::lock_guard<std::mutex> hold(writer_);
     return save_checkpoint_locked();
   }
@@ -710,12 +715,13 @@ class QssdDisk final : public BlockDisk {
     return read_bytes(lba*kSectorSize,target,std::size_t(count)*kSectorSize);
   }
   bool flush() override {
+    if(access_==Access::ReadOnly)return false;
     std::lock_guard<std::mutex> hold(writer_);
     return fd_ >= 0 && ::fsync(fd_) == 0;
   }
 
   bool write(std::uint64_t lba,std::uint16_t count,const std::uint8_t* source) override {
-    if(!source||!count||count>127||lba>sectors()||count>sectors()-lba)return false;
+    if(access_==Access::ReadOnly||!source||!count||count>127||lba>sectors()||count>sectors()-lba)return false;
     std::lock_guard<std::mutex> hold(writer_);
     try{
       const auto old=states_.snapshot();

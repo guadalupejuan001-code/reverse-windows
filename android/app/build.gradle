@@ -1,5 +1,16 @@
+import groovy.json.JsonSlurper
+
 plugins {
     id 'com.android.application'
+}
+
+def etherPreview = providers.gradleProperty('etherPreview').map { it == 'true' }.getOrElse(false)
+def appVersion = '0.1.9'
+def dependencyLock = rootProject.layout.projectDirectory.file('../config/dependencies.lock.json')
+def dependencies = new JsonSlurper().parseText(providers.fileContents(dependencyLock).asText.get())
+def mundoXSha = dependencies.components.find { it.key == 'mundo_x' }?.commit
+if (!(mundoXSha ==~ /[0-9a-f]{40}/)) {
+    throw new GradleException('A full Mundo X commit is required in config/dependencies.lock.json')
 }
 
 android {
@@ -8,11 +19,13 @@ android {
     ndkVersion '27.2.12479018'
 
     defaultConfig {
-        applicationId 'com.reversewindows.android'
+        applicationId(etherPreview ? 'com.reversewindows.android.ether.r019' : 'com.reversewindows.android')
         minSdk 26
         targetSdk 35
-        versionCode 1
-        versionName '0.1.0'
+        versionCode 10
+        versionName appVersion
+        manifestPlaceholders = [appLabel: etherPreview ? 'REVERSE Windows Ether ' + appVersion : 'REVERSE Windows']
+        buildConfigField 'String', 'MUNDO_X_SHA', "\"${mundoXSha}\""
 
         externalNativeBuild {
             cmake { arguments '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON' }

@@ -26,6 +26,11 @@ target_include_directories(reverse_windows_component_headers INTERFACE
   "${REVERSE_QSSD_ROOT}/include"
   "${REVERSE_GPU_VIRTUAL_ROOT}/include")
 target_link_libraries(reverse_windows_component_headers INTERFACE Threads::Threads)
+if(MSVC)
+  target_compile_options(reverse_windows_component_headers INTERFACE /fp:strict)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(reverse_windows_component_headers INTERFACE -frounding-math)
+endif()
 
 add_executable(reverse_windows_boot_probe src/reverse_windows_boot_probe.cpp)
 target_link_libraries(reverse_windows_boot_probe PRIVATE reverse_windows_component_headers)
@@ -45,19 +50,56 @@ if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_executable(reverse_windows_android_boot_session_test tests/android_boot_session_test.cpp)
   target_link_libraries(reverse_windows_android_boot_session_test PRIVATE reverse_windows_component_headers)
-  set(android_boot_fixture "${CMAKE_CURRENT_BINARY_DIR}/android-synthetic-boot.iso")
+  set(android_boot_fixture "${CMAKE_CURRENT_BINARY_DIR}/android-c03-boot.iso")
   add_test(NAME reverse_windows_android_synthetic_iso
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/c10_android_boot_iso.py"
       "${android_boot_fixture}")
   set_tests_properties(reverse_windows_android_synthetic_iso PROPERTIES FIXTURES_SETUP android_boot_iso)
   add_test(NAME reverse_windows_android_bios_iso_qssd
-    COMMAND reverse_windows_android_boot_session_test "${android_boot_fixture}")
+    COMMAND reverse_windows_android_boot_session_test "${android_boot_fixture}"
+      "${CMAKE_CURRENT_BINARY_DIR}/c03-boot-evidence.json")
   set_tests_properties(reverse_windows_android_bios_iso_qssd PROPERTIES
     FIXTURES_REQUIRED android_boot_iso TIMEOUT 60)
   add_executable(reverse_windows_atapi_cdrom_guest_test tests/atapi_cdrom_guest_test.cpp)
   target_link_libraries(reverse_windows_atapi_cdrom_guest_test PRIVATE reverse_windows_component_headers)
   add_test(NAME reverse_windows_android_atapi_guest COMMAND reverse_windows_atapi_cdrom_guest_test)
   set_tests_properties(reverse_windows_android_atapi_guest PROPERTIES TIMEOUT 60)
+  add_executable(reverse_windows_protected_entry_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_group6_0f00_test.cpp")
+  target_link_libraries(reverse_windows_protected_entry_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_protected_entry_stack COMMAND reverse_windows_protected_entry_test)
+  set_tests_properties(reverse_windows_protected_entry_stack PROPERTIES TIMEOUT 60)
+  add_executable(reverse_windows_protected_real_transition_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_protected_real_transition_test.cpp")
+  target_link_libraries(reverse_windows_protected_real_transition_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_protected_real_transition COMMAND reverse_windows_protected_real_transition_test)
+  set_tests_properties(reverse_windows_protected_real_transition PROPERTIES TIMEOUT 60)
+  add_executable(reverse_windows_cpu_profile_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_cpu_profile_test.cpp")
+  target_link_libraries(reverse_windows_cpu_profile_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_cpu_profile COMMAND reverse_windows_cpu_profile_test)
+  add_executable(reverse_windows_lock_rmw_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_lock_rmw_test.cpp")
+  target_link_libraries(reverse_windows_lock_rmw_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_lock_rmw COMMAND reverse_windows_lock_rmw_test)
+  foreach(cpu_test IN ITEMS x86_long_null_ss x86_far_transfer64 x86_system64)
+    add_executable(reverse_windows_${cpu_test}_test
+      "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/${cpu_test}_test.cpp")
+    target_link_libraries(reverse_windows_${cpu_test}_test PRIVATE reverse_windows_component_headers)
+    add_test(NAME reverse_windows_${cpu_test} COMMAND reverse_windows_${cpu_test}_test)
+  endforeach()
+  add_executable(reverse_windows_x64_optical_qssd_test tests/x64_optical_qssd_test.cpp)
+  target_link_libraries(reverse_windows_x64_optical_qssd_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_x64_optical_qssd COMMAND reverse_windows_x64_optical_qssd_test)
+
+  foreach(fpu_test IN ITEMS x86_sse_fp32 x86_sse2_packed_oracle x86_c09r1_stage5_cvt_fxsr
+            x86_sse_legacy_forms x86_mmx x86_x87_arithmetic_oracle x86_x87_state)
+    add_executable(reverse_windows_${fpu_test}_test
+      "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/${fpu_test}_test.cpp")
+    target_link_libraries(reverse_windows_${fpu_test}_test PRIVATE reverse_windows_component_headers)
+    add_test(NAME reverse_windows_${fpu_test} COMMAND reverse_windows_${fpu_test}_test)
+    set_tests_properties(reverse_windows_${fpu_test} PROPERTIES TIMEOUT 120)
+  endforeach()
 
   add_test(NAME reverse_windows_real_x86_demo
     COMMAND reverse_windows_boot_probe --demo-x86 --steps 200000 --ram-mib 2048 --resident-mib 256)

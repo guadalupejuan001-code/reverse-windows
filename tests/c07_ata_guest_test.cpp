@@ -136,9 +136,59 @@ void run_device(const std::string& path) {
     setup_pic(p);
     out32(p,0xcf8,0x80001000U);in32_store(p,0xcfc,0x9500);
     out32(p,0xcf8,0x80001008U);in32_store(p,0xcfc,0x9504);
-    out8(p,0x1f6,0xe0);out8(p,0x1f7,0xec);
-    in8_store(p,0x1f7,0x9508);  // DRQ ready
-    rep_words(p,true,0xa000);
+    out8(p,0x3f6,6);in8_store(p,0x3f6,0x9510); // SRST with nIEN set.
+    out8(p,0x3f6,2);
+    for(unsigned i=0;i<5;++i)in8_store(p,0x1f1+i,0x9511+i);
+    out8(p,0x1f6,0xe0);out8(p,0x1f7,0xec);rep_words(p,true,0xa000,16);
+    ins(p,{0xf4});
+    program(pc,p);
+    need(pc.cpu.memory[0x9510]==0x80&&pc.cpu.read32(0x9511)==0x00010101U&&
+         pc.cpu.memory[0x9515]==0,"ATA reset signature on the primary master was wrong");
+    need(board.attached_ata()->counters().identifies==1&&
+         board.attached_ata()->counters().identify_data_transfers==0&&
+         board.evidence().ata_irqs==0,"partial IDENTIFY was counted or signaled while nIEN set");
+
+    p.clear();
+    out8(p,0x1f6,0xf0);
+    out8(p,0x1f2,0x55);out8(p,0x1f3,0xaa);out8(p,0x1f7,0xec);
+    in8_store(p,0x1f2,0x9516);in8_store(p,0x1f3,0x9517);in8_store(p,0x1f7,0x9518);
+    out8(p,0x1f6,0xe0);
+    in8_store(p,0x3f6,0x9508); // Poll alternate status without acknowledging IRQ.
+    out8(p,0x3f6,0); // Re-enable and deliver the pending master interrupt.
+    rep_words(p,true,0xa020,240);
+    in8_store(p,0x1f7,0x9519);
+    ins(p,{0xf4});
+    program(pc,p);
+    need(pc.cpu.read16(0x9516)==0&&pc.cpu.memory[0x9518]==0,
+         "ATA task-file probes detected a disk on an empty slave");
+    need(pc.cpu.memory[0x9519]==0x50,"completed IDENTIFY did not clear DRQ");
+    need(board.attached_ata()->counters().identifies==1&&
+         board.attached_ata()->counters().identify_data_transfers==1&&
+         board.evidence().ata_irqs==1&&pc.cpu.read32(0x9700)==1,
+         "IDENTIFY from primary master lost data or pending IRQ after absent slave probe");
+
+    p.clear();
+    out8(p,0x3f6,2);out8(p,0x1f7,0xec);
+    in8_store(p,0x1f7,0x951a); // Main status acknowledges even while nIEN is set.
+    out8(p,0x3f6,0);
+    out8(p,0x3f6,4);out8(p,0x3f6,0);
+    ins(p,{0xf4});
+    program(pc,p);
+    need(pc.cpu.memory[0x951a]==0x58&&board.attached_ata()->counters().identifies==2&&
+         board.attached_ata()->counters().identify_data_transfers==1&&board.evidence().ata_irqs==1,
+         "acknowledged or interrupted IDENTIFY was signaled or counted as complete");
+
+    p.clear();
+    out8(p,0x1f1,3);out8(p,0x1f2,0x08);out8(p,0x1f7,0xef); // SET FEATURES PIO 0.
+    in8_store(p,0x1f7,0x951b);
+    out8(p,0x1f1,3);out8(p,0x1f2,0x42);out8(p,0x1f7,0xef); // UDMA unsupported.
+    in8_store(p,0x1f7,0x951c);in8_store(p,0x1f1,0x951d);
+    ins(p,{0xf4});
+    program(pc,p);
+    need(pc.cpu.memory[0x951b]==0x50&&pc.cpu.memory[0x951c]==0x51&&
+         pc.cpu.memory[0x951d]==0x04,"SET FEATURES must accept PIO and reject UDMA");
+
+    p.clear();
     lba28(p,low);out8(p,0x1f7,0x30);rep_words(p,false,0xb000);
     in8_store(p,0x1f7,0x9509);
     out8(p,0x1f7,0xe7);in8_store(p,0x1f7,0x950a);
@@ -152,10 +202,27 @@ void run_device(const std::string& path) {
          "PCI device is not class 0x0101 legacy IDE");
     need(pc.cpu.memory[0x9508]==0x58,"IDENTIFY did not assert DRQ");
     need(pc.cpu.read16(0xa000)==0x40,"IDENTIFY did not report ATA fixed disk");
-    need((pc.cpu.read16(0xa000+83*2)&(1<<10))!=0,
-         "IDENTIFY did not advertise LBA48");
+    need(pc.cpu.read16(0xa000+83*2)==0x7400&&pc.cpu.read16(0xa000+86*2)==0x3400&&
+         pc.cpu.read16(0xa000+87*2)==0x4000,"IDENTIFY LBA48 and FLUSH capabilities are invalid");
+    need(pc.cpu.read16(0xa000+49*2)==0x0200&&pc.cpu.read16(0xa000+53*2)==0&&
+         pc.cpu.read16(0xa000+47*2)==0x8000&&pc.cpu.read16(0xa000+106*2)==0x4000,
+         "IDENTIFY should describe 512-byte sectors and claim only supported PIO operations");
     need(pc.cpu.read32(0xa000+60*2)==0x0fffffffU,
          "IDENTIFY LBA28 capacity limit incorrect");
+    need(pc.cpu.read64(0xa000+100*2)==disk.sectors(),"IDENTIFY sector count differs from QSSD backend");
+    std::string model;
+    for(unsigned i=27;i<47;++i){
+      const auto w=pc.cpu.read16(0xa000+i*2);
+      model.push_back(char(w>>8));model.push_back(char(w));
+    }
+    std::string expected_model="REVERSE QSSD VIRTUAL ATA DISK";
+    expected_model.resize(40,' ');
+    need(model==expected_model,"IDENTIFY model encoding or padding differs");
+    unsigned sum=0;
+    for(unsigned i=0;i<512;++i)sum+=pc.cpu.memory[0xa000+i];
+    need(pc.cpu.memory[0xa000+510]==0xa5&&(sum&0xffU)==0,"IDENTIFY integrity word is invalid");
+    std::cout<<"C03_QSSD_IDENTIFY_DEVICE_PASS sectors="<<disk.sectors()
+             <<" sector_bytes=512 lba48=1 checksum=1 irq14_unmasked=1 absent_slave=1\n";
     need(pc.cpu.memory[0x9509]==0x50&&pc.cpu.memory[0x950a]==0x50&&
          pc.cpu.memory[0x950b]==0x50,
          "ATA PIO complete or FLUSH status incorrect");

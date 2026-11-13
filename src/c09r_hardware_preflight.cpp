@@ -48,11 +48,12 @@ int main(int argc,char** argv){
     const bool pae=basic[3]&(1U<<6),nx=extended[3]&(1U<<20);
     const bool cx16=basic[2]&(1U<<13),prefetchw=extended[2]&(1U<<8);
     const bool lahf=extended[2]&(1U<<0),long64=extended[3]&(1U<<29);
-    const bool sse2=basic[3]&(1U<<26),x87=basic[3]&1U;
+    const bool mmx=basic[3]&(1U<<23),fxsr=basic[3]&(1U<<24);
+    const bool sse=basic[3]&(1U<<25),sse2=basic[3]&(1U<<26),x87=basic[3]&1U;
     require(pae&&nx&&cx16&&prefetchw&&lahf&&long64,
             "One or more tested Windows 10 CPU features were lost");
-    require(!sse2&&!x87,
-            "SSE2/x87 must not be advertised before they exist");
+    require(mmx&&fxsr&&sse&&sse2&&!x87,
+            "Canonical C02 CPUID profile differs from the verified release profile");
     QssdDisk::create(name,64);
     bool pci=false,ether=false,graphics=false;
     std::uint64_t frame_bytes=0,graphic_serial=0,qssd_physical=0;
@@ -132,6 +133,9 @@ int main(int argc,char** argv){
       <<",\"pc_cpu_prefetchw\":"<<yes(prefetchw)
       <<",\"pc_cpu_lahf_sahf\":"<<yes(lahf)
       <<",\"pc_cpu_long_mode\":"<<yes(long64)
+      <<",\"pc_cpu_mmx\":"<<yes(mmx)
+      <<",\"pc_cpu_fxsr\":"<<yes(fxsr)
+      <<",\"pc_cpu_sse\":"<<yes(sse)
       <<",\"pc_cpu_sse2\":"<<yes(sse2)
       <<",\"pc_cpu_x87\":"<<yes(x87)
       <<",\"pci_ata_guest_detected\":"<<yes(pci)

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace reverse_windows {
@@ -20,30 +21,39 @@ class BiosHardDisk {
   BiosHardDisk(cosmic_pc::PcMachine& pc, BlockDisk& disk)
       : pc_(pc), disk_(disk), previous_(pc.cpu.interrupt_hook) {
     if (!previous_) throw std::invalid_argument("PcMachine BIOS handler is missing");
-    pc_.cpu.interrupt_hook = [this](cosmic_pc::Cpu& cpu, std::uint8_t vector) {
+    std::function<bool(cosmic_pc::Cpu&, std::uint8_t)> interrupt =
+        [this](cosmic_pc::Cpu& cpu, std::uint8_t vector) {
       if (vector == 0x13 && cpu.reg8(cosmic_pc::Cpu::EDX) == 0x80) {
         handle(cpu);
         return true;
       }
       return previous_(cpu, vector);
     };
+    pc_.set_bios_hard_disk_attached(true);
+    pc_.cpu.interrupt_hook = std::move(interrupt);
   }
   BiosHardDisk(const BiosHardDisk&) = delete;
   BiosHardDisk& operator=(const BiosHardDisk&) = delete;
-  ~BiosHardDisk() { pc_.cpu.interrupt_hook = previous_; }
+  ~BiosHardDisk() {
+    pc_.cpu.interrupt_hook = std::move(previous_);
+    pc_.set_bios_hard_disk_attached(false);
+  }
 
  private:
   static constexpr std::uint16_t kHeads = 255;
   static constexpr std::uint16_t kSectorsPerTrack = 63;
   static constexpr std::uint16_t kMaxTransferSectors = 127;
+  static constexpr std::uint16_t kDiskStatus = 0x474;
 
   static std::uint8_t ah(const cosmic_pc::Cpu& cpu) { return cpu.reg8(4); }
   static void ah(cosmic_pc::Cpu& cpu, std::uint8_t value) { cpu.set_reg8(4, value); }
   static void success(cosmic_pc::Cpu& cpu) {
+    cpu.write8(kDiskStatus, 0);
     ah(cpu, 0); cpu.set_flag(cosmic_pc::Cpu::CF, false);
   }
-  void error(cosmic_pc::Cpu& cpu, std::uint8_t code) {
-    last_error_ = code; ah(cpu, code); cpu.set_flag(cosmic_pc::Cpu::CF, true);
+  static void error(cosmic_pc::Cpu& cpu, std::uint8_t code) {
+    cpu.write8(kDiskStatus, code);
+    ah(cpu, code); cpu.set_flag(cosmic_pc::Cpu::CF, true);
   }
   static std::uint64_t seg_off(std::uint16_t segment, std::uint16_t offset) {
     return (std::uint64_t(segment) << 4U) + offset;
@@ -79,7 +89,7 @@ class BiosHardDisk {
         ((unsigned(cpu.reg8(cosmic_pc::Cpu::ECX)) & 0xc0U) << 2U);
     const auto head = unsigned(cpu.reg8(6));
     const auto count = cpu.reg8(cosmic_pc::Cpu::EAX);
-    const auto address = seg_off(cpu.segments[cosmic_pc::Cpu::ES], cpu.reg16(cosmic_pc::Cpu::EBX));
+    const auto address = cpu.real_mode_segment_address(cosmic_pc::Cpu::ES, cpu.reg16(cosmic_pc::Cpu::EBX));
     if (sector == 0 || head >= kHeads || cylinder >= 1024) {
       error(cpu, 4); cpu.set_reg8(cosmic_pc::Cpu::EAX, 0); return;
     }
@@ -90,11 +100,10 @@ class BiosHardDisk {
     }
     success(cpu);
     cpu.set_reg8(cosmic_pc::Cpu::EAX, count);
-    last_error_ = 0;
   }
 
   void extended(cosmic_pc::Cpu& cpu, bool is_write) {
-    const auto dap = seg_off(cpu.segments[cosmic_pc::Cpu::DS], cpu.reg16(cosmic_pc::Cpu::ESI));
+    const auto dap = cpu.real_mode_segment_address(cosmic_pc::Cpu::DS, cpu.reg16(cosmic_pc::Cpu::ESI));
     if (!guest_span(cpu, dap, 16) || cpu.read8(dap) < 16 || cpu.read8(dap+1) != 0) {
       error(cpu, 1); return;
     }
@@ -103,18 +112,17 @@ class BiosHardDisk {
     const std::uint64_t lba = std::uint64_t(cpu.read32(dap + 8)) |
         (std::uint64_t(cpu.read32(dap + 12)) << 32);
     // Reject EDD flat-address form until its full 24-byte packet is supported.
-    if (offset == 0xffff && segment == 0xffff ||
+    if ((offset == 0xffff && segment == 0xffff) ||
         !transfer(cpu, is_write, lba, count, seg_off(segment, offset))) {
       cpu.write16(dap + 2, 0);
       error(cpu, 4);
       return;
     }
     success(cpu);
-    last_error_ = 0;
   }
 
   void drive_parameters(cosmic_pc::Cpu& cpu) {
-    const auto physical = seg_off(cpu.segments[cosmic_pc::Cpu::DS], cpu.reg16(cosmic_pc::Cpu::ESI));
+    const auto physical = cpu.real_mode_segment_address(cosmic_pc::Cpu::DS, cpu.reg16(cosmic_pc::Cpu::ESI));
     if (!guest_span(cpu, physical, 26) || cpu.read16(physical) < 26) {
       error(cpu, 1); return;
     }
@@ -128,16 +136,16 @@ class BiosHardDisk {
     cpu.write32(physical + 12, kSectorsPerTrack);
     cpu.write64(physical + 16, disk_.sectors());
     cpu.write16(physical + 24, 512);
-    success(cpu); last_error_ = 0;
+    success(cpu);
   }
 
   void handle(cosmic_pc::Cpu& cpu) {
     // PcMachine's CPU only routes software INT to BIOS in real mode.
     switch (ah(cpu)) {
       case 0x00: // Reset disk controller
-        success(cpu); last_error_ = 0; return;
+        success(cpu); return;
       case 0x01: {
-        const auto previous = last_error_;
+        const auto previous = cpu.read8(kDiskStatus);
         ah(cpu, previous); cpu.set_flag(cosmic_pc::Cpu::CF, previous != 0); return;
       }
       case 0x02: chs(cpu, false); return;
@@ -151,26 +159,26 @@ class BiosHardDisk {
         cpu.set_reg8(cosmic_pc::Cpu::ECX, (kSectorsPerTrack & 63) | ((last >> 2) & 0xc0));
         cpu.set_reg8(6, kHeads - 1);
         cpu.set_reg8(cosmic_pc::Cpu::EDX, 1);
-        success(cpu); last_error_ = 0; return;
+        success(cpu); return;
       }
       case 0x15: {
+        success(cpu);
         cpu.set_reg8(4, 3); // Fixed disk
         const auto n = static_cast<std::uint32_t>(
             std::min<std::uint64_t>(disk_.sectors(), 0xffffffffULL));
         cpu.set_reg16(cosmic_pc::Cpu::ECX, n >> 16);
         cpu.set_reg16(cosmic_pc::Cpu::EDX, n & 0xffff);
-        cpu.set_flag(cosmic_pc::Cpu::CF, false);
-        last_error_ = 0; return;
+        return;
       }
       case 0x41:
         if (cpu.reg16(cosmic_pc::Cpu::EBX) != 0x55aa) {
           error(cpu, 1); return;
         }
+        success(cpu);
         cpu.set_reg16(cosmic_pc::Cpu::EBX, 0xaa55);
         cpu.set_reg16(cosmic_pc::Cpu::ECX, 1); // EDD transfer services only
         ah(cpu, 0x30); // EDD 3.x version query, supported subset is explicit
-        cpu.set_flag(cosmic_pc::Cpu::CF, false);
-        last_error_ = 0; return;
+        return;
       case 0x42: extended(cpu, false); return;
       case 0x43: extended(cpu, true); return;
       case 0x48: drive_parameters(cpu); return;
@@ -182,6 +190,5 @@ class BiosHardDisk {
   cosmic_pc::PcMachine& pc_;
   BlockDisk& disk_;
   std::function<bool(cosmic_pc::Cpu&, std::uint8_t)> previous_;
-  std::uint8_t last_error_ = 0;
 };
 }  // namespace reverse_windows

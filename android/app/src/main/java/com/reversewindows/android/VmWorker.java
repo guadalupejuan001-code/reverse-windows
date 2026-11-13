@@ -1,6 +1,7 @@
 package com.reversewindows.android;
 
 import android.content.ContentResolver;
+import android.content.Context;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -8,6 +9,8 @@ import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
 import android.util.Log;
+
+import org.json.JSONObject;
 
 import java.io.File;
 import java.io.IOException;
@@ -19,6 +22,7 @@ final class VmWorker {
         void onFrame(Frame frame);
         void onError(String message, boolean hasSession);
         void onDiskCreated();
+        void onHardwareChecked(String json);
     }
 
     static final class Frame {
@@ -36,13 +40,23 @@ final class VmWorker {
     }
 
     private static final String TAG = "ReverseWindows";
+    private static final String BUILD_METADATA =
+            "\"app_version\":" + JSONObject.quote(BuildConfig.VERSION_NAME) +
+            ",\"app_version_code\":" + BuildConfig.VERSION_CODE +
+            ",\"application_id\":" + JSONObject.quote(BuildConfig.APPLICATION_ID) +
+            ",\"mundo_x_sha\":" + JSONObject.quote(BuildConfig.MUNDO_X_SHA);
     private static final int DISK_GIB = 64;
-    private static final int STEPS_PER_SLICE = 4096;
+    private static final int INITIAL_SLICE_STEPS = 4096;
+    private static final int MIN_SLICE_STEPS = 64;
+    private static final int MAX_SLICE_STEPS = 16384;
+    private static final long TARGET_SLICE_NS = 8_000_000L;
+    private static final long HALTED_POLL_DELAY_MS = 35;
     private static final long FRAME_INTERVAL_MS = 100;
     private static final long STATUS_INTERVAL_MS = 350;
     private static final int MAX_FRAME_WIDTH = 960;
     private static final int MAX_FRAME_HEIGHT = 720;
 
+    private final Context context;
     private final ContentResolver resolver;
     private final File disk;
     private final Listener listener;
@@ -55,6 +69,7 @@ final class VmWorker {
     private volatile boolean released;
     private long handle;
     private int outcome;
+    private int sliceSteps = INITIAL_SLICE_STEPS;
     private boolean running;
     private boolean foreground = true;
     private boolean debugSelfTest;
@@ -68,8 +83,9 @@ final class VmWorker {
     private String lastLoggedStatus = "";
     private final Runnable slice = this::runSlice;
 
-    VmWorker(ContentResolver resolver, File disk, Listener listener) {
-        this.resolver = resolver;
+    VmWorker(Context context, File disk, Listener listener) {
+        this.context = context.getApplicationContext();
+        this.resolver = this.context.getContentResolver();
         this.disk = disk;
         this.listener = listener;
         thread.start();
@@ -87,6 +103,39 @@ final class VmWorker {
         });
     }
 
+    void checkHardware(Uri iso) {
+        worker.post(() -> {
+            if (released || handle != 0) return;
+            try {
+                String diskPath = disk.exists() ? disk.getAbsolutePath() : "";
+                String result;
+                if (iso == null) {
+                    result = NativeMachine.checkHardware(context, diskPath, -1, 0, null);
+                } else {
+                    ParcelFileDescriptor selected = null;
+                    String issue = "Android no pudo abrir la ISO.";
+                    try {
+                        selected = resolver.openFileDescriptor(iso, "r");
+                    } catch (IOException | SecurityException error) {
+                        if (error.getMessage() != null) issue = error.getMessage();
+                    }
+                    if (selected == null) {
+                        result = NativeMachine.checkHardware(context, diskPath, -1, 0, issue);
+                    } else {
+                        try (ParcelFileDescriptor fd = selected) {
+                            result = NativeMachine.checkHardware(context, diskPath, fd.getFd(),
+                                    Math.max(0, fd.getStatSize()), null);
+                        }
+                    }
+                }
+                String json = withBuildMetadata(result);
+                send(() -> listener.onHardwareChecked(json));
+            } catch (IOException | RuntimeException | LinkageError error) {
+                report(error);
+            }
+        });
+    }
+
     void start(int source, Uri iso, boolean debug) {
         worker.post(() -> {
             if (handle != 0) return;
@@ -99,14 +148,15 @@ final class VmWorker {
                     if (iso == null) throw new IOException("Elige primero una imagen ISO.");
                     try (ParcelFileDescriptor fd = resolver.openFileDescriptor(iso, "r")) {
                         if (fd == null) throw new IOException("Android no pudo abrir la ISO.");
-                        handle = NativeMachine.open(path, 0, fd.getFd(),
+                        handle = NativeMachine.open(context, path, 0, fd.getFd(),
                                 Math.max(0, fd.getStatSize()), source);
                     }
                 } else {
-                    handle = NativeMachine.open(path, 0, -1, 0, source);
+                    handle = NativeMachine.open(context, path, 0, -1, 0, source);
                 }
                 if (handle == 0) throw new IllegalStateException("La máquina no se pudo iniciar.");
-                outcome = 0;
+                outcome = NativeMachine.RUNNING;
+                sliceSteps = INITIAL_SLICE_STEPS;
                 lastStatus = 0;
                 lastFrame = 0;
                 forceFrame = true;
@@ -147,7 +197,7 @@ final class VmWorker {
             try {
                 NativeMachine.key(handle, ascii, scan, pressed);
                 if (outcome == NativeMachine.WAITING_KEY && pressed) {
-                    outcome = 0;
+                    outcome = NativeMachine.RUNNING;
                     schedule(0);
                 }
             } catch (RuntimeException | LinkageError error) {
@@ -159,7 +209,8 @@ final class VmWorker {
     void stop() {
         worker.post(() -> {
             try {
-                String diagnostic = handle == 0 ? "" : NativeMachine.diagnostic(handle);
+                String diagnostic = handle == 0 ? "" :
+                        withBuildMetadata(NativeMachine.diagnostic(handle));
                 closeMachine();
                 send(() -> listener.onState(diagnostic, false, false, false));
             } catch (RuntimeException | LinkageError error) {
@@ -185,7 +236,9 @@ final class VmWorker {
         worker.removeCallbacks(slice);
         if (!released && foreground && running && handle != 0 &&
                 outcome != NativeMachine.WAITING_KEY && !isTerminal()) {
-            worker.postDelayed(slice, delay);
+            // Rejoin the ordinary queue after each slice so pending controls can run.
+            if (delay == 0) worker.post(slice);
+            else worker.postDelayed(slice, delay);
         }
     }
 
@@ -193,7 +246,14 @@ final class VmWorker {
         if (released || !running || !foreground || handle == 0) return;
         try {
             int previous = outcome;
-            outcome = NativeMachine.step(handle, STEPS_PER_SLICE);
+            long started = SystemClock.elapsedRealtimeNanos();
+            outcome = NativeMachine.step(handle, sliceSteps);
+            if (outcome == NativeMachine.RUNNING) {
+                long elapsed = Math.max(1, SystemClock.elapsedRealtimeNanos() - started);
+                long estimate = sliceSteps * TARGET_SLICE_NS / elapsed;
+                sliceSteps = (int) Math.max(MIN_SLICE_STEPS,
+                        Math.min(MAX_SLICE_STEPS, (sliceSteps + estimate) / 2));
+            }
             long now = SystemClock.uptimeMillis();
             if (now - lastFrame >= FRAME_INTERVAL_MS || outcome != previous || forceFrame) {
                 publishFrame();
@@ -201,7 +261,7 @@ final class VmWorker {
             }
             if (now - lastStatus >= STATUS_INTERVAL_MS || outcome != previous) publishState();
             if (isTerminal()) running = false;
-            schedule(outcome == NativeMachine.HALTED ? 35 : 2);
+            schedule(outcome == NativeMachine.HALTED ? HALTED_POLL_DELAY_MS : 0);
         } catch (RuntimeException | LinkageError error) {
             report(error);
         }
@@ -254,7 +314,7 @@ final class VmWorker {
 
     private void publishState() {
         lastStatus = SystemClock.uptimeMillis();
-        String json = NativeMachine.diagnostic(handle);
+        String json = withBuildMetadata(NativeMachine.diagnostic(handle));
         boolean stopped = outcome == NativeMachine.STOPPED;
         boolean active = running && !isTerminal();
         if (debugSelfTest) {
@@ -265,6 +325,14 @@ final class VmWorker {
             }
         }
         send(() -> listener.onState(json, active, true, stopped));
+    }
+
+    private static String withBuildMetadata(String json) {
+        if (json == null || !json.startsWith("{\"")) {
+            throw new IllegalStateException("El diagnóstico de la máquina virtual no es válido.");
+        }
+        // Preserve the native JSON's full 64-bit register values.
+        return "{" + BUILD_METADATA + "," + json.substring(1);
     }
 
     private boolean isTerminal() {

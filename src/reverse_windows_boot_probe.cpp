@@ -63,8 +63,8 @@ Options parse(int argc, char** argv) {
         else if (arg == "--create-qssd-gib") out.create_qssd_gib = positive(next(), 16384, "create-qssd-gib");
         else if (arg == "--create-disk-gib") out.create_disk_gib = positive(next(), 256, "create-disk-gib");
         else if (arg == "--steps") out.steps = positive(next(), 100000000, "steps");
-        else if (arg == "--ram-mib") out.ram_mib = positive(next(), 2048, "ram-mib");
-        else if (arg == "--resident-mib") out.resident_mib = positive(next(), 2048, "resident-mib");
+        else if (arg == "--ram-mib") out.ram_mib = positive(next(), cosmic_pc::PcMachine::max_ram_mib(), "ram-mib");
+        else if (arg == "--resident-mib") out.resident_mib = positive(next(), cosmic_pc::PcMachine::max_ram_mib(), "resident-mib");
         else if (arg == "--evidence") out.evidence_path = next();
         else if (arg == "--trace") out.trace_path = next();
         else if (arg == "--trace-max-events")
@@ -135,7 +135,7 @@ int main(int argc, char** argv) {
             qdisk = candidate.get();
             disk = std::move(candidate);
         }
-        std::shared_ptr<std::ifstream> medium;
+        cosmic_pc::PcMachine::Reader read_iso;
         std::optional<cosmic_pc::BootPlan> optical_plan;
         std::uint64_t optical_bytes=0;
         std::string kind;
@@ -152,13 +152,13 @@ int main(int argc, char** argv) {
             }, disk->bytes(), "raw");
         } else {
             kind = "user-ISO";
-            medium = std::make_shared<std::ifstream>(opts.iso_path, std::ios::binary);
+            const auto medium = std::make_shared<std::ifstream>(opts.iso_path, std::ios::binary);
             if (!*medium) throw std::runtime_error("ISO is not readable");
             medium->seekg(0, std::ios::end);
             const auto end = medium->tellg();
             if (end <= 0) throw std::runtime_error("Invalid ISO size");
             optical_bytes=static_cast<std::uint64_t>(end);
-            auto read_iso=[medium](std::uint64_t offset, std::uint8_t* data, std::size_t size) {
+            read_iso=[medium](std::uint64_t offset, std::uint8_t* data, std::size_t size) {
                 medium->clear();
                 medium->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
                 medium->read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(size));
@@ -175,7 +175,7 @@ int main(int argc, char** argv) {
         if (disk) hdd = std::make_unique<reverse_windows::BiosHardDisk>(pc, *disk);
         // One canonical guest CPU. The motherboard wraps its existing I/O hooks
         // after boot firmware and QSSD are mounted, and stays alive until exit.
-        reverse_windows::PcMotherboardC06 motherboard(pc,disk.get());
+        reverse_windows::PcMotherboardC06 motherboard(pc,disk.get(),read_iso,optical_bytes);
         std::unique_ptr<reverse_windows::C09GuestTrace> trace;
         if (!opts.trace_path.empty()) {
             trace=std::make_unique<reverse_windows::C09GuestTrace>(
@@ -191,24 +191,28 @@ int main(int argc, char** argv) {
         std::uint64_t vga_total_upload_bytes=vga_frame.transferred_bytes;
         std::uint64_t vga_baseline_bytes=4000;
 
-        while (pc.cpu.instructions < opts.steps && pc.status() != "fault" && !pc.cpu.halted) {
+        const bool demo = opts.source == Options::Source::DemoX86 ||
+                          opts.source == Options::Source::DemoX64;
+        auto platform = motherboard.evidence();
+        while (platform.ticks < opts.steps && pc.status() != "fault" && !platform.powered_off) {
+            if (pc.cpu.halted && (demo || !pc.cpu.flag(cosmic_pc::Cpu::IF))) break;
             if (pc.waiting_key) {
                 if (opts.source != Options::Source::DemoX86) break;
                 pc.key('X', 0x2d);
             }
-            const auto before = pc.cpu.instructions;
+            const auto before = platform.ticks;
             const auto chunk = static_cast<unsigned>(
                 std::min<std::uint64_t>(5000, opts.steps - before));
             pc.run(chunk);
+            platform = motherboard.evidence();
             vga_frame=vga_work.capture();
             ++vga_captures;
             vga_total_upload_bytes+=vga_frame.transferred_bytes;
             vga_baseline_bytes+=4000;
-            if (pc.cpu.instructions == before && !pc.waiting_key) break;
+            if (platform.ticks == before && !pc.waiting_key) break;
         }
         if (trace) trace->finish();
         const auto final_json = pc.json();
-        const auto platform = motherboard.evidence();
         const auto* ata = motherboard.attached_ata();
         const auto ata_stats = ata ? ata->counters() : reverse_windows::AtaC07::Counters{};
         const std::string evidence = std::string("{\"schema\":\"reverse-windows-boot-evidence-v1\",") +
@@ -225,6 +229,8 @@ int main(int argc, char** argv) {
             ",\"c09_trace\":{\"enabled\":" + std::string(trace?"true":"false") +
             ",\"schema\":\"reverse-windows-c09-trace-v1\",\"windows_pe_verified\":false}" +
             ",\"writable_hdd_attached\":" + std::string(disk ? "true" : "false") +
+            ",\"bios_fixed_disks\":" + std::to_string(pc.cpu.read8(0x475)) +
+            ",\"atapi_cdrom\":" + std::string(motherboard.optical_attached()?"true":"false") +
             ",\"storage_backend\":" + cosmic_pc::PcMachine::quote(qdisk ? "QSSD-journaled" : disk ? "raw" : "none") +
             ",\"qssd_commits\":" + std::to_string(qdisk ? qdisk->stats().commits : 0) +
             ",\"qssd_physical_bytes\":" + std::to_string(qdisk ? qdisk->stats().physical_bytes : 0) +

@@ -35,9 +35,13 @@ jobs:
         abi: [arm64-v8a, x86_64]
     env:
       ANDROID_ABI: ${{ matrix.abi }}
+      ANDROID_APP_ID: com.reversewindows.android.ether.r019
+      ANDROID_VERSION: "0.1.9"
+      ANDROID_VERSION_CODE: "10"
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-java@v4
         with:
@@ -61,7 +65,8 @@ jobs:
               subprocess.run(["git", "-C", target, "checkout", "--quiet", "--detach", "FETCH_HEAD"], check=True)
           PY
           python3 scripts/verify_deps.py
-      - name: Verify synthetic ISO boot, keyboard, QSSD write and disk reboot
+          printf 'MUNDO_X_SHA=%s\n' "$(git -C deps/mundo-X rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Verify synthetic ISO boot, CPU mode transitions, keyboard and QSSD reboot
         if: matrix.abi == 'arm64-v8a'
         run: |
           cmake -S . -B build \
@@ -70,9 +75,17 @@ jobs:
             -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" \
             -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
           cmake --build build --target reverse_windows_android_boot_session_test \
-            reverse_windows_atapi_cdrom_guest_test reverse_windows_c06_motherboard_guest_test --parallel 2
+            reverse_windows_atapi_cdrom_guest_test reverse_windows_c06_motherboard_guest_test \
+            reverse_windows_protected_entry_test reverse_windows_protected_real_transition_test \
+            reverse_windows_cpu_profile_test reverse_windows_lock_rmw_test \
+            reverse_windows_x86_long_null_ss_test reverse_windows_x86_far_transfer64_test \
+            reverse_windows_x86_system64_test reverse_windows_x64_optical_qssd_test \
+            reverse_windows_x86_sse_fp32_test reverse_windows_x86_sse2_packed_oracle_test \
+            reverse_windows_x86_c09r1_stage5_cvt_fxsr_test reverse_windows_x86_sse_legacy_forms_test \
+            reverse_windows_x86_mmx_test reverse_windows_x86_x87_arithmetic_oracle_test \
+            reverse_windows_x86_x87_state_test reverse_windows_c09r1_fxstate_test --parallel 2
           ctest --test-dir build --output-on-failure \
-            -R '^(reverse_windows_android_|reverse_windows_c06_real_motherboard$)'
+            -R '^(reverse_windows_android_|reverse_windows_c06_real_motherboard$|reverse_windows_protected_entry_stack$|reverse_windows_protected_real_transition$|reverse_windows_cpu_profile$|reverse_windows_lock_rmw$|reverse_windows_x64_optical_qssd$|reverse_windows_x86_(far_transfer64|system64|long_null_ss|sse|mmx|x87)|reverse_windows_x86_c09r1_stage5_cvt_fxsr$|reverse_windows_c09r1_x87_fxsave_context$)'
       - name: Install Android command-line tools and pinned packages
         uses: android-actions/setup-android@v3
         with:
@@ -81,19 +94,24 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Build signed debug APK
         working-directory: android
-        run: ./gradlew --no-daemon --stacktrace -PandroidAbi="$ANDROID_ABI" :app:assembleDebug
+        run: ./gradlew --no-daemon --stacktrace -PandroidAbi="$ANDROID_ABI" -PetherPreview=true :app:assembleDebug
       - name: Verify APK signature, manifest and native ABI
+        shell: bash
         run: |
           apk=android/app/build/outputs/apk/debug/app-debug.apk
           tools="$ANDROID_HOME/build-tools/35.0.0"
           out="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI"
           mkdir -p "$out"
-          apk_name="REVERSE-Windows-Android-$ANDROID_ABI-debug.apk"
+          apk_name="REVERSE-Windows-Ether-$ANDROID_VERSION-$ANDROID_ABI-debug.apk"
           cp "$apk" "$out/$apk_name"
           "$tools/apksigner" verify --verbose --print-certs "$apk" | tee "$out/signature.txt"
+          grep -Fxq 'Number of signers: 1' "$out/signature.txt"
+          signer_sha256=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$out/signature.txt")
+          [[ "$signer_sha256" =~ ^[[:xdigit:]]{64}$ ]]
           "$tools/zipalign" -c -P 16 -v 4 "$apk" > "$out/alignment.txt"
           "$tools/aapt" dump badging "$apk" > "$out/manifest.txt"
-          grep -Fq "package: name='com.reversewindows.android'" "$out/manifest.txt"
+          grep -Fq "package: name='$ANDROID_APP_ID' versionCode='$ANDROID_VERSION_CODE' versionName='$ANDROID_VERSION'" "$out/manifest.txt"
+          grep -Fxq "application-label:'REVERSE Windows Ether $ANDROID_VERSION'" "$out/manifest.txt"
           grep -Fxq "native-code: '$ANDROID_ABI'" "$out/manifest.txt"
           entry="lib/$ANDROID_ABI/libreverse_windows_android.so"
           unzip -p "$apk" "$entry" > "$RUNNER_TEMP/reverse-windows-android.so"
@@ -113,6 +131,11 @@ jobs:
           fi
           {
             printf 'source_sha=%s\n' "$(git rev-parse HEAD)"
+            printf 'mundo_x_sha=%s\n' "$MUNDO_X_SHA"
+            printf 'android_application_id=%s\n' "$ANDROID_APP_ID"
+            printf 'android_version=%s\n' "$ANDROID_VERSION"
+            printf 'android_version_code=%s\n' "$ANDROID_VERSION_CODE"
+            printf 'android_signer_sha256=%s\n' "$signer_sha256"
             printf 'android_abi=%s\n' "$ANDROID_ABI"
             printf 'android_ndk=27.2.12479018\n'
           } > "$out/build.txt"
@@ -122,7 +145,7 @@ jobs:
         if: matrix.abi == 'arm64-v8a'
         uses: actions/upload-artifact@v4
         with:
-          name: REVERSE-Windows-Android-arm64-v8a-debug
+          name: REVERSE-Windows-Ether-${{ env.ANDROID_VERSION }}-arm64-v8a-debug
           path: ${{ runner.temp }}/reverse-windows-arm64-v8a
           if-no-files-found: error
       - name: Enable KVM for Android runtime smoke test
@@ -150,12 +173,13 @@ jobs:
           trap 'adb logcat -d > "$log"' EXIT
           adb install -r "$apk"
           adb logcat -c
-          adb shell am start -W -n com.reversewindows.android/.MainActivity --ez com.reversewindows.android.SELF_TEST true
+          adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity" --ez com.reversewindows.android.SELF_TEST true
+          build_fields="\"app_version\":\"$ANDROID_VERSION\",\"app_version_code\":$ANDROID_VERSION_CODE,\"application_id\":\"$ANDROID_APP_ID\",\"mundo_x_sha\":\"$MUNDO_X_SHA\""
           wait_for_state() {
             local expected="$1"
             for attempt in {1..50}; do
               if adb logcat -d -s ReverseWindows:I '*:S' > "$log" &&
-                grep -Fq "\"source\":\"self-test\",\"status\":\"$expected\"" "$log"; then
+                grep -Fq "$build_fields,\"schema\":\"reverse-windows-android-session-v1\",\"source\":\"self-test\",\"status\":\"$expected\"" "$log"; then
                 return 0
               fi
               sleep 1
@@ -164,6 +188,25 @@ jobs:
             return 1
           }
           wait_for_state waiting_key
+          python3 - "$log" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          sessions = [
+              json.loads(line[line.index('{"app_version"'):])
+              for line in pathlib.Path(sys.argv[1]).read_text().splitlines()
+              if '{"app_version"' in line and 'reverse-windows-android-session-v1' in line
+          ]
+          ram = sessions[-1]["ram_profile"]
+          assert ram["resident_bytes"] <= ram["backing_budget_bytes"], ram
+          assert ram["spilled_bytes"] == 0 and ram["spill_writes"] == 0, ram
+          assert ram["spill_mode"] in {"file", "disabled", "unavailable"}, ram
+          if ram["spill_mode"] == "file":
+              assert ram["spill_limit_bytes"] > 0 and not ram["spill_error"], ram
+          elif ram["spill_mode"] == "unavailable":
+              assert ram["spill_limit_bytes"] == 0 and ram["spill_error"], ram
+          PY
           adb shell input keyevent KEYCODE_ENTER
           wait_for_state halted
           BASH

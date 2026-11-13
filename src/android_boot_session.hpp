@@ -1,5 +1,6 @@
 #pragma once
 
+#include "android_ram_backing.hpp"
 #include "bios_hard_disk.hpp"
 #include "c06_motherboard.hpp"
 #include "c09r_guest_vga_fabric.hpp"
@@ -12,6 +13,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <ostream>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -23,12 +25,37 @@ class AndroidBootSession final {
  public:
   enum class BootSource { Iso=1, Disk=2, SelfTest=3 };
   enum class Step { Running=0, WaitingKey=1, Halted=2, Fault=3 };
+  struct RamProfile {
+    std::size_t physical_bytes;
+    std::size_t backing_bytes;
+  };
+  static constexpr RamProfile kDefaultRamProfile{2048ULL * 1024 * 1024, 256ULL * 1024 * 1024};
+  static constexpr std::uint64_t kMaxResidentBytes = 1024ULL * 1024 * 1024;
+
+  static RamProfile ram_profile(std::uint64_t available_bytes, std::uint64_t low_threshold,
+                                bool low_memory) {
+    constexpr std::uint64_t MiB = 1024 * 1024;
+    const auto headroom = available_bytes > low_threshold ? available_bytes - low_threshold : 0;
+    const auto backing = (headroom / 2) / cosmic_pc::MemoryFabric::kPageSize *
+                         cosmic_pc::MemoryFabric::kPageSize;
+    if (low_memory || backing < 16 * MiB)
+      throw std::runtime_error("Android tiene poca RAM disponible para iniciar el equipo virtual.");
+    // Keep room above Android's low-memory threshold for the handset. The
+    // 4 GiB address space is selected only when more backing is available.
+    const auto physical = backing >= 768 * MiB && cosmic_pc::PcMachine::max_ram_mib() >= 4096
+        ? cosmic_pc::PcMachine::kMaxPhysicalBytes : kDefaultRamProfile.physical_bytes;
+    return {static_cast<std::size_t>(physical),
+            static_cast<std::size_t>(std::min({backing, physical, kMaxResidentBytes}))};
+  }
 
   AndroidBootSession(std::filesystem::path disk, unsigned create_gib,
-                     BootSource source, int iso_fd=-1, std::uint64_t iso_bytes=0)
-      : source_(source), vga_(pc_) {
+                     BootSource source, int iso_fd=-1, std::uint64_t iso_bytes=0,
+                     RamProfile profile=kDefaultRamProfile,
+                     const std::filesystem::path& ram_cache={})
+      : source_(source), pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_) {
     if (disk.empty() && (create_gib || source != BootSource::SelfTest))
       throw std::invalid_argument("Selecciona o crea un disco QSSD para iniciar.");
+    spill_ = configure_spill(pc_, ram_cache);
     switch (source) {
       case BootSource::Iso:
         iso_ = std::make_shared<OpticalReader>(iso_fd, iso_bytes);
@@ -57,7 +84,6 @@ class AndroidBootSession final {
     }
     if (disk_) {
       bios_disk_ = std::make_unique<BiosHardDisk>(pc_, *disk_);
-      pc_.cpu.write8(0x475, 1); // BIOS data area hard-disk count even when booted from CD.
     }
     if (iso_) {
       board_ = std::make_unique<PcMotherboardC06>(pc_, disk_.get(),
@@ -68,17 +94,126 @@ class AndroidBootSession final {
       board_ = std::make_unique<PcMotherboardC06>(pc_, disk_.get());
     }
     board_->enable_ps2_keyboard();
+    if (source != BootSource::SelfTest) pc_.enable_guest_restart();
+    pc_.enable_boot_acceleration();
+    if (source == BootSource::Iso) pc_.enable_boot_hotspots();
+#if defined(MUNDO_X_PC_ETHER_NEXT)
+    pc_.cpu.enable_ether_next();
+#endif
   }
 
   static void create_disk(const std::filesystem::path& disk, unsigned gib) {
     QssdDisk::create(disk, gib);
   }
 
+  static std::string check_hardware(const std::filesystem::path& disk, int iso_fd=-1,
+                                    std::uint64_t iso_bytes=0, const std::string& iso_error={},
+                                    RamProfile profile=kDefaultRamProfile,
+                                    const std::filesystem::path& ram_cache={}) {
+    cosmic_pc::PcMachine pc(profile.physical_bytes, profile.backing_bytes);
+    const auto spill = configure_spill(pc, ram_cache);
+    pc.boot_demo();
+    auto& cpu = pc.cpu;
+    const auto cpuid = [&](std::uint32_t leaf) {
+      constexpr unsigned address = 0x1000;
+      cpu.reset(0, address);
+      cpu.write16(address, 0xa20f); // CPUID
+      cpu.regs[cosmic_pc::Cpu::EAX] = leaf;
+      if (cpu.step() != cosmic_pc::StepResult::Executed)
+        throw std::runtime_error("No se pudo consultar CPUID.");
+      return cpu.regs;
+    };
+    const auto basic = cpuid(1), extended = cpuid(0x80000001U);
+    const auto flag = [](std::uint64_t reg, unsigned bit) { return bool(reg & (1ULL << bit)); };
+    pc.reset();
+    pc.run(1500);
+    std::array<std::uint8_t,4000> cells{};
+    pc.copy_vga_text(cells.data(), cells.size());
+    std::string text;
+    for (std::size_t i=0;i<cells.size();i+=2) text += char(cells[i]);
+    const bool ram = pc.waiting_key && text.find("ALU + RAM + lectura de disco: OK") != std::string::npos;
+    const bool vga = pc.waiting_key && text.find("Pulsa una tecla:") != std::string::npos;
+    pc.reset();
+    bool pci_ide = false;
+    {
+      const std::array<std::uint8_t,2048> optical_sector{};
+      PcMotherboardC06 board(pc, nullptr,
+          [&](auto offset, auto* data, auto count) {
+            if (offset > optical_sector.size() || count > optical_sector.size() - offset) return false;
+            std::copy_n(optical_sector.data()+offset, count, data);
+            return true;
+          }, optical_sector.size());
+      // Exercise guest I/O against the same motherboard used for ISO boots.
+      constexpr std::array<std::uint8_t,16> pci_probe{{
+          0x66,0xb8,0x08,0x10,0x00,0x80,0xba,0xf8,0x0c,0x66,0xef,
+          0xba,0xfc,0x0c,0x66,0xed}};
+      cpu.reset(0, 0x1000);
+      cpu.memory.write_block(0x1000, pci_probe.data(), pci_probe.size());
+      pci_ide = true;
+      for (unsigned i=0;i<5 && pci_ide;++i) pci_ide = cpu.step() == cosmic_pc::StepResult::Executed;
+      pci_ide = pci_ide && (cpu.regs[cosmic_pc::Cpu::EAX] >> 16) == 0x0101;
+    }
+
+    auto optical_issue = iso_error;
+    std::string disk_issue, ata_issue;
+    const bool has_iso = iso_fd>=0 || !optical_issue.empty();
+    const bool has_disk = !disk.empty();
+    if (iso_fd>=0) {
+      try {
+        OpticalReader reader(iso_fd,iso_bytes);
+        const auto plan = cosmic_pc::BootMedia(reader.size(),[&](auto off, auto* into, auto len) {
+          return reader.read(off,into,len);
+        }).plan("iso");
+        const auto address = std::uint64_t(plan.load_segment)*16;
+        if (address>pc.cpu.memory.size() || plan.image.size()>pc.cpu.memory.size()-address)
+          throw std::runtime_error("La imagen de arranque excede la RAM.");
+      } catch (const std::exception& error) { optical_issue = error.what(); }
+    }
+    if (has_disk) {
+      try {
+        QssdDisk volume(disk,QssdDisk::Access::ReadOnly);
+        std::array<std::uint8_t,512> first{};
+        if (!volume.read(0,1,first.data())) throw std::runtime_error("No se pudo leer el sector inicial.");
+        try {
+          check_ata_identify(pc, volume);
+        } catch (const std::exception& error) { ata_issue = error.what(); }
+      } catch (const std::exception& error) { disk_issue = error.what(); }
+    }
+    std::ostringstream out;
+    out << std::boolalpha << "{\"schema\":\"reverse-windows-hardware-check-v1\",\"checks\":{"
+        << "\"cpu_x64\":" << flag(extended[cosmic_pc::Cpu::EDX],29)
+        << ",\"cpu_pae\":" << flag(basic[cosmic_pc::Cpu::EDX],6)
+        << ",\"cpu_nx\":" << flag(extended[cosmic_pc::Cpu::EDX],20)
+        << ",\"cpu_mmx\":" << flag(basic[cosmic_pc::Cpu::EDX],23)
+        << ",\"cpu_sse\":" << flag(basic[cosmic_pc::Cpu::EDX],25)
+        << ",\"cpu_sse2\":" << flag(basic[cosmic_pc::Cpu::EDX],26)
+        << ",\"cpu_x87\":" << flag(basic[cosmic_pc::Cpu::EDX],0)
+        << ",\"cpu_fxsr\":" << flag(basic[cosmic_pc::Cpu::EDX],24)
+        << ",\"cpu_cx16\":" << flag(basic[cosmic_pc::Cpu::ECX],13)
+        << ",\"cpu_lahf_sahf\":" << flag(extended[cosmic_pc::Cpu::ECX],0)
+        << ",\"cpu_prefetchw\":" << flag(extended[cosmic_pc::Cpu::ECX],8)
+        << ",\"ram\":" << ram << ",\"pci_ide\":" << pci_ide << ",\"vga\":" << vga << ",\"iso_boot\":";
+    if (has_iso) out << optical_issue.empty(); else out << "null";
+    out << ",\"qssd\":";
+    if (has_disk) out << disk_issue.empty(); else out << "null";
+    out << ",\"qssd_ata\":";
+    if (!has_disk || !disk_issue.empty()) out << "null"; else out << ata_issue.empty();
+    out << "},\"ram_profile\":";
+    write_ram_profile(out, pc, spill);
+    out << ",\"ready_for_windows10_install\":false,\"errors\":{"
+        << "\"iso_boot\":" << cosmic_pc::PcMachine::quote(optical_issue)
+        << ",\"qssd\":" << cosmic_pc::PcMachine::quote(disk_issue)
+        << ",\"qssd_ata\":" << cosmic_pc::PcMachine::quote(ata_issue) << "}}";
+    return out.str();
+  }
+
   Step step(unsigned budget) {
     if (!is_stopped()) pc_.run(budget);
+    if (!pc_.cpu.fault && pc_.host_error.empty() &&
+        pc_.guest_restart() != cosmic_pc::PcMachine::GuestRestart::None) restart_guest();
     if (pc_.cpu.fault || !pc_.host_error.empty()) return Step::Fault;
     if (pc_.waiting_key) return Step::WaitingKey;
-    if (pc_.cpu.halted || board_->evidence().powered_off) return Step::Halted;
+    if (is_stopped()) return Step::Halted;
     return Step::Running;
   }
 
@@ -169,8 +304,40 @@ class AndroidBootSession final {
     } else {
       out << "null";
     }
+    out << ",\"ram_profile\":";
+    write_ram_profile(out, pc_, spill_);
+    const auto gate_work = pc_.quantum_session->gate_work_stats();
+    const auto& boot_work = pc_.boot_acceleration();
+    out << ",\"ether_next\":{\"quantum_gates_in\":" << gate_work.input_gates
+        << ",\"quantum_gates_run\":" << gate_work.executed_gates
+        << ",\"quantum_gates_cancelled\":" << gate_work.cancelled_gates
+        << ",\"pullback_cache_hits\":" << gate_work.pullback_hits
+        << ",\"boot_rep_batches\":" << boot_work.batches
+        << ",\"boot_rep_elements\":" << boot_work.rep_elements
+        << ",\"boot_rep_bytes\":" << boot_work.bytes
+        << ",\"boot_shift_loop_batches\":" << boot_work.shift_loop_batches
+        << ",\"boot_shift_loop_steps\":" << boot_work.shift_loop_steps;
+#if defined(MUNDO_X_PC_ETHER_NEXT)
+    const auto ether = pc_.cpu.ether_next_stats();
+    out << ",\"neon_requested\":" << (pc_.cpu.ether_next_enabled() ? "true" : "false")
+        << ",\"arm64_host\":" << (pc_.cpu.ether_next_native_host() ? "true" : "false")
+        << ",\"neon_guest_instructions\":" << ether.native_instructions
+        << ",\"cache_hits\":" << ether.cache.hits << ",\"cache_misses\":" << ether.cache.misses
+        << ",\"cache_fallbacks\":" << ether.cache.fallbacks;
+#endif
+    out << '}';
+    if (const auto& hotspots = pc_.boot_hotspots()) {
+      out << ",\"boot_hotspots\":";
+      hotspots->write_json(out);
+    }
+    const auto& mode = pc_.boot_mode_progress();
+    out << ",\"boot_progress\":{\"handed_off\":" << (pc_.cpu.instructions ? "true" : "false")
+        << ",\"mode_changes\":" << mode.changes << ",\"last_mode_from\":\"" << mode.from
+        << "\",\"last_mode_to\":\"" << mode.to << "\",\"last_mode_step\":" << mode.step
+        << ",\"restarts\":" << restarts_ << ",\"last_restart\":\"" << last_restart_ << "\"}";
     out << ",\"atapi_cdrom\":" << (board_->optical_attached() ? "true" : "false")
         << ",\"ata\":{\"commands\":" << counts.commands
+        << ",\"identify_data_transfers\":" << counts.identify_data_transfers
         << ",\"read_sectors\":" << counts.read_sectors
         << ",\"write_sectors\":" << counts.write_sectors << ",\"flushes\":" << counts.flushes
         << "},\"irq\":{\"ticks\":" << platform.ticks << ",\"delivered\":" << platform.irq_delivered
@@ -181,6 +348,113 @@ class AndroidBootSession final {
   }
 
  private:
+  struct SpillInfo {
+    AndroidRamBacking* file = nullptr; // Owned by the same PcMachine's MemoryFabric.
+    std::uint64_t limit = 0;
+    std::string state = "disabled";
+    std::string detail;
+  };
+
+  static SpillInfo configure_spill(cosmic_pc::PcMachine& pc, const std::filesystem::path& directory) {
+    SpillInfo info;
+    if (directory.empty()) return info;
+    auto& memory = pc.cpu.memory;
+    if (memory.budget_bytes() >= memory.size()) return info;
+    info.limit = std::min(AndroidRamBacking::spill_budget(directory), memory.size());
+    if (!info.limit) {
+      info.state = "unavailable";
+      info.detail = "No hay espacio disponible para el respaldo temporal de RAM.";
+      return info;
+    }
+    try {
+      auto file = std::make_unique<AndroidRamBacking>(directory, memory.size(), info.limit);
+      auto* file_stats = file.get();
+      memory.attach_page_backing(std::move(file));
+      info.file = file_stats;
+      info.state = "file";
+    } catch (const std::exception& error) {
+      info.state = "unavailable";
+      info.detail = error.what();
+      info.limit = 0;
+    }
+    return info;
+  }
+
+  static void write_ram_profile(std::ostream& out, const cosmic_pc::PcMachine& pc,
+                                const SpillInfo& spill) {
+    const auto metrics = pc.cpu.memory.metrics();
+    out << "{\"address_space_bytes\":" << pc.cpu.memory.size()
+        << ",\"usable_bytes\":" << pc.usable_ram_bytes()
+        << ",\"backing_budget_bytes\":" << pc.cpu.memory.budget_bytes()
+        << ",\"resident_bytes\":" << metrics.allocated_bytes
+        << ",\"spill_mode\":" << cosmic_pc::PcMachine::quote(spill.state)
+        << ",\"spill_error\":" << cosmic_pc::PcMachine::quote(spill.detail)
+        << ",\"spill_limit_bytes\":" << spill.limit
+        << ",\"spilled_bytes\":" << metrics.backing_bytes
+        << ",\"spill_file_payload_bytes\":" << (spill.file ? spill.file->file_payload_bytes() : 0)
+        << ",\"spill_reads\":" << metrics.backing_reads
+        << ",\"spill_writes\":" << metrics.backing_writes << '}';
+  }
+
+  static void check_ata_identify(cosmic_pc::PcMachine& pc, QssdDisk& volume) {
+    constexpr std::uint16_t code = 0x1000, data = 0x1800;
+    constexpr std::uint8_t identify_probe[]{
+        0xfa, 0xfc,                        // CLI; CLD
+        0xba,0xf6,0x01, 0xb0,0xe0, 0xee, // Select primary master.
+        0x42, 0xb0,0xec, 0xee, 0xec,      // Issue IDENTIFY DEVICE and read status.
+        0x24,0x89, 0x3c,0x08, 0x75,0x0b, // Require DRQ, no BSY or ERR.
+        0xba,0xf0,0x01,                   // DX = ATA data register.
+        0xbf,0x00,0x18, 0xb9,0x00,0x01, // DI = data; CX = 256 words.
+        0xf3,0x6d,                       // REP INSW from the real ATA device.
+        0xf4};                            // Halt; only the full response counts.
+    PcMotherboardC06 board(pc, &volume);
+    auto& cpu = pc.cpu;
+    cpu.reset(0, code);
+    cpu.memory.write_block(code, identify_probe, sizeof(identify_probe));
+    pc.run(300);
+    const auto counts = board.attached_ata()->counters();
+    if (cpu.fault || !cpu.halted || counts.identify_data_transfers != 1 ||
+        (cpu.read16(data + 83 * 2) & 0xc400U) != 0x4400U ||
+        cpu.read64(data + 100 * 2) != volume.sectors())
+      throw std::runtime_error("El invitado de prueba no confirmó la capacidad ATA del QSSD.");
+  }
+
+  void restart_guest() {
+    using Restart = cosmic_pc::PcMachine::GuestRestart;
+    switch (pc_.guest_restart()) {
+      case Restart::A20Port: last_restart_="port92"; break;
+      case Restart::KeyboardController: last_restart_="i8042"; break;
+      case Restart::BiosBootstrap: last_restart_="int19"; break;
+      case Restart::None: return;
+    }
+    try {
+      flush();
+      std::array<std::uint8_t,512> sector{};
+      if (!disk_ || !disk_->read(0,1,sector.data()))
+        throw std::runtime_error("No se pudo leer el QSSD durante el reinicio.");
+      const bool bootable = sector[510]==0x55 && sector[511]==0xaa &&
+          std::any_of(sector.begin(),sector.begin()+440,[](std::uint8_t byte) { return byte!=0; });
+      const auto next = bootable ? BootSource::Disk : BootSource::Iso;
+      if (next==BootSource::Iso && !iso_)
+        throw std::runtime_error("El QSSD no contiene un sector de arranque.");
+      if (next!=source_ || pc_.cpu.instructions>=65536) rapid_restarts_=0;
+      else if (++rapid_restarts_>3)
+        throw std::runtime_error("El medio solicitó reinicios repetidos al arrancar.");
+
+      if (next==BootSource::Disk) {
+        pc_.mount([this](auto off, auto* into, auto count) {
+          return disk_->read_bytes(off,into,count);
+        },disk_->bytes(),"raw");
+      } else {
+        pc_.mount([reader=iso_](auto off, auto* into, auto count) {
+          return reader->read(off,into,count);
+        },iso_->size(),"iso");
+      }
+      source_=next;
+      ++restarts_;
+      text_visible_=false;
+    } catch (const std::exception& error) { pc_.host_error=error.what(); }
+  }
   class OpticalReader {
    public:
     OpticalReader(int fd, std::uint64_t expected_size) {
@@ -239,7 +513,8 @@ class AndroidBootSession final {
   }
 
   BootSource source_;
-  cosmic_pc::PcMachine pc_{2048ULL * 1024 * 1024, 256ULL * 1024 * 1024};
+  cosmic_pc::PcMachine pc_;
+  SpillInfo spill_;
   std::shared_ptr<OpticalReader> iso_;
   std::unique_ptr<QssdDisk> disk_;
   std::unique_ptr<BiosHardDisk> bios_disk_;
@@ -250,5 +525,8 @@ class AndroidBootSession final {
   bool text_visible_ = false;
   std::uint64_t vga_serial_ = 0;
   std::uint64_t vga_transfer_bytes_ = 0;
+  std::uint64_t restarts_ = 0;
+  unsigned rapid_restarts_ = 0;
+  const char* last_restart_ = "";
 };
 } // namespace reverse_windows

@@ -23,7 +23,8 @@
 namespace reverse_windows {
 class PcMotherboardC06 {
  public:
-  static constexpr std::uint64_t kLocalApic=0xfee00000ULL,kIoApic=0xfec00000ULL;
+  static constexpr std::uint64_t kLocalApic=cosmic_pc::PcMachine::kLocalApicAddress,
+      kIoApic=cosmic_pc::PcMachine::kIoApicAddress;
   struct Evidence {
     std::uint64_t ticks,irq_delivered,pit_irqs,apic_irqs;
     bool pci_present,acpi_installed,powered_off;
@@ -115,9 +116,12 @@ class PcMotherboardC06 {
   std::function<std::optional<std::uint32_t>(std::uint16_t,unsigned)> prior_in_;
   std::function<bool(std::uint16_t,unsigned,std::uint32_t)> prior_out_;
   std::function<bool(std::uint64_t)> prior_mmio_claim_;
+  std::function<bool(std::uint64_t,std::size_t)> prior_mmio_range_claim_;
   std::function<std::optional<std::uint8_t>(std::uint64_t)> prior_mmio_read_;
   std::function<bool(std::uint64_t,std::uint8_t)> prior_mmio_write_;
   std::function<void()> prior_tick_;
+  std::function<unsigned(unsigned)> prior_batch_limit_;
+  std::function<void(unsigned)> prior_batch_advance_;
   std::function<void()> prior_reset_;
   Pic master_{},slave_{};
   std::unique_ptr<AtaC07> ata_;
@@ -130,8 +134,9 @@ class PcMotherboardC06 {
   std::array<std::uint8_t,256> host_cfg_{},isa_cfg_{};
   std::uint16_t pm_control_=0;
   bool powered_off_=false;
+  bool ferr_was_asserted_=false;
   std::uint64_t ticks_=0,irq_delivered_=0,pit_irqs_=0,apic_irqs_=0;
-  std::uint32_t apic_tpr_=0,apic_svr_=0xff,apic_lvt_timer_=0x10000;
+  std::uint32_t apic_svr_=0xff,apic_lvt_timer_=0x10000;
   std::uint32_t apic_timer_reload_=0,apic_timer_counter_=0,apic_divider_=0x3;
   std::bitset<256> lapic_pending_;
   std::uint32_t lapic_in_service_=0,ioapic_select_=0;
@@ -159,10 +164,11 @@ class PcMotherboardC06 {
     master_=Pic{};slave_=Pic{};slave_.vector=0x70;
     pit_=Pit{};pci_selector_=0;clock_steps_=0;
     cmos_index_=0;rtc_b_=2;pm_control_=0;powered_off_=false;
+    ferr_was_asserted_=false;pc_.cpu.set_x87_ignne(false);
     ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=0;
     if(ata_)ata_->reset();
     if(optical_)optical_->reset();
-    apic_tpr_=0;apic_svr_=0xff;apic_lvt_timer_=0x10000;
+    pc_.cpu.set_apic_task_priority(0);apic_svr_=0xff;apic_lvt_timer_=0x10000;
     apic_timer_reload_=apic_timer_counter_=0;apic_divider_=3;
     lapic_pending_.reset();lapic_in_service_=0;ioapic_select_=0;
     io_redir_low_.fill(0x10000U);io_redir_high_.fill(0);
@@ -308,6 +314,11 @@ class PcMotherboardC06 {
     if(width!=1)return false;
     const auto b=std::uint8_t(value);
     switch(p){
+      case 0xf0:
+        // PC/AT coprocessor acknowledgement. A PIC edge already recorded in
+        // IRR still follows normal acceptance/EOI. IGNNE# lasts until FERR# falls.
+        pc_.cpu.set_x87_ignne(pc_.cpu.x87_ferr_asserted());
+        return true;
       case 0x20:master_.command(b);return true;
       case 0x21:master_.data(b);return true;
       case 0xa0:slave_.command(b);return true;
@@ -327,13 +338,20 @@ class PcMotherboardC06 {
     return (a>=kLocalApic&&a<kLocalApic+4096)||
            (a>=kIoApic&&a<kIoApic+4096);
   }
+  bool mmio_range_claim(std::uint64_t start,std::size_t length) const {
+    const auto overlaps=[&](std::uint64_t base){
+      return start<base+4096U && (start>=base || length>base-start);
+    };
+    return length && (overlaps(kLocalApic) || overlaps(kIoApic) ||
+        (prior_mmio_claim_ && (!prior_mmio_range_claim_ || prior_mmio_range_claim_(start,length))));
+  }
   std::optional<std::uint32_t> mmio_register(std::uint64_t base) const {
     if(base>=kLocalApic&&base<kLocalApic+4096) {
       const auto r=unsigned(base-kLocalApic);
       switch(r) {
         case 0x20:return 0; // LAPIC ID 0
         case 0x30:return 0x00030014U; // local APIC version; bounded LVT subset
-        case 0x80:return apic_tpr_;
+        case 0x80:return pc_.cpu.apic_task_priority();
         case 0xb0:return 0; // EOI write-only
         case 0xf0:return apic_svr_;
         case 0x320:return apic_lvt_timer_;
@@ -366,7 +384,7 @@ class PcMotherboardC06 {
     if(base>=kLocalApic&&base<kLocalApic+4096){
       const auto r=unsigned(base-kLocalApic);
       switch(r){
-        case 0x80:apic_tpr_=v&0xffU;return true;
+        case 0x80:pc_.cpu.set_apic_task_priority(std::uint8_t(v));return true;
         case 0xb0:lapic_in_service_=0;return true;
         case 0xf0:apic_svr_=v&0x1ffU;return true;
         case 0x320:
@@ -410,7 +428,7 @@ class PcMotherboardC06 {
       if(lapic_pending_[vector])return std::uint8_t(vector);
     return std::nullopt;
   }
-  void signal_storage_irq(unsigned line){
+  void signal_slave_irq(unsigned line){
     const auto redirect=io_redir_low_[line];
     if(lapic_on() && !(redirect&0x10000U) && (redirect&0xffU)>=0x20U){
       lapic_pending_.set(redirect&0xffU);
@@ -429,6 +447,11 @@ class PcMotherboardC06 {
   }
   void poll(){
     ++ticks_;
+    auto& cpu=pc_.cpu;
+    const bool ferr=cpu.x87_ferr_asserted();
+    if(ferr&&!ferr_was_asserted_)signal_slave_irq(13);
+    if(!ferr&&ferr_was_asserted_)cpu.set_x87_ignne(false);
+    ferr_was_asserted_=ferr;
     if(pit_.tick())signal_irq0();
     if(keyboard_&&keyboard_->needs_irq()&&!(prior_in_(0x64,1).value_or(0)&1U)){
       const auto redirect=io_redir_low_[1];
@@ -447,11 +470,15 @@ class PcMotherboardC06 {
         if(apic_lvt_timer_&0x20000U)apic_timer_counter_=apic_timer_reload_;
       }
     }
-    auto& cpu=pc_.cpu;
+    // The slave's INT output reaches the master independently of CPU IF or
+    // LAPIC acceptance. The guest can read both IRRs with interrupts disabled.
+    const auto slave_irq=slave_.pending();
+    if(slave_irq)master_.irr|=std::uint8_t(1U<<2);
+    else if(!(master_.isr&(1U<<2)))master_.irr&=std::uint8_t(~(1U<<2));
     if(cpu.fault||!cpu.flag(cosmic_pc::Cpu::IF))return;
     if(lapic_on()&&!lapic_in_service_){
       const auto request=highest_lapic_request();
-      if(request&&(*request&0xf0U)>(apic_tpr_&0xf0U)){
+      if(request&&(*request&0xf0U)>(cpu.apic_task_priority()&0xf0U)){
         if(cpu.raise_external_irq(*request)){
           lapic_in_service_=*request;lapic_pending_.reset(*request);
           ++apic_irqs_;++irq_delivered_;
@@ -461,9 +488,6 @@ class PcMotherboardC06 {
     }
     // 8259 cascade: a pending slave IRQ presents IRQ2 at the master PIC.
     // Deliver the SLAVE vector, not master IRQ2's vector. Both PICs must EOI.
-    const auto slave_irq=slave_.pending();
-    if(slave_irq)master_.irr|=std::uint8_t(1U<<2);
-    else if(!(master_.isr&(1U<<2)))master_.irr&=std::uint8_t(~(1U<<2));
     const auto master_irq=master_.pending();
     if(master_irq){
       const unsigned n=master_irq-1;
@@ -479,19 +503,39 @@ class PcMotherboardC06 {
     }
   }
 
+  // The current step has already polled the board. Stop the batch before
+  // another tick could change the interrupt or timer state visible to the CPU.
+  unsigned batch_limit(unsigned steps) const {
+    if(prior_tick_ || powered_off_ || pc_.cpu.x87_ferr_asserted()!=ferr_was_asserted_ ||
+       (keyboard_&&keyboard_->needs_irq()) ||
+       (pc_.cpu.flag(cosmic_pc::Cpu::IF) && (master_.pending() ||
+          (lapic_on() && !lapic_in_service_ && highest_lapic_request())))) return 1;
+    if(pit_.enabled) steps=std::min(steps,std::max(1U,pit_.counter));
+    if(lapic_on()&&apic_timer_counter_) steps=std::min(steps,apic_timer_counter_);
+    return steps;
+  }
+  void advance_batch(unsigned extra_steps) {
+    ticks_+=extra_steps;
+    if(pit_.enabled) pit_.counter-=extra_steps;
+    if(lapic_on()&&apic_timer_counter_) apic_timer_counter_-=extra_steps;
+  }
+
  public:
   explicit PcMotherboardC06(cosmic_pc::PcMachine& machine, BlockDisk* disk=nullptr,
                             AtapiCdrom::Reader optical={}, std::uint64_t optical_bytes=0):pc_(machine){
-    if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_storage_irq(14);});
+    if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_slave_irq(14);});
     if(optical)optical_=std::make_unique<AtapiCdrom>(
-        std::move(optical),optical_bytes,[this](){signal_storage_irq(15);});
+        std::move(optical),optical_bytes,[this](){signal_slave_irq(15);});
     // The machine must be booted/mounted first. ACPI goes into reserved BIOS
     // memory and is never presented by E820 as allocatable guest RAM.
     prior_in_=pc_.cpu.in_hook;prior_out_=pc_.cpu.out_hook;
     prior_mmio_claim_=pc_.cpu.mmio_claim_hook;
+    prior_mmio_range_claim_=pc_.cpu.mmio_range_claim_hook;
     prior_mmio_read_=pc_.cpu.mmio_read_hook;
     prior_mmio_write_=pc_.cpu.mmio_write_hook;
     prior_tick_=pc_.device_step_hook;
+    prior_batch_limit_=pc_.device_batch_limit_hook;
+    prior_batch_advance_=pc_.device_batch_advance_hook;
     prior_reset_=pc_.device_reset_hook;
     reset_devices();
     pc_.cpu.in_hook=[this](std::uint16_t p,unsigned w){
@@ -501,11 +545,14 @@ class PcMotherboardC06 {
     };
     pc_.cpu.out_hook=[this](std::uint16_t p,unsigned w,std::uint32_t v){
       if(keyboard_&&(p==0x60||p==0x64))return io_write(p,w,v);
-      if(owned_port(p))return io_write(p,w,v);
+      if(p==0xf0||owned_port(p))return io_write(p,w,v);
       return prior_out_&&prior_out_(p,w,v);
     };
     pc_.cpu.mmio_claim_hook=[this](std::uint64_t a){
       return mmio_claim(a)||(prior_mmio_claim_&&prior_mmio_claim_(a));
+    };
+    pc_.cpu.mmio_range_claim_hook=[this](std::uint64_t start,std::size_t length){
+      return mmio_range_claim(start,length);
     };
     pc_.cpu.mmio_read_hook=[this](std::uint64_t a){
       if(mmio_claim(a))return mmio_byte(a);
@@ -519,6 +566,8 @@ class PcMotherboardC06 {
       if(prior_tick_)prior_tick_();
       poll();
     };
+    pc_.device_batch_limit_hook=[this](unsigned steps){return batch_limit(steps);};
+    pc_.device_batch_advance_hook=[this](unsigned steps){advance_batch(steps);};
     pc_.device_reset_hook=[this](){
       if(prior_reset_)prior_reset_();
       reset_devices();
@@ -526,12 +575,16 @@ class PcMotherboardC06 {
   }
   ~PcMotherboardC06(){
     // Never leave a hook pointing at a destroyed motherboard instance.
+    pc_.cpu.set_x87_ignne(false);
     pc_.cpu.in_hook=std::move(prior_in_);
     pc_.cpu.out_hook=std::move(prior_out_);
     pc_.cpu.mmio_claim_hook=std::move(prior_mmio_claim_);
+    pc_.cpu.mmio_range_claim_hook=std::move(prior_mmio_range_claim_);
     pc_.cpu.mmio_read_hook=std::move(prior_mmio_read_);
     pc_.cpu.mmio_write_hook=std::move(prior_mmio_write_);
     pc_.device_step_hook=std::move(prior_tick_);
+    pc_.device_batch_limit_hook=std::move(prior_batch_limit_);
+    pc_.device_batch_advance_hook=std::move(prior_batch_advance_);
     pc_.device_reset_hook=std::move(prior_reset_);
   }
   PcMotherboardC06(const PcMotherboardC06&)=delete;

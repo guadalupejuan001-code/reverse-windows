@@ -76,6 +76,198 @@ void pic_pit_guest(){
   std::cout<<"C06_PIC_PIT_GUEST_IRQ_PASS ticks="<<board.evidence().ticks
            <<" pit="<<board.evidence().pit_irqs<<"\n";
 }
+void rep_boot_with_pit_guest(bool local_apic){
+  const auto check=[&](bool accelerate){
+    PcMachine pc(16*1024*1024);boot32(pc);
+    PcMotherboardC06 board(pc);
+    auto& cpu=pc.cpu;
+    pc.enable_boot_acceleration(accelerate);
+    pc.enable_boot_hotspots();
+    cpu.idtr={0x1000,0x15000};
+    cpu.regs[Cpu::ESP]=0x190000;
+    gate(cpu,0x42,0x13000);
+    std::vector<std::uint8_t> handler{
+        0x89,0x0d,0x04,0x91,0,0,             // Record interrupted ECX.
+        0x50,0x8b,0x44,0x24,0x04,
+        0xa3,0x08,0x91,0,0};                 // Record interrupted EIP.
+    if(local_apic)emit(handler,{0xc7,0x05,0xb0,0,0xe0,0xfe,0,0,0,0});
+    else emit(handler,{0xb0,0xff,0xe6,0x21,0xb0,0x20,0xe6,0x20});
+    emit(handler,{0x58,0xcf});
+    code(cpu,0x13000,handler);
+    std::vector<std::uint8_t> program{0xfa,0xfc};
+    const auto out=[&](std::uint8_t value,std::uint8_t port){emit(program,{0xb0,value,0xe6,port});};
+    if(local_apic){
+      const auto write_reg=[&](std::uint32_t address,std::uint32_t value){
+        emit(program,{0xc7,0x05});
+        for(unsigned i=0;i<4;++i)program.push_back(std::uint8_t(address>>(8*i)));
+        for(unsigned i=0;i<4;++i)program.push_back(std::uint8_t(value>>(8*i)));
+      };
+      write_reg(0xfee000f0,0x1ff);write_reg(0xfee00320,0x42);write_reg(0xfee00380,300);
+    }else{
+      gate(cpu,0x40,0x13000);
+      out(0x11,0x20);out(0x40,0x21);out(0x04,0x21);out(0x01,0x21);out(0xfe,0x21);
+      out(0x34,0x43);out(0x2c,0x40);out(0x01,0x40); // PIT period of 300 ticks.
+    }
+    emit(program,{0xb9,0x00,0x80,0,0,0xbf,0,0,0x20,0,0xb0,0x5a,0xfb});
+    const auto rep_ip=0xa000+program.size();
+    emit(program,{0xf3,0xaa,0xfa,0xf4});
+    code(cpu,0xa000,program);cpu.eip=0xa000;
+    run(pc,34000);
+    const auto ecx=cpu.read32(0x9104);
+    need(cpu.halted&&cpu.read8(0x200000)==0x5a&&cpu.read8(0x207fff)==0x5a&&
+         cpu.read8(0x208000)==0&&cpu.regs[Cpu::ECX]==0&&cpu.regs[Cpu::ESP]==0x190000,
+         "batched guest must retain REP result, register and interrupt stack semantics");
+    need(board.evidence().irq_delivered==1&&ecx>0&&ecx<32768&&cpu.read32(0x9108)==rep_ip,
+         "timer IRQ must interrupt REP at a restartable guest element boundary");
+    need(!accelerate||pc.boot_acceleration().rep_elements>32000,
+         "board never granted large REP batches");
+    return std::array<std::uint64_t,4>{ecx,cpu.instructions,board.evidence().ticks,board.evidence().pit_irqs};
+  };
+  need(check(false)==check(true),"batched timer delivery crossed a guest interrupt deadline");
+}
+void shift_boot_with_pit_guest(){
+  const auto check=[](bool accelerate,std::uint8_t period_low){
+    PcMachine pc(16*1024*1024);
+    pc.boot_demo();
+    PcMotherboardC06 board(pc);
+    pc.enable_boot_acceleration(accelerate);
+    pc.enable_boot_hotspots();
+    auto& cpu=pc.cpu;
+    cpu.set_reg16(Cpu::ESP,0x8800);
+    cpu.write16(0x40*4,0x9000);
+    cpu.write16(0x40*4+2,0);
+    code(cpu,0x9000,{
+        0x89,0x0e,0x04,0x91,           // Record interrupted CX.
+        0x50,0x55,0x89,0xe5,           // Save AX and BP, then set BP to SP.
+        0x8b,0x46,0x04,0xa3,0x08,0x91, // Record interrupted IP.
+        0xb0,0xff,0xe6,0x21,           // Mask PIT so it fires once.
+        0xb0,0x20,0xe6,0x20,           // Acknowledge the PIC.
+        0x5d,0x58,0xcf});              // Restore BP and AX, then IRET.
+    std::vector<std::uint8_t> program{0xfa};
+    const auto out=[&](std::uint8_t value,std::uint8_t port){emit(program,{0xb0,value,0xe6,port});};
+    out(0x11,0x20);out(0x40,0x21);out(0x04,0x21);out(0x01,0x21);out(0xfe,0x21);
+    out(0x34,0x43);out(period_low,0x40);out(0x01,0x40);
+    emit(program,{0xb9,0x00,0x20,0xb8,0x5a,0xa5,0xba,0x7d,0xa2,0xfb});
+    constexpr auto entry=0xa000;
+    const auto loop_ip=entry+program.size();
+    emit(program,{0xd1,0xea,0xd1,0xd8,0xe2,0xfa,0xfa,0xf4});
+    code(cpu,entry,program);
+    cpu.eip=entry;
+    for(unsigned slice=0;slice<8&&!cpu.halted;++slice)run(pc,4091);
+    const auto ip=cpu.read16(0x9108);
+    const auto cx=cpu.read16(0x9104);
+    need(cpu.halted&&cpu.reg16(Cpu::ECX)==0&&cpu.reg16(Cpu::EAX)==0&&
+         cpu.reg16(Cpu::EDX)==0&&cpu.reg16(Cpu::ESP)==0x8800,
+         "shift loop and IRQ must preserve registers and balance the interrupt stack");
+    need(board.evidence().irq_delivered==1&&cx>0&&cx<8192&&
+         ip>=loop_ip&&ip<loop_ip+6&&((ip-loop_ip)%2)==0,
+         "PIT must interrupt at a shift, rotate or LOOP boundary");
+    need(!accelerate||pc.boot_acceleration().shift_loop_steps>23000,
+         "board never granted large shift-loop batches");
+    return std::array<std::uint64_t,6>{ip,cx,cpu.instructions,cpu.eflags,
+                                     board.evidence().ticks,board.evidence().pit_irqs};
+  };
+  for(const auto period:{0x2c,0x2d,0x2e})
+    need(check(false,period)==check(true,period),"shift batches changed the PIT interrupt boundary");
+}
+void pic_legacy_x87_guest(){
+  PcMachine pc(16*1024*1024);boot32(pc);
+  PcMotherboardC06 board(pc);
+  auto& cpu=pc.cpu;
+  cpu.idtr={0x1000,0x15000};
+  cpu.regs[Cpu::ESP]=0x190000;
+  cpu.cr0&=~0x2eU; // Clear NE, TS, EM and MP.
+  gate(cpu,0x75,0x13000);
+  code(cpu,0x13000,{
+      0xb0,0,0xe6,0xf0,   // Acknowledge FERR# and assert IGNNE#.
+      0x9b,               // A waiting instruction can now run.
+      0xdf,0xe0,          // FNSTSW AX still reports the unmasked error.
+      0x66,0xa3,0,0x91,0,0,
+      0xdb,0xe2,          // FNCLEX clears pending status, FERR# and IGNNE#.
+      0xb0,0x20,0xe6,0xa0,0xe6,0x20,
+      0xcf});
+  cpu.write16(0x9104,0x037b); // Unmask divide-by-zero.
+  const std::vector<std::uint8_t> program={
+      0xfa,
+      0xb0,0xfb,0xe6,0x21, // Unmask the master cascade.
+      0xb0,0xdf,0xe6,0xa1, // Unmask slave IRQ13.
+      0xd9,0x2d,4,0x91,0,0, // FLDCW [9104]
+      0xd9,0xe8,0xd9,0xee, // FLD1, FLDZ
+      0xde,0xf9,           // FDIVP ST(1), ST(0): 1/0
+      0xe4,0x20,0xa2,2,0x91,0,0, // Master IRR while IF is clear.
+      0xe4,0xa0,0xa2,3,0x91,0,0, // Slave IRR while IF is clear.
+      0x9b,0xf4};          // FWAIT, HLT
+  code(cpu,0xa000,program);
+  cpu.eip=0xa000;
+  run(pc,40);
+  const auto wait_ip=0xa000+program.size()-2;
+  const auto wait_insns=cpu.instructions;
+  need((cpu.read16(0x9102)&0x2004U)==0x2004U,
+       "Both PICs must expose the pending IRQ13 cascade while CPU IF is clear");
+  need(cpu.eip==wait_ip && cpu.x87_ferr_asserted() && !cpu.halted,
+       "FWAIT did not hold at the same IP with FERR# pending");
+  need(cpu.step()==cosmic_pc::StepResult::WaitingForX87 && cpu.instructions==wait_insns &&
+       board.evidence().irq_delivered==0,
+       "FWAIT retired or IRQ13 was delivered while IF was clear");
+  cpu.set_flag(Cpu::IF,true); // Permit the pending hardware interrupt at FWAIT.
+  run(pc,40);
+  need(cpu.halted && cpu.eip==wait_ip+2 && cpu.regs[Cpu::ESP]==0x190000 &&
+       board.evidence().irq_delivered==1 && !cpu.x87_ferr_asserted() &&
+       (cpu.read16(0x9100)&0x8084U)==0x8084U,
+       "IRQ13/IGNNE# handler did not reenter the held FWAIT after one interrupt");
+  cpu.halted=false;
+  cpu.eip=0xa000;
+  run(pc,40);
+  need(cpu.eip==wait_ip && cpu.x87_ferr_asserted() && !cpu.halted &&
+       board.evidence().irq_delivered==1,
+       "New x87 error bypassed FWAIT after FNCLEX released IGNNE#");
+  cpu.set_flag(Cpu::IF,true);
+  run(pc,40);
+  need(cpu.halted && board.evidence().irq_delivered==2 && !cpu.x87_ferr_asserted(),
+       "A second independent FERR# edge did not deliver IRQ13");
+  std::cout<<"C02_X87_LEGACY_FERR_PASS IRQ13=2 FWAIT=hold-and-retry IGNNE=cleared\n";
+}
+void optical_irq_wakes_sti_hlt(){
+  PcMachine pc(16*1024*1024);boot32(pc);
+  std::array<std::uint8_t,2048> optical_sector{};
+  PcMotherboardC06 board(pc,nullptr,
+      [&optical_sector](auto offset,auto* data,auto count){
+        if(offset>optical_sector.size()||count>optical_sector.size()-offset)return false;
+        std::copy_n(optical_sector.data()+offset,count,data);
+        return true;
+      },optical_sector.size());
+  auto& cpu=pc.cpu;
+  cpu.idtr={0x1000,0x15000};
+  cpu.regs[Cpu::ESP]=0x190000;
+  gate(cpu,0x77,0x13000);
+  code(cpu,0x13000,{
+      0x50,0x52,                         // PUSH EAX, EDX
+      0x66,0xba,0x77,0x01,0xec,           // Sample ATAPI command status.
+      0xa2,0x00,0x91,0x00,0x00,           // Save sampled status.
+      0x8b,0x44,0x24,0x08,                // Record saved EIP from IRQ frame.
+      0xa3,0x04,0x91,0x00,0x00,
+      0xb0,0x20,0xe6,0xa0,0xe6,0x20,       // EOI to slave and master.
+      0x5a,0x58,0xcf});                    // POP EDX, EAX; IRETD
+  const std::vector<std::uint8_t> program={
+      0xfa,                               // Queue IRQ15 with CPU IRQs disabled.
+      0xb0,0xfb,0xe6,0x21,                 // Unmask PIC cascade.
+      0xb0,0x7f,0xe6,0xa1,                 // Unmask IRQ15.
+      0x66,0xba,0x77,0x01,0xb0,0xa1,0xee, // IDENTIFY PACKET DEVICE.
+      0xfb,0xf4,                          // STI; HLT before pending IRQ delivery.
+      0xc6,0x05,0x01,0x91,0x00,0x00,0x01, // Reached code after the wait.
+      0xfa,0xf4};
+  constexpr auto start=0xa000U;
+  constexpr auto after_hlt=start+18;
+  code(cpu,start,program);
+  cpu.eip=start;
+  run(pc,70);
+  need(cpu.halted&&cpu.read8(0x9101)==1,
+       "ATAPI IRQ15 must wake the first HLT and resume its next instruction");
+  need(cpu.read32(0x9104)==after_hlt&&(cpu.read8(0x9100)&0x48U)==0x48U&&
+       board.evidence().irq_delivered==1&&cpu.regs[Cpu::ESP]==0x190000,
+       "ATAPI IRQ15 must see DRQ, stack the instruction after HLT, and balance IRET");
+  std::cout<<"C03_ATAPI_IRQ15_STI_HLT_PASS irq15=1 wake=1 resume_ip="<<after_hlt<<"\n";
+}
 unsigned checksum(Cpu& cpu,std::uint32_t addr,std::uint32_t size){
   unsigned total=0;for(unsigned i=0;i<size;++i)total+=cpu.memory[addr+i];
   return total&255;
@@ -272,14 +464,114 @@ void queued_lapic_requests_guest(){
   need(pc.cpu.regs[Cpu::ESP]==0x190000,"queued LAPIC interrupts did not restore the guest stack");
   std::cout<<"C06_LAPIC_QUEUED_IRQ_PASS timer=0x42 keyboard=0x31\n";
 }
+void cr8_lapic_priority_guest(){
+  PcMachine pc(16*1024*1024);
+  pc.boot_long_mode_demo();
+  auto& cpu=pc.cpu;
+  for(unsigned i=0;i<5000&&!cpu.is_long_mode();++i){
+    if(cpu.step()==cosmic_pc::StepResult::Faulted)
+      throw std::runtime_error(cpu.fault->describe());
+  }
+  need(cpu.is_long_mode(),"CR8 fixture did not execute an actual transition to long mode");
+  PcMotherboardC06 board(pc);
+  constexpr std::uint32_t apic=0xfee00000, entry=0xa000, handler=0x13000, stack=0x190000;
+  constexpr std::uint8_t vector=0x42;
+  cpu.write64(0x2000+(apic>>30)*8,0x4003);
+  cpu.write64(0x4000+((apic>>21)&511)*8,std::uint64_t(apic)|0x83);
+  cpu.idtr={0x1000,0x15000};
+  cpu.write64(cpu.idtr.base+16*vector, (handler&0xffffU)|
+      (std::uint64_t(cpu.segments[Cpu::CS])<<16)|(0x8eULL<<40)|
+      (std::uint64_t(handler>>16)<<48));
+  cpu.write64(cpu.idtr.base+16*vector+8,0);
+  code(cpu,handler,{
+      0xc6,0x04,0x25,0x00,0x90,0x00,0x00,vector, // MOV byte [0x9000], vector
+      0x50,0xb8,0xb0,0x00,0xe0,0xfe,             // PUSH RAX; MOV EAX,LAPIC EOI
+      0xc7,0x00,0x00,0x00,0x00,0x00,0x58,0x48,0xcf // EOI; POP RAX; IRETQ
+  });
+  std::vector<std::uint8_t> guest{0xfa};
+  const auto write_reg=[&](std::uint32_t address,std::uint32_t value){
+    emit(guest,{0xbf});
+    for(unsigned i=0;i<4;++i)guest.push_back(std::uint8_t(address>>(8*i)));
+    emit(guest,{0xc7,0x07});
+    for(unsigned i=0;i<4;++i)guest.push_back(std::uint8_t(value>>(8*i)));
+  };
+  write_reg(apic+0x80,0xab);
+  emit(guest,{
+      0x45,0x0f,0x20,0x00,      // MOV R8,CR8; ModR/M MOD bits are ignored.
+      0xb8,0x05,0x00,0x00,0x00, // MOV EAX,5
+      0x44,0x0f,0x22,0xc0,      // MOV CR8,RAX
+      0x8b,0x17                 // MOV EDX,[RDI], the same LAPIC TPR.
+  });
+  write_reg(apic+0xf0,0x1ff);
+  write_reg(apic+0x320,vector);
+  write_reg(apic+0x380,3);
+  emit(guest,{0xfb,0x90}); // STI; clear the one-instruction interrupt shadow.
+  const auto wait_ip=entry+guest.size();
+  emit(guest,{0xeb,0xfe});
+  code(cpu,entry,guest);
+  cpu.eip=entry;
+  cpu.regs[Cpu::ESP]=stack;
+  run(pc,100);
+  need(cpu.eip==wait_ip && cpu.regs[Cpu::R8]==0xa && cpu.regs[Cpu::EDX]==0x50,
+       "CR8 and LAPIC MMIO must share priority, and a CR8 write must clear low TPR bits");
+  need(board.evidence().apic_irqs==0&&cpu.read8(0x9000)==0,
+       "CR8 must hold a pending lower-priority LAPIC timer interrupt");
+  code(cpu,static_cast<std::uint32_t>(wait_ip),{0x31,0xc0,0x44,0x0f,0x22,0xc0,0xf4});
+  run(pc,64);
+  need(cpu.halted&&board.evidence().apic_irqs==1&&cpu.read8(0x9000)==vector&&
+       cpu.regs[Cpu::ESP]==stack,
+       "lowering CR8 must release the pending IRQ and IRETQ must restore the stack");
+
+  cpu.idtr={0,0};
+  cpu.set_apic_task_priority(0x70);
+  const auto expect_fault=[&](std::initializer_list<std::uint8_t> bytes,
+                              cosmic_pc::FaultCode expected){
+    code(cpu,entry,bytes);cpu.eip=entry;cpu.halted=false;cpu.fault.reset();
+    const auto before=cpu.regs;
+    need(cpu.step()==cosmic_pc::StepResult::Faulted&&cpu.fault->code==expected&&
+         cpu.fault->error_code==0&&cpu.eip==entry&&cpu.regs==before&&
+         cpu.apic_task_priority()==0x70,
+         "invalid MOV control-register operation changed guest state or exception class");
+  };
+  cpu.regs[Cpu::EAX]=1ULL<<40;
+  expect_fault({0x44,0x0f,0x22,0xc0},cosmic_pc::FaultCode::ProtectionFault);
+  expect_fault({0x44,0x0f,0x20,0xc8},cosmic_pc::FaultCode::InvalidInstruction);
+  expect_fault({0xf0,0x44,0x0f,0x22,0xc0},cosmic_pc::FaultCode::InvalidInstruction);
+
+  // Enter actual ring 3 with a user-accessible identity mapping via IRETQ.
+  cpu.write64(0x1000,0x2007);cpu.write64(0x2000,0x3007);cpu.write64(0x3000,0x87);
+  cpu.gdtr={0x2f,0x14000};
+  cpu.write64(0x14018,0x00af9b000000ffffULL);
+  cpu.write64(0x14020,0x00affb000000ffffULL);
+  cpu.write64(0x14028,0x00cff3000000ffffULL);
+  code(cpu,entry,{0x6a,0x2b,0x68,0x00,0x00,0x1a,0x00,0x6a,0x02,
+                  0x6a,0x23,0x68,0x00,0xa1,0x00,0x00,0x48,0xcf});
+  cpu.eip=entry;cpu.fault.reset();
+  for(unsigned i=0;i<6;++i)need(cpu.step()==cosmic_pc::StepResult::Executed,"ring 3 entry failed");
+  need(cpu.cpl()==3&&cpu.eip==0xa100,"CPL3 test did not enter guest ring 3");
+  code(cpu,0xa100,{0x44,0x0f,0x20,0xc0});
+  need(cpu.step()==cosmic_pc::StepResult::Faulted&&
+       cpu.fault->code==cosmic_pc::FaultCode::ProtectionFault&&cpu.fault->error_code==0&&
+       cpu.apic_task_priority()==0x70,"CPL3 must not access CR8");
+  pc.boot_long_mode_demo();
+  need(cpu.apic_task_priority()==0&&cpu.read32(apic+0x80)==0,"reset retained a previous CR8/TPR value");
+  std::cout<<"C06_CR8_LAPIC_TPR_PASS mmio=1 pending_irq=1 precise_faults=1 reset=1\n";
+}
 }
 int main(){
   try{
     pic_pit_guest();
+    rep_boot_with_pit_guest(false);
+    rep_boot_with_pit_guest(true);
+    shift_boot_with_pit_guest();
+    std::cout<<"ETHER_BOOT_IRQ_TIMING_PASS pit=1 lapic=1 shift_loop=1\n";
+    optical_irq_wakes_sti_hlt();
+    pic_legacy_x87_guest();
     pci_acpi_cmos_guest();
     ioapic_lapic_guest();
     ps2_keyboard_guest();
     queued_lapic_requests_guest();
+    cr8_lapic_priority_guest();
     std::cout<<"REVERSE_WINDOWS_C06_MOTHERBOARD_PASS checks="<<checks
              <<" windows_booted=false full_acpi=false full_apic=false\n";
     return 0;

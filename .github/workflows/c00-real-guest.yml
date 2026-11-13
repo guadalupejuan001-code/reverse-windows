@@ -1,4 +1,4 @@
-name: C09R1 stage4 SSE2, MXCSR, x87 and hardware regressions
+name: REVERSE Windows Ether boot, RAM and QSSD regressions
 on:
   push:
     branches: [main, "feature/**"]
@@ -10,18 +10,27 @@ permissions:
 
 jobs:
   native-real-guest:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: x86_64
+          - runner: ubuntu-24.04-arm
+            architecture: aarch64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
     steps:
       - name: Checkout REVERSE Windows
         uses: actions/checkout@v7
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Checkout canonical Mundo X CPU (exact SHA)
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/mundo-X
-          ref: 2dd0c52abbc99cd231a8d81a15be8a11b0a721ef
+          ref: 7476131e87fd95a9ad2fcb163c793ed27d60b365
           path: deps/mundo-X
           persist-credentials: false
       - name: Checkout GPU-VIRTUAL C12 plus physical work authority
@@ -46,20 +55,48 @@ jobs:
           path: deps/REVERSE-PC
           persist-credentials: false
       - name: Enforce exact component SHAs and real source files
-        run: python3 scripts/verify_deps.py
+        run: |
+          test "$(uname -m)" = "${{ matrix.architecture }}"
+          git rev-parse HEAD
+          python3 scripts/verify_deps.py
       - name: Compile native boot probe against actual x86/x64 CPU
         run: |
           cmake -S . -B build -DREVERSE_MUNDO_X_ROOT="$PWD/deps/mundo-X" -DREVERSE_QSSD_ROOT="$PWD/deps/Virtual-qSSD-" -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
           cmake --build build --parallel 2
       - name: Execute real x86 and long-mode x64 guest demos
         run: ctest --test-dir build --output-on-failure
+      - name: Capture C03 boot and guest VGA evidence
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_bios_disk_test | tee build/c03-bios-disk.log
+          grep -q C03_BIOS_CD_QSSD_DISCOVERY_PASS build/c03-bios-disk.log
+          python3 tests/c03_render_vga.py build/c03-boot-evidence.json build/c03-qssd-vga.svg
+      - name: Verify x64 transfers through optical boot data and QSSD reboot
+        run: |
+          set -euo pipefail
+          ctest --test-dir build --output-on-failure -V \
+            -R '^(reverse_windows_x64_optical_qssd|reverse_windows_x86_(far_transfer64|system64|long_null_ss))$'
+      - name: Capture C02 MMX, SSE, x87 and FXSR conformance evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -m | tee build/c02-cpu-conformance.log
+          lscpu | sed -n '/^Vendor ID:/p; /^Model name:/p' | tee -a build/c02-cpu-conformance.log
+          git -C deps/mundo-X rev-parse HEAD | tee -a build/c02-cpu-conformance.log
+          ctest --test-dir build -V -R \
+            '^(reverse_windows_x86_(mmx|sse_legacy_forms|x87_arithmetic_oracle|x87_state)|reverse_windows_c09r1_x87_(fxsave_context|deferred_mf)|reverse_windows_c05_real_cpl3_tss)$' \
+            | tee -a build/c02-cpu-conformance.log
       - name: Capture authentic C06 PCI PIC PIT APIC ACPI guest evidence
         run: |
           set -euo pipefail
           ./build/reverse_windows_c06_motherboard_guest_test | tee build/reverse-windows-c06-motherboard.log
           grep -q 'C06_PIC_PIT_GUEST_IRQ_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'C02_X87_LEGACY_FERR_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'C03_ATAPI_IRQ15_STI_HLT_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'ETHER_BOOT_IRQ_TIMING_PASS' build/reverse-windows-c06-motherboard.log
           grep -q 'C06_PCI_ACPI_CMOS_REAL_GUEST_PASS' build/reverse-windows-c06-motherboard.log
           grep -q 'C06_IOAPIC_LAPIC_MMIO_IRQ_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'C06_CR8_LAPIC_TPR_PASS' build/reverse-windows-c06-motherboard.log
           grep -q 'REVERSE_WINDOWS_C06_MOTHERBOARD_PASS' build/reverse-windows-c06-motherboard.log
       - name: Verify real C07 guest PCI ATA PIO IRQ14 and durable QSSD replay
         shell: bash
@@ -67,6 +104,7 @@ jobs:
           set -euo pipefail
           ./build/reverse_windows_c07_ata_guest_test | tee build/reverse-windows-c07-ata.log
           for marker in C07_REAL_GUEST_PCI_ATA_PIO_IRQ_PASS \
+            C03_QSSD_IDENTIFY_DEVICE_PASS \
             C07_LBA48_HIGH_SPARSE_GUEST_PASS \
             C07_ATA_PIO_MULTI_SECTOR_PASS \
             C07_ATA_COMMAND_ERRORS_PASS \
@@ -175,7 +213,8 @@ jobs:
           assert report['qssd_logical_bytes']==64*1024**3
           assert report['pc_cpu_cx16'] and report['pc_cpu_pae'] and report['pc_cpu_nx']
           assert report['pc_cpu_lahf_sahf'] and report['pc_cpu_prefetchw']
-          assert not report['pc_cpu_sse2'] and not report['pc_cpu_x87']
+          assert all(report[f'pc_cpu_{feature}'] for feature in ('mmx','fxsr','sse','sse2'))
+          assert not report['pc_cpu_x87']
           assert report['pci_ata_guest_detected']
           assert report['ether_xi_memory_aperture']
           assert report['gpu_virtual_vga_delta']
@@ -207,6 +246,7 @@ jobs:
           assert not report["c09_trace"]["windows_pe_verified"]
           assert report["ide_c07"]["attached"]
           assert report["ide_c07"]["ata_commands"]>=1
+          assert report["bios_fixed_disks"]==1 and report["atapi_cdrom"]
           assert report["machine"]["cpu_mode"]=="protected16"
           assert report["machine"]["status"]=="halted"
           print("C09_PROBE_COHERENT_WITH_TRACE_PASS windows_pe=false")
@@ -276,7 +316,7 @@ jobs:
           assert iso["pci_cfg_out_cf8"]>=1 and iso["pci_cfg_in_cfc"]>=1
           assert iso["first_terminal_blocker"]["type"]=="guest_halt"
           assert fault["first_terminal_blocker"]["type"]=="terminal_instruction_fault"
-          assert fault["first_terminal_blocker"]["first_observed"]["decoded"]=="f000"
+          assert fault["first_terminal_blocker"]["first_observed"]["decoded"]=="f090"
           assert fault["truncated"] and quota["truncated"]
           assert quota["first_terminal_blocker"]["type"]=="no_terminal_fault_observed_with_truncated_trace"
           for report in (iso,fault,quota):
@@ -304,7 +344,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: reverse-windows-c00-x64-evidence
+          name: reverse-windows-c03-${{ matrix.architecture }}-evidence
           path: |
             build/reverse-windows-x64.json
             build/reverse-windows-c06-motherboard.log
@@ -325,6 +365,10 @@ jobs:
             build/c09-quota-diagnosis.json
             build/c09-hardware-trace.log
             build/c09r-hardware-audit.jsonl
+            build/c02-cpu-conformance.log
+            build/c03-boot-evidence.json
+            build/c03-bios-disk.log
+            build/c03-qssd-vga.svg
             build/reverse_windows_c09r1_sse2_fp_test.log
             build/reverse_windows_c09r1_ring3_fpu_test.log
             build/reverse_windows_c09r1_exact_x87_test.log
