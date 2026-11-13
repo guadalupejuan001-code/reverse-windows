@@ -147,6 +147,8 @@ class AndroidBootSession final {
         << "\"cpu_x64\":" << flag(extended[cosmic_pc::Cpu::EDX],29)
         << ",\"cpu_pae\":" << flag(basic[cosmic_pc::Cpu::EDX],6)
         << ",\"cpu_nx\":" << flag(extended[cosmic_pc::Cpu::EDX],20)
+        << ",\"cpu_mmx\":" << flag(basic[cosmic_pc::Cpu::EDX],23)
+        << ",\"cpu_sse\":" << flag(basic[cosmic_pc::Cpu::EDX],25)
         << ",\"cpu_sse2\":" << flag(basic[cosmic_pc::Cpu::EDX],26)
         << ",\"cpu_x87\":" << flag(basic[cosmic_pc::Cpu::EDX],0)
         << ",\"cpu_fxsr\":" << flag(basic[cosmic_pc::Cpu::EDX],24)

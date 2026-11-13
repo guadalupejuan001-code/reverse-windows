@@ -18,7 +18,7 @@ MMX comparte los registros físicos de x87. `EMMS` marca vacías sus etiquetas. 
 
 La aritmética x87 usa un formato de 80 bits independiente de `long double`, con precisión de 24, 53 y 64 bits y los cuatro modos de redondeo. Las pruebas cubren conversiones, etiquetas, entornos x87 y entrega de `#MF` en modo real, protegido y compatibilidad IA-32e. La placa entrega IRQ13 mediante el PIC cuando el huésped selecciona la ruta FERR heredada. `FXSAVE` y `FXRSTOR` se prueban con ambos formatos de puntero en modo largo, conservación de XMM/MXCSR, y guardado y recuperación de imágenes repartidas entre páginas.
 
-Las pruebas se ejecutan en anfitriones x86_64 y ARM64. El primero compara resultados con instrucciones x86 del procesador físico. Ambos ejecutan los casos de referencia y la misma integración de `PcMachine`. El bit x87 de CPUID sigue desactivado mientras falten ocho instrucciones trascendentales. La instalación de Windows 10 sigue sin verificar.
+Las pruebas se ejecutan en anfitriones x86_64 y ARM64. El primero compara resultados con instrucciones x86 del procesador físico. Ambos ejecutan los casos de referencia y la misma integración de `PcMachine`. CPUID anuncia MMX, FXSR, SSE y SSE2. El bit x87 sigue desactivado mientras falten ocho instrucciones trascendentales. La instalación de Windows 10 sigue sin verificar.
 
 ## C01 · Cobertura de CPU SSE/SSE2
 

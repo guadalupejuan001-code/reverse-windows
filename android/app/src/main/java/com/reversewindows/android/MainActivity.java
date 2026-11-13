@@ -43,7 +43,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private static final int ACCENT = 0xff77e5cb;
     private static final int ERROR = 0xffffa9a4;
     private static final String[][] HARDWARE_CHECKS = {
-            {"cpu_x64", "CPU x64"}, {"cpu_sse2", "SSE2"}, {"cpu_x87", "x87"},
+            {"cpu_x64", "CPU x64"}, {"cpu_mmx", "MMX"}, {"cpu_sse", "SSE"},
+            {"cpu_sse2", "SSE2"}, {"cpu_x87", "x87"},
             {"cpu_pae", "PAE"}, {"cpu_nx", "NX"}, {"cpu_cx16", "CMPXCHG16B"},
             {"cpu_lahf_sahf", "LAHF/SAHF"}, {"cpu_prefetchw", "PREFETCHW"}, {"cpu_fxsr", "FXSR"},
             {"ram", "RAM"}, {"pci_ide", "Controlador PCI IDE"}, {"vga", "Video VGA"},

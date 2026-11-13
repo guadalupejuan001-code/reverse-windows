@@ -80,7 +80,8 @@ int main(int argc, char** argv) {
     const auto original = bytes(fixture);
     const auto missing = Session::check_hardware({});
     for (const auto* marker : {"\"iso_boot\":null", "\"qssd\":null", "\"cpu_x64\":true",
-                              "\"cpu_sse2\":false", "\"cpu_x87\":false", "\"cpu_fxsr\":false",
+                              "\"cpu_mmx\":true", "\"cpu_sse\":true", "\"cpu_sse2\":true",
+                              "\"cpu_x87\":false", "\"cpu_fxsr\":true",
                               "\"ram\":true", "\"vga\":true", "\"pci_ide\":true",
                               "\"ready_for_windows10_install\":false"})
       require(missing.find(marker) != std::string::npos, marker);
