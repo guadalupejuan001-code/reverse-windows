@@ -68,6 +68,9 @@ class AndroidBootSession final {
       board_ = std::make_unique<PcMotherboardC06>(pc_, disk_.get());
     }
     board_->enable_ps2_keyboard();
+#if defined(MUNDO_X_PC_ETHER_NEXT)
+    pc_.cpu.enable_ether_next();
+#endif
   }
 
   static void create_disk(const std::filesystem::path& disk, unsigned gib) {
@@ -169,6 +172,20 @@ class AndroidBootSession final {
     } else {
       out << "null";
     }
+    const auto gate_work = pc_.quantum_session->gate_work_stats();
+    out << ",\"ether_next\":{\"quantum_gates_in\":" << gate_work.input_gates
+        << ",\"quantum_gates_run\":" << gate_work.executed_gates
+        << ",\"quantum_gates_cancelled\":" << gate_work.cancelled_gates
+        << ",\"pullback_cache_hits\":" << gate_work.pullback_hits;
+#if defined(MUNDO_X_PC_ETHER_NEXT)
+    const auto ether = pc_.cpu.ether_next_stats();
+    out << ",\"neon_requested\":" << (pc_.cpu.ether_next_enabled() ? "true" : "false")
+        << ",\"arm64_host\":" << (pc_.cpu.ether_next_native_host() ? "true" : "false")
+        << ",\"neon_guest_instructions\":" << ether.native_instructions
+        << ",\"cache_hits\":" << ether.cache.hits << ",\"cache_misses\":" << ether.cache.misses
+        << ",\"cache_fallbacks\":" << ether.cache.fallbacks;
+#endif
+    out << '}';
     out << ",\"atapi_cdrom\":" << (board_->optical_attached() ? "true" : "false")
         << ",\"ata\":{\"commands\":" << counts.commands
         << ",\"read_sectors\":" << counts.read_sectors

@@ -16,8 +16,12 @@ foreach(required_header IN ITEMS
 endforeach()
 
 find_package(Threads REQUIRED)
-add_library(reverse_windows_android SHARED native_machine.cpp)
+add_library(reverse_windows_android SHARED
+    native_machine.cpp
+    "${REVERSE_MUNDO_X_ROOT}/native/src/ether_transform.cpp"
+    "${REVERSE_MUNDO_X_ROOT}/native/src/ether_neon.cpp")
 target_compile_features(reverse_windows_android PRIVATE cxx_std_17)
+target_compile_definitions(reverse_windows_android PRIVATE MUNDO_X_PC_ETHER_NEXT=1)
 target_include_directories(reverse_windows_android PRIVATE
     "${REVERSE_WINDOWS_ROOT}/src"
     "${REVERSE_MUNDO_X_ROOT}/pc-android/native"

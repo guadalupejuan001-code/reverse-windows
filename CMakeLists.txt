@@ -58,6 +58,11 @@ if(BUILD_TESTING)
   target_link_libraries(reverse_windows_atapi_cdrom_guest_test PRIVATE reverse_windows_component_headers)
   add_test(NAME reverse_windows_android_atapi_guest COMMAND reverse_windows_atapi_cdrom_guest_test)
   set_tests_properties(reverse_windows_android_atapi_guest PROPERTIES TIMEOUT 60)
+  add_executable(reverse_windows_protected_entry_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_group6_0f00_test.cpp")
+  target_link_libraries(reverse_windows_protected_entry_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_protected_entry_stack COMMAND reverse_windows_protected_entry_test)
+  set_tests_properties(reverse_windows_protected_entry_stack PROPERTIES TIMEOUT 60)
 
   add_test(NAME reverse_windows_real_x86_demo
     COMMAND reverse_windows_boot_probe --demo-x86 --steps 200000 --ram-mib 2048 --resident-mib 256)

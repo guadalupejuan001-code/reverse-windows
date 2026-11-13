@@ -12,6 +12,12 @@ La app conecta el selector de archivos de Android, el arranque BIOS de Mundo X y
 
 Desinstalar la app borra su disco privado. Para conservar la instalación, actualiza con un APK firmado con la misma clave.
 
+## Actualización 0.1.1
+
+La CPU conserva el descriptor de pila heredado del modo real hasta que el cargador vuelve a cargar `SS`. La prueba reproduce el `PUSH 0x50` en `2000:083F` del diagnóstico en Samsung y comprueba que el invitado continúa. Los cambios de selector posteriores siguen sujetos a las comprobaciones de privilegio.
+
+El Ether Next de Mundo X añade reducción de lotes XI y caché de transformaciones. En ARM64, el decodificador usa NEON en formas SSE2 enteras de registro admitidas. El intérprete conserva el fetch, el avance de RIP y las interrupciones. `Copiar diagnóstico` incluye el número de instrucciones invitadas que realmente pasaron por NEON. En modo protegido de 16 bits este contador seguirá en cero. Las capacidades CPUID conservan el perfil de la CPU anterior.
+
 ## Qué se comprobó
 
 - Un huésped El Torito lee su ISO, recibe una tecla por BIOS, muestra salida VGA, escribe un MBR en QSSD y arranca desde ese MBR al reabrir el disco. Se comprueba que la ISO conserve los mismos bytes.
