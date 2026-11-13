@@ -12,5 +12,7 @@ class BlockDisk {
   virtual bool read_bytes(std::uint64_t offset, std::uint8_t* dest, std::size_t size) = 0;
   virtual bool read(std::uint64_t lba, std::uint16_t count, std::uint8_t* dest) = 0;
   virtual bool write(std::uint64_t lba, std::uint16_t count, const std::uint8_t* source) = 0;
+  // Complete a guest FLUSH CACHE with the host backend's real sync barrier.
+  virtual bool flush() = 0;
 };
 }  // namespace reverse_windows

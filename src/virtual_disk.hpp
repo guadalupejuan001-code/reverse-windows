@@ -78,6 +78,12 @@ class DiskImage final : public BlockDisk {
     return file_.gcount() == size && static_cast<bool>(file_);
   }
 
+  bool flush() override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    file_.flush();  // fstream durability is weaker than QSSD fdatasync/fsync.
+    return static_cast<bool>(file_);
+  }
+
   bool write(std::uint64_t lba, std::uint16_t sectors, const std::uint8_t* source) override {
     if (!source || !within(lba, sectors)) return false;
     std::lock_guard<std::mutex> lock(mutex_);

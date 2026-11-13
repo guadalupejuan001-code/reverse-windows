@@ -3,6 +3,7 @@
 // PCI configuration / 8259 PIC / PIT channel0 / RTC CMOS / ACPI PM register
 // model / a bounded LAPIC and IOAPIC register subset. Not a chipset clone.
 #include "c06_acpi.hpp"
+#include "c07_ata.hpp"
 #include "pc_machine.hpp"
 #include <algorithm>
 #include <array>
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <ctime>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -22,6 +24,7 @@ class PcMotherboardC06 {
   struct Evidence {
     std::uint64_t ticks,irq_delivered,pit_irqs,apic_irqs;
     bool pci_present,acpi_installed,powered_off;
+    std::uint64_t ata_irqs=0;
   };
 
  private:
@@ -113,6 +116,9 @@ class PcMotherboardC06 {
   std::function<void()> prior_tick_;
   std::function<void()> prior_reset_;
   Pic master_{},slave_{};
+  std::unique_ptr<AtaC07> ata_;
+  std::array<std::uint8_t,256> ata_cfg_{};
+  std::uint64_t ata_irq_delivered_=0;
   Pit pit_{};
   std::uint32_t pci_selector_=0,clock_steps_=0;
   std::uint8_t cmos_index_=0,rtc_b_=2;
@@ -147,7 +153,8 @@ class PcMotherboardC06 {
     master_=Pic{};slave_=Pic{};slave_.vector=0x70;
     pit_=Pit{};pci_selector_=0;clock_steps_=0;
     cmos_index_=0;rtc_b_=2;pm_control_=0;powered_off_=false;
-    ticks_=irq_delivered_=pit_irqs_=apic_irqs_=0;
+    ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=0;
+    if(ata_)ata_->reset();
     apic_tpr_=0;apic_svr_=0xff;apic_lvt_timer_=0x10000;
     apic_timer_reload_=apic_timer_counter_=0;apic_divider_=3;
     lapic_pending_.reset();lapic_in_service_=0;ioapic_select_=0;
@@ -155,11 +162,24 @@ class PcMotherboardC06 {
     mmio_pending_={};
     build_config(host_cfg_,0x0001,0x00);
     build_config(isa_cfg_,0x0002,0x01);
+    if(ata_){
+      ata_cfg_.fill(0);
+      config32(ata_cfg_,0,(0xc071U<<16)|0x1b36U); // synthetic C07 PCI IDE
+      ata_cfg_[4]=1; // PCI I/O space decode enabled
+      ata_cfg_[8]=1; // revision
+      ata_cfg_[9]=0; // both channels legacy compatibility, no bus mastering
+      ata_cfg_[10]=0x01;ata_cfg_[11]=0x01; // PCI 0x0101 IDE controller
+      config32(ata_cfg_,0x10,0x1f1); // primary command BAR I/O
+      config32(ata_cfg_,0x14,0x3f5); // primary control BAR I/O
+      // Secondary channel has no attached drive; BAR2/3 and BAR4 DMA absent.
+      ata_cfg_[0x3c]=14;ata_cfg_[0x3d]=1; // legacy IRQ14 / INT A
+    }
     // After a real PcMachine::reset, firmware RAM is new; republish the
     // same discovered tables and keep their E820-reserved addresses.
     AcpiC06::install(pc_.cpu);
   }
   bool owned_port(std::uint16_t p) const {
+    if(ata_ && ata_->handles(p) && (ata_cfg_[4]&1U))return true;
     return p==0x20||p==0x21||p==0xa0||p==0xa1||
            (p>=0x40&&p<=0x43)||(p>=0x70&&p<=0x71)||
            (p>=0xcf8&&p<=0xcff)||(p>=0x600&&p<=0x60b);
@@ -171,6 +191,7 @@ class PcMotherboardC06 {
     const unsigned dev=(pci_selector_>>11)&31;
     if(dev==0)return &host_cfg_;
     if(dev==1)return &isa_cfg_;
+    if(dev==2&&ata_)return &ata_cfg_;
     return nullptr;
   }
   std::optional<std::uint32_t> pci_read(std::uint16_t p,unsigned width){
@@ -230,6 +251,7 @@ class PcMotherboardC06 {
     return (rtc_b_&4)?std::uint8_t(raw):bcd(raw);
   }
   std::optional<std::uint32_t> io_read(std::uint16_t p,unsigned width){
+    if(ata_&&ata_->handles(p)&&(ata_cfg_[4]&1U))return ata_->input(p,width);
     if(p>=0xcf8&&p<=0xcff)return pci_read(p,width);
     if(p==0x608&&width==4)return std::uint32_t(ticks_&0x00ffffffU);
     if((p==0x604&&width==2))return pm_control_;
@@ -247,6 +269,7 @@ class PcMotherboardC06 {
     }
   }
   bool io_write(std::uint16_t p,unsigned width,std::uint32_t value){
+    if(ata_&&ata_->handles(p)&&(ata_cfg_[4]&1U))return ata_->output(p,width,value);
     if(p>=0xcf8&&p<=0xcff)return pci_write(p,width,value);
     if(p==0x604&&width==2){
       pm_control_=std::uint16_t(value);
@@ -354,6 +377,15 @@ class PcMotherboardC06 {
     return true;
   }
   bool lapic_on()const{return bool(apic_svr_&0x100);}
+  void signal_irq14(){
+    if(!ata_)return;
+    const auto redirect=io_redir_low_[14];
+    if(lapic_on() && !(redirect&0x10000U) && (redirect&0xffU)>=0x20U){
+      lapic_pending_=std::uint8_t(redirect);
+    }else{
+      slave_.irr|=(1U<<6);
+    }
+  }
   void signal_irq0(){
     ++pit_irqs_;
     const auto redirect=io_redir_low_[0];
@@ -385,17 +417,29 @@ class PcMotherboardC06 {
       }
       return;
     }
+    // 8259 cascade: a pending slave IRQ presents IRQ2 at the master PIC.
+    // Deliver the SLAVE vector, not master IRQ2's vector. Both PICs must EOI.
+    const auto slave_irq=slave_.pending();
+    if(slave_irq)master_.irr|=std::uint8_t(1U<<2);
+    else if(!(master_.isr&(1U<<2)))master_.irr&=std::uint8_t(~(1U<<2));
     const auto master_irq=master_.pending();
     if(master_irq){
       const unsigned n=master_irq-1;
-      if(cpu.raise_external_irq(std::uint8_t(master_.vector+n))){
+      if(n==2&&slave_irq){
+        const unsigned sn=slave_irq-1;
+        if(cpu.raise_external_irq(std::uint8_t(slave_.vector+sn))){
+          slave_.accepted(sn);master_.accepted(2);
+          ++irq_delivered_;if(sn==6)++ata_irq_delivered_;
+        }
+      }else if(cpu.raise_external_irq(std::uint8_t(master_.vector+n))){
         master_.accepted(n);++irq_delivered_;
       }
     }
   }
 
  public:
-  explicit PcMotherboardC06(cosmic_pc::PcMachine& machine):pc_(machine){
+  explicit PcMotherboardC06(cosmic_pc::PcMachine& machine, BlockDisk* disk=nullptr):pc_(machine){
+    if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_irq14();});
     // The machine must be booted/mounted first. ACPI goes into reserved BIOS
     // memory and is never presented by E820 as allocatable guest RAM.
     prior_in_=pc_.cpu.in_hook;prior_out_=pc_.cpu.out_hook;
@@ -446,10 +490,12 @@ class PcMotherboardC06 {
   PcMotherboardC06(const PcMotherboardC06&)=delete;
   PcMotherboardC06& operator=(const PcMotherboardC06&)=delete;
   Evidence evidence()const{
-    return {ticks_,irq_delivered_,pit_irqs_,apic_irqs_,true,true,powered_off_};
+    return {ticks_,irq_delivered_,pit_irqs_,apic_irqs_,true,true,powered_off_,ata_irq_delivered_};
   }
   // Deterministic single guest-cycle advance; no host sleeper or background
   // worker. PC's canonical run loop calls this once per guest step.
   void advance_one(){poll();}
+  AtaC07* attached_ata(){return ata_.get();}
+  const AtaC07* attached_ata()const{return ata_.get();}
 };
 } // namespace reverse_windows
