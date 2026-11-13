@@ -186,7 +186,9 @@ void run_device(const std::string& path) {
     // Bad task-file address and invalid command must return ATA error,
     // not a host CPU fault, and never write beyond QSSD.
     std::vector<std::uint8_t> bad;
-    lba28(bad,0x0fffffffU);out8(bad,0x1f7,0x20);
+    // This 256-GiB QSSD legitimately contains the entire LBA28 range.
+    // To test IDNF, issue LBA48 at exactly one sector beyond its last LBA.
+    lba48(bad,disk.sectors());out8(bad,0x1f7,0x24);
     in8_store(bad,0x1f7,0x9601);in8_store(bad,0x1f1,0x9602);
     out8(bad,0x1f7,0x99);
     in8_store(bad,0x1f7,0x9603);in8_store(bad,0x1f1,0x9604);
