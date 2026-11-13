@@ -48,6 +48,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             {"cpu_sse2", "SSE2"}, {"cpu_x87", "x87"},
             {"cpu_pae", "PAE"}, {"cpu_nx", "NX"}, {"cpu_cx16", "CMPXCHG16B"},
             {"cpu_lahf_sahf", "LAHF/SAHF"}, {"cpu_prefetchw", "PREFETCHW"}, {"cpu_fxsr", "FXSR"},
+            {"lapic", "Controlador local de interrupciones (xAPIC)"},
             {"ram", "RAM"}, {"pci_ide", "Controlador PCI IDE"}, {"vga", "Video VGA"},
             {"iso_boot", "Arranque desde ISO"}, {"qssd", "Archivo QSSD"},
             {"qssd_ata", "Capacidad QSSD por ATA"},
@@ -443,7 +444,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
                     status.setTextColor(fault ? ERROR : TEXT);
                     String message = switch (code) {
                         case "waiting_key" -> "BIOS espera una tecla";
-                        case "halted" -> "La CPU invitada entró en espera";
+                        case "halted" -> terminal ? "La CPU invitada se detuvo"
+                                : "La CPU invitada espera una interrupción";
                         case "powered_off" -> "El invitado se apagó";
                         case "fault" -> "Arranque detenido por un fallo";
                         default -> boot != null && boot.optBoolean("handed_off")
@@ -467,6 +469,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         JSONObject machine = diagnostic.optJSONObject("machine");
         if (machine == null) machine = diagnostic;
         JSONObject ata = diagnostic.optJSONObject("ata");
+        JSONObject atapi = diagnostic.optJSONObject("atapi");
+        JSONObject irq = diagnostic.optJSONObject("irq");
         JSONObject volume = diagnostic.optJSONObject("disk");
         JSONObject ether = diagnostic.optJSONObject("ether_next");
         JSONObject ram = diagnostic.optJSONObject("ram_profile");
@@ -510,6 +514,10 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         }
         if ("iso".equals(diagnostic.optString("source"))) {
             progress.append(String.format(Locale.getDefault(), "\nLecturas de la ISO por BIOS: %,d", reads));
+            if (atapi != null && atapi.optLong("packets") > 0) {
+                progress.append(String.format(Locale.getDefault(), "\nSectores del CD leídos por ATAPI: %,d",
+                        atapi.optLong("read_sectors")));
+            }
         } else if (volume != null) {
             progress.append(String.format(Locale.getDefault(), "\nLecturas del disco por BIOS: %,d", reads));
         }
@@ -521,6 +529,11 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
                     "\nSectores leídos por ATA: %,d · Operaciones guardadas en QSSD: %,d", readSectors, commits));
         }
         String detail = machine.optString("message");
+        if (irq != null && irq.optBoolean("halted_with_if")) {
+            progress.append(String.format(Locale.getDefault(),
+                    "\nInterrupciones entregadas: %,d · Temporizador APIC: %,d",
+                    irq.optLong("delivered"), irq.optLong("lapic_timer_count")));
+        }
         if ("fault".equals(diagnostic.optString("status")) && !detail.isEmpty()) {
             progress.append("\nÚltimo bloqueo: ").append(detail);
         } else if (session && handedOff && blankTextFrame) {

@@ -165,10 +165,10 @@ class AcpiC06 {
     cpu.memory.write_block(facs_address,facs.data(),facs.size());
 
     auto madt=table("APIC",64,3);
-    u32(madt,36,0xfee00000U);u32(madt,40,1); // legacy 8259 PIC also present
+    u32(madt,36,cosmic_pc::PcMachine::kLocalApicAddress);u32(madt,40,1); // 8259 PIC present.
     madt[44]=0;madt[45]=8;madt[46]=0;madt[47]=0;u32(madt,48,1);
     madt[52]=1;madt[53]=12;madt[54]=1;madt[55]=0; // IOAPIC ID1
-    u32(madt,56,0xfec00000U);u32(madt,60,0);
+    u32(madt,56,cosmic_pc::PcMachine::kIoApicAddress);u32(madt,60,0);
     publish(cpu,madt_address,std::move(madt));
 
     const auto aml=dsdt_aml();

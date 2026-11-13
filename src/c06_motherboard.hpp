@@ -30,6 +30,11 @@ class PcMotherboardC06 {
     bool pci_present,acpi_installed,powered_off;
     std::uint64_t ata_irqs=0;
   };
+  struct InterruptState {
+    bool global_enabled, software_enabled;
+    unsigned pending, in_service, priority;
+    std::uint32_t timer_count;
+  };
 
  private:
   struct Pic {
@@ -129,18 +134,27 @@ class PcMotherboardC06 {
   std::array<std::uint8_t,256> ata_cfg_{};
   std::uint64_t ata_irq_delivered_=0;
   Pit pit_{};
-  std::uint32_t pci_selector_=0,clock_steps_=0;
+  std::uint32_t pci_selector_=0;
   std::uint8_t cmos_index_=0,rtc_b_=2;
   std::array<std::uint8_t,256> host_cfg_{},isa_cfg_{};
   std::uint16_t pm_control_=0x0001; // SCI_EN: firmware starts in ACPI mode.
   bool powered_off_=false;
   bool ferr_was_asserted_=false;
   std::uint64_t ticks_=0,irq_delivered_=0,pit_irqs_=0,apic_irqs_=0;
-  std::uint32_t apic_svr_=0xff,apic_lvt_timer_=0x10000;
-  std::uint32_t apic_timer_reload_=0,apic_timer_counter_=0,apic_divider_=0x3;
-  std::bitset<256> lapic_pending_;
-  std::uint32_t lapic_in_service_=0,ioapic_select_=0;
+  static constexpr std::uint32_t kLvtMasked=1U<<16;
+  static constexpr unsigned kTimer=0,kLint0=3,kLint1=4,kError=5;
+  std::uint32_t apic_svr_=0xff,apic_ldr_=0,apic_dfr_=0xffffffffU;
+  std::uint32_t apic_esr_=0,apic_errors_=0;
+  std::uint32_t apic_icr_low_=0,apic_icr_high_=0;
+  std::array<std::uint32_t,6> apic_lvt_{};
+  std::uint32_t apic_timer_reload_=0,apic_divider_=0;
+  std::uint64_t apic_timer_cycles_=0;
+  std::bitset<256> lapic_pending_,lapic_in_service_,lapic_pending_level_,lapic_in_service_level_;
+  std::bitset<256> lapic_pending_ata_;
+  bool prior_local_apic_=false;
+  std::uint32_t ioapic_select_=0;
   std::array<std::uint32_t,24> io_redir_low_{},io_redir_high_{};
+  std::array<std::uint8_t,24> io_remote_vector_{};
   // Register dword writes are assembled by the byte MMIO bridge, not applied
   // once per byte. Incomplete writes don't expose partial device state.
   struct PendingWrite {std::uint64_t aligned=0;std::uint32_t value=0;std::uint8_t bytes=0;};
@@ -162,16 +176,22 @@ class PcMotherboardC06 {
   void reset_devices(){
     if(keyboard_) keyboard_->reset();
     master_=Pic{};slave_=Pic{};slave_.vector=0x70;
-    pit_=Pit{};pci_selector_=0;clock_steps_=0;
+    pit_=Pit{};pci_selector_=0;
     cmos_index_=0;rtc_b_=2;pm_control_=0x0001;powered_off_=false;
     ferr_was_asserted_=false;pc_.cpu.set_x87_ignne(false);
     ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=0;
     if(ata_)ata_->reset();
     if(optical_)optical_->reset();
-    pc_.cpu.set_apic_task_priority(0);apic_svr_=0xff;apic_lvt_timer_=0x10000;
-    apic_timer_reload_=apic_timer_counter_=0;apic_divider_=3;
-    lapic_pending_.reset();lapic_in_service_=0;ioapic_select_=0;
+    pc_.cpu.set_apic_task_priority(0);
+    apic_svr_=0xff;apic_ldr_=0;apic_dfr_=0xffffffffU;apic_esr_=apic_errors_=0;
+    apic_icr_low_=apic_icr_high_=0;
+    apic_lvt_.fill(kLvtMasked);
+    apic_timer_reload_=apic_divider_=0;apic_timer_cycles_=0;
+    lapic_pending_.reset();lapic_in_service_.reset();
+    lapic_pending_level_.reset();lapic_in_service_level_.reset();lapic_pending_ata_.reset();
+    ioapic_select_=0;
     io_redir_low_.fill(0x10000U);io_redir_high_.fill(0);
+    io_remote_vector_.fill(0);
     mmio_pending_={};
     build_config(host_cfg_,0x0001,0x00);
     build_config(isa_cfg_,0x0002,0x01);
@@ -341,18 +361,60 @@ class PcMotherboardC06 {
     return length && (overlaps(kLocalApic) || overlaps(kIoApic) ||
         (prior_mmio_claim_ && (!prior_mmio_range_claim_ || prior_mmio_range_claim_(start,length))));
   }
+  static unsigned highest_vector(const std::bitset<256>& vectors) {
+    if(vectors.none())return 0;
+    for(unsigned vector=255;vector>=16;--vector)
+      if(vectors[vector])return vector;
+    return 0;
+  }
+  static std::uint32_t vector_register(const std::bitset<256>& vectors,unsigned offset) {
+    const unsigned first=(offset&0x70U)*2;
+    std::uint32_t result=0;
+    for(unsigned i=0;i<32;++i)
+      if(vectors[first+i])result|=1U<<i;
+    return result;
+  }
+  unsigned processor_priority() const {
+    const auto tpr=pc_.cpu.apic_task_priority();
+    const auto service=highest_vector(lapic_in_service_)&0xf0U;
+    return (tpr&0xf0U)>=service?tpr:service;
+  }
+  unsigned timer_divisor() const {
+    const auto index=(apic_divider_&3U)|((apic_divider_&8U)>>1);
+    return 1U<<((index+1)&7U);
+  }
+  std::uint32_t timer_count() const {
+    const auto divisor=timer_divisor();
+    return std::uint32_t((apic_timer_cycles_+divisor-1)/divisor);
+  }
+  static std::optional<unsigned> lvt_index(unsigned offset) {
+    if(offset>=0x320&&offset<=0x370&&(offset&15U)==0)
+      return (offset-0x320)/16;
+    return std::nullopt;
+  }
   std::optional<std::uint32_t> mmio_register(std::uint64_t base) const {
     if(base>=kLocalApic&&base<kLocalApic+4096) {
+      if(!pc_.cpu.apic_global_enabled())return std::nullopt;
       const auto r=unsigned(base-kLocalApic);
+      if(r>=0x100&&r<=0x170&&(r&15U)==0)return vector_register(lapic_in_service_,r);
+      if(r>=0x180&&r<=0x1f0&&(r&15U)==0)
+        return vector_register(lapic_pending_level_|lapic_in_service_level_,r);
+      if(r>=0x200&&r<=0x270&&(r&15U)==0)return vector_register(lapic_pending_,r);
+      if(const auto lvt=lvt_index(r))return apic_lvt_[*lvt];
       switch(r) {
         case 0x20:return 0; // LAPIC ID 0
-        case 0x30:return 0x00030014U; // local APIC version; bounded LVT subset
+        case 0x30:return 0x00050014U; // Version 0x14, six LVT entries.
         case 0x80:return pc_.cpu.apic_task_priority();
+        case 0xa0:return processor_priority();
         case 0xb0:return 0; // EOI write-only
+        case 0xd0:return apic_ldr_;
+        case 0xe0:return apic_dfr_;
         case 0xf0:return apic_svr_;
-        case 0x320:return apic_lvt_timer_;
+        case 0x280:return apic_esr_;
+        case 0x300:return apic_icr_low_;
+        case 0x310:return apic_icr_high_;
         case 0x380:return apic_timer_reload_;
-        case 0x390:return apic_timer_counter_;
+        case 0x390:return timer_count();
         case 0x3e0:return apic_divider_;
         default:return std::nullopt;
       }
@@ -366,7 +428,8 @@ class PcMotherboardC06 {
       if(ioapic_select_==2)return 0;
       if(ioapic_select_>=0x10&&ioapic_select_<0x40) {
         const unsigned pin=(ioapic_select_-0x10)/2;
-        return (ioapic_select_&1)?io_redir_high_[pin]:io_redir_low_[pin];
+        return (ioapic_select_&1)?io_redir_high_[pin]:
+            io_redir_low_[pin]|(io_remote_vector_[pin]?1U<<14:0);
       }
     }
     return std::nullopt;
@@ -378,16 +441,34 @@ class PcMotherboardC06 {
   }
   bool mmio_commit(std::uint64_t base,std::uint32_t v) {
     if(base>=kLocalApic&&base<kLocalApic+4096){
+      if(!pc_.cpu.apic_global_enabled())return false;
       const auto r=unsigned(base-kLocalApic);
+      if(const auto lvt=lvt_index(r)){
+        if(*lvt==kTimer&&(v&0x40000U))return false; // No TSC deadline.
+        const std::uint32_t writable=*lvt==kTimer?0x300ffU:
+            (*lvt==kLint0||*lvt==kLint1)?0x1a7ffU:
+            (*lvt==kError?0x100ffU:0x107ffU);
+        apic_lvt_[*lvt]=(v&writable)|(lapic_on()?0:kLvtMasked);
+        return true;
+      }
       switch(r){
         case 0x80:pc_.cpu.set_apic_task_priority(std::uint8_t(v));return true;
-        case 0xb0:lapic_in_service_=0;return true;
-        case 0xf0:apic_svr_=v&0x1ffU;return true;
-        case 0x320:
-          if(v&~0x300ffU)return false; // only fixed, masked and periodic LVT
-          apic_lvt_timer_=v;return true;
-        case 0x380:apic_timer_reload_=v;apic_timer_counter_=v;return true;
-        case 0x3e0:apic_divider_=v&0x0bU;return true;
+        case 0xb0:complete_lapic_irq();return true;
+        case 0xd0:apic_ldr_=v&0xff000000U;return true;
+        case 0xe0:apic_dfr_=(v&0xf0000000U)|0x0fffffffU;return true;
+        case 0xf0:
+          apic_svr_=v&0x1ffU;
+          if(!lapic_on())for(auto& lvt:apic_lvt_)lvt|=kLvtMasked;
+          return true;
+        case 0x280:apic_esr_=std::exchange(apic_errors_,0);return true;
+        case 0x300:return send_local_ipi(v);
+        case 0x310:apic_icr_high_=v&0xff000000U;return true;
+        case 0x380:
+          apic_timer_reload_=v;apic_timer_cycles_=std::uint64_t(v)*timer_divisor();return true;
+        case 0x3e0:{
+          const auto count=timer_count();
+          apic_divider_=v&0x0bU;apic_timer_cycles_=std::uint64_t(count)*timer_divisor();return true;
+        }
         default:return false;
       }
     }
@@ -398,7 +479,8 @@ class PcMotherboardC06 {
       if(ioapic_select_>=0x10&&ioapic_select_<0x40){
         const unsigned pin=(ioapic_select_-0x10)/2;
         if(ioapic_select_&1)io_redir_high_[pin]=v&0xff000000U;
-        else io_redir_low_[pin]=v;return true;
+        else io_redir_low_[pin]=v&0x1afffU;
+        return true;
       }
       return false;
     }
@@ -417,54 +499,91 @@ class PcMotherboardC06 {
     }
     return true;
   }
-  bool lapic_on()const{return bool(apic_svr_&0x100);}
-  std::optional<std::uint8_t> highest_lapic_request() const {
-    if(!lapic_pending_.any())return std::nullopt;
-    for(unsigned vector=255;vector>=0x20;--vector)
-      if(lapic_pending_[vector])return std::uint8_t(vector);
-    return std::nullopt;
+  bool lapic_on()const{return pc_.cpu.apic_global_enabled()&&(apic_svr_&0x100U);}
+  bool pic_connected() const {
+    const auto lint=apic_lvt_[kLint0];
+    return !lapic_on()||(lint&(kLvtMasked|0x700U))==0x700U; // ExtINT.
   }
-  void signal_slave_irq(unsigned line){
-    const auto redirect=io_redir_low_[line];
-    if(lapic_on() && !(redirect&0x10000U) && (redirect&0xffU)>=0x20U){
-      lapic_pending_.set(redirect&0xffU);
-    }else{
-      slave_.irr|=std::uint8_t(1U<<(line-8));
+  unsigned deliverable_lapic_vector() const {
+    if(!lapic_on())return 0;
+    const auto vector=highest_vector(lapic_pending_);
+    return (vector&0xf0U)>(processor_priority()&0xf0U)?vector:0;
+  }
+  bool lapic_destination(std::uint32_t command,std::uint32_t destination) const {
+    const auto id=destination>>24;
+    if(!(command&(1U<<11)))return id==0||id==255;
+    const auto logical=apic_ldr_>>24;
+    if(id==255)return true;
+    if((apic_dfr_>>28)==15)return (id&logical)!=0;
+    return (id&0xf0U)==(logical&0xf0U)&&(id&logical&0x0fU)!=0;
+  }
+  bool send_local_ipi(std::uint32_t value) {
+    const unsigned mode=(value>>8)&7U,shorthand=(value>>18)&3U,vector=value&255U;
+    const bool self=shorthand==1||shorthand==2||
+        (!shorthand&&lapic_destination(value,apic_icr_high_));
+    if(self&&mode>1)return false;
+    apic_icr_low_=value&0x000ccfffU;
+    if(self&&mode<=1&&lapic_on()){
+      if(vector>=16)lapic_pending_.set(vector);
+      else signal_apic_error(1U<<5);
     }
+    return true;
   }
-  void signal_irq0(){
-    ++pit_irqs_;
-    const auto redirect=io_redir_low_[0];
-    if(lapic_on()&&!(redirect&0x10000U) && (redirect&0xffU)>=0x20U){
-      lapic_pending_.set(redirect&0xffU);
-    }else{
-      master_.irr|=1U;
+  void signal_apic_error(std::uint32_t bit) {
+    apic_errors_|=bit;
+    const auto lvt=apic_lvt_[kError];
+    if(lapic_on()&&!(lvt&kLvtMasked)&&(lvt&255U)>=16)lapic_pending_.set(lvt&255U);
+  }
+  void complete_lapic_irq() {
+    const auto vector=highest_vector(lapic_in_service_);
+    if(!vector)return;
+    lapic_in_service_.reset(vector);
+    if(!lapic_in_service_level_.test(vector))return;
+    lapic_in_service_level_.reset(vector);
+    for(auto& remote:io_remote_vector_)if(remote==vector)remote=0;
+  }
+  void signal_isa_irq(unsigned line) {
+    // Keep the legacy PIC edge even when the guest uses the I/O APIC.
+    if(line>=8)slave_.irr|=std::uint8_t(1U<<(line-8));
+    else master_.irr|=std::uint8_t(1U<<line);
+    const auto redirect=io_redir_low_[line];
+    const unsigned vector=redirect&255U,mode=(redirect>>8)&7U;
+    if(lapic_on()&&!(redirect&(1U<<16))&&mode<=1&&
+       lapic_destination(redirect,io_redir_high_[line])){
+      if(vector<16){signal_apic_error(1U<<6);return;}
+      const bool level=(redirect&(1U<<15))!=0;
+      if(level&&io_remote_vector_[line])return;
+      if(level){
+        io_remote_vector_[line]=std::uint8_t(vector);
+        lapic_pending_level_.set(vector);
+      }
+      lapic_pending_.set(vector);
+      if(line==14)lapic_pending_ata_.set(vector);
     }
   }
   void poll(){
     ++ticks_;
     auto& cpu=pc_.cpu;
     const bool ferr=cpu.x87_ferr_asserted();
-    if(ferr&&!ferr_was_asserted_)signal_slave_irq(13);
+    if(ferr&&!ferr_was_asserted_)signal_isa_irq(13);
     if(!ferr&&ferr_was_asserted_)cpu.set_x87_ignne(false);
     ferr_was_asserted_=ferr;
-    if(pit_.tick())signal_irq0();
+    if(pit_.tick()){
+      ++pit_irqs_;
+      signal_isa_irq(0);
+    }
     if(keyboard_&&keyboard_->needs_irq()&&!(prior_in_(0x64,1).value_or(0)&1U)){
-      const auto redirect=io_redir_low_[1];
-      if(lapic_on()&&!(redirect&0x10000U)&&(redirect&0xffU)>=0x20U)
-        lapic_pending_.set(redirect&0xffU);
-      else
-        master_.irr|=1U<<1;
+      signal_isa_irq(1);
       keyboard_->mark_irq();
     }
-    // Synthetic tick-based LAPIC timer: not a calibrated physical TSC or
-    // 1.193-MHz PIT clock. Windows timing compliance remains unverified.
-    if(lapic_on()&&apic_timer_counter_){
-      if(--apic_timer_counter_==0){
-        if(!(apic_lvt_timer_&0x10000U)&&std::uint8_t(apic_lvt_timer_)>=0x20)
-          lapic_pending_.set(apic_lvt_timer_&0xffU);
-        if(apic_lvt_timer_&0x20000U)apic_timer_counter_=apic_timer_reload_;
+    // The divisor uses deterministic board cycles as its input clock.
+    if(pc_.cpu.apic_global_enabled()&&apic_timer_cycles_&&!--apic_timer_cycles_){
+      const auto lvt=apic_lvt_[kTimer];
+      if(lapic_on()&&!(lvt&kLvtMasked)){
+        if((lvt&255U)>=16)lapic_pending_.set(lvt&255U);
+        else signal_apic_error(1U<<6);
       }
+      if(lvt&0x20000U)apic_timer_cycles_=std::uint64_t(apic_timer_reload_)*timer_divisor();
     }
     // The slave's INT output reaches the master independently of CPU IF or
     // LAPIC acceptance. The guest can read both IRRs with interrupts disabled.
@@ -472,19 +591,20 @@ class PcMotherboardC06 {
     if(slave_irq)master_.irr|=std::uint8_t(1U<<2);
     else if(!(master_.isr&(1U<<2)))master_.irr&=std::uint8_t(~(1U<<2));
     if(cpu.fault||!cpu.flag(cosmic_pc::Cpu::IF))return;
-    if(lapic_on()&&!lapic_in_service_){
-      const auto request=highest_lapic_request();
-      if(request&&(*request&0xf0U)>(cpu.apic_task_priority()&0xf0U)){
-        if(cpu.raise_external_irq(*request)){
-          lapic_in_service_=*request;lapic_pending_.reset(*request);
-          ++apic_irqs_;++irq_delivered_;
-        }
-        return;
+    if(const auto vector=deliverable_lapic_vector()){
+      if(cpu.raise_external_irq(std::uint8_t(vector))){
+        lapic_in_service_.set(vector);lapic_pending_.reset(vector);
+        lapic_in_service_level_.set(vector,lapic_pending_level_[vector]);
+        lapic_pending_level_.reset(vector);
+        if(lapic_pending_ata_[vector])++ata_irq_delivered_;
+        lapic_pending_ata_.reset(vector);
+        ++apic_irqs_;++irq_delivered_;
       }
+      return;
     }
     // 8259 cascade: a pending slave IRQ presents IRQ2 at the master PIC.
     // Deliver the SLAVE vector, not master IRQ2's vector. Both PICs must EOI.
-    const auto master_irq=master_.pending();
+    const auto master_irq=pic_connected()?master_.pending():0;
     if(master_irq){
       const unsigned n=master_irq-1;
       if(n==2&&slave_irq){
@@ -504,24 +624,25 @@ class PcMotherboardC06 {
   unsigned batch_limit(unsigned steps) const {
     if(prior_tick_ || powered_off_ || pc_.cpu.x87_ferr_asserted()!=ferr_was_asserted_ ||
        (keyboard_&&keyboard_->needs_irq()) ||
-       (pc_.cpu.flag(cosmic_pc::Cpu::IF) && (master_.pending() ||
-          (lapic_on() && !lapic_in_service_ && highest_lapic_request())))) return 1;
+       (pc_.cpu.flag(cosmic_pc::Cpu::IF) &&
+        ((pic_connected()&&master_.pending())||deliverable_lapic_vector()))) return 1;
     if(pit_.enabled) steps=std::min(steps,std::max(1U,pit_.counter));
-    if(lapic_on()&&apic_timer_counter_) steps=std::min(steps,apic_timer_counter_);
+    if(pc_.cpu.apic_global_enabled()&&apic_timer_cycles_&&apic_timer_cycles_<steps)
+      steps=unsigned(apic_timer_cycles_);
     return steps;
   }
   void advance_batch(unsigned extra_steps) {
     ticks_+=extra_steps;
     if(pit_.enabled) pit_.counter-=extra_steps;
-    if(lapic_on()&&apic_timer_counter_) apic_timer_counter_-=extra_steps;
+    if(pc_.cpu.apic_global_enabled()&&apic_timer_cycles_)apic_timer_cycles_-=extra_steps;
   }
 
  public:
   explicit PcMotherboardC06(cosmic_pc::PcMachine& machine, BlockDisk* disk=nullptr,
                             AtapiCdrom::Reader optical={}, std::uint64_t optical_bytes=0):pc_(machine){
-    if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_slave_irq(14);});
+    if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_isa_irq(14);});
     if(optical)optical_=std::make_unique<AtapiCdrom>(
-        std::move(optical),optical_bytes,[this](){signal_slave_irq(15);});
+        std::move(optical),optical_bytes,[this](){signal_isa_irq(15);});
     // The machine must be booted/mounted first. ACPI goes into reserved BIOS
     // memory and is never presented by E820 as allocatable guest RAM.
     prior_in_=pc_.cpu.in_hook;prior_out_=pc_.cpu.out_hook;
@@ -568,9 +689,12 @@ class PcMotherboardC06 {
       if(prior_reset_)prior_reset_();
       reset_devices();
     };
+    prior_local_apic_=pc_.cpu.local_apic_present();
+    pc_.cpu.set_local_apic_present(true);
   }
   ~PcMotherboardC06(){
     // Never leave a hook pointing at a destroyed motherboard instance.
+    pc_.cpu.set_local_apic_present(prior_local_apic_);
     pc_.cpu.set_x87_ignne(false);
     pc_.cpu.in_hook=std::move(prior_in_);
     pc_.cpu.out_hook=std::move(prior_out_);
@@ -587,6 +711,10 @@ class PcMotherboardC06 {
   PcMotherboardC06& operator=(const PcMotherboardC06&)=delete;
   Evidence evidence()const{
     return {ticks_,irq_delivered_,pit_irqs_,apic_irqs_,true,true,powered_off_,ata_irq_delivered_};
+  }
+  InterruptState interrupt_state()const{
+    return {pc_.cpu.apic_global_enabled(),lapic_on(),highest_vector(lapic_pending_),
+            highest_vector(lapic_in_service_),processor_priority(),timer_count()};
   }
   // Deterministic single guest-cycle advance; no host sleeper or background
   // worker. PC's canonical run loop calls this once per guest step.
