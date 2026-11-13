@@ -81,8 +81,8 @@ def iso(events: list[dict]) -> None:
 
 def fault(events: list[dict]) -> None:
     terminal = [x for x in events if x.get("type") == "terminal-fault"]
-    require(terminal and terminal[-1].get("decoded") == "f0",
-            "unsupported LOCK prefix must appear as an exact terminal fault")
+    require(terminal and terminal[-1].get("decoded") == "f000",
+            "unsupported LOCK ADD prefix must expose exact decoded f000 bytes")
     finish = events[-1]
     require(finish.get("cpu_status") == "fault" and finish.get("terminal_faults") == 1,
             "real fault must stop the emulator with a terminal diagnostic")
