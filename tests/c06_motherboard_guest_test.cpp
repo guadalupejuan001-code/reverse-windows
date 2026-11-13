@@ -541,6 +541,37 @@ void apic_timer_divisor_and_global_enable(){
        "warm boot must reinitialize the LAPIC");
   std::cout<<"C06_APIC_DIVISOR_MSR_PASS divisors=8 global_enable=1 reset=1\n";
 }
+void tsc_across_halt(){
+  const auto elapsed=[](unsigned interval){
+    PcMachine pc(16U<<20);boot32(pc);
+    PcMotherboardC06 board(pc);
+    auto& cpu=pc.cpu;
+    cpu.idtr={0x1000,0x15000};
+    cpu.regs[Cpu::ESP]=0x190000;
+    gate(cpu,0x42,0x13000);
+    code(cpu,0x13000,{0xc7,0x05,0xb0,0,0xe0,0xfe,0,0,0,0,0xcf});
+    code(cpu,0xa000,{
+        0x0f,0x31,0xa3,0,0x90,0,0,  // RDTSC and store its low word.
+        0xfb,0xf4,                  // Wait in HLT for the LAPIC timer.
+        0x0f,0x31,0xa3,4,0x90,0,0,
+        0xfa,0xf4});
+    cpu.eip=0xa000;
+    const auto apic=PcMachine::kLocalApicAddress;
+    cpu.write32(apic+0xf0,0x1ff);
+    cpu.write32(apic+0x320,0x42);
+    cpu.write32(apic+0x3e0,0x0b);
+    cpu.write32(apic+0x380,interval);
+    run(pc,interval+16);
+    need(cpu.halted&&!cpu.flag(Cpu::IF)&&board.evidence().apic_irqs==1,
+         "TSC fixture did not wake through the LAPIC timer");
+    return std::array<std::uint64_t,2>{
+        cpu.read32(0x9004)-cpu.read32(0x9000),cpu.instructions};
+  };
+  const auto short_wait=elapsed(32),long_wait=elapsed(320);
+  need(short_wait[1]==long_wait[1]&&long_wait[0]==short_wait[0]+(320-32)*64,
+       "RDTSC must include halted virtual cycles without counting them as instructions");
+  std::cout<<"C06_APIC_TSC_HLT_PASS short="<<short_wait[0]<<" long="<<long_wait[0]<<"\n";
+}
 void ps2_keyboard_guest(){
   PcMachine pc(16*1024*1024);boot32(pc);
   PcMotherboardC06 board(pc);
@@ -729,6 +760,7 @@ int main(){
     ioapic_lapic_guest();
     nested_apic_guest();
     apic_timer_divisor_and_global_enable();
+    tsc_across_halt();
     ps2_keyboard_guest();
     queued_lapic_requests_guest();
     cr8_lapic_priority_guest();
