@@ -3,6 +3,7 @@
 #include "qssd_disk.hpp"
 #include "c06_motherboard.hpp"
 #include "c09_guest_trace.hpp"
+#include "c09r_guest_vga_fabric.hpp"
 #include "virtual_disk.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -182,6 +183,14 @@ int main(int argc, char** argv) {
             if (optical_plan) trace->note_boot_plan(*optical_plan,optical_bytes);
         }
 
+        // The live guest framebuffer is the only source of pixels.
+        // GPU-VIRTUAL selects exact updates; qSSD StateBus versions the plan.
+        reverse_windows::GuestVgaFabricC09R vga_work(pc);
+        auto vga_frame=vga_work.capture();
+        std::uint64_t vga_captures=1;
+        std::uint64_t vga_total_upload_bytes=vga_frame.transferred_bytes;
+        std::uint64_t vga_baseline_bytes=4000;
+
         while (pc.cpu.instructions < opts.steps && pc.status() != "fault" && !pc.cpu.halted) {
             if (pc.waiting_key) {
                 if (opts.source != Options::Source::DemoX86) break;
@@ -191,6 +200,10 @@ int main(int argc, char** argv) {
             const auto chunk = static_cast<unsigned>(
                 std::min<std::uint64_t>(5000, opts.steps - before));
             pc.run(chunk);
+            vga_frame=vga_work.capture();
+            ++vga_captures;
+            vga_total_upload_bytes+=vga_frame.transferred_bytes;
+            vga_baseline_bytes+=4000;
             if (pc.cpu.instructions == before && !pc.waiting_key) break;
         }
         if (trace) trace->finish();
@@ -202,6 +215,13 @@ int main(int argc, char** argv) {
             "\"guest_kind\":" + cosmic_pc::PcMachine::quote(kind) +
             ",\"source\":\"original-Mundo-X-PcMachine\"" +
             ",\"windows10_boot_verified\":false" +
+            ",\"c09r_gpu_vga_work\":{\"owner\":\"GPU-VIRTUAL-plus-qSSD-StateBus\",\"source\":\"real-guest-VGA\",\"frames\":" +
+               std::to_string(vga_captures) + ",\"full_frame_bytes_baseline\":" +
+               std::to_string(vga_baseline_bytes) + ",\"planned_host_update_bytes\":" +
+               std::to_string(vga_total_upload_bytes) + ",\"latest_qssd_graphics_serial\":" +
+               std::to_string(vga_frame.qssd_serial) +
+               ",\"last_exact_mirror\":" + std::string(vga_frame.exact_mirror?"true":"false") +
+               ",\"windows_graphics_driver_ready\":false}" +
             ",\"c09_trace\":{\"enabled\":" + std::string(trace?"true":"false") +
             ",\"schema\":\"reverse-windows-c09-trace-v1\",\"windows_pe_verified\":false}" +
             ",\"writable_hdd_attached\":" + std::string(disk ? "true" : "false") +

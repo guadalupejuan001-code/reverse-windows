@@ -29,6 +29,19 @@ def main():
         raise RuntimeError("Windows readiness must not be fabricated")
     if machine["ram_bytes"] != 2048 * 1024 * 1024:
         raise RuntimeError("Logical guest RAM inconsistent")
+    work = evidence.get("c09r_gpu_vga_work")
+    if not isinstance(work, dict):
+        raise RuntimeError("GPU-VIRTUAL/qSSD work was not connected to actual guest")
+    if work.get("source") != "real-guest-VGA" or not work.get("last_exact_mirror"):
+        raise RuntimeError("Graphics plan did not reconstruct exact guest VGA")
+    if work.get("windows_graphics_driver_ready") is not False:
+        raise RuntimeError("Must not claim Windows display driver ready")
+    if (work.get("frames", 0) < 2 or
+            work.get("latest_qssd_graphics_serial", 0) < 2 or
+            work.get("planned_host_update_bytes", 1 << 62) >
+            work.get("full_frame_bytes_baseline", 0)):
+        raise RuntimeError("GPU-VIRTUAL plan did not preserve bounded work")
+
     if not isinstance(evidence["vga_text"], str):
         raise RuntimeError("No real guest VGA sample")
     print("REVERSE_WINDOWS_REAL_GUEST_X64_PASS", "instructions=" + str(machine["instructions"]), "CPU=" + machine["cpu_mode"])
