@@ -6,7 +6,7 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "d73d33c2ca18f152af6bcf62886f07080ae3f252",
+      "commit": "a7da66afba08a30121e9e8e9904bc2602e6ab801",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-Next-C02-CPU-conformance",
       "status": "candidate-C02-CPU-conformance-unmerged",

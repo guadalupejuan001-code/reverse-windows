@@ -76,6 +76,59 @@ void pic_pit_guest(){
   std::cout<<"C06_PIC_PIT_GUEST_IRQ_PASS ticks="<<board.evidence().ticks
            <<" pit="<<board.evidence().pit_irqs<<"\n";
 }
+void pic_legacy_x87_guest(){
+  PcMachine pc(16*1024*1024);boot32(pc);
+  PcMotherboardC06 board(pc);
+  auto& cpu=pc.cpu;
+  cpu.idtr={0x1000,0x15000};
+  cpu.regs[Cpu::ESP]=0x190000;
+  cpu.cr0&=~0x2eU; // Clear NE, TS, EM and MP.
+  gate(cpu,0x75,0x13000);
+  code(cpu,0x13000,{
+      0xb0,0,0xe6,0xf0,   // Acknowledge FERR# and assert IGNNE#.
+      0x9b,               // A waiting instruction can now run.
+      0xdf,0xe0,          // FNSTSW AX still reports the unmasked error.
+      0x66,0xa3,0,0x91,0,0,
+      0xdb,0xe2,          // FNCLEX clears pending status, FERR# and IGNNE#.
+      0xb0,0x20,0xe6,0xa0,0xe6,0x20,
+      0xcf});
+  cpu.write16(0x9104,0x037b); // Unmask divide-by-zero.
+  const std::vector<std::uint8_t> program={
+      0xfa,
+      0xb0,0xfb,0xe6,0x21, // Unmask the master cascade.
+      0xb0,0xdf,0xe6,0xa1, // Unmask slave IRQ13.
+      0xd9,0x2d,4,0x91,0,0, // FLDCW [9104]
+      0xd9,0xe8,0xd9,0xee, // FLD1, FLDZ
+      0xde,0xf9,           // FDIVP ST(1), ST(0): 1/0
+      0x9b,0xf4};          // FWAIT, HLT
+  code(cpu,0xa000,program);
+  cpu.eip=0xa000;
+  run(pc,40);
+  const auto wait_ip=0xa000+program.size()-2;
+  const auto wait_insns=cpu.instructions;
+  need(cpu.eip==wait_ip && cpu.x87_ferr_asserted() && !cpu.halted,
+       "FWAIT did not hold at the same IP with FERR# pending");
+  need(cpu.step()==cosmic_pc::StepResult::WaitingForX87 && cpu.instructions==wait_insns &&
+       board.evidence().irq_delivered==0,
+       "FWAIT retired or IRQ13 was delivered while IF was clear");
+  cpu.set_flag(Cpu::IF,true); // Permit the pending hardware interrupt at FWAIT.
+  run(pc,40);
+  need(cpu.halted && cpu.eip==wait_ip+2 && cpu.regs[Cpu::ESP]==0x190000 &&
+       board.evidence().irq_delivered==1 && !cpu.x87_ferr_asserted() &&
+       (cpu.read16(0x9100)&0x8084U)==0x8084U,
+       "IRQ13/IGNNE# handler did not reenter the held FWAIT after one interrupt");
+  cpu.halted=false;
+  cpu.eip=0xa000;
+  run(pc,40);
+  need(cpu.eip==wait_ip && cpu.x87_ferr_asserted() && !cpu.halted &&
+       board.evidence().irq_delivered==1,
+       "New x87 error bypassed FWAIT after FNCLEX released IGNNE#");
+  cpu.set_flag(Cpu::IF,true);
+  run(pc,40);
+  need(cpu.halted && board.evidence().irq_delivered==2 && !cpu.x87_ferr_asserted(),
+       "A second independent FERR# edge did not deliver IRQ13");
+  std::cout<<"C02_X87_LEGACY_FERR_PASS IRQ13=2 FWAIT=hold-and-retry IGNNE=cleared\n";
+}
 unsigned checksum(Cpu& cpu,std::uint32_t addr,std::uint32_t size){
   unsigned total=0;for(unsigned i=0;i<size;++i)total+=cpu.memory[addr+i];
   return total&255;
@@ -276,6 +329,7 @@ void queued_lapic_requests_guest(){
 int main(){
   try{
     pic_pit_guest();
+    pic_legacy_x87_guest();
     pci_acpi_cmos_guest();
     ioapic_lapic_guest();
     ps2_keyboard_guest();

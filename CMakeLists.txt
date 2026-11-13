@@ -26,6 +26,11 @@ target_include_directories(reverse_windows_component_headers INTERFACE
   "${REVERSE_QSSD_ROOT}/include"
   "${REVERSE_GPU_VIRTUAL_ROOT}/include")
 target_link_libraries(reverse_windows_component_headers INTERFACE Threads::Threads)
+if(MSVC)
+  target_compile_options(reverse_windows_component_headers INTERFACE /fp:strict)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(reverse_windows_component_headers INTERFACE -frounding-math)
+endif()
 
 add_executable(reverse_windows_boot_probe src/reverse_windows_boot_probe.cpp)
 target_link_libraries(reverse_windows_boot_probe PRIVATE reverse_windows_component_headers)

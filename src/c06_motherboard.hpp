@@ -130,6 +130,7 @@ class PcMotherboardC06 {
   std::array<std::uint8_t,256> host_cfg_{},isa_cfg_{};
   std::uint16_t pm_control_=0;
   bool powered_off_=false;
+  bool ferr_was_asserted_=false;
   std::uint64_t ticks_=0,irq_delivered_=0,pit_irqs_=0,apic_irqs_=0;
   std::uint32_t apic_tpr_=0,apic_svr_=0xff,apic_lvt_timer_=0x10000;
   std::uint32_t apic_timer_reload_=0,apic_timer_counter_=0,apic_divider_=0x3;
@@ -159,6 +160,7 @@ class PcMotherboardC06 {
     master_=Pic{};slave_=Pic{};slave_.vector=0x70;
     pit_=Pit{};pci_selector_=0;clock_steps_=0;
     cmos_index_=0;rtc_b_=2;pm_control_=0;powered_off_=false;
+    ferr_was_asserted_=false;pc_.cpu.set_x87_ignne(false);
     ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=0;
     if(ata_)ata_->reset();
     if(optical_)optical_->reset();
@@ -308,6 +310,11 @@ class PcMotherboardC06 {
     if(width!=1)return false;
     const auto b=std::uint8_t(value);
     switch(p){
+      case 0xf0:
+        // PC/AT coprocessor acknowledgement. A PIC edge already recorded in
+        // IRR still follows normal acceptance/EOI. IGNNE# lasts until FERR# falls.
+        pc_.cpu.set_x87_ignne(pc_.cpu.x87_ferr_asserted());
+        return true;
       case 0x20:master_.command(b);return true;
       case 0x21:master_.data(b);return true;
       case 0xa0:slave_.command(b);return true;
@@ -410,7 +417,7 @@ class PcMotherboardC06 {
       if(lapic_pending_[vector])return std::uint8_t(vector);
     return std::nullopt;
   }
-  void signal_storage_irq(unsigned line){
+  void signal_slave_irq(unsigned line){
     const auto redirect=io_redir_low_[line];
     if(lapic_on() && !(redirect&0x10000U) && (redirect&0xffU)>=0x20U){
       lapic_pending_.set(redirect&0xffU);
@@ -429,6 +436,11 @@ class PcMotherboardC06 {
   }
   void poll(){
     ++ticks_;
+    auto& cpu=pc_.cpu;
+    const bool ferr=cpu.x87_ferr_asserted();
+    if(ferr&&!ferr_was_asserted_)signal_slave_irq(13);
+    if(!ferr&&ferr_was_asserted_)cpu.set_x87_ignne(false);
+    ferr_was_asserted_=ferr;
     if(pit_.tick())signal_irq0();
     if(keyboard_&&keyboard_->needs_irq()&&!(prior_in_(0x64,1).value_or(0)&1U)){
       const auto redirect=io_redir_low_[1];
@@ -447,7 +459,6 @@ class PcMotherboardC06 {
         if(apic_lvt_timer_&0x20000U)apic_timer_counter_=apic_timer_reload_;
       }
     }
-    auto& cpu=pc_.cpu;
     if(cpu.fault||!cpu.flag(cosmic_pc::Cpu::IF))return;
     if(lapic_on()&&!lapic_in_service_){
       const auto request=highest_lapic_request();
@@ -482,9 +493,9 @@ class PcMotherboardC06 {
  public:
   explicit PcMotherboardC06(cosmic_pc::PcMachine& machine, BlockDisk* disk=nullptr,
                             AtapiCdrom::Reader optical={}, std::uint64_t optical_bytes=0):pc_(machine){
-    if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_storage_irq(14);});
+    if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_slave_irq(14);});
     if(optical)optical_=std::make_unique<AtapiCdrom>(
-        std::move(optical),optical_bytes,[this](){signal_storage_irq(15);});
+        std::move(optical),optical_bytes,[this](){signal_slave_irq(15);});
     // The machine must be booted/mounted first. ACPI goes into reserved BIOS
     // memory and is never presented by E820 as allocatable guest RAM.
     prior_in_=pc_.cpu.in_hook;prior_out_=pc_.cpu.out_hook;
@@ -501,7 +512,7 @@ class PcMotherboardC06 {
     };
     pc_.cpu.out_hook=[this](std::uint16_t p,unsigned w,std::uint32_t v){
       if(keyboard_&&(p==0x60||p==0x64))return io_write(p,w,v);
-      if(owned_port(p))return io_write(p,w,v);
+      if(p==0xf0||owned_port(p))return io_write(p,w,v);
       return prior_out_&&prior_out_(p,w,v);
     };
     pc_.cpu.mmio_claim_hook=[this](std::uint64_t a){
@@ -526,6 +537,7 @@ class PcMotherboardC06 {
   }
   ~PcMotherboardC06(){
     // Never leave a hook pointing at a destroyed motherboard instance.
+    pc_.cpu.set_x87_ignne(false);
     pc_.cpu.in_hook=std::move(prior_in_);
     pc_.cpu.out_hook=std::move(prior_out_);
     pc_.cpu.mmio_claim_hook=std::move(prior_mmio_claim_);

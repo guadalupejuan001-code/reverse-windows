@@ -16,9 +16,9 @@ Desinstalar la app borra su disco privado. Para conservar la instalación, actua
 
 MMX comparte los registros físicos de x87. `EMMS` marca vacías sus etiquetas. Las pruebas cubren operaciones empaquetadas, transferencias MMX/XMM y conversiones. SSE/SSE2 incorpora `RCP`, `RSQRT`, `MASKMOVDQU` y `MOVNTI`, además de comprobar la prioridad de excepciones con subnormales y el redondeo cerca del umbral FTZ.
 
-La aritmética x87 usa un formato de 80 bits independiente de `long double`, con precisión de 24, 53 y 64 bits y los cuatro modos de redondeo. Las pruebas cubren conversiones, etiquetas, estado de excepción y entornos x87. `FXSAVE` y `FXRSTOR` se prueban con ambos formatos de puntero en modo largo, conservación de XMM/MXCSR, y guardado y recuperación de imágenes repartidas entre páginas.
+La aritmética x87 usa un formato de 80 bits independiente de `long double`, con precisión de 24, 53 y 64 bits y los cuatro modos de redondeo. Las pruebas cubren conversiones, etiquetas, entornos x87 y entrega de `#MF` en modo real, protegido y compatibilidad IA-32e. La placa entrega IRQ13 mediante el PIC cuando el huésped selecciona la ruta FERR heredada. `FXSAVE` y `FXRSTOR` se prueban con ambos formatos de puntero en modo largo, conservación de XMM/MXCSR, y guardado y recuperación de imágenes repartidas entre páginas.
 
-Las pruebas se ejecutan en anfitriones x86_64 y ARM64. El primero compara resultados con instrucciones x86 del procesador físico. Ambos ejecutan los casos de referencia y la misma integración de `PcMachine`. CPUID conserva el perfil anterior mientras sigan pendientes la entrega de excepciones en modo protegido de 16 bits y en compatibilidad IA-32e, ocho instrucciones trascendentales x87 y la entrega heredada por IRQ13. La instalación de Windows 10 sigue sin verificar.
+Las pruebas se ejecutan en anfitriones x86_64 y ARM64. El primero compara resultados con instrucciones x86 del procesador físico. Ambos ejecutan los casos de referencia y la misma integración de `PcMachine`. El bit x87 de CPUID sigue desactivado mientras falten ocho instrucciones trascendentales. La instalación de Windows 10 sigue sin verificar.
 
 ## C01 · Cobertura de CPU SSE/SSE2
 
