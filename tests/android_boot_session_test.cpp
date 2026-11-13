@@ -216,7 +216,7 @@ int main(int argc, char** argv) {
     for (const auto* marker : {"\"iso_boot\":null", "\"qssd\":null", "\"qssd_ata\":null", "\"cpu_x64\":true",
                               "\"cpu_mmx\":true", "\"cpu_sse\":true", "\"cpu_sse2\":true",
                               "\"cpu_x87\":false", "\"cpu_fxsr\":true",
-                              "\"ram\":true", "\"vga\":true", "\"pci_ide\":true",
+                              "\"lapic\":true", "\"ram\":true", "\"vga\":true", "\"pci_ide\":true",
                               "\"ready_for_windows10_install\":false"})
       require(missing.find(marker) != std::string::npos, marker);
     {
@@ -249,7 +249,9 @@ int main(int argc, char** argv) {
                                  "\"read_sectors\":0", "\"write_sectors\":0",
                                  "\"irq14\":1", "\"atapi_cdrom\":true",
                                  "\"atapi\":{\"packets\":0,\"read_sectors\":0,\"rejected_packets\":0",
-                                 "\"last_rejected_packet\":0"})
+                                 "\"last_rejected_packet\":0", "\"halted_with_if\":false",
+                                 "\"lapic_global_enabled\":true", "\"lapic_software_enabled\":false",
+                                 "\"lapic_pending_vector\":0", "\"lapic_timer_count\":0"})
         require(progress.find(marker) != std::string::npos, marker);
       const auto text = screen(frame);
       require(text.compare(0, 14, "EL TORITO BIOS") == 0 &&

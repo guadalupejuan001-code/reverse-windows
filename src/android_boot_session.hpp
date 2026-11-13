@@ -123,7 +123,7 @@ class AndroidBootSession final {
         throw std::runtime_error("No se pudo consultar CPUID.");
       return cpu.regs;
     };
-    const auto basic = cpuid(1), extended = cpuid(0x80000001U);
+    const auto extended = cpuid(0x80000001U);
     const auto flag = [](std::uint64_t reg, unsigned bit) { return bool(reg & (1ULL << bit)); };
     pc.reset();
     pc.run(1500);
@@ -134,7 +134,8 @@ class AndroidBootSession final {
     const bool ram = pc.waiting_key && text.find("ALU + RAM + lectura de disco: OK") != std::string::npos;
     const bool vga = pc.waiting_key && text.find("Pulsa una tecla:") != std::string::npos;
     pc.reset();
-    bool pci_ide = false;
+    bool pci_ide = false, local_apic = false;
+    decltype(cpu.regs) basic{};
     {
       const std::array<std::uint8_t,2048> optical_sector{};
       PcMotherboardC06 board(pc, nullptr,
@@ -143,6 +144,18 @@ class AndroidBootSession final {
             std::copy_n(optical_sector.data()+offset, count, data);
             return true;
           }, optical_sector.size());
+      basic = cpuid(1);
+      constexpr unsigned probe = 0x1000;
+      cpu.reset(0, probe);
+      cpu.write16(probe, 0x320f); // RDMSR
+      cpu.regs[cosmic_pc::Cpu::ECX] = 0x1b;
+      const auto base = cosmic_pc::PcMachine::kLocalApicAddress;
+      local_apic = flag(basic[cosmic_pc::Cpu::EDX],9) &&
+          cpu.step() == cosmic_pc::StepResult::Executed &&
+          cpu.regs[cosmic_pc::Cpu::EDX] == 0 &&
+          cpu.regs[cosmic_pc::Cpu::EAX] == (base | 0x900U) &&
+          cpu.read32(AcpiC06::madt_address+36) == base &&
+          (cpu.read32(base+0x30)&0xffU) == 0x14U;
       // Exercise guest I/O against the same motherboard used for ISO boots.
       constexpr std::array<std::uint8_t,16> pci_probe{{
           0x66,0xb8,0x08,0x10,0x00,0x80,0xba,0xf8,0x0c,0x66,0xef,
@@ -192,7 +205,8 @@ class AndroidBootSession final {
         << ",\"cpu_cx16\":" << flag(basic[cosmic_pc::Cpu::ECX],13)
         << ",\"cpu_lahf_sahf\":" << flag(extended[cosmic_pc::Cpu::ECX],0)
         << ",\"cpu_prefetchw\":" << flag(extended[cosmic_pc::Cpu::ECX],8)
-        << ",\"ram\":" << ram << ",\"pci_ide\":" << pci_ide << ",\"vga\":" << vga << ",\"iso_boot\":";
+        << ",\"lapic\":" << local_apic << ",\"ram\":" << ram
+        << ",\"pci_ide\":" << pci_ide << ",\"vga\":" << vga << ",\"iso_boot\":";
     if (has_iso) out << optical_issue.empty(); else out << "null";
     out << ",\"qssd\":";
     if (has_disk) out << disk_issue.empty(); else out << "null";
@@ -289,6 +303,7 @@ class AndroidBootSession final {
 
   std::string diagnostic() const {
     const auto platform = board_->evidence();
+    const auto interrupts = board_->interrupt_state();
     const auto status = platform.powered_off ? "powered_off" : pc_.status();
     const auto* ata = board_->attached_ata();
     const auto counts = ata ? ata->counters() : AtaC07::Counters{};
@@ -351,7 +366,15 @@ class AndroidBootSession final {
         << ",\"read_sectors\":" << counts.read_sectors
         << ",\"write_sectors\":" << counts.write_sectors << ",\"flushes\":" << counts.flushes
         << "},\"irq\":{\"ticks\":" << platform.ticks << ",\"delivered\":" << platform.irq_delivered
-        << ",\"irq14\":" << platform.ata_irqs << "},\"vga\":{\"qssd_graphics_serial\":"
+        << ",\"irq14\":" << platform.ata_irqs << ",\"lapic_delivered\":" << platform.apic_irqs
+        << ",\"halted_with_if\":" << (pc_.cpu.halted && pc_.cpu.flag(cosmic_pc::Cpu::IF) ? "true" : "false")
+        << ",\"lapic_global_enabled\":" << (interrupts.global_enabled ? "true" : "false")
+        << ",\"lapic_software_enabled\":" << (interrupts.software_enabled ? "true" : "false")
+        << ",\"lapic_pending_vector\":" << interrupts.pending
+        << ",\"lapic_in_service_vector\":" << interrupts.in_service
+        << ",\"lapic_priority\":" << interrupts.priority
+        << ",\"lapic_timer_count\":" << interrupts.timer_count
+        << "},\"vga\":{\"qssd_graphics_serial\":"
         << vga_serial_ << ",\"planned_update_bytes\":" << vga_transfer_bytes_
         << "},\"machine\":" << pc_.json() << '}';
     return out.str();

@@ -423,6 +423,8 @@ void ioapic_lapic_guest(){
   };
   emit(p,{0xa1,0x30,0,0xe0,0xfe, // MOV EAX, [FEE00030] LAPIC version
           0xa3,0x04,0x91,0,0});  // store version
+  emit(p,{0xb8,1,0,0,0,0x0f,0xa2,0x89,0x15,0x08,0x91,0,0, // CPUID.01H
+          0xb9,0x1b,0,0,0,0x0f,0x32,0xa3,0x0c,0x91,0,0}); // IA32_APIC_BASE
   write_reg(0xfee000f0,0x1ff);   // software enable local APIC
   write_reg(0xfec00000,0x10);   // IOAPIC select redirection0 low
   write_reg(0xfec00010,0x31);   // unmask GSI0 vector31
@@ -432,8 +434,12 @@ void ioapic_lapic_guest(){
           0xfb,0xf4,0xeb,0xfe});
   code(pc.cpu,0xa000,p);pc.cpu.eip=0xa000;pc.cpu.halted=false;
   run(pc,220);
-  need(pc.cpu.read32(0x9104)==0x00030014,
+  need(pc.cpu.read32(0x9104)==0x00050014,
        "guest did not read actual LAPIC MMIO version");
+  need((pc.cpu.read32(0x9108)&(1U<<9))!=0 &&
+       (pc.cpu.read32(0x910c)&0xfffff000U)==pc.cpu.read32(AcpiC06::madt_address+36) &&
+       (pc.cpu.read32(0x910c)&0xfffU)==0x900,
+       "guest CPUID, IA32_APIC_BASE and MADT must describe the same bootstrap LAPIC");
   need(pc.cpu.read32(0x9100)==0x90123456,
        "guest IOAPIC -> LAPIC vector31 handler did not execute");
   need(board.evidence().apic_irqs>=1,
@@ -441,9 +447,99 @@ void ioapic_lapic_guest(){
   need(pc.cpu.regs[Cpu::ESP]==0x190000,
        "LAPIC guest IRET did not restore interrupted stack");
   bool unsupported=false;
-  try{(void)pc.cpu.read32(0xfee00120);}catch(const std::exception&){unsupported=true;}
+  try{(void)pc.cpu.read32(0xfee00290);}catch(const std::exception&){unsupported=true;}
   need(unsupported,"unsupported local APIC register must not fake value");
   std::cout<<"C06_IOAPIC_LAPIC_MMIO_IRQ_PASS delivered="<<board.evidence().apic_irqs<<"\n";
+}
+void nested_apic_guest(){
+  PcMachine pc(16*1024*1024);boot32(pc);
+  PcMotherboardC06 board(pc);
+  auto& cpu=pc.cpu;
+  cpu.idtr={0x1000,0x15000};
+  cpu.regs[Cpu::ESP]=0x190000;
+  gate(cpu,0x42,0x13000);
+  gate(cpu,0x61,0x13200);
+  const auto mov_mmio=[](auto& program,std::uint32_t address,std::uint32_t value){
+    emit(program,{0xc7,0x05});
+    for(unsigned i=0;i<4;++i)program.push_back(std::uint8_t(address>>(8*i)));
+    for(unsigned i=0;i<4;++i)program.push_back(std::uint8_t(value>>(8*i)));
+  };
+  const auto snapshot=[](auto& program,std::uint32_t address,std::uint32_t storage){
+    emit(program,{0xa1});
+    for(unsigned i=0;i<4;++i)program.push_back(std::uint8_t(address>>(8*i)));
+    emit(program,{0xa3});
+    for(unsigned i=0;i<4;++i)program.push_back(std::uint8_t(storage>>(8*i)));
+  };
+  constexpr auto apic=std::uint32_t(PcMachine::kLocalApicAddress);
+  std::vector<std::uint8_t> outer{0x50}; // Preserve EAX across the interrupt.
+  snapshot(outer,apic+0x120,0x9004); // ISR vector 42h.
+  snapshot(outer,apic+0x0a0,0x9008); // PPR from ISR.
+  mov_mmio(outer,apic+0x300,0x40061); // Self IPI with higher priority.
+  snapshot(outer,apic+0x230,0x900c); // Pending vector 61h with IF clear.
+  emit(outer,{0xfb,0xf4,0xfa}); // Wake from HLT via the self IPI.
+  snapshot(outer,apic+0x0a0,0x9010); // PPR must return to the outer ISR.
+  mov_mmio(outer,apic+0x0b0,0);
+  emit(outer,{0x58,0xcf});
+  code(cpu,0x13000,outer);
+  std::vector<std::uint8_t> inner{0x50};
+  snapshot(inner,apic+0x130,0x9014);
+  snapshot(inner,apic+0x0a0,0x9018);
+  mov_mmio(inner,apic+0x0b0,0);
+  emit(inner,{0x58,0xcf});
+  code(cpu,0x13200,inner);
+  std::vector<std::uint8_t> guest{0xfa};
+  mov_mmio(guest,apic+0x0f0,0x1ff);
+  mov_mmio(guest,apic+0x3e0,0x0b); // Divide by 1.
+  mov_mmio(guest,apic+0x320,0x42);
+  mov_mmio(guest,apic+0x380,12);
+  emit(guest,{0xfb,0xf4,0xfa,0xf4}); // HLT wakes on the timer, then stops.
+  code(cpu,0xa000,guest);cpu.eip=0xa000;
+  run(pc,100);
+  need(cpu.halted&&!cpu.flag(Cpu::IF)&&cpu.regs[Cpu::ESP]==0x190000&&
+       board.evidence().apic_irqs==2,"APIC must wake HLT and unwind nested IRQs");
+  need(cpu.read32(0x9004)==4&&cpu.read32(0x9008)==0x40&&cpu.read32(0x900c)==2&&
+       cpu.read32(0x9010)==0x40&&cpu.read32(0x9014)==2&&cpu.read32(0x9018)==0x60,
+       "APIC IRR, ISR and PPR did not reflect the actual interrupt nesting");
+  need(cpu.read32(apic+0x120)==0&&cpu.read32(apic+0x130)==0&&
+       board.interrupt_state().in_service==0&&board.interrupt_state().priority==0,
+       "EOI must release exactly the highest in-service interrupt");
+  std::cout<<"C06_APIC_NESTED_HLT_PASS timer=0x42 self_ipi=0x61 eoi=2\n";
+}
+void apic_timer_divisor_and_global_enable(){
+  PcMachine pc(16*1024*1024);boot32(pc);
+  PcMotherboardC06 board(pc);
+  auto& cpu=pc.cpu;
+  constexpr auto apic=std::uint32_t(PcMachine::kLocalApicAddress);
+  constexpr std::array<unsigned,8> divisors{{2,4,8,16,32,64,128,1}};
+  cpu.write32(apic+0xf0,0x1ff);
+  cpu.write32(apic+0x320,0x42);
+  for(unsigned i=0;i<divisors.size();++i){
+    cpu.write32(apic+0x3e0,(i&3U)|((i&4U)<<1));
+    cpu.write32(apic+0x380,2);
+    for(unsigned n=0;n<divisors[i]-1;++n)board.advance_one();
+    need(cpu.read32(apic+0x390)==2,"LAPIC timer ticked before its divide interval");
+    board.advance_one();
+    need(cpu.read32(apic+0x390)==1,"LAPIC timer did not honor its programmed divisor");
+  }
+  code(cpu,0xa000,{0x0f,0x30}); // WRMSR, with global enable clear.
+  cpu.eip=0xa000;
+  cpu.regs[Cpu::ECX]=0x1b;cpu.regs[Cpu::EAX]=apic|0x100U;cpu.regs[Cpu::EDX]=0;
+  need(cpu.step()==cosmic_pc::StepResult::Executed&&!board.interrupt_state().global_enabled,
+       "clearing IA32_APIC_BASE.EN must disable the board's LAPIC");
+  for(unsigned i=0;i<8;++i)board.advance_one();
+  need(board.interrupt_state().timer_count==1&&board.interrupt_state().pending==0,
+       "global disable must stop the countdown and interrupt delivery");
+  cpu.eip=0xa000;cpu.regs[Cpu::EAX]=apic|0x900U;
+  need(cpu.step()==cosmic_pc::StepResult::Executed&&board.interrupt_state().software_enabled,
+       "restoring IA32_APIC_BASE.EN must re-enable the programmed LAPIC");
+  board.advance_one();
+  need(board.interrupt_state().timer_count==0&&board.interrupt_state().pending==0x42,
+       "timer must resume and queue its programmed vector");
+  pc.boot_long_mode_demo();
+  need(board.interrupt_state().global_enabled&&!board.interrupt_state().software_enabled&&
+       !board.interrupt_state().pending&&!board.interrupt_state().timer_count,
+       "warm boot must reinitialize the LAPIC");
+  std::cout<<"C06_APIC_DIVISOR_MSR_PASS divisors=8 global_enable=1 reset=1\n";
 }
 void ps2_keyboard_guest(){
   PcMachine pc(16*1024*1024);boot32(pc);
@@ -631,6 +727,8 @@ int main(){
     pic_legacy_x87_guest();
     pci_acpi_cmos_guest();
     ioapic_lapic_guest();
+    nested_apic_guest();
+    apic_timer_divisor_and_global_enable();
     ps2_keyboard_guest();
     queued_lapic_requests_guest();
     cr8_lapic_priority_guest();
