@@ -107,6 +107,12 @@ if(BUILD_TESTING)
   add_test(NAME reverse_windows_c09_real_hardware_trace
     COMMAND reverse_windows_c09_hardware_trace_test)
 
+  add_executable(reverse_windows_c09r_cpu_features
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_windows10_c09r_cpu_readiness_test.cpp")
+  target_link_libraries(reverse_windows_c09r_cpu_features PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c09r_real_cpu_cx16_prefetchw
+    COMMAND reverse_windows_c09r_cpu_features)
+
   add_test(NAME reverse_windows_c09r_iso_free_hardware_preflight
     COMMAND reverse_windows_c09r_hardware_preflight --self-test)
 
@@ -122,5 +128,6 @@ if(BUILD_TESTING)
                        reverse_windows_c08_raw_vs_qssd_benchmark
                        reverse_windows_c09_cpu_precise_step_trace
                        reverse_windows_c09_real_hardware_trace
-                       reverse_windows_c09r_iso_free_hardware_preflight PROPERTIES TIMEOUT 120)
+                       reverse_windows_c09r_iso_free_hardware_preflight
+                       reverse_windows_c09r_real_cpu_cx16_prefetchw PROPERTIES TIMEOUT 120)
 endif()
