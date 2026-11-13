@@ -1,15 +1,15 @@
 {
   "schema": "reverse-windows-dependency-lock-v1",
-  "recorded_at": "2026-11-12",
+  "recorded_at": "2026-11-13",
   "policy": "exact-commit-only-no-silent-fallback-no-automatic-merge",
   "components": [
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "ad801ea2a4e80ca6e08023a19a6b640c04e1e166",
+      "commit": "2dd0c52abbc99cd231a8d81a15be8a11b0a721ef",
       "checkout": "deps/mundo-X",
-      "role": "canonical-Mundo-X-C09R1-stage3-SSE2-binary64-MXCSR-x87-80bit-FPU-exceptions-CPUID-off",
-      "status": "candidate-C09R1-stage3-unmerged",
+      "role": "canonical-Mundo-X-stage4-SSE2-MXCSR-x87-CPUID-SSE2-x87-FXSR-off",
+      "status": "candidate-C09R1-stage4-unmerged",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/x86_cpu.hpp",
@@ -27,7 +27,12 @@
         "pc-android/native/tests/x86_c09r1_stage3_fp_test.cpp",
         "pc-android/native/tests/x86_c09r1_stage3_ring3_test.cpp",
         "pc-android/native/tests/x86_c09r1_stage3_x87_precision_test.cpp",
-        "pc-android/native/tests/x86_c09r1_stage3_x87_mf_test.cpp"
+        "pc-android/native/tests/x86_c09r1_stage3_x87_mf_test.cpp",
+        "pc-android/native/tests/x86_c09r1_stage4_daz_ftz_test.cpp",
+        "pc-android/native/tests/x86_c09r1_stage4_mxcsr_test.cpp",
+        "pc-android/native/tests/x86_c09r1_stage4_x87_test.cpp",
+        "pc-android/native/tests/x86_c09r1_stage4_packed_cvt_test.cpp",
+        "pc-android/native/tests/x86_c09r1_stage4_sse2_misc_test.cpp"
       ]
     },
     {
