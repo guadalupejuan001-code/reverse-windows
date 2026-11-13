@@ -12,6 +12,10 @@ La app conecta el selector de archivos de Android, el arranque BIOS de Mundo X y
 
 Desinstalar la app borra su disco privado. Para conservar la instalación, actualiza con un APK firmado con la misma clave.
 
+## Actualización 0.1.3
+
+La ISO en el Samsung superó `0050:089D` y llegó a modo protegido de 32 bits. Se detuvo en `0020:446056` al leer el registro `IA32_TSC` (`RDMSR`, `ECX=0x10`). La CPU expone por `RDMSR` el mismo contador virtual que por `RDTSC` y permite ajustarlo por `WRMSR` desde CPL0. El contador sigue midiendo pasos del intérprete y no tiempo de pared. Los registros MSR pendientes se identifican por su índice en el diagnóstico.
+
 ## Actualización 0.1.2
 
 La prueba con la ISO en el Samsung superó `2000:083F` y se detuvo al ejecutar `0F 22 C0` (`MOV CR0,EAX`) en `0050:089D`. El cargador quería volver de modo protegido de 16 bits a modo real. La CPU admite esa transición y conserva los descriptores de segmento en caché. Una regresión de El Torito comprueba el regreso a modo real, las lecturas de BIOS y la persistencia del QSSD con un huésped sintético.

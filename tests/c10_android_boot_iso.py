@@ -21,13 +21,31 @@ def image() -> bytearray:
         0x0F, 0x01, 0x16, 0x00, 0x02,     # LGDT [0200]
         0x66, 0xB8, 0x11, 0, 0, 0,        # MOV EAX,00000011 (PE=1)
         0x0F, 0x22, 0xC0,                 # MOV CR0,EAX
-        0xEA, 0x92, 0x08, 0x50, 0x00,     # JMP FAR 0050:0892 (protected16)
+        0xEA, 0x00, 0x04, 0x20, 0x00,     # JMP FAR 0020:0400 (protected32)
     ))
     iso[start : start + len(enter_protected)] = enter_protected
     u16(iso, start + 0x200, 0x5F)
     u32(iso, start + 0x202, 0x20280)
+    u64(iso, start + 0x280 + 0x20, desc(0x20000, 0xFFFF, 0x9A) | (1 << 54))
     u64(iso, start + 0x280 + 0x50, desc(0x20800, 0xFFFF, 0x9A))
     u64(iso, start + 0x280 + 0x58, desc(0x20000, 0xFFFF, 0x92))
+
+    read_tsc = bytes((
+        0x89, 0xD3,                       # MOV EBX,EDX (preserve BIOS drive in DL)
+        0xB9, 0x10, 0, 0, 0,              # MOV ECX,00000010 (IA32_TSC)
+        0x0F, 0x31,                       # RDTSC
+        0x89, 0xC6,                       # MOV ESI,EAX
+        0x89, 0xD7,                       # MOV EDI,EDX
+        0x0F, 0x32,                       # RDMSR at protected32 CPL0
+        0x39, 0xFA, 0x75, 0x14,           # CMP EDX,EDI; JNE failure
+        0x29, 0xF0, 0x76, 0x10,           # SUB EAX,ESI; JBE failure
+        0x3D, 0x00, 0x10, 0, 0,           # CMP EAX,4096 (same advancing counter)
+        0x77, 0x09,                       # JA failure
+        0x89, 0xDA,                       # MOV EDX,EBX
+        0xEA, 0x92, 0x08, 0, 0, 0x50, 0,  # JMP FAR 0050:0892 (protected16)
+        0xF4,                             # failure: HLT with IF clear
+    ))
+    iso[start + 0x400 : start + 0x400 + len(read_tsc)] = read_tsc
 
     exit_protected = bytes((
         0xB8, 0x58, 0, 0x8E, 0xD8,       # MOV DS,0058 (cached base 0x20000)

@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
         return Session(disk, 1, Session::BootSource::Iso, iso.value, original.size());
       }();
       run_until(session, Session::Step::WaitingKey,
-                "El Torito guest did not return from protected16 and reach the BIOS prompt");
+                "El Torito guest did not check IA32_TSC and return to the real-mode BIOS prompt");
       require(session.diagnostic().find("\"cpu_mode\":\"real16\"") != std::string::npos,
               "Guest BIOS prompt was reached outside real mode");
       require(screen(session).find("ISO -> QSSD") != std::string::npos,
@@ -120,8 +120,8 @@ int main(int argc, char** argv) {
               "Reboot diagnostic did not identify QSSD");
     }
     std::cout << "REVERSE_WINDOWS_ANDROID_BIOS_ISO_QSSD_PASS "
-                 "synthetic_iso=true protected16_to_real16=true bios_key=true guest_vga=true "
-                 "persistent_reboot=true\n";
+                 "synthetic_iso=true protected32_ia32_tsc=true protected16_to_real16=true "
+                 "bios_key=true guest_vga=true persistent_reboot=true\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "REVERSE_WINDOWS_ANDROID_BIOS_ISO_QSSD_FAIL " << error.what() << '\n';
