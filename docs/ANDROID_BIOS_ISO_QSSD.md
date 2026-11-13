@@ -12,11 +12,19 @@ La app conecta el selector de archivos de Android, el arranque BIOS de Mundo X y
 
 Desinstalar la app borra su disco privado. Para conservar la instalación, actualiza con un APK firmado con la misma clave.
 
+## C02 · Conformidad de CPU
+
+MMX comparte los registros físicos de x87. `EMMS` marca vacías sus etiquetas. Las pruebas cubren operaciones empaquetadas, transferencias MMX/XMM y conversiones. SSE/SSE2 incorpora `RCP`, `RSQRT`, `MASKMOVDQU` y `MOVNTI`, además de comprobar la prioridad de excepciones con subnormales y el redondeo cerca del umbral FTZ.
+
+La aritmética x87 usa un formato de 80 bits independiente de `long double`, con precisión de 24, 53 y 64 bits y los cuatro modos de redondeo. Las pruebas cubren conversiones, etiquetas, estado de excepción y entornos x87. `FXSAVE` y `FXRSTOR` se prueban con ambos formatos de puntero en modo largo, conservación de XMM/MXCSR, y guardado y recuperación de imágenes repartidas entre páginas.
+
+Las pruebas se ejecutan en anfitriones x86_64 y ARM64. El primero compara resultados con instrucciones x86 del procesador físico. Ambos ejecutan los casos de referencia y la misma integración de `PcMachine`. CPUID conserva el perfil anterior mientras sigan pendientes la entrega de excepciones en modo protegido de 16 bits y en compatibilidad IA-32e, ocho instrucciones trascendentales x87 y la entrega heredada por IRQ13. La instalación de Windows 10 sigue sin verificar.
+
 ## C01 · Cobertura de CPU SSE/SSE2
 
 La CPU integra aritmética SSE de precisión simple, comparaciones, movimientos, conversiones SSE2 entre datos de 32 y 64 bits, y operaciones enteras empaquetadas. Las pruebas comprueban resultados y excepciones contra x86 y ejecutan los mismos casos en ARM64. `FXSAVE` y `FXRSTOR` preservan el acceso a x87 con `CR4.OSFXSR=0`. La integración prueba también el recorrido sintético BIOS, ISO, teclado, QSSD y reinicio del huésped.
 
-Las capacidades SSE, SSE2, FXSR y x87 siguen sin anunciarse mientras falten formas MMX, `MASKMOVDQU`, aproximaciones SSE y casos verificados de estado y redondeo x87. El instalador de Windows queda por verificar con la ISO del usuario.
+El perfil CPUID de C01 dejó las capacidades SSE, SSE2, FXSR y x87 desactivadas mientras se completaban las pruebas de conformidad.
 
 ## Actualización 0.1.4
 
@@ -46,7 +54,7 @@ El Ether Next de Mundo X añade reducción de lotes XI y caché de transformacio
 
 ## Límites
 
-Se verificó el flujo con huéspedes sintéticos. Windows 10 todavía tiene pendiente su primer arranque con la ISO del usuario. La CPU conserva la cobertura parcial de SSE2/x87 y CPUID de la PR #19. IDE/ATAPI y PS/2 tienen cobertura parcial. El controlador gráfico de Windows y el reinicio del instalador desde QSSD se deben verificar con Windows real.
+Se verificó el flujo con huéspedes sintéticos. IDE/ATAPI y PS/2 tienen cobertura parcial. La pantalla del instalador, el reconocimiento del QSSD y el reinicio de Windows se deben comprobar con el medio real.
 
 ## Compilar
 

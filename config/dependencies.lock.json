@@ -6,10 +6,10 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "9e3ae834c3daefa9bb9b45e1d3a25fc11311d59b",
+      "commit": "d73d33c2ca18f152af6bcf62886f07080ae3f252",
       "checkout": "deps/mundo-X",
-      "role": "canonical-Mundo-X-Ether-Next-ARM64-and-SSE-conformance",
-      "status": "candidate-Ether-Next-SSE-conformance-unmerged",
+      "role": "canonical-Mundo-X-Ether-Next-C02-CPU-conformance",
+      "status": "candidate-C02-CPU-conformance-unmerged",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/x86_cpu.hpp",
@@ -43,7 +43,14 @@
         "pc-android/native/tests/x86_sse_fp32_test.cpp",
         "pc-android/native/tests/x86_sse2_packed_oracle_test.cpp",
         "pc-android/native/tests/x86_c09r1_stage5_cvt_fxsr_test.cpp",
-        "pc-android/native/tests/x86_ether_next_guest_test.cpp"
+        "pc-android/native/tests/x86_ether_next_guest_test.cpp",
+        "pc-android/native/x86_ext80.hpp",
+        "pc-android/native/x86_mmx.inc",
+        "pc-android/native/x86_x87_state.inc",
+        "pc-android/native/tests/x86_mmx_test.cpp",
+        "pc-android/native/tests/x86_sse_legacy_forms_test.cpp",
+        "pc-android/native/tests/x86_x87_arithmetic_oracle_test.cpp",
+        "pc-android/native/tests/x86_x87_state_test.cpp"
       ]
     },
     {

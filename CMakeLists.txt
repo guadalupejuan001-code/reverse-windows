@@ -77,11 +77,13 @@ if(BUILD_TESTING)
   target_link_libraries(reverse_windows_lock_rmw_test PRIVATE reverse_windows_component_headers)
   add_test(NAME reverse_windows_lock_rmw COMMAND reverse_windows_lock_rmw_test)
 
-  foreach(sse_test IN ITEMS x86_sse_fp32 x86_sse2_packed_oracle x86_c09r1_stage5_cvt_fxsr)
-    add_executable(reverse_windows_${sse_test}_test
-      "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/${sse_test}_test.cpp")
-    target_link_libraries(reverse_windows_${sse_test}_test PRIVATE reverse_windows_component_headers)
-    add_test(NAME reverse_windows_${sse_test} COMMAND reverse_windows_${sse_test}_test)
+  foreach(fpu_test IN ITEMS x86_sse_fp32 x86_sse2_packed_oracle x86_c09r1_stage5_cvt_fxsr
+            x86_sse_legacy_forms x86_mmx x86_x87_arithmetic_oracle x86_x87_state)
+    add_executable(reverse_windows_${fpu_test}_test
+      "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/${fpu_test}_test.cpp")
+    target_link_libraries(reverse_windows_${fpu_test}_test PRIVATE reverse_windows_component_headers)
+    add_test(NAME reverse_windows_${fpu_test} COMMAND reverse_windows_${fpu_test}_test)
+    set_tests_properties(reverse_windows_${fpu_test} PROPERTIES TIMEOUT 120)
   endforeach()
 
   add_test(NAME reverse_windows_real_x86_demo
