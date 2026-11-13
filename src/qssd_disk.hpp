@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
