@@ -1,4 +1,4 @@
-name: C09R1 stage3 canonical SSE2/x87 MXCSR and full hardware regression - no Windows ISO
+name: C09R1 stage4 SSE2, MXCSR, x87 and hardware regressions
 on:
   push:
     branches: [main, "feature/**"]
@@ -17,11 +17,11 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Checkout C09R CPU with verified CX16 and PREFETCHW (exact SHA)
+      - name: Checkout canonical Mundo X CPU (exact SHA)
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/mundo-X
-          ref: 73b18d07b62275b23641f870914ded3662a97acb
+          ref: fd20afd2aca2cec5c40b63a14ae0e7842b68df9a
           path: deps/mundo-X
           persist-credentials: false
       - name: Checkout GPU-VIRTUAL C12 plus physical work authority
@@ -125,6 +125,20 @@ jobs:
           grep -q '"qssd_maintenance":"compact"' build/c08-cli-compact.json
           test -f build/c08-cli-smoke.rqvd.rqix
           echo C08_CLI_OFFLINE_MAINTENANCE_PASS
+      - name: Verify C09R-1 stage4 SSE2, MXCSR and x87
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_c09r1_daz_ftz_test | tee build/reverse_windows_c09r1_daz_ftz_test.log
+          grep -Fq 'C09R1_STAGE4_DAZ_FTZ_PASS' build/reverse_windows_c09r1_daz_ftz_test.log
+          ./build/reverse_windows_c09r1_stage4_mxcsr_test | tee build/reverse_windows_c09r1_stage4_mxcsr_test.log
+          grep -Fq 'REVERSE_WINDOWS_C09R1_STAGE4_MXCSR_PASS' build/reverse_windows_c09r1_stage4_mxcsr_test.log
+          ./build/reverse_windows_c09r1_stage4_x87_test | tee build/reverse_windows_c09r1_stage4_x87_test.log
+          grep -Fq 'REVERSE_WINDOWS_C09R1_STAGE4_X87_PASS' build/reverse_windows_c09r1_stage4_x87_test.log
+          ./build/reverse_windows_c09r1_stage4_packed_cvt_test | tee build/reverse_windows_c09r1_stage4_packed_cvt_test.log
+          grep -Fq 'REVERSE_WINDOWS_C09R1_STAGE4_PACKED_CVT_PASS' build/reverse_windows_c09r1_stage4_packed_cvt_test.log
+          ./build/reverse_windows_c09r1_stage4_sse2_misc_test | tee build/reverse_windows_c09r1_stage4_sse2_misc_test.log
+          grep -Fq 'REVERSE_WINDOWS_C09R1_STAGE4_SSE2_MISC_PASS' build/reverse_windows_c09r1_stage4_sse2_misc_test.log
       - name: Prove C09R-1 stage3 XMM/x87/SSE2/IDT and Ring3 context without Windows
         shell: bash
         run: |
@@ -315,4 +329,9 @@ jobs:
             build/reverse_windows_c09r1_ring3_fpu_test.log
             build/reverse_windows_c09r1_exact_x87_test.log
             build/reverse_windows_c09r1_x87_mf_test.log
+            build/reverse_windows_c09r1_daz_ftz_test.log
+            build/reverse_windows_c09r1_stage4_mxcsr_test.log
+            build/reverse_windows_c09r1_stage4_x87_test.log
+            build/reverse_windows_c09r1_stage4_packed_cvt_test.log
+            build/reverse_windows_c09r1_stage4_sse2_misc_test.log
           if-no-files-found: warn

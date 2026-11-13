@@ -1,18 +1,18 @@
-# C09R-1 etapa 4 — Integración provisional DAZ/FTZ, no conformidad SSE2 completa
+# C09R-1 etapa 4 — Integración SSE2, MXCSR y x87
 
-Se continúa sobre REVERSE Windows PR #18 y Mundo X PR #96. El CPU único y original sigue siendo `cosmic_pc::Cpu` de Mundo X, fijado mediante el SHA exacto `73b18d07b62275b23641f870914ded3662a97acb`. El commit se marca **candidato sin fusionar** hasta que pasen las suites de Mundo X y REVERSE Windows.
+REVERSE Windows PR #19 continúa la PR #18 e integra la CPU canónica de Mundo X PR #96 en el commit `fd20afd2aca2cec5c40b63a14ae0e7842b68df9a`. El workflow comprueba el SHA y los archivos requeridos antes de compilar.
 
-Se agregó CTest `reverse_windows_c09r1_daz_ftz_mxcsr` que compila directamente `x86_c09r1_stage4_daz_ftz_test.cpp` del checkout canónico. Los tests existentes C04–C09R-1, QSSD, PCI ATA/IRQ14, GPU Virtual y Ether/XI se mantienen en la misma máquina y no se alteraron sus commits. No hay una CPU secundaria ni un disco paralelo.
+## Pruebas integradas
 
-## Cambios de CPU
+| Área | Cobertura |
+| --- | --- |
+| DAZ/FTZ | Cero con signo, máscaras de `LDMXCSR` y `FXSAVE`, resultados subnormales y #XM por underflow desenmascarado |
+| SSE2 | NaN, comparaciones, movimientos, operaciones lógicas, conversiones empaquetadas y prioridad de excepciones |
+| x87 | Seis casos de precisión y redondeo PC/RC y errores en pila llena o vacía |
+| Contexto y hardware | Ring 3 → Ring 0 → Ring 3, `FXSAVE/FXRSTOR`, QSSD, PCI ATA/IRQ14, GPU Virtual y Ether/XI |
 
-- MXCSR.DAZ (bit6) aceptado en LDMXCSR y FXSAVE.MXCSR_MASK.
-- Los operandos FP64 subnormales se convierten en cero con signo cuando DAZ=1, sin marcar DE; DAZ=0 conserva el subnormal y la bandera DE.
-- Se conserva el tratamiento previo de FTZ para salidas FP64 subnormales.
-- Se prueban rutas de guest x64, valor numérico, estado MXCSR, FXSAVE y bits reservados.
+CTest compila las cinco pruebas de etapa 4 desde el checkout fijado de Mundo X. El workflow las ejecuta además para archivar sus resultados y conserva las regresiones previas. Mundo X ejecuta las pruebas contra hardware x86 y en un runner ARM64 con resultados de referencia.
 
-## Limitaciones
+## Límites
 
-Este ciclo **no ha completado** el conjunto de instrucciones SSE2 ni la semántica de NaN, todas las excepciones MXCSR, redondeo x87 PC/RC, stack faults y validación ARM64. Sigue sin demostrarse compatibilidad Windows 10. **CPUID x87/FXSR/SSE2 permanece apagado**. No se ejecutó ni utilizó la ISO del usuario. No se generó APK. La PR permanece en borrador y no se fusionará automáticamente.
-
-Las pruebas de CI deben comprobarse sobre el HEAD exacto antes de declarar la integración aprobada.
+CPUID SSE2/x87/FXSR continúa desactivado. Faltan instrucciones SSE2, combinaciones de excepciones y escenarios de contexto. Parte de la aritmética extendida x87 depende de `long double` y la conversión `FSTP` a memoria tiene cobertura limitada. Se usaron huéspedes sintéticos. El arranque de Windows y la ISO del usuario quedan fuera de esta campaña.
