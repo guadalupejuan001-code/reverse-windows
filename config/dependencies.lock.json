@@ -6,7 +6,7 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "fd20afd2aca2cec5c40b63a14ae0e7842b68df9a",
+      "commit": "2dd0c52abbc99cd231a8d81a15be8a11b0a721ef",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-stage4-SSE2-MXCSR-x87-CPUID-SSE2-x87-FXSR-off",
       "status": "candidate-C09R1-stage4-unmerged",
