@@ -31,6 +31,10 @@ def image() -> bytearray:
     u64(iso, start + 0x280 + 0x58, desc(0x20000, 0xFFFF, 0x92))
 
     read_tsc = bytes((
+        0xB9, 1, 0, 0, 0,                 # MOV ECX,1
+        0xF0, 0x09, 0x0D, 0x90, 3, 0, 0, # LOCK OR DWORD [0390],ECX
+        0x83, 0x3D, 0x90, 3, 0, 0, 1,    # CMP DWORD [0390],1
+        0x74, 1, 0xF4,                    # JE timestamp probe; otherwise HLT
         0x89, 0xD3,                       # MOV EBX,EDX (preserve BIOS drive in DL)
         0xB9, 0x10, 0, 0, 0,              # MOV ECX,00000010 (IA32_TSC)
         0x0F, 0x31,                       # RDTSC
@@ -72,7 +76,7 @@ def image() -> bytearray:
     ))
     keyboard_jump = 9 + 5 * len(b"ISO -> QSSD") + 7
     write_jump = len(code) - 1
-    code += show(b" MBR SAVED") + b"\xfa\xf4"
+    code += b"\xb0\x03\xe6\x92\xfa\xf4"  # Preserve A20 and request reset via port 92h.
     failure = len(code)
     code += show(b" | FAILED") + b"\xfa\xf4"
     program = bytearray(code)

@@ -19,6 +19,7 @@ final class VmWorker {
         void onFrame(Frame frame);
         void onError(String message, boolean hasSession);
         void onDiskCreated();
+        void onHardwareChecked(String json);
     }
 
     static final class Frame {
@@ -82,6 +83,39 @@ final class VmWorker {
                 NativeMachine.createDisk(disk.getAbsolutePath(), DISK_GIB);
                 send(listener::onDiskCreated);
             } catch (RuntimeException | LinkageError error) {
+                report(error);
+            }
+        });
+    }
+
+    void checkHardware(Uri iso) {
+        worker.post(() -> {
+            if (released || handle != 0) return;
+            try {
+                String diskPath = disk.exists() ? disk.getAbsolutePath() : "";
+                String result;
+                if (iso == null) {
+                    result = NativeMachine.checkHardware(diskPath, -1, 0, null);
+                } else {
+                    ParcelFileDescriptor selected = null;
+                    String issue = "Android no pudo abrir la ISO.";
+                    try {
+                        selected = resolver.openFileDescriptor(iso, "r");
+                    } catch (IOException | SecurityException error) {
+                        if (error.getMessage() != null) issue = error.getMessage();
+                    }
+                    if (selected == null) {
+                        result = NativeMachine.checkHardware(diskPath, -1, 0, issue);
+                    } else {
+                        try (ParcelFileDescriptor fd = selected) {
+                            result = NativeMachine.checkHardware(diskPath, fd.getFd(),
+                                    Math.max(0, fd.getStatSize()), null);
+                        }
+                    }
+                }
+                String json = result;
+                send(() -> listener.onHardwareChecked(json));
+            } catch (IOException | RuntimeException | LinkageError error) {
                 report(error);
             }
         });

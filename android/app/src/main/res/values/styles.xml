@@ -12,6 +12,9 @@
     </style>
     <item name="vm_monitor" type="id" />
     <item name="vm_status" type="id" />
+    <item name="vm_copy_diagnostic" type="id" />
+    <item name="vm_hardware_check" type="id" />
+    <item name="vm_hardware_result" type="id" />
     <item name="vm_select_iso" type="id" />
     <item name="vm_create_disk" type="id" />
     <item name="vm_boot_iso" type="id" />

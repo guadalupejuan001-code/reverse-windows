@@ -21,7 +21,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/mundo-X
-          ref: 2531a975b9c29839f39559201f52cec8bc1a0af2
+          ref: b698a7e3b8ae9a8c257c252a7ed8b0993231bae4
           path: deps/mundo-X
           persist-credentials: false
       - name: Checkout GPU-VIRTUAL C12 plus physical work authority
@@ -276,7 +276,7 @@ jobs:
           assert iso["pci_cfg_out_cf8"]>=1 and iso["pci_cfg_in_cfc"]>=1
           assert iso["first_terminal_blocker"]["type"]=="guest_halt"
           assert fault["first_terminal_blocker"]["type"]=="terminal_instruction_fault"
-          assert fault["first_terminal_blocker"]["first_observed"]["decoded"]=="f000"
+          assert fault["first_terminal_blocker"]["first_observed"]["decoded"]=="f090"
           assert fault["truncated"] and quota["truncated"]
           assert quota["first_terminal_blocker"]["type"]=="no_terminal_fault_observed_with_truncated_trace"
           for report in (iso,fault,quota):

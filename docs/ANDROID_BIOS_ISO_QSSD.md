@@ -12,6 +12,12 @@ La app conecta el selector de archivos de Android, el arranque BIOS de Mundo X y
 
 Desinstalar la app borra su disco privado. Para conservar la instalación, actualiza con un APK firmado con la misma clave.
 
+## Actualización 0.1.4
+
+**Comprobar equipo virtual** ejecuta una prueba de RAM, VGA y detección PCI IDE, consulta CPUID y revisa la entrada BIOS de la ISO y el QSSD en modo de solo lectura. El panel muestra la entrega al cargador, cambios de modo de CPU, lecturas, escrituras confirmadas y el motivo de un fallo aunque VGA esté en negro. La ausencia de SSE2, x87 y FXSR en el perfil anunciado se muestra como comprobación pendiente.
+
+La CPU ejecuta `LOCK OR` y las variantes de RAM documentadas de la familia atómica x86. La petición de reinicio del huésped sincroniza el QSSD, comprueba si contiene un sector de arranque y selecciona QSSD o la ISO montada. La prueba integrada escribe un MBR, solicita el reinicio desde el propio huésped y arranca desde el mismo QSSD. WinPE visible con un QSSD escribible y el reinicio de Windows se deben comprobar con el medio real.
+
 ## Actualización 0.1.3
 
 La ISO en el Samsung superó `0050:089D` y llegó a modo protegido de 32 bits. Se detuvo en `0020:446056` al leer el registro `IA32_TSC` (`RDMSR`, `ECX=0x10`). La CPU expone por `RDMSR` el mismo contador virtual que por `RDTSC` y permite ajustarlo por `WRMSR` desde CPL0. El contador sigue midiendo pasos del intérprete y no tiempo de pared. Los registros MSR pendientes se identifican por su índice en el diagnóstico.

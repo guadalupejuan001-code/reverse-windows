@@ -78,6 +78,12 @@ int main(int argc, char** argv) {
     const auto fixture = dir.path / "boot.iso";
     std::filesystem::copy_file(argv[1], fixture);
     const auto original = bytes(fixture);
+    const auto missing = Session::check_hardware({});
+    for (const auto* marker : {"\"iso_boot\":null", "\"qssd\":null", "\"cpu_x64\":true",
+                              "\"cpu_sse2\":false", "\"cpu_x87\":false", "\"cpu_fxsr\":false",
+                              "\"ram\":true", "\"vga\":true", "\"pci_ide\":true",
+                              "\"ready_for_windows10_install\":false"})
+      require(missing.find(marker) != std::string::npos, marker);
     {
       bool rejected = false;
       try {
@@ -96,21 +102,38 @@ int main(int argc, char** argv) {
       }();
       run_until(session, Session::Step::WaitingKey,
                 "El Torito guest did not check IA32_TSC and return to the real-mode BIOS prompt");
-      require(session.diagnostic().find("\"cpu_mode\":\"real16\"") != std::string::npos,
+      const auto progress = session.diagnostic();
+      require(progress.find("\"cpu_mode\":\"real16\"") != std::string::npos,
               "Guest BIOS prompt was reached outside real mode");
+      require(progress.find("\"last_mode_from\":\"protected16\",\"last_mode_to\":\"real16\"") != std::string::npos,
+              "Guest mode transition was missing from the boot diagnostic");
       require(screen(session).find("ISO -> QSSD") != std::string::npos,
               "Guest-generated VGA prompt missing");
       session.key(0x0d, 0x1c, false);
       require(session.step(10) == Session::Step::WaitingKey, "Key release advanced BIOS prompt");
       session.key(0x0d, 0x1c, true);
-      run_until(session, Session::Step::Halted, "Guest did not complete the BIOS write");
-      require(screen(session).find("MBR SAVED") != std::string::npos,
-              "Guest did not confirm the QSSD MBR write");
-      require(session.diagnostic().find("\"commits\":1") != std::string::npos,
-              "QSSD diagnostic did not record the write");
+      run_until(session, Session::Step::Halted, "Guest did not reboot from the QSSD it had written");
+      require(screen(session).find("QSSD REBOOT OK") != std::string::npos,
+              "Guest-requested restart did not execute QSSD boot code");
+      const auto restarted = session.diagnostic();
+      for (const auto* marker : {"\"commits\":1", "\"source\":\"qssd\"", "\"restarts\":1",
+                                 "\"last_restart\":\"port92\"", "\"atapi_cdrom\":true"})
+        require(restarted.find(marker) != std::string::npos, marker);
       session.flush();
     }
     require(bytes(fixture) == original, "Guest changed the read-only ISO");
+    {
+      std::ofstream append(disk, std::ios::binary | std::ios::app);
+      append.put('\0');
+    }
+    const auto with_tail = bytes(disk);
+    {
+      FileDescriptor iso(fixture, O_RDONLY);
+      const auto readiness = Session::check_hardware(disk, iso.value, original.size());
+      require(readiness.find("\"iso_boot\":true,\"qssd\":true") != std::string::npos,
+              "Hardware check did not read the committed media");
+    }
+    require(bytes(disk)==with_tail, "Preflight modified the QSSD or recovered its tail in place");
     {
       Session reboot(disk, 0, Session::BootSource::Disk);
       run_until(reboot, Session::Step::Halted, "QSSD guest did not complete its boot");
@@ -120,8 +143,9 @@ int main(int argc, char** argv) {
               "Reboot diagnostic did not identify QSSD");
     }
     std::cout << "REVERSE_WINDOWS_ANDROID_BIOS_ISO_QSSD_PASS "
-                 "synthetic_iso=true protected32_ia32_tsc=true protected16_to_real16=true "
-                 "bios_key=true guest_vga=true persistent_reboot=true\n";
+                 "synthetic_iso=true protected32_ia32_tsc=true protected32_lock_or=true "
+                 "protected16_to_real16=true bios_key=true guest_vga=true read_only_preflight=true "
+                 "guest_restart=true persistent_reboot=true\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "REVERSE_WINDOWS_ANDROID_BIOS_ISO_QSSD_FAIL " << error.what() << '\n';

@@ -16,6 +16,7 @@ final class NativeMachine {
     private NativeMachine() {}
 
     static native void createDisk(String qssdPath, int capacityGiB);
+    static native String checkHardware(String qssdPath, int isoFd, long isoBytes, String isoError);
     static native long open(String qssdPath, int capacityGiB, int isoFd, long isoBytes, int bootSource);
     static native void close(long handle);
     static native int step(long handle, int instructions);

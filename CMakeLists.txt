@@ -72,6 +72,10 @@ if(BUILD_TESTING)
     "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_cpu_profile_test.cpp")
   target_link_libraries(reverse_windows_cpu_profile_test PRIVATE reverse_windows_component_headers)
   add_test(NAME reverse_windows_cpu_profile COMMAND reverse_windows_cpu_profile_test)
+  add_executable(reverse_windows_lock_rmw_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_lock_rmw_test.cpp")
+  target_link_libraries(reverse_windows_lock_rmw_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_lock_rmw COMMAND reverse_windows_lock_rmw_test)
 
   add_test(NAME reverse_windows_real_x86_demo
     COMMAND reverse_windows_boot_probe --demo-x86 --steps 200000 --ram-mib 2048 --resident-mib 256)

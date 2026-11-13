@@ -8,6 +8,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
 import android.database.Cursor;
+import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
@@ -24,6 +25,7 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -40,6 +42,13 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private static final int MUTED = 0xffa4b3c7;
     private static final int ACCENT = 0xff77e5cb;
     private static final int ERROR = 0xffffa9a4;
+    private static final String[][] HARDWARE_CHECKS = {
+            {"cpu_x64", "CPU x64"}, {"cpu_sse2", "SSE2"}, {"cpu_x87", "x87"},
+            {"cpu_pae", "PAE"}, {"cpu_nx", "NX"}, {"cpu_cx16", "CMPXCHG16B"},
+            {"cpu_lahf_sahf", "LAHF/SAHF"}, {"cpu_prefetchw", "PREFETCHW"}, {"cpu_fxsr", "FXSR"},
+            {"ram", "RAM"}, {"pci_ide", "Controlador PCI IDE"}, {"vga", "Video VGA"},
+            {"iso_boot", "Arranque desde ISO"}, {"qssd", "Disco QSSD"},
+    };
 
     private File disk;
     private SharedPreferences prefs;
@@ -47,6 +56,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private String isoName;
     private VmWorker worker;
     private GuestMonitor monitor;
+    private ScrollView scroll;
     private TextView media;
     private TextView storage;
     private TextView status;
@@ -61,12 +71,16 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private Button pause;
     private Button stop;
     private Button evidence;
+    private Button hardwareCheck;
+    private TextView hardwareResult;
     private LinearLayout controls;
     private boolean pending;
     private boolean session;
     private boolean running;
     private boolean fault;
     private boolean terminal;
+    private boolean checkingHardware;
+    private boolean blankTextFrame;
     private String lastJson = "";
 
     @Override
@@ -91,7 +105,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     }
 
     private void buildScreen() {
-        ScrollView scroll = new ScrollView(this);
+        scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         scroll.setBackgroundColor(BG);
         scroll.setClipToPadding(false);
@@ -117,21 +131,26 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         add(body, source, 4);
 
         LinearLayout display = card(body, 14);
+        status = label("Máquina apagada", 16, TEXT);
+        status.setId(R.id.vm_status);
+        status.setTypeface(Typeface.DEFAULT_BOLD);
+        status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        display.addView(status);
+        stats = label("", 13, MUTED);
+        stats.setTextIsSelectable(true);
+        add(display, stats, 5);
+        evidence = action("Copiar diagnóstico", false, this::copyEvidence);
+        evidence.setId(R.id.vm_copy_diagnostic);
+        add(display, evidence, 8);
+
         monitor = new GuestMonitor(this, this);
         monitor.setBackground(panel(0xff080b10, 9, BORDER));
         monitor.setClipToOutline(true);
         int availableWidth = getResources().getConfiguration().screenWidthDp;
         int displayHeight = Math.max(200, Math.min(370, (availableWidth - 62) * 5 / 8));
-        display.addView(monitor, new LinearLayout.LayoutParams(-1, dp(displayHeight)));
-
-        status = label("Máquina apagada", 16, TEXT);
-        status.setId(R.id.vm_status);
-        status.setTypeface(Typeface.DEFAULT_BOLD);
-        add(display, status, 12);
-        stats = label("", 12, MUTED);
-        stats.setTypeface(Typeface.MONOSPACE);
-        stats.setTextIsSelectable(true);
-        add(display, stats, 5);
+        LinearLayout.LayoutParams monitorParams = new LinearLayout.LayoutParams(-1, dp(displayHeight));
+        monitorParams.topMargin = dp(10);
+        display.addView(monitor, monitorParams);
 
         controls = column();
         add(display, controls, 9);
@@ -196,8 +215,14 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         biosTest.setId(R.id.vm_bios_test);
         pair(bootRow, bootDisk, biosTest);
 
-        evidence = action("Copiar diagnóstico", false, this::copyEvidence);
-        add(body, evidence, 10);
+        hardwareCheck = action("Comprobar equipo virtual", false, this::checkHardware);
+        hardwareCheck.setId(R.id.vm_hardware_check);
+        add(setup, hardwareCheck, 12);
+        hardwareResult = label("", 13, MUTED);
+        hardwareResult.setId(R.id.vm_hardware_result);
+        hardwareResult.setVisibility(View.GONE);
+        hardwareResult.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        add(setup, hardwareResult, 6);
         setContentView(scroll);
     }
 
@@ -228,6 +253,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         if (persisted) editor.putString("iso", chosen.toString()).putString("iso_name", isoName);
         else editor.remove("iso").remove("iso_name");
         editor.apply();
+        clearHardwareResult();
         updateControls();
     }
 
@@ -255,6 +281,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         iso = null;
         isoName = null;
         prefs.edit().remove("iso").remove("iso_name").apply();
+        clearHardwareResult();
         updateControls();
     }
 
@@ -278,6 +305,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         pending = true;
         fault = false;
         terminal = false;
+        blankTextFrame = false;
         lastJson = "";
         monitor.reset();
         monitor.requestFocus();
@@ -286,11 +314,70 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             case NativeMachine.BOOT_QSSD -> "BIOS · QSSD";
             default -> "BIOS · PRUEBA";
         });
-        status.setText("Iniciando máquina…");
+        status.setText("Cargando medio de arranque…");
         status.setTextColor(TEXT);
         stats.setText("");
         updateControls();
         worker.start(bootSource, iso, debug);
+        showBootStatus();
+    }
+
+    private void checkHardware() {
+        if (session || pending) return;
+        pending = true;
+        checkingHardware = true;
+        setHardwareResult("Comprobando equipo virtual y medios seleccionados…", MUTED);
+        updateControls();
+        worker.checkHardware(iso);
+    }
+
+    private void clearHardwareResult() {
+        hardwareResult.setVisibility(View.GONE);
+    }
+
+    private void setHardwareResult(String result, int color) {
+        hardwareResult.setText(result);
+        hardwareResult.setTextColor(color);
+        hardwareResult.setVisibility(View.VISIBLE);
+        hardwareResult.post(() -> hardwareResult.requestRectangleOnScreen(new Rect(
+                0, 0, hardwareResult.getWidth(), Math.min(hardwareResult.getHeight(), dp(72)))));
+    }
+
+    @Override
+    public void onHardwareChecked(String json) {
+        pending = false;
+        checkingHardware = false;
+        try {
+            JSONObject preflight = new JSONObject(json);
+            JSONObject checks = preflight.getJSONObject("checks");
+            JSONObject errors = preflight.optJSONObject("errors");
+            boolean ready = preflight.getBoolean("ready_for_windows10_install");
+            StringBuilder result = new StringBuilder(ready
+                    ? "Requisitos comprobados para Windows 10"
+                    : "Requisitos pendientes para Windows 10");
+            for (String[] check : HARDWARE_CHECKS) {
+                String key = check[0];
+                String checkResult;
+                if (!checks.has(key)) checkResult = "sin resultado";
+                else if (checks.isNull(key)) {
+                    checkResult = switch (key) {
+                        case "qssd" -> "sin disco creado";
+                        case "iso_boot" -> "sin ISO elegida";
+                        default -> "sin resultado";
+                    };
+                } else if (checks.optBoolean(key)) checkResult = "aprobado";
+                else if (key.startsWith("cpu_")) {
+                    checkResult = "la CPU no anuncia esta capacidad";
+                } else checkResult = "falló la comprobación";
+                result.append('\n').append(check[1]).append(" · ").append(checkResult);
+                String detail = errors == null ? "" : errors.optString(key);
+                if (!detail.isEmpty()) result.append('\n').append(detail);
+            }
+            setHardwareResult(result.toString(), ready ? ACCENT : MUTED);
+        } catch (JSONException error) {
+            setHardwareResult("El resultado del equipo virtual no se pudo leer.", ERROR);
+        }
+        updateControls();
     }
 
     private void confirmStop() {
@@ -310,6 +397,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
 
     @Override
     public void onState(String json, boolean active, boolean hasSession, boolean stopped) {
+        boolean wasFault = fault;
         pending = false;
         session = hasSession;
         running = active;
@@ -323,52 +411,130 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         }
         if (!json.isEmpty()) {
             try {
-                JSONObject evidence = new JSONObject(json);
-                JSONObject machine = evidence.optJSONObject("machine");
-                if (machine == null) machine = evidence;
-                String code = evidence.optString("status");
+                JSONObject diagnostic = new JSONObject(json);
+                String code = diagnostic.optString("status");
+                JSONObject boot = diagnostic.optJSONObject("boot_progress");
                 if (session) {
+                    switch (diagnostic.optString("source")) {
+                        case "iso" -> source.setText("BIOS · CD/DVD");
+                        case "qssd" -> source.setText("BIOS · QSSD");
+                    }
                     fault = "fault".equals(code);
                     status.setTextColor(fault ? ERROR : TEXT);
                     String message = switch (code) {
                         case "waiting_key" -> "BIOS espera una tecla";
-                        case "halted" -> "CPU invitada en HLT";
+                        case "halted" -> "La CPU invitada entró en espera";
                         case "powered_off" -> "El invitado se apagó";
-                        case "fault" -> "El invitado se detuvo";
-                        default -> "En ejecución";
+                        case "fault" -> "Arranque detenido por un fallo";
+                        default -> boot != null && boot.optBoolean("handed_off")
+                                ? "Invitado en ejecución" : "Arranque en ejecución";
                     };
                     status.setText(!active && !fault && !terminal
                             ? "Máquina en pausa" : message);
                 }
-                String mode = machine.optString("cpu_mode", "CPU");
-                String rip = machine.optString("rip_hex", "");
-                String detail = machine.optString("message", "");
-                String position = String.format(Locale.US, "%s · CS %04X · IP %s\n%,d pasos",
-                        mode, machine.optInt("cs", 0), rip, machine.optLong("instructions"));
-                if (fault && !detail.isEmpty()) position += "\n" + detail;
-                stats.setText(position);
+                updateBootProgress(diagnostic, boot);
             } catch (JSONException error) {
                 stats.setText("Diagnóstico disponible para copiar.");
             }
+        } else if (!session) {
+            stats.setText("");
         }
         updateControls();
+        if (fault && !wasFault) showBootStatus();
+    }
+
+    private void updateBootProgress(JSONObject diagnostic, JSONObject boot) {
+        JSONObject machine = diagnostic.optJSONObject("machine");
+        if (machine == null) machine = diagnostic;
+        JSONObject ata = diagnostic.optJSONObject("ata");
+        JSONObject volume = diagnostic.optJSONObject("disk");
+        long steps = machine.optLong("instructions");
+        long reads = machine.optLong("disk_reads");
+        long readSectors = ata == null ? 0 : ata.optLong("read_sectors");
+        long commits = volume == null ? 0 : volume.optLong("commits");
+        boolean handedOff = boot == null ? steps > 0 : boot.optBoolean("handed_off");
+        StringBuilder progress = new StringBuilder(handedOff ? "BIOS entregó el control al invitado"
+                : "BIOS preparando el arranque");
+        progress.append("\nModo ").append(modeName(machine.optString("cpu_mode")));
+        progress.append(String.format(Locale.getDefault(), " · %,d instrucciones", steps));
+        if (boot != null && boot.optLong("mode_changes") > 0) {
+            progress.append("\nÚltimo cambio: ").append(modeName(boot.optString("last_mode_from")))
+                    .append(" → ").append(modeName(boot.optString("last_mode_to")));
+        }
+        long restarts = boot == null ? 0 : boot.optLong("restarts");
+        if (restarts > 0) {
+            progress.append(String.format(Locale.getDefault(), "\nReinicios automáticos: %,d", restarts));
+        }
+        if ("iso".equals(diagnostic.optString("source"))) {
+            progress.append(String.format(Locale.getDefault(), "\nLecturas de la ISO por BIOS: %,d", reads));
+        } else if (volume != null) {
+            progress.append(String.format(Locale.getDefault(), "\nLecturas del disco por BIOS: %,d", reads));
+        }
+        if (volume != null) {
+            progress.append(String.format(Locale.getDefault(),
+                    "\nSectores leídos por ATA: %,d · Operaciones guardadas en QSSD: %,d", readSectors, commits));
+        }
+        String detail = machine.optString("message");
+        if ("fault".equals(diagnostic.optString("status")) && !detail.isEmpty()) {
+            progress.append("\nÚltimo bloqueo: ").append(detail);
+        } else if (session && handedOff && blankTextFrame) {
+            progress.append("\nLa pantalla VGA todavía está en blanco.");
+        }
+        stats.setText(progress);
+    }
+
+    private static String modeName(String mode) {
+        return switch (mode) {
+            case "real16" -> "real de 16 bits";
+            case "protected16" -> "protegido de 16 bits";
+            case "protected32" -> "protegido de 32 bits";
+            case "compat16" -> "de compatibilidad de 16 bits";
+            case "compat32" -> "de compatibilidad de 32 bits";
+            case "long64" -> "de 64 bits";
+            default -> mode.isEmpty() ? "sin datos" : mode;
+        };
+    }
+
+    private void showBootStatus() {
+        scroll.post(() -> scroll.smoothScrollTo(0, 0));
     }
 
     @Override
     public void onFrame(VmWorker.Frame frame) {
+        boolean blank = frame.text != null;
+        if (frame.text != null) {
+            for (int cell = 0; cell + 1 < frame.text.length; cell += 2) {
+                int character = frame.text[cell] & 0xff;
+                int attribute = frame.text[cell + 1] & 0xff;
+                if ((attribute & 0x70) != 0 || (character != 0 && character != 32 && (attribute & 0x0f) != 0)) {
+                    blank = false;
+                    break;
+                }
+            }
+        }
+        blankTextFrame = blank;
         monitor.show(frame);
     }
 
     @Override
     public void onError(String message, boolean hasSession) {
         pending = false;
+        if (checkingHardware) {
+            checkingHardware = false;
+            setHardwareResult("No se pudo comprobar el equipo virtual.\n" + message, ERROR);
+            updateControls();
+            return;
+        }
         session = hasSession;
         running = false;
         fault = true;
         status.setTextColor(ERROR);
         status.setText("Máquina detenida");
-        stats.setText(message);
+        stats.setText("Último bloqueo: " + message);
+        lastJson = "{\"schema\":\"reverse-windows-android-error-v1\",\"status\":\"fault\",\"message\":"
+                + JSONObject.quote(message) + "}";
         updateControls();
+        showBootStatus();
     }
 
     @Override
@@ -377,6 +543,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         status.setText("QSSD listo");
         status.setTextColor(TEXT);
         stats.setText("El disco virtual está vacío.");
+        clearHardwareResult();
         updateControls();
     }
 
@@ -392,16 +559,18 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         bootIso.setEnabled(setup && iso != null && diskReady);
         bootDisk.setEnabled(setup && diskReady);
         biosTest.setEnabled(setup);
+        hardwareCheck.setEnabled(setup);
         controls.setVisibility(session ? View.VISIBLE : View.GONE);
         pause.setText(running ? "Pausar" : "Reanudar");
         pause.setEnabled(session && !pending && !fault && !terminal);
         stop.setEnabled(session && !pending);
-        evidence.setEnabled(!lastJson.isEmpty());
+        evidence.setVisibility(lastJson.isEmpty() ? View.GONE : View.VISIBLE);
     }
 
     private void copyEvidence() {
         ClipboardManager clipboard = getSystemService(ClipboardManager.class);
         clipboard.setPrimaryClip(ClipData.newPlainText("REVERSE Windows", lastJson));
+        if (Build.VERSION.SDK_INT < 33) Toast.makeText(this, "Diagnóstico copiado", Toast.LENGTH_SHORT).show();
     }
 
     private void sendGuestKey(int ascii, int scan) {

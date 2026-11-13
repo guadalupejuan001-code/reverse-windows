@@ -73,6 +73,16 @@ auto session(jlong handle, Action action) {
 
 extern "C" {
 
+JNIEXPORT jstring JNICALL Java_com_reversewindows_android_NativeMachine_checkHardware(
+        JNIEnv* env, jclass, jstring disk, jint iso_fd, jlong iso_bytes, jstring iso_error) {
+    return call<jstring>(env, nullptr, [&] {
+        if (iso_bytes < 0) throw std::invalid_argument("Tamaño de medio inválido.");
+        const auto result = Session::check_hardware(string_from(env, disk), iso_fd,
+                static_cast<std::uint64_t>(iso_bytes), string_from(env, iso_error));
+        return env->NewStringUTF(result.c_str());
+    });
+}
+
 JNIEXPORT jlong JNICALL Java_com_reversewindows_android_NativeMachine_open(
         JNIEnv* env, jclass, jstring disk, jint capacity, jint iso_fd, jlong iso_bytes, jint source) {
     return call<jlong>(env, 0, [&] {
