@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">REVERSE Windows</string>
+    <style name="AppTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#77E5CB</item>
+        <item name="android:windowBackground">#0C111A</item>
+        <item name="android:statusBarColor">#0C111A</item>
+        <item name="android:navigationBarColor">#0C111A</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
+    <item name="vm_monitor" type="id" />
+    <item name="vm_status" type="id" />
+    <item name="vm_select_iso" type="id" />
+    <item name="vm_create_disk" type="id" />
+    <item name="vm_boot_iso" type="id" />
+    <item name="vm_boot_disk" type="id" />
+    <item name="vm_bios_test" type="id" />
+</resources>

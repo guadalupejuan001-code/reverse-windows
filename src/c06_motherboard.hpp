@@ -4,9 +4,12 @@
 // model / a bounded LAPIC and IOAPIC register subset. Not a chipset clone.
 #include "c06_acpi.hpp"
 #include "c07_ata.hpp"
+#include "atapi_cdrom.hpp"
 #include "pc_machine.hpp"
+#include "ps2_keyboard.hpp"
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <chrono>
 #include <cstdint>
 #include <ctime>
@@ -108,6 +111,7 @@ class PcMotherboardC06 {
   };
 
   cosmic_pc::PcMachine& pc_;
+  std::optional<Ps2Keyboard> keyboard_;
   std::function<std::optional<std::uint32_t>(std::uint16_t,unsigned)> prior_in_;
   std::function<bool(std::uint16_t,unsigned,std::uint32_t)> prior_out_;
   std::function<bool(std::uint64_t)> prior_mmio_claim_;
@@ -117,6 +121,7 @@ class PcMotherboardC06 {
   std::function<void()> prior_reset_;
   Pic master_{},slave_{};
   std::unique_ptr<AtaC07> ata_;
+  std::unique_ptr<AtapiCdrom> optical_;
   std::array<std::uint8_t,256> ata_cfg_{};
   std::uint64_t ata_irq_delivered_=0;
   Pit pit_{};
@@ -128,7 +133,7 @@ class PcMotherboardC06 {
   std::uint64_t ticks_=0,irq_delivered_=0,pit_irqs_=0,apic_irqs_=0;
   std::uint32_t apic_tpr_=0,apic_svr_=0xff,apic_lvt_timer_=0x10000;
   std::uint32_t apic_timer_reload_=0,apic_timer_counter_=0,apic_divider_=0x3;
-  std::optional<std::uint8_t> lapic_pending_;
+  std::bitset<256> lapic_pending_;
   std::uint32_t lapic_in_service_=0,ioapic_select_=0;
   std::array<std::uint32_t,24> io_redir_low_{},io_redir_high_{};
   // Register dword writes are assembled by the byte MMIO bridge, not applied
@@ -150,11 +155,13 @@ class PcMotherboardC06 {
     b[0x0e]=0; // multifunction=0; no storage devices declared before C07
   }
   void reset_devices(){
+    if(keyboard_) keyboard_->reset();
     master_=Pic{};slave_=Pic{};slave_.vector=0x70;
     pit_=Pit{};pci_selector_=0;clock_steps_=0;
     cmos_index_=0;rtc_b_=2;pm_control_=0;powered_off_=false;
     ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=0;
     if(ata_)ata_->reset();
+    if(optical_)optical_->reset();
     apic_tpr_=0;apic_svr_=0xff;apic_lvt_timer_=0x10000;
     apic_timer_reload_=apic_timer_counter_=0;apic_divider_=3;
     lapic_pending_.reset();lapic_in_service_=0;ioapic_select_=0;
@@ -162,7 +169,7 @@ class PcMotherboardC06 {
     mmio_pending_={};
     build_config(host_cfg_,0x0001,0x00);
     build_config(isa_cfg_,0x0002,0x01);
-    if(ata_){
+    if(ata_ || optical_){
       ata_cfg_.fill(0);
       config32(ata_cfg_,0,(0xc071U<<16)|0x1b36U); // synthetic C07 PCI IDE
       ata_cfg_[4]=1; // PCI I/O space decode enabled
@@ -171,7 +178,10 @@ class PcMotherboardC06 {
       ata_cfg_[10]=0x01;ata_cfg_[11]=0x01; // PCI 0x0101 IDE controller
       config32(ata_cfg_,0x10,0x1f1); // primary command BAR I/O
       config32(ata_cfg_,0x14,0x3f5); // primary control BAR I/O
-      // Secondary channel has no attached drive; BAR2/3 and BAR4 DMA absent.
+      if(optical_){
+        config32(ata_cfg_,0x18,0x171);
+        config32(ata_cfg_,0x1c,0x375);
+      }
       ata_cfg_[0x3c]=14;ata_cfg_[0x3d]=1; // legacy IRQ14 / INT A
     }
     // After a real PcMachine::reset, firmware RAM is new; republish the
@@ -180,6 +190,7 @@ class PcMotherboardC06 {
   }
   bool owned_port(std::uint16_t p) const {
     if(ata_ && ata_->handles(p) && (ata_cfg_[4]&1U))return true;
+    if(optical_ && optical_->handles(p) && (ata_cfg_[4]&1U))return true;
     return p==0x20||p==0x21||p==0xa0||p==0xa1||
            (p>=0x40&&p<=0x43)||(p>=0x70&&p<=0x71)||
            (p>=0xcf8&&p<=0xcff)||(p>=0x600&&p<=0x60b);
@@ -191,7 +202,7 @@ class PcMotherboardC06 {
     const unsigned dev=(pci_selector_>>11)&31;
     if(dev==0)return &host_cfg_;
     if(dev==1)return &isa_cfg_;
-    if(dev==2&&ata_)return &ata_cfg_;
+    if(dev==2&&(ata_||optical_))return &ata_cfg_;
     return nullptr;
   }
   std::optional<std::uint32_t> pci_read(std::uint16_t p,unsigned width){
@@ -251,7 +262,14 @@ class PcMotherboardC06 {
     return (rtc_b_&4)?std::uint8_t(raw):bcd(raw);
   }
   std::optional<std::uint32_t> io_read(std::uint16_t p,unsigned width){
+    if(keyboard_&&width==1&&(p==0x60||p==0x64)){
+      const auto status=prior_in_(0x64,1).value_or(0);
+      if(p==0x64)return status|(keyboard_->has_data()?1U:0U);
+      if(status&1U)return prior_in_(p,width);
+      return keyboard_->read_data();
+    }
     if(ata_&&ata_->handles(p)&&(ata_cfg_[4]&1U))return ata_->input(p,width);
+    if(optical_&&optical_->handles(p)&&(ata_cfg_[4]&1U))return optical_->input(p,width);
     if(p>=0xcf8&&p<=0xcff)return pci_read(p,width);
     if(p==0x608&&width==4)return std::uint32_t(ticks_&0x00ffffffU);
     if((p==0x604&&width==2))return pm_control_;
@@ -269,7 +287,16 @@ class PcMotherboardC06 {
     }
   }
   bool io_write(std::uint16_t p,unsigned width,std::uint32_t value){
+    if(keyboard_&&width==1&&(p==0x60||p==0x64)){
+      const auto data=std::uint8_t(value);
+      if(p==0x60&&!keyboard_->controller_expects_data())return keyboard_->command(data);
+      if(!prior_out_(p,width,value))return false;
+      if(p==0x64)keyboard_->controller_command(data);
+      else keyboard_->controller_data(data);
+      return true;
+    }
     if(ata_&&ata_->handles(p)&&(ata_cfg_[4]&1U))return ata_->output(p,width,value);
+    if(optical_&&optical_->handles(p)&&(ata_cfg_[4]&1U))return optical_->output(p,width,value);
     if(p>=0xcf8&&p<=0xcff)return pci_write(p,width,value);
     if(p==0x604&&width==2){
       pm_control_=std::uint16_t(value);
@@ -377,20 +404,25 @@ class PcMotherboardC06 {
     return true;
   }
   bool lapic_on()const{return bool(apic_svr_&0x100);}
-  void signal_irq14(){
-    if(!ata_)return;
-    const auto redirect=io_redir_low_[14];
+  std::optional<std::uint8_t> highest_lapic_request() const {
+    if(!lapic_pending_.any())return std::nullopt;
+    for(unsigned vector=255;vector>=0x20;--vector)
+      if(lapic_pending_[vector])return std::uint8_t(vector);
+    return std::nullopt;
+  }
+  void signal_storage_irq(unsigned line){
+    const auto redirect=io_redir_low_[line];
     if(lapic_on() && !(redirect&0x10000U) && (redirect&0xffU)>=0x20U){
-      lapic_pending_=std::uint8_t(redirect);
+      lapic_pending_.set(redirect&0xffU);
     }else{
-      slave_.irr|=(1U<<6);
+      slave_.irr|=std::uint8_t(1U<<(line-8));
     }
   }
   void signal_irq0(){
     ++pit_irqs_;
     const auto redirect=io_redir_low_[0];
     if(lapic_on()&&!(redirect&0x10000U) && (redirect&0xffU)>=0x20U){
-      lapic_pending_=std::uint8_t(redirect);
+      lapic_pending_.set(redirect&0xffU);
     }else{
       master_.irr|=1U;
     }
@@ -398,24 +430,34 @@ class PcMotherboardC06 {
   void poll(){
     ++ticks_;
     if(pit_.tick())signal_irq0();
+    if(keyboard_&&keyboard_->needs_irq()&&!(prior_in_(0x64,1).value_or(0)&1U)){
+      const auto redirect=io_redir_low_[1];
+      if(lapic_on()&&!(redirect&0x10000U)&&(redirect&0xffU)>=0x20U)
+        lapic_pending_.set(redirect&0xffU);
+      else
+        master_.irr|=1U<<1;
+      keyboard_->mark_irq();
+    }
     // Synthetic tick-based LAPIC timer: not a calibrated physical TSC or
     // 1.193-MHz PIT clock. Windows timing compliance remains unverified.
     if(lapic_on()&&apic_timer_counter_){
       if(--apic_timer_counter_==0){
         if(!(apic_lvt_timer_&0x10000U)&&std::uint8_t(apic_lvt_timer_)>=0x20)
-          lapic_pending_=std::uint8_t(apic_lvt_timer_);
+          lapic_pending_.set(apic_lvt_timer_&0xffU);
         if(apic_lvt_timer_&0x20000U)apic_timer_counter_=apic_timer_reload_;
       }
     }
     auto& cpu=pc_.cpu;
     if(cpu.fault||!cpu.flag(cosmic_pc::Cpu::IF))return;
-    if(lapic_pending_ && lapic_on() && !lapic_in_service_ &&
-       ((*lapic_pending_&0xf0U)>(apic_tpr_&0xf0U))){
-      if(cpu.raise_external_irq(*lapic_pending_)){
-        lapic_in_service_=*lapic_pending_;lapic_pending_.reset();
-        ++apic_irqs_;++irq_delivered_;
+    if(lapic_on()&&!lapic_in_service_){
+      const auto request=highest_lapic_request();
+      if(request&&(*request&0xf0U)>(apic_tpr_&0xf0U)){
+        if(cpu.raise_external_irq(*request)){
+          lapic_in_service_=*request;lapic_pending_.reset(*request);
+          ++apic_irqs_;++irq_delivered_;
+        }
+        return;
       }
-      return;
     }
     // 8259 cascade: a pending slave IRQ presents IRQ2 at the master PIC.
     // Deliver the SLAVE vector, not master IRQ2's vector. Both PICs must EOI.
@@ -438,8 +480,11 @@ class PcMotherboardC06 {
   }
 
  public:
-  explicit PcMotherboardC06(cosmic_pc::PcMachine& machine, BlockDisk* disk=nullptr):pc_(machine){
-    if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_irq14();});
+  explicit PcMotherboardC06(cosmic_pc::PcMachine& machine, BlockDisk* disk=nullptr,
+                            AtapiCdrom::Reader optical={}, std::uint64_t optical_bytes=0):pc_(machine){
+    if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_storage_irq(14);});
+    if(optical)optical_=std::make_unique<AtapiCdrom>(
+        std::move(optical),optical_bytes,[this](){signal_storage_irq(15);});
     // The machine must be booted/mounted first. ACPI goes into reserved BIOS
     // memory and is never presented by E820 as allocatable guest RAM.
     prior_in_=pc_.cpu.in_hook;prior_out_=pc_.cpu.out_hook;
@@ -450,10 +495,12 @@ class PcMotherboardC06 {
     prior_reset_=pc_.device_reset_hook;
     reset_devices();
     pc_.cpu.in_hook=[this](std::uint16_t p,unsigned w){
+      if(keyboard_&&(p==0x60||p==0x64))return io_read(p,w);
       if(owned_port(p))return io_read(p,w);
       return prior_in_?prior_in_(p,w):std::nullopt;
     };
     pc_.cpu.out_hook=[this](std::uint16_t p,unsigned w,std::uint32_t v){
+      if(keyboard_&&(p==0x60||p==0x64))return io_write(p,w,v);
       if(owned_port(p))return io_write(p,w,v);
       return prior_out_&&prior_out_(p,w,v);
     };
@@ -495,7 +542,12 @@ class PcMotherboardC06 {
   // Deterministic single guest-cycle advance; no host sleeper or background
   // worker. PC's canonical run loop calls this once per guest step.
   void advance_one(){poll();}
+  void enable_ps2_keyboard(){keyboard_.emplace();}
+  bool inject_ps2_key(unsigned code,bool pressed){
+    return keyboard_&&keyboard_->inject(code,pressed);
+  }
   AtaC07* attached_ata(){return ata_.get();}
   const AtaC07* attached_ata()const{return ata_.get();}
+  bool optical_attached()const{return bool(optical_);}
 };
 } // namespace reverse_windows

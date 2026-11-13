@@ -1,0 +1,187 @@
+name: REVERSE Windows Android boot
+
+on:
+  push:
+    paths:
+      - "android/**"
+      - "src/**"
+      - "tests/**"
+      - "config/dependencies.lock.json"
+      - "scripts/verify_deps.py"
+      - "CMakeLists.txt"
+      - ".github/workflows/android-boot.yml"
+  pull_request:
+    paths:
+      - "android/**"
+      - "src/**"
+      - "tests/**"
+      - "config/dependencies.lock.json"
+      - "scripts/verify_deps.py"
+      - "CMakeLists.txt"
+      - ".github/workflows/android-boot.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: Android ${{ matrix.abi }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, x86_64]
+    env:
+      ANDROID_ABI: ${{ matrix.abi }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Checkout exact component revisions
+        run: |
+          python3 scripts/verify_deps.py --manifest-only
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import subprocess
+
+          manifest = pathlib.Path("config/dependencies.lock.json")
+          for component in json.loads(manifest.read_text())["components"]:
+              target = component["checkout"]
+              url = "https://github.com/" + component["repository"] + ".git"
+              subprocess.run(["git", "init", "--quiet", target], check=True)
+              subprocess.run(["git", "-C", target, "fetch", "--quiet", "--depth", "1", url,
+                              component["commit"]], check=True)
+              subprocess.run(["git", "-C", target, "checkout", "--quiet", "--detach", "FETCH_HEAD"], check=True)
+          PY
+          python3 scripts/verify_deps.py
+      - name: Verify synthetic ISO boot, keyboard, QSSD write and disk reboot
+        if: matrix.abi == 'arm64-v8a'
+        run: |
+          cmake -S . -B build \
+            -DREVERSE_MUNDO_X_ROOT="$PWD/deps/mundo-X" \
+            -DREVERSE_QSSD_ROOT="$PWD/deps/Virtual-qSSD-" \
+            -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" \
+            -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+          cmake --build build --target reverse_windows_android_boot_session_test \
+            reverse_windows_atapi_cdrom_guest_test reverse_windows_c06_motherboard_guest_test --parallel 2
+          ctest --test-dir build --output-on-failure \
+            -R '^(reverse_windows_android_|reverse_windows_c06_real_motherboard$)'
+      - name: Install Android command-line tools and pinned packages
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: "11076708"
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018 cmake;3.22.1"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build signed debug APK
+        working-directory: android
+        run: ./gradlew --no-daemon --stacktrace -PandroidAbi="$ANDROID_ABI" :app:assembleDebug
+      - name: Verify APK signature, manifest and native ABI
+        run: |
+          apk=android/app/build/outputs/apk/debug/app-debug.apk
+          tools="$ANDROID_HOME/build-tools/35.0.0"
+          out="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI"
+          mkdir -p "$out"
+          apk_name="REVERSE-Windows-Android-$ANDROID_ABI-debug.apk"
+          cp "$apk" "$out/$apk_name"
+          "$tools/apksigner" verify --verbose --print-certs "$apk" | tee "$out/signature.txt"
+          "$tools/zipalign" -c -P 16 -v 4 "$apk" > "$out/alignment.txt"
+          "$tools/aapt" dump badging "$apk" > "$out/manifest.txt"
+          grep -Fq "package: name='com.reversewindows.android'" "$out/manifest.txt"
+          grep -Fxq "native-code: '$ANDROID_ABI'" "$out/manifest.txt"
+          entry="lib/$ANDROID_ABI/libreverse_windows_android.so"
+          unzip -p "$apk" "$entry" > "$RUNNER_TEMP/reverse-windows-android.so"
+          readelf -h -lW "$RUNNER_TEMP/reverse-windows-android.so" > "$out/native-elf.txt"
+          if [[ "$ANDROID_ABI" == arm64-v8a ]]; then
+            grep -Fq 'AArch64' "$out/native-elf.txt"
+            python3 - "$out/native-elf.txt" <<'PY'
+          import pathlib
+          import sys
+
+          lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+          load = [line.split()[-1] for line in lines if line.split()[:1] == ["LOAD"]]
+          assert load and all(int(value, 16) >= 16384 for value in load), load
+          PY
+          else
+            grep -Fq 'X86-64' "$out/native-elf.txt"
+          fi
+          {
+            printf 'source_sha=%s\n' "$(git rev-parse HEAD)"
+            printf 'android_abi=%s\n' "$ANDROID_ABI"
+            printf 'android_ndk=27.2.12479018\n'
+          } > "$out/build.txt"
+          cp config/dependencies.lock.json "$out/"
+          (cd "$out" && sha256sum "$apk_name" > SHA256SUMS)
+      - name: Publish ARM64 APK and verification
+        if: matrix.abi == 'arm64-v8a'
+        uses: actions/upload-artifact@v4
+        with:
+          name: REVERSE-Windows-Android-arm64-v8a-debug
+          path: ${{ runner.temp }}/reverse-windows-arm64-v8a
+          if-no-files-found: error
+      - name: Enable KVM for Android runtime smoke test
+        id: kvm
+        if: matrix.abi == 'x86_64'
+        run: |
+          if [[ ! -c /dev/kvm ]]; then
+            printf 'Android emulator smoke skipped because this runner lacks /dev/kvm.\n' | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          echo "available=true" >> "$GITHUB_OUTPUT"
+      - name: Prepare Android runtime check
+        if: matrix.abi == 'x86_64' && steps.kvm.outputs.available == 'true'
+        run: |
+          cat > "$RUNNER_TEMP/reverse-windows-adb-smoke.sh" <<'BASH'
+          set -euo pipefail
+          apk=android/app/build/outputs/apk/debug/app-debug.apk
+          log="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/android-runtime.log"
+          trap 'adb logcat -d > "$log"' EXIT
+          adb install -r "$apk"
+          adb logcat -c
+          adb shell am start -W -n com.reversewindows.android/.MainActivity --ez com.reversewindows.android.SELF_TEST true
+          wait_for_state() {
+            local expected="$1"
+            for attempt in {1..50}; do
+              if adb logcat -d -s ReverseWindows:I '*:S' > "$log" &&
+                grep -Fq "\"source\":\"self-test\",\"status\":\"$expected\"" "$log"; then
+                return 0
+              fi
+              sleep 1
+            done
+            cat "$log"
+            return 1
+          }
+          wait_for_state waiting_key
+          adb shell input keyevent KEYCODE_ENTER
+          wait_for_state halted
+          BASH
+      - name: Run synthetic BIOS and keyboard on Android
+        if: matrix.abi == 'x86_64' && steps.kvm.outputs.available == 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          enable-hw-keyboard: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: bash "$RUNNER_TEMP/reverse-windows-adb-smoke.sh"
+      - name: Preserve Android x86_64 runtime evidence
+        if: always() && matrix.abi == 'x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: REVERSE-Windows-Android-x86_64-smoke
+          path: ${{ runner.temp }}/reverse-windows-x86_64
+          if-no-files-found: warn

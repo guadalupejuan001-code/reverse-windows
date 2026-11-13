@@ -191,12 +191,95 @@ void ioapic_lapic_guest(){
   need(unsupported,"unsupported local APIC register must not fake value");
   std::cout<<"C06_IOAPIC_LAPIC_MMIO_IRQ_PASS delivered="<<board.evidence().apic_irqs<<"\n";
 }
+void ps2_keyboard_guest(){
+  PcMachine pc(16*1024*1024);boot32(pc);
+  PcMotherboardC06 board(pc);
+  board.enable_ps2_keyboard();
+  pc.cpu.idtr={0x1000,0x15000};
+  pc.cpu.regs[Cpu::ESP]=0x190000;
+  pc.cpu.regs[Cpu::EDI]=0x9300;
+  gate(pc.cpu,0x21,0x13400);
+  code(pc.cpu,0x13400,{
+      0xe4,0x60,             // IN AL, 60h
+      0xaa,                  // STOSB, next guest byte
+      0xb0,0x20,0xe6,0x20, // PIC EOI
+      0xcf                   // IRETD
+  });
+  std::vector<std::uint8_t> p;
+  const auto out=[&](std::uint8_t value,std::uint8_t port){
+    emit(p,{0xb0,value,0xe6,port});
+  };
+  out(0x11,0x20);out(0x20,0x21);out(0x04,0x21);out(0x01,0x21);
+  out(0xfd,0x21); // Unmask PS/2 IRQ1 only.
+  out(0x60,0x64);out(0x05,0x60); // System + IRQ1, set 2 at the data port.
+  out(0xf2,0x60); // Identify keyboard and receive ACK, AB, 83.
+  emit(p,{0xfb,0xf4,0xeb,0xfd}); // STI; HLT; JMP to HLT for the next byte.
+  code(pc.cpu,0xa000,p);pc.cpu.eip=0xa000;pc.cpu.halted=false;pc.cpu.fault.reset();
+  run(pc,160);
+  need(pc.cpu.read8(0x9300)==0xfa && pc.cpu.read8(0x9301)==0xab &&
+       pc.cpu.read8(0x9302)==0x83 && pc.cpu.regs[Cpu::EDI]==0x9303,
+       "guest PS/2 identify responses missing or out of order");
+  need(board.inject_ps2_key(0xe04b,true) && board.inject_ps2_key(0xe04b,false),
+       "host extended key was not queued");
+  run(pc,160);
+  const std::array<std::uint8_t,5> sequence{0xe0,0x6b,0xe0,0xf0,0x6b};
+  for(unsigned i=0;i<sequence.size();++i)
+    need(pc.cpu.read8(0x9303+i)==sequence[i],"guest scan-set 2 make/break bytes differ");
+  need(board.evidence().irq_delivered==8 && pc.cpu.regs[Cpu::EDI]==0x9308 &&
+       pc.cpu.regs[Cpu::ESP]==0x190000,"PS/2 IRQ1 must resume and return the guest for every byte");
+  std::cout<<"C06_PS2_KEYBOARD_IRQ1_PASS bytes=8 protected32=true\n";
+}
+void queued_lapic_requests_guest(){
+  PcMachine pc(16*1024*1024);boot32(pc);
+  PcMotherboardC06 board(pc);
+  board.enable_ps2_keyboard();
+  pc.cpu.idtr={0x1000,0x15000};
+  pc.cpu.regs[Cpu::ESP]=0x190000;
+  pc.cpu.regs[Cpu::EDI]=0x9400;
+  gate(pc.cpu,0x31,0x13400);
+  gate(pc.cpu,0x42,0x13500);
+  code(pc.cpu,0x13400,{
+      0xe4,0x60,0xaa, // Read the keyboard byte and append to guest evidence.
+      0xc7,0x05,0xb0,0,0xe0,0xfe,0,0,0,0,0xcf // LAPIC EOI and IRETD.
+  });
+  code(pc.cpu,0x13500,{
+      0xb0,0x42,0xaa, // Mark timer completion and append to guest evidence.
+      0xc7,0x05,0xb0,0,0xe0,0xfe,0,0,0,0,0xcf
+  });
+  std::vector<std::uint8_t> setup{0xfa}; // CLI until both devices have raised IRQ.
+  const auto write_reg=[&](std::uint32_t address,std::uint32_t value){
+    emit(setup,{0xc7,0x05});
+    for(unsigned i=0;i<4;++i)setup.push_back(std::uint8_t(address>>(8*i)));
+    for(unsigned i=0;i<4;++i)setup.push_back(std::uint8_t(value>>(8*i)));
+  };
+  write_reg(0xfee000f0,0x1ff); // Enable LAPIC.
+  write_reg(0xfec00000,0x12); // IOAPIC GSI1.
+  write_reg(0xfec00010,0x31); // PS/2 vector 31h.
+  write_reg(0xfee00320,0x42); // One-shot timer vector 42h.
+  write_reg(0xfee00380,2);
+  emit(setup,{0xb0,0x60,0xe6,0x64,0xb0,0x45,0xe6,0x60,0xeb,0xfe});
+  code(pc.cpu,0xa000,setup);pc.cpu.eip=0xa000;pc.cpu.halted=false;pc.cpu.fault.reset();
+  run(pc,100);
+  need(board.inject_ps2_key(0x1e,true),"test keyboard did not queue a scan code");
+  run(pc,25);
+  need(board.evidence().irq_delivered==0,"IRQ was delivered while guest IF was clear");
+  code(pc.cpu,0xa100,{0xfb,0xf4,0xeb,0xfd});
+  pc.cpu.eip=0xa100;
+  run(pc,100);
+  need(pc.cpu.read8(0x9400)==0x42 && pc.cpu.read8(0x9401)==0x1e &&
+       pc.cpu.regs[Cpu::EDI]==0x9402 && board.evidence().apic_irqs==2,
+       "LAPIC lost a pending request or delivered vectors out of priority order");
+  need(pc.cpu.regs[Cpu::ESP]==0x190000,"queued LAPIC interrupts did not restore the guest stack");
+  std::cout<<"C06_LAPIC_QUEUED_IRQ_PASS timer=0x42 keyboard=0x31\n";
+}
 }
 int main(){
   try{
     pic_pit_guest();
     pci_acpi_cmos_guest();
     ioapic_lapic_guest();
+    ps2_keyboard_guest();
+    queued_lapic_requests_guest();
     std::cout<<"REVERSE_WINDOWS_C06_MOTHERBOARD_PASS checks="<<checks
              <<" windows_booted=false full_acpi=false full_apic=false\n";
     return 0;

@@ -1,0 +1,303 @@
+package com.reversewindows.android;
+
+import android.content.ContentResolver;
+import android.net.Uri;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.Looper;
+import android.os.ParcelFileDescriptor;
+import android.os.SystemClock;
+import android.util.Log;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+final class VmWorker {
+    interface Listener {
+        void onState(String json, boolean running, boolean hasSession, boolean stopped);
+        void onFrame(Frame frame);
+        void onError(String message, boolean hasSession);
+        void onDiskCreated();
+    }
+
+    static final class Frame {
+        final int width;
+        final int height;
+        final byte[] text;
+        final int[] pixels;
+
+        Frame(int width, int height, byte[] text, int[] pixels) {
+            this.width = width;
+            this.height = height;
+            this.text = text;
+            this.pixels = pixels;
+        }
+    }
+
+    private static final String TAG = "ReverseWindows";
+    private static final int DISK_GIB = 64;
+    private static final int STEPS_PER_SLICE = 4096;
+    private static final long FRAME_INTERVAL_MS = 100;
+    private static final long STATUS_INTERVAL_MS = 350;
+    private static final int MAX_FRAME_WIDTH = 960;
+    private static final int MAX_FRAME_HEIGHT = 720;
+
+    private final ContentResolver resolver;
+    private final File disk;
+    private final Listener listener;
+    private final HandlerThread thread = new HandlerThread("reverse-windows-vm");
+    private final Handler worker;
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private final AtomicBoolean framePending = new AtomicBoolean();
+    private final byte[] textCells = new byte[4000];
+
+    private volatile boolean released;
+    private long handle;
+    private int outcome;
+    private boolean running;
+    private boolean foreground = true;
+    private boolean debugSelfTest;
+    private long lastFrame;
+    private long lastStatus;
+    private int[] graphics;
+    private int graphicsWidth;
+    private int graphicsHeight;
+    private boolean forceFrame;
+    private boolean retryFrame;
+    private String lastLoggedStatus = "";
+    private final Runnable slice = this::runSlice;
+
+    VmWorker(ContentResolver resolver, File disk, Listener listener) {
+        this.resolver = resolver;
+        this.disk = disk;
+        this.listener = listener;
+        thread.start();
+        worker = new Handler(thread.getLooper());
+    }
+
+    void createDisk() {
+        worker.post(() -> {
+            try {
+                NativeMachine.createDisk(disk.getAbsolutePath(), DISK_GIB);
+                send(listener::onDiskCreated);
+            } catch (RuntimeException | LinkageError error) {
+                report(error);
+            }
+        });
+    }
+
+    void start(int source, Uri iso, boolean debug) {
+        worker.post(() -> {
+            if (handle != 0) return;
+            try {
+                debugSelfTest = debug;
+                lastLoggedStatus = "";
+                retryFrame = false;
+                String path = source == NativeMachine.BOOT_SELF_TEST ? "" : disk.getAbsolutePath();
+                if (source == NativeMachine.BOOT_ISO) {
+                    if (iso == null) throw new IOException("Elige primero una imagen ISO.");
+                    try (ParcelFileDescriptor fd = resolver.openFileDescriptor(iso, "r")) {
+                        if (fd == null) throw new IOException("Android no pudo abrir la ISO.");
+                        handle = NativeMachine.open(path, 0, fd.getFd(),
+                                Math.max(0, fd.getStatSize()), source);
+                    }
+                } else {
+                    handle = NativeMachine.open(path, 0, -1, 0, source);
+                }
+                if (handle == 0) throw new IllegalStateException("La máquina no se pudo iniciar.");
+                outcome = 0;
+                lastStatus = 0;
+                lastFrame = 0;
+                forceFrame = true;
+                running = true;
+                publishState();
+                schedule(0);
+            } catch (IOException | RuntimeException | LinkageError error) {
+                report(error);
+            }
+        });
+    }
+
+    void setForeground(boolean visible) {
+        worker.post(() -> {
+            foreground = visible;
+            if (visible) schedule(0);
+            else worker.removeCallbacks(slice);
+        });
+    }
+
+    void setRunning(boolean resume) {
+        worker.post(() -> {
+            if (handle == 0 || isTerminal()) return;
+            running = resume;
+            worker.removeCallbacks(slice);
+            if (running) schedule(0);
+            try {
+                publishState();
+            } catch (RuntimeException | LinkageError error) {
+                report(error);
+            }
+        });
+    }
+
+    void key(int ascii, int scan, boolean pressed) {
+        worker.post(() -> {
+            if (handle == 0 || !running || isTerminal()) return;
+            try {
+                NativeMachine.key(handle, ascii, scan, pressed);
+                if (outcome == NativeMachine.WAITING_KEY && pressed) {
+                    outcome = 0;
+                    schedule(0);
+                }
+            } catch (RuntimeException | LinkageError error) {
+                report(error);
+            }
+        });
+    }
+
+    void stop() {
+        worker.post(() -> {
+            try {
+                String diagnostic = handle == 0 ? "" : NativeMachine.diagnostic(handle);
+                closeMachine();
+                send(() -> listener.onState(diagnostic, false, false, false));
+            } catch (RuntimeException | LinkageError error) {
+                report(error);
+            }
+        });
+    }
+
+    void release() {
+        released = true;
+        worker.post(() -> {
+            try {
+                closeMachine();
+            } catch (RuntimeException | LinkageError error) {
+                Log.w(TAG, "No se pudo cerrar el volumen QSSD", error);
+            } finally {
+                thread.quitSafely();
+            }
+        });
+    }
+
+    private void schedule(long delay) {
+        worker.removeCallbacks(slice);
+        if (!released && foreground && running && handle != 0 &&
+                outcome != NativeMachine.WAITING_KEY && !isTerminal()) {
+            worker.postDelayed(slice, delay);
+        }
+    }
+
+    private void runSlice() {
+        if (released || !running || !foreground || handle == 0) return;
+        try {
+            int previous = outcome;
+            outcome = NativeMachine.step(handle, STEPS_PER_SLICE);
+            long now = SystemClock.uptimeMillis();
+            if (now - lastFrame >= FRAME_INTERVAL_MS || outcome != previous || forceFrame) {
+                publishFrame();
+                lastFrame = now;
+            }
+            if (now - lastStatus >= STATUS_INTERVAL_MS || outcome != previous) publishState();
+            if (isTerminal()) running = false;
+            schedule(outcome == NativeMachine.HALTED ? 35 : 2);
+        } catch (RuntimeException | LinkageError error) {
+            report(error);
+        }
+    }
+
+    private void publishFrame() {
+        if (!framePending.compareAndSet(false, true)) {
+            retryFrame = true;
+            return;
+        }
+        retryFrame = false;
+        boolean posted = false;
+        try {
+            int[] info = NativeMachine.videoInfo(handle);
+            if (info == null || info.length != 3 || info[0] <= 0 || info[1] <= 0) return;
+            Frame frame;
+            if (info[2] == 0) {
+                int copied = NativeMachine.copyText(handle, textCells);
+                if (copied == 0 && !forceFrame) return;
+                frame = new Frame(info[0], info[1], textCells, null);
+            } else {
+                double scale = Math.min(1.0, Math.min((double) MAX_FRAME_WIDTH / info[0],
+                        (double) MAX_FRAME_HEIGHT / info[1]));
+                int width = Math.max(1, (int) (info[0] * scale));
+                int height = Math.max(1, (int) (info[1] * scale));
+                if (graphics == null || graphicsWidth != width || graphicsHeight != height) {
+                    graphics = new int[width * height];
+                    graphicsWidth = width;
+                    graphicsHeight = height;
+                }
+                NativeMachine.copyGraphics(handle, width, height, graphics);
+                frame = new Frame(width, height, null, graphics);
+            }
+            forceFrame = false;
+            posted = main.post(() -> {
+                try {
+                    if (!released) listener.onFrame(frame);
+                } finally {
+                    framePending.set(false);
+                    // The final frame may have changed while Android was presenting the prior one.
+                    worker.post(() -> {
+                        if (retryFrame && handle != 0) publishFrame();
+                    });
+                }
+            });
+        } finally {
+            if (!posted) framePending.set(false);
+        }
+    }
+
+    private void publishState() {
+        lastStatus = SystemClock.uptimeMillis();
+        String json = NativeMachine.diagnostic(handle);
+        boolean stopped = outcome == NativeMachine.STOPPED;
+        boolean active = running && !isTerminal();
+        if (debugSelfTest) {
+            String state = Integer.toString(outcome);
+            if (!state.equals(lastLoggedStatus)) {
+                Log.i(TAG, json);
+                lastLoggedStatus = state;
+            }
+        }
+        send(() -> listener.onState(json, active, true, stopped));
+    }
+
+    private boolean isTerminal() {
+        return outcome == NativeMachine.FAULT || outcome == NativeMachine.STOPPED;
+    }
+
+    private void closeMachine() {
+        worker.removeCallbacks(slice);
+        running = false;
+        retryFrame = false;
+        if (handle == 0) return;
+        long current = handle;
+        handle = 0;
+        try {
+            NativeMachine.flush(current);
+        } finally {
+            NativeMachine.close(current);
+        }
+    }
+
+    private void report(Throwable error) {
+        worker.removeCallbacks(slice);
+        running = false;
+        String detail = error.getMessage();
+        String message = detail == null || detail.isEmpty() ? error.getClass().getSimpleName() : detail;
+        boolean hasSession = handle != 0;
+        if (hasSession) outcome = NativeMachine.FAULT;
+        send(() -> listener.onError(message, hasSession));
+    }
+
+    private void send(Runnable action) {
+        main.post(() -> {
+            if (!released) action.run();
+        });
+    }
+}
