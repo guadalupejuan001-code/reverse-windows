@@ -113,11 +113,29 @@ def generate() -> bytearray:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=pathlib.Path)
+    parser.add_argument("--fault-disk", action="store_true",
+                        help="Make a synthetic raw x86 MBR that fails on LOCK prefix")
+    parser.add_argument("--bad-catalog", action="store_true",
+                        help="Make deliberately corrupt El Torito checksum")
     args = parser.parse_args()
     if args.output.exists():
         raise SystemExit("Refuse to overwrite existing ISO fixture")
-    args.output.write_bytes(generate())
-    print("C09_SYNTHETIC_EL_TORITO_CREATED windows_image=false", args.output)
+    if args.fault_disk and args.bad_catalog:
+        raise SystemExit("Select only one negative fixture")
+    if args.fault_disk:
+        raw = bytearray(512)
+        raw[0:32] = b"\x90" * 32
+        raw[32:33] = b"\xf0"  # unsupported LOCK prefix
+        raw[510:512] = b"\x55\xaa"
+        args.output.write_bytes(raw)
+        print("C09_SYNTHETIC_RAW_FAULT_CREATED windows_image=false", args.output)
+    else:
+        iso = generate()
+        if args.bad_catalog:
+            iso[CATALOG * SECTOR + 4] ^= 0x01
+        args.output.write_bytes(iso)
+        print("C09_SYNTHETIC_EL_TORITO_CREATED windows_image=false",
+              "valid_catalog=" + str(not args.bad_catalog), args.output)
 
 
 if __name__ == "__main__":
