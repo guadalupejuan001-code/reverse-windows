@@ -116,6 +116,14 @@ if(BUILD_TESTING)
   add_test(NAME reverse_windows_c09r_iso_free_hardware_preflight
     COMMAND reverse_windows_c09r_hardware_preflight --self-test)
 
+  # C09R1 keeps the exact FPU/XMM test inside Mundo X, the sole x86 CPU
+  # authority; we compile the original source, not an emulation copy.
+  add_executable(reverse_windows_c09r1_cpu_extended_state
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_c09r1_extended_state_test.cpp")
+  target_link_libraries(reverse_windows_c09r1_cpu_extended_state PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c09r1_xmm_x87_fxsave_fxrstor
+    COMMAND reverse_windows_c09r1_cpu_extended_state)
+
   set_tests_properties(reverse_windows_real_x86_demo reverse_windows_real_x64_demo
                        reverse_windows_x86_hdd_write_read_persist
                        reverse_windows_qssd_sparse_atomic_reboot_x86
@@ -129,5 +137,6 @@ if(BUILD_TESTING)
                        reverse_windows_c09_cpu_precise_step_trace
                        reverse_windows_c09_real_hardware_trace
                        reverse_windows_c09r_iso_free_hardware_preflight
-                       reverse_windows_c09r_real_cpu_cx16_prefetchw PROPERTIES TIMEOUT 120)
+                       reverse_windows_c09r_real_cpu_cx16_prefetchw
+                       reverse_windows_c09r1_xmm_x87_fxsave_fxrstor PROPERTIES TIMEOUT 120)
 endif()
