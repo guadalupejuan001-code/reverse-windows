@@ -13,7 +13,7 @@
 
 namespace {
 struct Options {
-    enum class Source { None, DemoX86, DemoX64, Iso, Disk } source = Source::None;
+    enum class Source { None, DemoX86, DemoX64, Iso, Disk, QssdCheckpoint, QssdCompact } source = Source::None;
     std::string iso_path;
     std::string disk_path;
     std::string qssd_path;
@@ -48,6 +48,10 @@ Options parse(int argc, char** argv) {
             else if (arg == "--demo-x64") out.source = Options::Source::DemoX64;
             else if (arg == "--boot-hdd") out.source = Options::Source::Disk;
             else { out.source = Options::Source::Iso; out.iso_path = next(); }
+        } else if (arg == "--qssd-checkpoint" || arg == "--qssd-compact") {
+            if (out.source != Options::Source::None) throw std::invalid_argument("One action/boot source only");
+            out.source = arg == "--qssd-checkpoint" ? Options::Source::QssdCheckpoint :
+                                                        Options::Source::QssdCompact;
         } else if (arg == "--disk") out.disk_path = next();
         else if (arg == "--qssd-disk") out.qssd_path = next();
         else if (arg == "--create-qssd-gib") out.create_qssd_gib = positive(next(), 16384, "create-qssd-gib");
@@ -58,7 +62,13 @@ Options parse(int argc, char** argv) {
         else if (arg == "--evidence") out.evidence_path = next();
         else throw std::invalid_argument("Unknown option: " + arg);
     }
-    if (out.source == Options::Source::None) throw std::invalid_argument("Select --demo-x86, --demo-x64 or --iso FILE");
+    if (out.source == Options::Source::None) throw std::invalid_argument("Select a boot source or --qssd-checkpoint/--qssd-compact");
+    if (out.source == Options::Source::QssdCheckpoint ||
+        out.source == Options::Source::QssdCompact) {
+        if (out.qssd_path.empty() || !out.disk_path.empty() ||
+            out.create_qssd_gib || out.create_disk_gib)
+            throw std::invalid_argument("QSSD maintenance requires only --qssd-disk PATH.rqvd");
+    }
     if (out.ram_mib < 2) throw std::invalid_argument("Mundo X PC requires at least 2 MiB logical RAM");
     if (out.create_disk_gib && out.disk_path.empty()) throw std::invalid_argument("--create-disk-gib requires --disk PATH.rvdisk");
     if (out.create_qssd_gib && out.qssd_path.empty()) throw std::invalid_argument("--create-qssd-gib requires --qssd-disk PATH.rqvd");
@@ -71,6 +81,26 @@ Options parse(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         const auto opts = parse(argc, argv);
+        if (opts.source == Options::Source::QssdCheckpoint) {
+            reverse_windows::QssdDisk disk(opts.qssd_path);
+            if (!disk.checkpoint()) throw std::runtime_error("QSSD index checkpoint could not be fsynced/published");
+            const auto stats=disk.stats();
+            std::cout << "{\"qssd_maintenance\":\"checkpoint\",\"logical_bytes\":"
+                      <<stats.logical_bytes<<",\"journal_bytes\":"<<stats.physical_bytes
+                      <<",\"commits\":"<<stats.commits<<",\"volume_generation\":"
+                      <<disk.generation()<<",\"status\":\"published\"}\n";
+            return 0;
+        }
+        if (opts.source == Options::Source::QssdCompact) {
+            const auto results=reverse_windows::QssdDisk::compact(opts.qssd_path);
+            std::cout << "{\"qssd_maintenance\":\"compact\",\"before_bytes\":"
+                      <<results.before_bytes<<",\"after_bytes\":"<<results.after_bytes
+                      <<",\"live_blocks\":"<<results.live_blocks
+                      <<",\"volume_generation\":"<<results.generation
+                      <<",\"checkpoint_published\":"
+                      <<(results.checkpoint_saved?"true":"false")<<"}\n";
+            return 0;
+        }
         cosmic_pc::PcMachine pc(
             static_cast<std::size_t>(opts.ram_mib * 1024ULL * 1024ULL),
             static_cast<std::size_t>(opts.resident_mib * 1024ULL * 1024ULL));
