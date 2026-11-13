@@ -305,7 +305,9 @@ class AndroidBootSession final {
         << ",\"pullback_cache_hits\":" << gate_work.pullback_hits
         << ",\"boot_rep_batches\":" << boot_work.batches
         << ",\"boot_rep_elements\":" << boot_work.rep_elements
-        << ",\"boot_rep_bytes\":" << boot_work.bytes;
+        << ",\"boot_rep_bytes\":" << boot_work.bytes
+        << ",\"boot_shift_loop_batches\":" << boot_work.shift_loop_batches
+        << ",\"boot_shift_loop_steps\":" << boot_work.shift_loop_steps;
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     const auto ether = pc_.cpu.ether_next_stats();
     out << ",\"neon_requested\":" << (pc_.cpu.ether_next_enabled() ? "true" : "false")

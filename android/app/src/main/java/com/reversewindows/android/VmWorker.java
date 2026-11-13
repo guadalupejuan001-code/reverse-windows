@@ -10,6 +10,8 @@ import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
 import android.util.Log;
 
+import org.json.JSONObject;
+
 import java.io.File;
 import java.io.IOException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -38,6 +40,11 @@ final class VmWorker {
     }
 
     private static final String TAG = "ReverseWindows";
+    private static final String BUILD_METADATA =
+            "\"app_version\":" + JSONObject.quote(BuildConfig.VERSION_NAME) +
+            ",\"app_version_code\":" + BuildConfig.VERSION_CODE +
+            ",\"application_id\":" + JSONObject.quote(BuildConfig.APPLICATION_ID) +
+            ",\"mundo_x_sha\":" + JSONObject.quote(BuildConfig.MUNDO_X_SHA);
     private static final int DISK_GIB = 64;
     private static final int INITIAL_SLICE_STEPS = 4096;
     private static final int MIN_SLICE_STEPS = 64;
@@ -121,7 +128,7 @@ final class VmWorker {
                         }
                     }
                 }
-                String json = result;
+                String json = withBuildMetadata(result);
                 send(() -> listener.onHardwareChecked(json));
             } catch (IOException | RuntimeException | LinkageError error) {
                 report(error);
@@ -202,7 +209,8 @@ final class VmWorker {
     void stop() {
         worker.post(() -> {
             try {
-                String diagnostic = handle == 0 ? "" : NativeMachine.diagnostic(handle);
+                String diagnostic = handle == 0 ? "" :
+                        withBuildMetadata(NativeMachine.diagnostic(handle));
                 closeMachine();
                 send(() -> listener.onState(diagnostic, false, false, false));
             } catch (RuntimeException | LinkageError error) {
@@ -306,7 +314,7 @@ final class VmWorker {
 
     private void publishState() {
         lastStatus = SystemClock.uptimeMillis();
-        String json = NativeMachine.diagnostic(handle);
+        String json = withBuildMetadata(NativeMachine.diagnostic(handle));
         boolean stopped = outcome == NativeMachine.STOPPED;
         boolean active = running && !isTerminal();
         if (debugSelfTest) {
@@ -317,6 +325,14 @@ final class VmWorker {
             }
         }
         send(() -> listener.onState(json, active, true, stopped));
+    }
+
+    private static String withBuildMetadata(String json) {
+        if (json == null || !json.startsWith("{\"")) {
+            throw new IllegalStateException("El diagnóstico de la máquina virtual no es válido.");
+        }
+        // Preserve the native JSON's full 64-bit register values.
+        return "{" + BUILD_METADATA + "," + json.substring(1);
     }
 
     private boolean isTerminal() {

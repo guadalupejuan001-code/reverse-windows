@@ -125,6 +125,51 @@ void rep_boot_with_pit_guest(bool local_apic){
   };
   need(check(false)==check(true),"batched timer delivery crossed a guest interrupt deadline");
 }
+void shift_boot_with_pit_guest(){
+  const auto check=[](bool accelerate,std::uint8_t period_low){
+    PcMachine pc(16*1024*1024);
+    pc.boot_demo();
+    PcMotherboardC06 board(pc);
+    pc.enable_boot_acceleration(accelerate);
+    pc.enable_boot_hotspots();
+    auto& cpu=pc.cpu;
+    cpu.set_reg16(Cpu::ESP,0x8800);
+    cpu.write16(0x40*4,0x9000);
+    cpu.write16(0x40*4+2,0);
+    code(cpu,0x9000,{
+        0x89,0x0e,0x04,0x91,           // Record interrupted CX.
+        0x50,0x55,0x89,0xe5,           // Save AX and BP, then set BP to SP.
+        0x8b,0x46,0x04,0xa3,0x08,0x91, // Record interrupted IP.
+        0xb0,0xff,0xe6,0x21,           // Mask PIT so it fires once.
+        0xb0,0x20,0xe6,0x20,           // Acknowledge the PIC.
+        0x5d,0x58,0xcf});              // Restore BP and AX, then IRET.
+    std::vector<std::uint8_t> program{0xfa};
+    const auto out=[&](std::uint8_t value,std::uint8_t port){emit(program,{0xb0,value,0xe6,port});};
+    out(0x11,0x20);out(0x40,0x21);out(0x04,0x21);out(0x01,0x21);out(0xfe,0x21);
+    out(0x34,0x43);out(period_low,0x40);out(0x01,0x40);
+    emit(program,{0xb9,0x00,0x20,0xb8,0x5a,0xa5,0xba,0x7d,0xa2,0xfb});
+    constexpr auto entry=0xa000;
+    const auto loop_ip=entry+program.size();
+    emit(program,{0xd1,0xea,0xd1,0xd8,0xe2,0xfa,0xfa,0xf4});
+    code(cpu,entry,program);
+    cpu.eip=entry;
+    for(unsigned slice=0;slice<8&&!cpu.halted;++slice)run(pc,4091);
+    const auto ip=cpu.read16(0x9108);
+    const auto cx=cpu.read16(0x9104);
+    need(cpu.halted&&cpu.reg16(Cpu::ECX)==0&&cpu.reg16(Cpu::EAX)==0&&
+         cpu.reg16(Cpu::EDX)==0&&cpu.reg16(Cpu::ESP)==0x8800,
+         "shift loop and IRQ must preserve registers and balance the interrupt stack");
+    need(board.evidence().irq_delivered==1&&cx>0&&cx<8192&&
+         ip>=loop_ip&&ip<loop_ip+6&&((ip-loop_ip)%2)==0,
+         "PIT must interrupt at a shift, rotate or LOOP boundary");
+    need(!accelerate||pc.boot_acceleration().shift_loop_steps>23000,
+         "board never granted large shift-loop batches");
+    return std::array<std::uint64_t,6>{ip,cx,cpu.instructions,cpu.eflags,
+                                     board.evidence().ticks,board.evidence().pit_irqs};
+  };
+  for(const auto period:{0x2c,0x2d,0x2e})
+    need(check(false,period)==check(true,period),"shift batches changed the PIT interrupt boundary");
+}
 void pic_legacy_x87_guest(){
   PcMachine pc(16*1024*1024);boot32(pc);
   PcMotherboardC06 board(pc);
@@ -425,7 +470,8 @@ int main(){
     pic_pit_guest();
     rep_boot_with_pit_guest(false);
     rep_boot_with_pit_guest(true);
-    std::cout<<"ETHER_BOOT_IRQ_TIMING_PASS pit=1 lapic=1\n";
+    shift_boot_with_pit_guest();
+    std::cout<<"ETHER_BOOT_IRQ_TIMING_PASS pit=1 lapic=1 shift_loop=1\n";
     optical_irq_wakes_sti_hlt();
     pic_legacy_x87_guest();
     pci_acpi_cmos_guest();
