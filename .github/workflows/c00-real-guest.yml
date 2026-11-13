@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/mundo-X
-          ref: 9a1ba074586b642c23211a519b45e966018cf1e3
+          ref: b643fdda3e5128ec2e1357aeeec563746f471ede
           path: deps/mundo-X
           persist-credentials: false
       - name: Checkout GPU-VIRTUAL C12 plus physical work authority
@@ -223,7 +223,7 @@ jobs:
           assert report['gpu_virtual_vga_delta']
           assert report['gpu_vga_delta_upload_bytes']==4
           assert report['gpu_full_frame_bytes']==4000
-          assert report['qssd_graphics_serial']>=4
+          assert report['qssd_graphics_serial']==3
           assert 'REVERSE_WINDOWS_C09R_READINESS_PASS' in lines[-1]
           print('C09R_USER_TECH_REAL_HARDWARE_AUDIT_PASS windows_ran=false')
           PY

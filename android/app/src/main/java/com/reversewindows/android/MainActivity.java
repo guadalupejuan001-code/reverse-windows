@@ -480,6 +480,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         long identifyTransfers = ata == null ? 0 : ata.optLong("identify_data_transfers");
         long batchedElements = ether == null ? 0 : ether.optLong("boot_rep_elements");
         long shiftLoopSteps = ether == null ? 0 : ether.optLong("boot_shift_loop_steps");
+        long zeroLoopSteps = ether == null ? 0 : ether.optLong("boot_zero_loop_steps");
         long commits = volume == null ? 0 : volume.optLong("commits");
         boolean handedOff = boot == null ? steps > 0 : boot.optBoolean("handed_off");
         StringBuilder progress = new StringBuilder(handedOff ? "BIOS entregó el control al invitado"
@@ -503,6 +504,10 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         if (shiftLoopSteps > 0) {
             progress.append(String.format(Locale.getDefault(),
                     "\nEther · %,d instrucciones de bucles de bits en bloque", shiftLoopSteps));
+        }
+        if (zeroLoopSteps > 0) {
+            progress.append(String.format(Locale.getDefault(),
+                    "\nEther · %,d instrucciones de borrado de RAM en bloque", zeroLoopSteps));
         }
         if (boot != null && boot.optLong("mode_changes") > 0) {
             progress.append("\nÚltimo cambio: ").append(modeName(boot.optString("last_mode_from")))

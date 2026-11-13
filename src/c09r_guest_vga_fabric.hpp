@@ -41,6 +41,12 @@ class GuestVgaFabricC09R final {
   Frame capture() {
     Frame result;
     machine_.copy_vga_text(result.complete.data(),result.complete.size());
+    if (initialized_ && result.complete == previous_) {
+      result.revision=revision_;
+      result.qssd_serial=work_.snapshot()->serial;
+      result.exact_mirror=true;
+      return result;
+    }
     std::vector<xgpu::PhysicalCandidate> candidates;
     candidates.reserve(2000);
     for(unsigned cell=0;cell<2000;++cell) {
@@ -61,8 +67,8 @@ class GuestVgaFabricC09R final {
     }
     // GPU-VIRTUAL, not a duplicate visibility planner, authorizes which
     // exact guest VGA cells are transported for actual host presentation.
-    auto plan=gpu_.plan(candidates,{6},++revision_,true,true,true,0.5f,0.5f);
-    result.revision=revision_;
+    result.revision=revision_+1;
+    auto plan=gpu_.plan(candidates,{6},result.revision,true,true,true,0.5f,0.5f);
     result.gpu_planned_cells=plan.camera_indices.size();
     result.reused_objects=plan.reused_objects;
     result.changed_cells=candidates.size();
@@ -79,24 +85,27 @@ class GuestVgaFabricC09R final {
     // 2-byte index + 2-byte exact VGA char/attribute per changed cell.
     // A full 4KB snapshot is cheaper for initial/large updates.
     result.full_snapshot=!initialized_||result.updates.size()*4>=4000;
+    auto next_mirror=mirror_;
     if(result.full_snapshot){
       result.transferred_bytes=4000;
-      mirror_=result.complete;
+      next_mirror=result.complete;
     }else{
       result.transferred_bytes=result.updates.size()*4;
       for(const auto& cell:result.updates){
-        mirror_[cell.index*2]=cell.character;
-        mirror_[cell.index*2+1]=cell.attribute;
+        next_mirror[cell.index*2]=cell.character;
+        next_mirror[cell.index*2+1]=cell.attribute;
       }
     }
-    result.exact_mirror=mirror_==result.complete;
+    result.exact_mirror=next_mirror==result.complete;
     if(!result.exact_mirror)
       throw std::runtime_error("GPU-VIRTUAL emitted a non-equivalent guest framebuffer delta");
-    previous_=result.complete;
-    initialized_=true;
     // Publish completed *exact* real VGA plan in original qSSD StateBus.
     const auto completed=plan.revision;
-    const auto view=work_.publish(std::move(plan),revision_,completed);
+    const auto view=work_.publish(std::move(plan),result.revision,completed);
+    revision_=result.revision;
+    mirror_=next_mirror;
+    previous_=result.complete;
+    initialized_=true;
     result.qssd_serial=view->serial;
     return result;
   }
