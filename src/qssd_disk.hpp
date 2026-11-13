@@ -11,6 +11,12 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
+#include <limits>
+#include <shared_mutex>
+#include <atomic>
+#include <chrono>
+#include <sys/file.h>
 #include <filesystem>
 #include <fcntl.h>
 #include <memory>
@@ -32,6 +38,17 @@ class QssdDisk final : public BlockDisk {
     std::uint64_t logical_bytes, physical_bytes, commits, raw_blocks;
     std::uint64_t zero_blocks, pattern_blocks, deduplicated_blocks, qssd_serial;
   };
+  struct RecoveryStats {
+    bool used_checkpoint=false;
+    std::uint64_t replayed_records=0, checkpoint_blocks=0;
+    std::uint64_t verified_prefix_bytes=0;
+  };
+  struct CompactResult {
+    std::uint64_t before_bytes=0, after_bytes=0, live_blocks=0;
+    std::uint64_t old_commits=0, compact_commits=0, generation=0;
+    bool replaced=false, checkpoint_saved=false;
+  };
+
 
  private:
   // Immutable 16-way radix nodes allow COW block-index updates in O(log16 blocks).
@@ -55,10 +72,18 @@ class QssdDisk final : public BlockDisk {
   struct Change { std::uint64_t block, offset; Kind kind; std::uint64_t digest; };
 
   static constexpr std::size_t kHeader=64, kRecHeader=40, kRecFooter=16;
+  static constexpr std::size_t kIndexHeader=112, kIndexEntry=16;
+  static constexpr std::uint64_t kFNVStart=14695981039346656037ULL;
+
   static constexpr std::size_t kDedupWindow=4096;
   int fd_=-1;
-  std::uint64_t capacity_=0, committed_end_=kHeader;
+  std::filesystem::path path_;
+  std::uint64_t capacity_=0, committed_end_=kHeader, generation_=0;
+  RecoveryStats recovery_{};
   std::mutex writer_;
+  // Readers can observe immutable qSSD epochs while the journal appends.
+  // Maintenance is offline, so no live-fd replacement is performed.
+
   qssd::StateBus<Epoch> states_{Epoch{}, 32};
   std::deque<std::pair<std::uint64_t,std::uint64_t>> dedup_fifo_;
   std::unordered_map<std::uint64_t,std::vector<std::uint64_t>> dedup_;
@@ -79,11 +104,40 @@ class QssdDisk final : public BlockDisk {
   static void put64(std::uint8_t* p, std::uint64_t v) {
     for(unsigned i=0;i<8;++i)p[i]=std::uint8_t(v>>(i*8));
   }
-  static std::uint64_t digest(const std::uint8_t* p,std::size_t n) {
-    std::uint64_t h=14695981039346656037ULL;
+  static std::uint64_t digest_update(std::uint64_t h,const std::uint8_t* p,std::size_t n) {
     for(std::size_t i=0;i<n;++i){h^=p[i];h*=1099511628211ULL;}
     return h;
   }
+  static std::uint64_t digest(const std::uint8_t* p,std::size_t n) {
+    return digest_update(kFNVStart,p,n);
+  }
+  static std::uint64_t fd_digest(int fd,std::uint64_t end) {
+    std::array<std::uint8_t,65536> page{};
+    auto h=kFNVStart;
+    for(std::uint64_t pos=0;pos<end;) {
+      const auto chunk=std::size_t(std::min<std::uint64_t>(end-pos,page.size()));
+      read_all(fd,pos,page.data(),chunk);
+      h=digest_update(h,page.data(),chunk);
+      pos+=chunk;
+    }
+    return h;
+  }
+  static void fsync_parent(const std::filesystem::path& path) {
+    auto parent=path.parent_path();
+    if(parent.empty())parent=".";
+    int dir=::open(parent.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if(dir<0)throw std::system_error(errno,std::generic_category(),"QSSD open parent for sync");
+    const bool ok=::fsync(dir)==0;
+    const int error=errno;
+    ::close(dir);
+    if(!ok)throw std::system_error(error,std::generic_category(),"QSSD directory sync");
+  }
+  static std::filesystem::path temp_name(const std::filesystem::path& path,const char* suffix) {
+    static std::atomic<unsigned long long> counter{0};
+    return path.string()+suffix+"."+std::to_string(::getpid())+"."+
+           std::to_string(counter.fetch_add(1,std::memory_order_relaxed));
+  }
+
   static void check_path(const std::filesystem::path& p) {
     if(p.empty()||p.extension()!=".rqvd")
       throw std::invalid_argument("QSSD disk must be an explicit .rqvd regular file");
@@ -117,6 +171,20 @@ class QssdDisk final : public BlockDisk {
       node=node->children[(block>>(level*4))&15];
     }
     return node?node->ref:Ref{};
+  }
+  template<class Visitor>
+  static void each_live(NodePtr node,unsigned level,std::uint64_t prefix,Visitor& visit) {
+    if(!node)return;
+    if(level==0) {
+      if(node->ref.offset)visit(prefix,node->ref.offset);
+      return;
+    }
+    const auto shift=(level-1U)*4U;
+    for(unsigned index=0;index<16;++index) {
+      if(node->children[index])
+        each_live(node->children[index],level-1,
+                  prefix|(std::uint64_t(index)<<shift),visit);
+    }
   }
   static NodePtr replace(NodePtr node,std::uint64_t block,int level,Ref ref) {
     auto next=std::make_shared<Node>(node?*node:Node{});
@@ -176,7 +244,7 @@ class QssdDisk final : public BlockDisk {
       throw std::runtime_error("QSSD decoded block digest differs");
     return data;
   }
-  std::uint64_t append(std::uint64_t at,Kind kind,std::uint64_t block,
+  static std::uint64_t append_to(int fd,std::uint64_t at,Kind kind,std::uint64_t block,
                        std::uint64_t hash,std::uint64_t reference,
                        const std::vector<std::uint8_t>& payload) {
     std::vector<std::uint8_t> bytes(kRecHeader+payload.size()+kRecFooter);
@@ -191,8 +259,13 @@ class QssdDisk final : public BlockDisk {
     std::memcpy(end,"QEND",4);
     put32(end+4,static_cast<std::uint32_t>(bytes.size()));
     put64(end+8,digest(bytes.data(),kRecHeader+payload.size()));
-    write_all(fd_,at,bytes.data(),bytes.size());
+    write_all(fd,at,bytes.data(),bytes.size());
     return at+bytes.size();
+  }
+  std::uint64_t append(std::uint64_t at,Kind kind,std::uint64_t block,
+                       std::uint64_t hash,std::uint64_t reference,
+                       const std::vector<std::uint8_t>& payload) {
+    return append_to(fd_,at,kind,block,hash,reference,payload);
   }
   void remember(std::uint64_t hash,std::uint64_t off) {
     dedup_[hash].push_back(off);
@@ -217,6 +290,7 @@ class QssdDisk final : public BlockDisk {
        u64(head.data()+32)!=digest(head.data(),32))
       throw std::runtime_error("QSSD invalid volume header");
     capacity_=u64(head.data()+16);
+    generation_=u64(head.data()+40); // old C03 images have zero generation
     if(capacity_<kGiB||capacity_>16384*kGiB||capacity_%kBlockSize)
       throw std::runtime_error("QSSD volume logical size invalid");
     auto state=Epoch{};
@@ -281,11 +355,13 @@ class QssdDisk final : public BlockDisk {
     ::close(fd);
     (void)complete;
   }
-  explicit QssdDisk(const std::filesystem::path& path) {
+  explicit QssdDisk(const std::filesystem::path& path) : path_(path) {
     check_path(path);
     fd_=::open(path.c_str(),O_RDWR|O_CLOEXEC|O_NOFOLLOW);
     if(fd_<0)throw std::system_error(errno,std::generic_category(),"QSSD open");
     try{
+      if(::flock(fd_,LOCK_EX|LOCK_NB)!=0)
+        throw std::runtime_error("QSSD volume already mounted for writing or maintenance");
       struct stat st{};
       if(::fstat(fd_,&st)!=0||!S_ISREG(st.st_mode))
         throw std::runtime_error("QSSD volume is not a regular file");
@@ -302,6 +378,9 @@ class QssdDisk final : public BlockDisk {
     return {capacity_,v->value->end,v->value->commits,v->value->raw,
             v->value->zeros,v->value->patterns,v->value->refs,v->serial};
   }
+  RecoveryStats recovery_stats() const {return recovery_;}
+  std::uint64_t generation() const noexcept {return generation_;}
+
   bool read_bytes(std::uint64_t offset,std::uint8_t* target,std::size_t size) override {
     if((!target&&size)||offset>capacity_||size>capacity_-offset)return false;
     try{
