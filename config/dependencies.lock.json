@@ -6,10 +6,10 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "0327844f4b1caf90bf71d9364b0eb467f14aa5c6",
+      "commit": "497846c633a03955fd75d71c7871ade90d60b8ce",
       "checkout": "deps/mundo-X",
-      "role": "canonical-PcMachine-C09R-tested-CMPXCHG16B-8B-PREFETCHW-and-CPU-trace",
-      "status": "candidate-C09R-unmerged",
+      "role": "canonical-PcMachine-C09R1-RAW80-FPU-XMM-FXSTATE-partial-SSE2-not-CPUID-advertised",
+      "status": "candidate-C09R1-unmerged",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/x86_cpu.hpp",
@@ -20,7 +20,8 @@
         "pc-android/native/tests/x86_bus_c06_test.cpp",
         "pc-android/native/tests/x86_port_pio_c07_test.cpp",
         "pc-android/native/tests/x86_trace_c09_test.cpp",
-        "pc-android/native/tests/x86_windows10_c09r_cpu_readiness_test.cpp"
+        "pc-android/native/tests/x86_windows10_c09r_cpu_readiness_test.cpp",
+        "pc-android/native/tests/x86_c09r1_extended_state_test.cpp"
       ]
     },
     {
