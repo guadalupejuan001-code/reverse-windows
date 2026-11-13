@@ -136,12 +136,16 @@ void run_device(const std::string& path) {
     setup_pic(p);
     out32(p,0xcf8,0x80001000U);in32_store(p,0xcfc,0x9500);
     out32(p,0xcf8,0x80001008U);in32_store(p,0xcfc,0x9504);
+    out32(p,0xcf8,0x80001010U);out32(p,0xcfc,0xffffffffU);in32_store(p,0xcfc,0x9520);
+    out32(p,0xcf8,0x8000103cU);in32_store(p,0xcfc,0x9524);
     out8(p,0x3f6,6);in8_store(p,0x3f6,0x9510); // SRST with nIEN set.
     out8(p,0x3f6,2);
     for(unsigned i=0;i<5;++i)in8_store(p,0x1f1+i,0x9511+i);
     out8(p,0x1f6,0xe0);out8(p,0x1f7,0xec);rep_words(p,true,0xa000,16);
     ins(p,{0xf4});
     program(pc,p);
+    need(pc.cpu.read32(0x9520)==0 && pc.cpu.read16(0x9524)==0x00ff,
+         "legacy IDE must leave its BAR and PCI INTx pin unimplemented");
     need(pc.cpu.memory[0x9510]==0x80&&pc.cpu.read32(0x9511)==0x00010101U&&
          pc.cpu.memory[0x9515]==0,"ATA reset signature on the primary master was wrong");
     need(board.attached_ata()->counters().identifies==1&&

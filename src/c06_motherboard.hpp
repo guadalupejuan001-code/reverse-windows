@@ -132,7 +132,7 @@ class PcMotherboardC06 {
   std::uint32_t pci_selector_=0,clock_steps_=0;
   std::uint8_t cmos_index_=0,rtc_b_=2;
   std::array<std::uint8_t,256> host_cfg_{},isa_cfg_{};
-  std::uint16_t pm_control_=0;
+  std::uint16_t pm_control_=0x0001; // SCI_EN: firmware starts in ACPI mode.
   bool powered_off_=false;
   bool ferr_was_asserted_=false;
   std::uint64_t ticks_=0,irq_delivered_=0,pit_irqs_=0,apic_irqs_=0;
@@ -163,7 +163,7 @@ class PcMotherboardC06 {
     if(keyboard_) keyboard_->reset();
     master_=Pic{};slave_=Pic{};slave_.vector=0x70;
     pit_=Pit{};pci_selector_=0;clock_steps_=0;
-    cmos_index_=0;rtc_b_=2;pm_control_=0;powered_off_=false;
+    cmos_index_=0;rtc_b_=2;pm_control_=0x0001;powered_off_=false;
     ferr_was_asserted_=false;pc_.cpu.set_x87_ignne(false);
     ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=0;
     if(ata_)ata_->reset();
@@ -182,13 +182,8 @@ class PcMotherboardC06 {
       ata_cfg_[8]=1; // revision
       ata_cfg_[9]=0; // both channels legacy compatibility, no bus mastering
       ata_cfg_[10]=0x01;ata_cfg_[11]=0x01; // PCI 0x0101 IDE controller
-      config32(ata_cfg_,0x10,0x1f1); // primary command BAR I/O
-      config32(ata_cfg_,0x14,0x3f5); // primary control BAR I/O
-      if(optical_){
-        config32(ata_cfg_,0x18,0x171);
-        config32(ata_cfg_,0x1c,0x375);
-      }
-      ata_cfg_[0x3c]=14;ata_cfg_[0x3d]=1; // legacy IRQ14 / INT A
+      // Legacy IDE decodes fixed ports and IRQ14/15, without PCI BARs or INTx.
+      ata_cfg_[0x3c]=0xff;
     }
     // After a real PcMachine::reset, firmware RAM is new; republish the
     // same discovered tables and keep their E820-reserved addresses.
@@ -199,7 +194,8 @@ class PcMotherboardC06 {
     if(optical_ && optical_->handles(p) && (ata_cfg_[4]&1U))return true;
     return p==0x20||p==0x21||p==0xa0||p==0xa1||
            (p>=0x40&&p<=0x43)||(p>=0x70&&p<=0x71)||
-           (p>=0xcf8&&p<=0xcff)||(p>=0x600&&p<=0x60b);
+           (p>=AcpiC06::pci_config_ports&&p<AcpiC06::pci_config_ports+8)||
+           (p>=AcpiC06::pm_event_port&&p<AcpiC06::pm_timer_port+4);
   }
   std::array<std::uint8_t,256>* selected_pci(){
     if(!(pci_selector_ & 0x80000000U) ||
@@ -276,10 +272,10 @@ class PcMotherboardC06 {
     }
     if(ata_&&ata_->handles(p)&&(ata_cfg_[4]&1U))return ata_->input(p,width);
     if(optical_&&optical_->handles(p)&&(ata_cfg_[4]&1U))return optical_->input(p,width);
-    if(p>=0xcf8&&p<=0xcff)return pci_read(p,width);
-    if(p==0x608&&width==4)return std::uint32_t(ticks_&0x00ffffffU);
-    if((p==0x604&&width==2))return pm_control_;
-    if((p==0x600||p==0x602)&&width==2)return 0; // no SCI events yet
+    if(p>=AcpiC06::pci_config_ports&&p<AcpiC06::pci_config_ports+8)return pci_read(p,width);
+    if(p==AcpiC06::pm_timer_port&&width==4)return std::uint32_t(ticks_&0x00ffffffU);
+    if(p==AcpiC06::pm_control_port&&width==2)return pm_control_;
+    if((p==AcpiC06::pm_event_port||p==AcpiC06::pm_event_port+2)&&width==2)return 0;
     if(width!=1)return std::nullopt;
     switch(p){
       case 0x20:return master_.status();
@@ -303,13 +299,13 @@ class PcMotherboardC06 {
     }
     if(ata_&&ata_->handles(p)&&(ata_cfg_[4]&1U))return ata_->output(p,width,value);
     if(optical_&&optical_->handles(p)&&(ata_cfg_[4]&1U))return optical_->output(p,width,value);
-    if(p>=0xcf8&&p<=0xcff)return pci_write(p,width,value);
-    if(p==0x604&&width==2){
-      pm_control_=std::uint16_t(value);
+    if(p>=AcpiC06::pci_config_ports&&p<AcpiC06::pci_config_ports+8)return pci_write(p,width,value);
+    if(p==AcpiC06::pm_control_port&&width==2){
+      pm_control_=std::uint16_t((value&0x1c00U)|0x0001U); // SLP_TYP and read-only SCI_EN.
       if((value&0x2000)&&((value>>10)&7)==5)powered_off_=true;
       return true;
     }
-    if((p==0x600||p==0x602)&&width==2)
+    if((p==AcpiC06::pm_event_port||p==AcpiC06::pm_event_port+2)&&width==2)
       return true; // no SCI generated, event mask values are not retained
     if(width!=1)return false;
     const auto b=std::uint8_t(value);
@@ -601,6 +597,7 @@ class PcMotherboardC06 {
   }
   AtaC07* attached_ata(){return ata_.get();}
   const AtaC07* attached_ata()const{return ata_.get();}
+  const AtapiCdrom* attached_atapi()const{return optical_.get();}
   bool optical_attached()const{return bool(optical_);}
 };
 } // namespace reverse_windows

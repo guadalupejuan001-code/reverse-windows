@@ -101,6 +101,24 @@ int main() {
     program.in8(0x177,0x9005);
     program.packet({0x03,0,0,0,18},2048);
     program.words(9,0x10210);
+    program.packet({0x5a,0x08,0x3f,0,0,0,0,0,36},10);
+    program.in8(0x174,0x9006);
+    program.words(18,0x10240);
+    program.in8(0x177,0x9007);
+    program.packet({0x5a,0,0x2a,0,0,0,0,0,10},2048);
+    program.words(5,0x10270);
+    program.packet({0x5a,0,0x6a,0,0,0,0,0,28},2048); // Changeable values.
+    program.words(14,0x10280);
+    program.packet({0x5a,0,0xea,0,0,0,0,0,28},2048); // Saved values are unsupported.
+    program.in8(0x177,0x9008);
+    program.packet({0x03,0,0,0,18},2048);
+    program.words(9,0x102a0);
+    program.packet({0x5a,0,0x2b,0,0,0,0,0,28},2048); // Unimplemented page.
+    program.in8(0x177,0x9009);
+    program.packet({0x03,0,0,0,18},2048);
+    program.words(9,0x102c0);
+    program.packet({0x5a,0,0x2a},2048); // Zero allocation, successful without data.
+    program.in8(0x177,0x900a);
     program.emit({0xfa,0xf4});
     cpu.memory.write_block(0xa000,program.bytes.data(),program.bytes.size());
     cpu.eip = 0xa000;
@@ -118,9 +136,31 @@ int main() {
     require(cpu.read8(0x9004) == 0x40, "READ (10) did not finish");
     require((cpu.read8(0x9005) & 1) && cpu.read8(0x10212) == 7 &&
             cpu.read8(0x1021c) == 0x27, "ISO write lacked DATA PROTECT sense");
+    require(cpu.read8(0x9006) == 10 && cpu.read8(0x9007) == 0x40 &&
+            cpu.read16(0x10240) == 0x2200 && cpu.read8(0x10242) == 1 &&
+            cpu.read16(0x10246) == 0 && cpu.read16(0x10248) == 0x0601 &&
+            cpu.read16(0x10250) == 0x122a && cpu.read8(0x10253) == 0 &&
+            cpu.read16(0x1025c) == 0x0200,
+            "MODE SENSE all pages returned incorrect read-only PIO data");
+    require(cpu.read16(0x10270) == 0x1a00 && cpu.read16(0x10278) == 0x122a,
+            "Truncated MODE SENSE must retain the available response length");
+    require(cpu.read16(0x10288) == 0x122a && cpu.read16(0x10294) == 0,
+            "MODE SENSE must report fixed capabilities as non-changeable");
+    require((cpu.read8(0x9008) & 1) && cpu.read8(0x102a2) == 5 &&
+            cpu.read8(0x102ac) == 0x39 && (cpu.read8(0x9009) & 1) &&
+            cpu.read8(0x102c2) == 5 && cpu.read8(0x102cc) == 0x24 &&
+            cpu.read8(0x900a) == 0x40,
+            "MODE SENSE errors or zero-allocation behavior is incorrect");
+    const auto& activity = board.attached_atapi()->activity();
+    require(activity.packets == 12 && activity.read_sectors == 2 &&
+            activity.rejected_packets == 3 && activity.last_packet == 0x5a &&
+            activity.last_rejected_packet == 0x5a && activity.last_sense == 5 &&
+            activity.last_asc == 0x24,
+            "ATAPI diagnostics did not preserve the optical command results");
     require(cpu.read32(0x9040) >= 8, "IRQ15 did not reach the guest IDT");
     std::cout << "REVERSE_WINDOWS_ATAPI_PROTECTED_GUEST_PASS bytes=" << cd.size()
-              << " irq15=" << cpu.read32(0x9040) << " readonly=true\n";
+              << " irq15=" << cpu.read32(0x9040) << " readonly=true mode_sense=1"
+              << " packets=" << activity.packets << " rejected=" << activity.rejected_packets << '\n';
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "REVERSE_WINDOWS_ATAPI_PROTECTED_GUEST_FAIL " << error.what() << '\n';

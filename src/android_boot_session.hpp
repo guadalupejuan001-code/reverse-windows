@@ -335,8 +335,18 @@ class AndroidBootSession final {
         << ",\"mode_changes\":" << mode.changes << ",\"last_mode_from\":\"" << mode.from
         << "\",\"last_mode_to\":\"" << mode.to << "\",\"last_mode_step\":" << mode.step
         << ",\"restarts\":" << restarts_ << ",\"last_restart\":\"" << last_restart_ << "\"}";
-    out << ",\"atapi_cdrom\":" << (board_->optical_attached() ? "true" : "false")
-        << ",\"ata\":{\"commands\":" << counts.commands
+    out << ",\"atapi_cdrom\":" << (board_->optical_attached() ? "true" : "false");
+    if (const auto* optical = board_->attached_atapi()) {
+      const auto& cd = optical->activity();
+      out << ",\"atapi\":{\"packets\":" << cd.packets
+          << ",\"read_sectors\":" << cd.read_sectors
+          << ",\"rejected_packets\":" << cd.rejected_packets
+          << ",\"last_packet\":" << unsigned(cd.last_packet)
+          << ",\"last_rejected_packet\":" << unsigned(cd.last_rejected_packet)
+          << ",\"last_sense\":" << unsigned(cd.last_sense)
+          << ",\"last_asc\":" << unsigned(cd.last_asc) << '}';
+    }
+    out << ",\"ata\":{\"commands\":" << counts.commands
         << ",\"identify_data_transfers\":" << counts.identify_data_transfers
         << ",\"read_sectors\":" << counts.read_sectors
         << ",\"write_sectors\":" << counts.write_sectors << ",\"flushes\":" << counts.flushes

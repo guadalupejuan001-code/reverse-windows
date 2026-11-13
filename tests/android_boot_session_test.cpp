@@ -247,7 +247,9 @@ int main(int argc, char** argv) {
                                  "\"handed_off\":true", "\"logical_bytes\":68719476736",
                                  "\"commits\":0", "\"identify_data_transfers\":1",
                                  "\"read_sectors\":0", "\"write_sectors\":0",
-                                 "\"irq14\":1", "\"atapi_cdrom\":true"})
+                                 "\"irq14\":1", "\"atapi_cdrom\":true",
+                                 "\"atapi\":{\"packets\":0,\"read_sectors\":0,\"rejected_packets\":0",
+                                 "\"last_rejected_packet\":0"})
         require(progress.find(marker) != std::string::npos, marker);
       const auto text = screen(frame);
       require(text.compare(0, 14, "EL TORITO BIOS") == 0 &&

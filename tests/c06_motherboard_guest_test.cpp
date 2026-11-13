@@ -283,10 +283,11 @@ void pci_acpi_cmos_guest(){
   need(checksum(pc.cpu,AcpiC06::rsdp_address,20)==0 &&
        checksum(pc.cpu,AcpiC06::rsdp_address,36)==0,
        "RSDP 1.0/2.0 checksums do not match");
+  const auto dsdt_size=pc.cpu.read32(AcpiC06::dsdt_address+4);
   const std::array<std::pair<std::uint32_t,unsigned>,5> tables{{
     {AcpiC06::rsdt_address,44U},{AcpiC06::xsdt_address,52U},
     {AcpiC06::fadt_address,244U},{AcpiC06::madt_address,64U},
-    {AcpiC06::dsdt_address,49U}
+    {AcpiC06::dsdt_address,dsdt_size}
   }};
   for(const auto& entry:tables)
     need(checksum(pc.cpu,entry.first,entry.second)==0,"ACPI table checksum invalid");
@@ -295,6 +296,56 @@ void pci_acpi_cmos_guest(){
        "ACPI table pointers do not describe the actual firmware");
   need(pc.cpu.read32(AcpiC06::madt_address+36)==0xfee00000U,
        "MADT LAPIC base does not match the mapped MMIO device");
+  const auto facs=pc.cpu.read32(AcpiC06::fadt_address+36);
+  need(facs==AcpiC06::facs_address && (facs&63U)==0 &&
+       pc.cpu.read64(AcpiC06::fadt_address+132)==facs &&
+       pc.cpu.read32(facs)==0x53434146U && pc.cpu.read32(facs+4)==64 &&
+       pc.cpu.read32(facs+16)==0,
+       "FADT did not expose aligned writable FACS with an unlocked Global Lock");
+
+  const auto aml=AcpiC06::dsdt_address+36;
+  const auto scope=aml+13;
+  const auto root=scope+8;
+  const auto package_end=[&](std::uint32_t length){
+    const auto lead=pc.cpu.read8(length);
+    const auto count=lead>>6;
+    unsigned size=lead&(count?15U:63U);
+    for(unsigned i=0;i<unsigned(count);++i)
+      size|=unsigned(pc.cpu.read8(length+1+i))<<(4+8*i);
+    return length+size;
+  };
+  need(pc.cpu.read8(scope)==0x10 &&
+       pc.cpu.read32(scope+4)==0x5f42535fU && pc.cpu.read16(root)==0x825b &&
+       pc.cpu.read32(root+4)==0x30494350U && pc.cpu.read32(root+14)==0x030ad041U &&
+       package_end(scope+1)==AcpiC06::dsdt_address+dsdt_size &&
+       package_end(root+2)==package_end(scope+1),
+       "DSDT does not describe the PCI0 root in the system bus scope");
+  const auto crs=root+30;
+  const auto resources=crs+10;
+  const std::array<std::pair<std::uint16_t,std::uint16_t>,5> ranges{{
+    {0,1},{0x170,8},{0x1f0,8},{0x376,1},{0x3f6,1}
+  }};
+  need(pc.cpu.read32(crs+1)==0x5352435fU && pc.cpu.read8(crs+5)==0x11 &&
+       pc.cpu.read8(crs+9)==82 && package_end(crs+6)==resources+82 &&
+       pc.cpu.read16(resources+80)==0x0079,
+       "PCI0 resource template has invalid AML boundaries");
+  for(unsigned i=0;i<ranges.size();++i){
+    const auto entry=resources+16*i;
+    const auto [first,count]=ranges[i];
+    need(pc.cpu.read16(entry)==0x0d88 && pc.cpu.read8(entry+3)==(i==0?2:1) &&
+         pc.cpu.read16(entry+8)==first && pc.cpu.read16(entry+10)==first+count-1 &&
+         pc.cpu.read16(entry+14)==count,
+         "PCI0 resource template does not match the fixed bus and IDE ports");
+  }
+  const auto prt=resources+82;
+  const auto reserved=prt+8;
+  need(pc.cpu.read32(prt+1)==0x5452505fU && pc.cpu.read8(prt+7)==0 &&
+       pc.cpu.read16(reserved)==0x825b && pc.cpu.read32(reserved+3)==0x30534552U &&
+       package_end(reserved+2)==package_end(root+2) &&
+       pc.cpu.read32(reserved+13)==0x020cd041U &&
+       pc.cpu.read32(reserved+26)==0x080cf84bU &&
+       pc.cpu.read16(reserved+30)==0x0079,
+       "DSDT incorrectly routes PCI INTx or does not reserve PCI config ports");
 
   std::vector<std::uint8_t> p;
   emit(p,{0xb8,0,0,0,0x80,   // MOV EAX,80000000 (PCI 0:0.0 vendor)
@@ -310,8 +361,10 @@ void pci_acpi_cmos_guest(){
           0xa1,0,0,0x0e,0,        // guest reads "RSD " at E0000
           0xa3,0x0c,0x90,0,0,
           0x66,0xba,0x04,0x06,    // MOV DX, 604 ACPI PM1a CNT
+          0x66,0xed,0x66,0xa3,0x10,0x90,0,0, // SCI_EN after firmware init
           0x66,0xb8,0x00,0x34,    // MOV AX, 3400 (S5 + SLP_EN)
           0x66,0xef,             // OUT DX, AX
+          0x66,0xed,0x66,0xa3,0x12,0x90,0,0, // SCI_EN stays set, SLP_EN is write-only
           0xf4});
   code(pc.cpu,0xa000,p);pc.cpu.eip=0xa000;pc.cpu.halted=false;
   pc.cpu.regs[Cpu::ESP]=0x190000;
@@ -324,8 +377,12 @@ void pci_acpi_cmos_guest(){
   need(pc.cpu.memory[0x9008]==2,"guest CMOS status B does not indicate BCD 24-hour");
   need(pc.cpu.read32(0x900c)==0x20445352U,
        "guest did not discover ACPI RSDP signature via real MOV");
+  need(pc.cpu.read16(0x9010)==1 && pc.cpu.read16(0x9012)==0x1401,
+       "guest ACPI PM1a control did not preserve SCI_EN and SLP_TYP");
   need(board.evidence().powered_off,
        "guest ACPI PM1a S5 request not recognized");
+  pc.cpu.write32(facs+16,2);
+  need(pc.cpu.read32(facs+16)==2,"FACS Global Lock is not writable");
   // Reboot the SAME PcMachine while the motherboard remains attached:
   // firmware ACPI must be restored after guest RAM is zeroed.
   pc.boot_long_mode_demo();
@@ -336,6 +393,10 @@ void pci_acpi_cmos_guest(){
        "reboot lost ACPI discovery in reserved firmware memory");
   need(!board.evidence().powered_off && board.evidence().ticks==0,
        "motherboard retained stale PM/timer state across reboot");
+  need(pc.cpu.read32(facs+16)==0 &&
+       pc.cpu.read32(AcpiC06::fadt_address+36)==facs &&
+       checksum(pc.cpu,AcpiC06::dsdt_address,dsdt_size)==0,
+       "reboot did not restore FACS and PCI root discovery");
   std::cout<<"C06_PCI_ACPI_CMOS_REAL_GUEST_PASS pci=0x"<<std::hex
            <<guest_pci_id<<std::dec<<" tables=5 reboot=PASS\n";
 }
