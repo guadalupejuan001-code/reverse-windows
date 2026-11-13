@@ -181,7 +181,33 @@ void run_device(const std::string& path) {
          "ATA LBA48 did not write actual high logical sector");
     need(board.attached_ata()->counters().write_sectors==2,
          "ATA LBA48 write was not a real backend commit");
+    std::vector<std::uint8_t> high_read;
+    lba48(high_read,high);out8(high_read,0x1f7,0x24);
+    rep_words(high_read,true,0xbc00);ins(high_read,{0xf4});
+    program(pc,high_read);
+    pc.cpu.memory.read_block(0xbc00,persist.data(),512);
+    need(persist==payload,"ATA LBA48 READ EXT via real REP INSW lost guest bytes");
     std::cout<<"C07_LBA48_HIGH_SPARSE_GUEST_PASS lba="<<high<<"\n";
+
+    // Two contiguous sectors in one ATA command. This exercises the PIO
+    // data phase and IRQ transition between sectors, not just 1-sector I/O.
+    std::array<std::uint8_t,1024> multi_data{},multi_back{};
+    for(std::size_t i=0;i<multi_data.size();++i)
+      multi_data[i]=std::uint8_t((i*23+i/17+11)&255);
+    pc.cpu.memory.write_block(0xc000,multi_data.data(),multi_data.size());
+    std::vector<std::uint8_t> multi;
+    out8(multi,0x1f6,0xe0);out8(multi,0x1f2,2);
+    out8(multi,0x1f3,20);out8(multi,0x1f4,0);out8(multi,0x1f5,0);
+    out8(multi,0x1f7,0x30);rep_words(multi,false,0xc000,512);
+    out8(multi,0x1f6,0xe0);out8(multi,0x1f2,2);
+    out8(multi,0x1f3,20);out8(multi,0x1f4,0);out8(multi,0x1f5,0);
+    out8(multi,0x1f7,0x20);rep_words(multi,true,0xc800,512);
+    ins(multi,{0xf4});program(pc,multi);
+    pc.cpu.memory.read_block(0xc800,multi_back.data(),multi_back.size());
+    need(multi_back==multi_data,"ATA 2-sector PIO register/DRQ transition failed");
+    need(board.attached_ata()->counters().write_sectors==4,
+         "ATA multi-sector guest did not commit both sectors");
+    std::cout<<"C07_ATA_PIO_MULTI_SECTOR_PASS sectors=2\n";
 
     // Bad task-file address and invalid command must return ATA error,
     // not a host CPU fault, and never write beyond QSSD.
@@ -233,7 +259,15 @@ void run_device(const std::string& path) {
          "QSSD reopen lost LBA48 PIO sector");
     need(disk.read(8,1,persist.data())&&persist==zero,
          "QSSD reopen recovered an aborted PIO write");
-    need(disk.stats().commits==2,"ATA guest writes are not exactly two QSSD commits");
+    std::array<std::uint8_t,1024> persisted_multi{};
+    std::array<std::uint8_t,512> expected_sector{};
+    need(disk.read(20,2,persisted_multi.data()),
+         "QSSD reopen cannot read 2-sector ATA transfer");
+    for(unsigned i=0;i<1024;++i) {
+      const auto expected=std::uint8_t((i*23+i/17+11)&255);
+      need(persisted_multi[i]==expected,"QSSD multi-sector replay byte mismatch");
+    }
+    need(disk.stats().commits==4,"ATA guest writes are not exactly four QSSD commits");
     std::cout<<"C07_QSSD_DURABILITY_REOPEN_PASS commits="
              <<disk.stats().commits<<" physical="<<disk.stats().physical_bytes<<"\n";
 
@@ -278,7 +312,7 @@ void test_corrupt_and_torn(const std::string& path){
   }
   {
     QssdDisk recovered(path);
-    need(recovered.stats().commits==2,
+    need(recovered.stats().commits==4,
          "QSSD torn final journal record recovered as a committed ATA write");
     std::array<std::uint8_t,512> data{};
     need(recovered.read(7,1,data.data())&&data[0]==3,
