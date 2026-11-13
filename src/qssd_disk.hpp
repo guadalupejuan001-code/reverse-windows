@@ -326,6 +326,11 @@ class QssdDisk final : public BlockDisk {
     if(!target||!count||lba>sectors()||count>sectors()-lba)return false;
     return read_bytes(lba*kSectorSize,target,std::size_t(count)*kSectorSize);
   }
+  bool flush() override {
+    std::lock_guard<std::mutex> hold(writer_);
+    return fd_ >= 0 && ::fsync(fd_) == 0;
+  }
+
   bool write(std::uint64_t lba,std::uint16_t count,const std::uint8_t* source) override {
     if(!source||!count||count>127||lba>sectors()||count>sectors()-lba)return false;
     std::lock_guard<std::mutex> hold(writer_);
