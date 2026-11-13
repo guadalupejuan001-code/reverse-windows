@@ -1,4 +1,4 @@
-name: C09 Original ISO tracing and C00-C08 regressions
+name: C09R Hardware readiness - no Windows ISO run
 on:
   push:
     branches: [main, "feature/**"]
@@ -17,11 +17,11 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Checkout C09 guest trace CPU (exact SHA, C07 preserved)
+      - name: Checkout C09R CPU with verified CX16 and PREFETCHW (exact SHA)
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/mundo-X
-          ref: 680afd0d42c1f3a5a88260d5d038eb92c2794c7e
+          ref: 943d267d25ecfd2d43936124de5fd0ffbea27421
           path: deps/mundo-X
           persist-credentials: false
       - name: Checkout GPU-VIRTUAL C12 plus physical work authority
@@ -49,7 +49,7 @@ jobs:
         run: python3 scripts/verify_deps.py
       - name: Compile native boot probe against actual x86/x64 CPU
         run: |
-          cmake -S . -B build -DREVERSE_MUNDO_X_ROOT="$PWD/deps/mundo-X" -DREVERSE_QSSD_ROOT="$PWD/deps/Virtual-qSSD-" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+          cmake -S . -B build -DREVERSE_MUNDO_X_ROOT="$PWD/deps/mundo-X" -DREVERSE_QSSD_ROOT="$PWD/deps/Virtual-qSSD-" -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
           cmake --build build --parallel 2
       - name: Execute real x86 and long-mode x64 guest demos
         run: ctest --test-dir build --output-on-failure
