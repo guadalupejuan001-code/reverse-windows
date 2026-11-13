@@ -68,7 +68,8 @@ void run(const std::string& path,const std::string& journal){
     // These instructions result in real physical APIC MMIO events.
     append(p,{0xa1,0x30,0x00,0xe0,0xfe,
               0xa3,0x04,0x91,0,0,
-              0xc7,0x05,0xf0,0x00,0xe0,0xfe,0xff,0x01,0,0});
+              0xc7,0x05,0xf0,0x00,0xe0,0xfe,0xff,0x01,0,0,
+              0xc7,0x05,0x50,0x03,0xe0,0xfe,0x00,0x07,0,0}); // LINT0 ExtINT.
     // Explicit PIC remap: master 0x20, slave 0x28, cascade IRQ2,
     // ATA IRQ14 = slave line6 -> vector 0x2e.
     out8(p,0x20,0x11);out8(p,0x21,0x20);
@@ -95,7 +96,7 @@ void run(const std::string& path,const std::string& journal){
     }
     need(pc.cpu.read32(0x9100)==0x12345678,
          "actual IRQ14 guest ISR did not run");
-    need(pc.cpu.read32(0x9104)==0x00030014,
+    need(pc.cpu.read32(0x9104)==0x00050014,
          "guest physical LAPIC version read failed");
     need(board.evidence().ata_irqs>=1,"PCI ATA IRQ14 did not reach PIC/IDT");
     need(board.attached_ata()->counters().write_sectors==1,
