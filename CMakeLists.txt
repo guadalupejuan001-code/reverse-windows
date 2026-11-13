@@ -107,6 +107,20 @@ if(BUILD_TESTING)
   add_test(NAME reverse_windows_c09_real_hardware_trace
     COMMAND reverse_windows_c09_hardware_trace_test)
 
+  # Always compile guest FPU/FXSAVE/SSE2 tests from the exact Mundo X
+  # CPU checkout. REVERSE Windows never adds a second SSE interpreter.
+  add_executable(reverse_windows_c09r1_fxstate_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_c09r1_fxstate_test.cpp")
+  target_link_libraries(reverse_windows_c09r1_fxstate_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c09r1_x87_fxsave_context
+    COMMAND reverse_windows_c09r1_fxstate_test)
+
+  add_executable(reverse_windows_c09r1_sse2_packed_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_c09r1_sse2_packed_test.cpp")
+  target_link_libraries(reverse_windows_c09r1_sse2_packed_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c09r1_sse2_integer_packed
+    COMMAND reverse_windows_c09r1_sse2_packed_test)
+
   add_executable(reverse_windows_c09r1_simd_subset
     "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_c09r1_xmm_subset_test.cpp")
   target_link_libraries(reverse_windows_c09r1_simd_subset PRIVATE reverse_windows_component_headers)
@@ -136,5 +150,7 @@ if(BUILD_TESTING)
                        reverse_windows_c09_real_hardware_trace
                        reverse_windows_c09r_iso_free_hardware_preflight
                        reverse_windows_c09r_real_cpu_cx16_prefetchw
-                       reverse_windows_c09r1_xmm_mxcsr_subset PROPERTIES TIMEOUT 120)
+                       reverse_windows_c09r1_xmm_mxcsr_subset
+                       reverse_windows_c09r1_x87_fxsave_context
+                       reverse_windows_c09r1_sse2_integer_packed PROPERTIES TIMEOUT 120)
 endif()
