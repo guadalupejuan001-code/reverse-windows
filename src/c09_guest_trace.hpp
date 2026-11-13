@@ -226,6 +226,20 @@ class C09GuestTrace final {
     pc_.cpu.mmio_write_hook=std::move(previous_mmio_write_);
     pc_.cpu.interrupt_hook=std::move(previous_bios_);
   }
+  void note_boot_plan(const cosmic_pc::BootPlan& plan,std::uint64_t medium_bytes) {
+    std::ostringstream o;
+    o<<"{\"type\":\"el-torito-boot-plan\",\"kind\":"<<quote(plan.kind)
+     <<",\"load_segment\":"<<quote(address(plan.load_segment))
+     <<",\"initial_cs\":"<<quote(address(plan.initial_cs))
+     <<",\"initial_rip\":"<<quote(address(plan.initial_ip))
+     <<",\"boot_drive\":"<<unsigned(plan.drive)
+     <<",\"logical_sector_bytes\":"<<plan.logical_sector_size
+     <<",\"source_offset\":"<<plan.source_offset
+     <<",\"image_bytes\":"<<plan.image.size()
+     <<",\"medium_bytes\":"<<medium_bytes
+     <<",\"windows_boot_verified\":false}";
+    record(o.str(),true);
+  }
   void finish(){
     if(finalized_)return;
     finalized_=true;
