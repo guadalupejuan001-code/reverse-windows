@@ -82,12 +82,20 @@ if(BUILD_TESTING)
     "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_lock_rmw_test.cpp")
   target_link_libraries(reverse_windows_lock_rmw_test PRIVATE reverse_windows_component_headers)
   add_test(NAME reverse_windows_lock_rmw COMMAND reverse_windows_lock_rmw_test)
-  foreach(cpu_test IN ITEMS x86_long_null_ss x86_far_transfer64 x86_system64)
+  foreach(cpu_test IN ITEMS x86_long_mode x86_long_null_ss x86_far_transfer64 x86_system64
+                            x86_ether_rep_batch x86_ether_shift_loop x86_ram_backing)
     add_executable(reverse_windows_${cpu_test}_test
       "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/${cpu_test}_test.cpp")
     target_link_libraries(reverse_windows_${cpu_test}_test PRIVATE reverse_windows_component_headers)
     add_test(NAME reverse_windows_${cpu_test} COMMAND reverse_windows_${cpu_test}_test)
   endforeach()
+  add_executable(reverse_windows_x86_ether_next_guest_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_ether_next_guest_test.cpp"
+    "${REVERSE_MUNDO_X_ROOT}/native/src/ether_transform.cpp"
+    "${REVERSE_MUNDO_X_ROOT}/native/src/ether_neon.cpp")
+  target_compile_definitions(reverse_windows_x86_ether_next_guest_test PRIVATE MUNDO_X_PC_ETHER_NEXT=1)
+  target_link_libraries(reverse_windows_x86_ether_next_guest_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_x86_ether_next_guest COMMAND reverse_windows_x86_ether_next_guest_test)
   add_executable(reverse_windows_x64_optical_qssd_test tests/x64_optical_qssd_test.cpp)
   target_link_libraries(reverse_windows_x64_optical_qssd_test PRIVATE reverse_windows_component_headers)
   add_test(NAME reverse_windows_x64_optical_qssd COMMAND reverse_windows_x64_optical_qssd_test)

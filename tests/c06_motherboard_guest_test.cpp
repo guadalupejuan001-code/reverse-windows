@@ -1,5 +1,6 @@
 #include "c06_motherboard.hpp"
 #include "pc_machine.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -169,6 +170,82 @@ void shift_boot_with_pit_guest(){
   };
   for(const auto period:{0x2c,0x2d,0x2e})
     need(check(false,period)==check(true,period),"shift batches changed the PIT interrupt boundary");
+}
+void zero_boot_with_lapic_guest(){
+  const auto check=[](bool accelerate, unsigned deadline){
+    PcMachine pc(16*1024*1024);boot32(pc);
+    PcMotherboardC06 board(pc);
+    pc.enable_boot_acceleration(accelerate);
+    pc.enable_boot_hotspots();
+    auto& cpu=pc.cpu;
+    cpu.idtr={0x1000,0x15000};
+    cpu.regs[Cpu::ESP]=0x190000;
+    gate(cpu,0x42,0x13000);
+    code(cpu,0x13000,{
+        0x89,0x0d,0x00,0x91,0,0, // Save ECX.
+        0x89,0x15,0x04,0x91,0,0, // Save EDX.
+        0x50,0x8b,0x44,0x24,0x04,0xa3,0x08,0x91,0,0, // Save interrupted EIP.
+        0xc7,0x05,0xb0,0,0xe0,0xfe,0,0,0,0,0x58,0xcf});
+    cpu.write32(0xfee000f0,0x1ff);
+    cpu.write32(0xfee00320,0x42);
+    cpu.write32(0xfee00380,deadline);
+
+    constexpr unsigned entry=0xa000, dst=0x200ffd, count=8194;
+    cpu.memory.fill(dst-1,0x5a,count+2);
+    cpu.regs[Cpu::EDX]=dst;
+    cpu.regs[Cpu::ECX]=count;
+    cpu.eflags=2|Cpu::IF|Cpu::DF|Cpu::CF|Cpu::OF;
+    code(cpu,entry,{0xc6,0x02,0,0x42,0x83,0xe9,1,0x75,0xf7,0xfa,0xf4});
+    cpu.eip=entry;
+    for(unsigned slice=0;slice<12&&!cpu.halted;++slice)run(pc,4091);
+    const auto ip=cpu.read32(0x9108), ecx=cpu.read32(0x9100), edx=cpu.read32(0x9104);
+    std::vector<std::uint8_t> data(count);
+    cpu.memory.read_block(dst,data.data(),data.size());
+    need(cpu.halted&&cpu.regs[Cpu::ECX]==0&&cpu.regs[Cpu::EDX]==dst+count&&
+         cpu.regs[Cpu::ESP]==0x190000&&cpu.eflags==(2|Cpu::DF|Cpu::PF|Cpu::ZF),
+         "zero loop must preserve final flags, registers and IRQ stack");
+    need(std::all_of(data.begin(),data.end(),[](auto byte){return byte==0;})&&
+         cpu.read8(dst-1)==0x5a&&cpu.read8(dst+count)==0x5a,
+         "zero loop changed bytes outside its exact multi-page range");
+    need(board.evidence().apic_irqs==1&&ecx>0&&ecx<count&&
+         (ip==entry||ip==entry+3||ip==entry+4||ip==entry+7),
+         "LAPIC must interrupt between the original guest opcodes");
+    need(!accelerate||pc.boot_acceleration().zero_loop_steps>32000,
+         "the protected32 zero loop did not use bounded batches");
+    return std::array<std::uint64_t,6>{ip,ecx,edx,cpu.instructions,cpu.eflags,board.evidence().ticks};
+  };
+  for(const auto deadline:{300U,301U,302U,303U})
+    need(check(false,deadline)==check(true,deadline),"zero batches changed the LAPIC interrupt boundary");
+
+  PcMachine pc(16*1024*1024);boot32(pc);
+  auto& cpu=pc.cpu;
+  code(cpu,0xa000,{0xc6,0x02,0,0x42,0x83,0xe9,1,0x75,0xf7,0xf4});
+  cpu.eip=0xa000;
+  cpu.regs[Cpu::ECX]=80;
+  cpu.regs[Cpu::EDX]=0x200000;
+  run(pc,4);
+  need(cpu.zero_loop_batch_candidate(),"scalar JNZ did not seed the zero loop");
+  cpu.memory[0xa002]=0x5a;
+  need(cpu.try_zero_loop_batch(128)==0,"changed loop bytes must reject batching");
+  cpu.memory[0xa002]=0;
+  cpu.regs[Cpu::EDX]=0xa000;
+  need(cpu.try_zero_loop_batch(128)==0,"writes that overlap the loop must remain scalar");
+  cpu.regs[Cpu::EDX]=0x200000;
+  cpu.memory.attach_window(0x200010,1,[](std::uint64_t){return std::uint8_t{0};},
+                            [](std::uint64_t,std::uint8_t){});
+  need(cpu.try_zero_loop_batch(128)==0,"Ether memory must retain byte callbacks");
+  cpu.mmio_claim_hook=[](std::uint64_t address){return address==0x200210;};
+  cpu.mmio_range_claim_hook=[](std::uint64_t address,std::size_t bytes){
+    return address<=0x200210&&0x200210-address<bytes;
+  };
+  cpu.regs[Cpu::EDX]=0x200200;
+  need(cpu.try_zero_loop_batch(128)==0,"MMIO inside the span must retain device writes");
+  cpu.regs[Cpu::EDX]=0x200300;
+  cpu.step_trace_hook=[](const auto&){};
+  need(cpu.try_zero_loop_batch(128)==0,"exact instruction traces must remain scalar");
+  cpu.step_trace_hook={};
+  need(cpu.try_zero_loop_batch(17)==16&&cpu.eip==0xa000&&cpu.regs[Cpu::ECX]==75,
+       "only whole zero-loop iterations may retire within a slice");
 }
 void pic_legacy_x87_guest(){
   PcMachine pc(16*1024*1024);boot32(pc);
@@ -754,6 +831,8 @@ int main(){
     rep_boot_with_pit_guest(true);
     shift_boot_with_pit_guest();
     std::cout<<"ETHER_BOOT_IRQ_TIMING_PASS pit=1 lapic=1 shift_loop=1\n";
+    zero_boot_with_lapic_guest();
+    std::cout<<"ETHER_BOOT_ZERO_LOOP_PASS protected32=1 lapic=1 bounds=1\n";
     optical_irq_wakes_sti_hlt();
     pic_legacy_x87_guest();
     pci_acpi_cmos_guest();

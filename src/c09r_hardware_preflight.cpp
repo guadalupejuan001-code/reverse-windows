@@ -87,10 +87,13 @@ int main(int argc,char** argv){
       ether=cpu.read8(addr)==0x5a;
       require(ether,"Ether/XI memory aperture not connected to this PC");
       GuestVgaFabricC09R gpu(pc);
-      const auto first=gpu.capture(),same=gpu.capture();
+      const auto first=gpu.capture();
+      const auto first_state=gpu.state();
+      const auto same=gpu.capture();
       require(first.exact_mirror&&same.exact_mirror&&
-              same.transferred_bytes==0,
-              "GPU-VIRTUAL did not preserve unchanged guest VGA frame");
+              same.transferred_bytes==0&&same.revision==first.revision&&
+              same.qssd_serial==first.qssd_serial&&gpu.state()==first_state,
+              "unchanged guest VGA frame must preserve its exact qSSD revision");
       cpu.reset(0,0x7c00);cpu.a20_enabled=true;
       const std::array<std::uint8_t,13> vga_code{{
         0xb8,0x00,0xb8,0x8e,0xc0,
@@ -105,7 +108,8 @@ int main(int argc,char** argv){
       const auto updated=gpu.capture();
       graphics=updated.exact_mirror&&
                updated.changed_cells==1&&updated.gpu_planned_cells==1&&
-               updated.transferred_bytes==4;
+               updated.transferred_bytes==4&&updated.revision==first.revision+1&&
+               updated.qssd_serial==first.qssd_serial+1;
       frame_bytes=updated.transferred_bytes;
       graphic_serial=updated.qssd_serial;
       require(graphics,"GPU-VIRTUAL did not select exact changed VGA bytes");
