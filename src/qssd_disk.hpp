@@ -49,6 +49,9 @@ class QssdDisk final : public BlockDisk {
     std::uint64_t old_commits=0, compact_commits=0, generation=0;
     bool replaced=false, checkpoint_saved=false;
   };
+  struct CacheStats {
+    std::uint64_t hits=0, misses=0, resident_blocks=0, resident_bytes=0;
+  };
 
 
  private:
@@ -77,6 +80,7 @@ class QssdDisk final : public BlockDisk {
   static constexpr std::uint64_t kFNVStart=14695981039346656037ULL;
 
   static constexpr std::size_t kDedupWindow=4096;
+  static constexpr std::size_t kReadCacheBlocks=128; // 512 KiB bounded data
   int fd_=-1;
   std::filesystem::path path_;
   std::uint64_t capacity_=0, committed_end_=kHeader, generation_=0;
@@ -88,6 +92,12 @@ class QssdDisk final : public BlockDisk {
   qssd::StateBus<Epoch> states_{Epoch{}, 32};
   std::deque<std::pair<std::uint64_t,std::uint64_t>> dedup_fifo_;
   std::unordered_map<std::uint64_t,std::vector<std::uint64_t>> dedup_;
+  using BlockData=std::array<std::uint8_t,kBlockSize>;
+  mutable std::mutex cache_mutex_;
+  mutable std::unordered_map<std::uint64_t,std::shared_ptr<const BlockData>> read_cache_;
+  mutable std::deque<std::uint64_t> read_fifo_;
+  mutable std::atomic<std::uint64_t> cache_hits_{0},cache_misses_{0};
+
 
   static std::uint32_t u32(const std::uint8_t* p) {
     std::uint32_t v=0;
@@ -263,6 +273,34 @@ class QssdDisk final : public BlockDisk {
     write_all(fd,at,bytes.data(),bytes.size());
     return at+bytes.size();
   }
+  void cache_insert(std::uint64_t off,std::shared_ptr<const BlockData> data) const {
+    std::lock_guard<std::mutex> guard(cache_mutex_);
+    if(read_cache_.find(off)!=read_cache_.end())return;
+    if(read_fifo_.size()>=kReadCacheBlocks) {
+      const auto old=read_fifo_.front();read_fifo_.pop_front();
+      read_cache_.erase(old);
+    }
+    read_cache_.emplace(off,std::move(data));
+    read_fifo_.push_back(off);
+  }
+  std::shared_ptr<const BlockData> cached_decode(std::uint64_t off,
+                                                  std::uint64_t limit) const {
+    {
+      std::lock_guard<std::mutex> guard(cache_mutex_);
+      const auto found=read_cache_.find(off);
+      if(found!=read_cache_.end()){
+        cache_hits_.fetch_add(1,std::memory_order_relaxed);
+        return found->second;
+      }
+    }
+    // The digest of the record is checked on first decode and refs only
+    // name immutable append-only offsets. A published offset is never reused.
+    auto decoded=std::make_shared<const BlockData>(decode(off,limit));
+    cache_misses_.fetch_add(1,std::memory_order_relaxed);
+    cache_insert(off,decoded);
+    return decoded;
+  }
+
   std::uint64_t append(std::uint64_t at,Kind kind,std::uint64_t block,
                        std::uint64_t hash,std::uint64_t reference,
                        const std::vector<std::uint8_t>& payload) {
@@ -632,6 +670,13 @@ class QssdDisk final : public BlockDisk {
   }
   RecoveryStats recovery_stats() const {return recovery_;}
   std::uint64_t generation() const noexcept {return generation_;}
+  CacheStats cache_stats() const {
+    std::lock_guard<std::mutex> hold(cache_mutex_);
+    const auto blocks=std::uint64_t(read_cache_.size());
+    return {cache_hits_.load(std::memory_order_relaxed),
+            cache_misses_.load(std::memory_order_relaxed),blocks,
+            blocks*kBlockSize};
+  }
   bool checkpoint() {
     std::lock_guard<std::mutex> hold(writer_);
     return save_checkpoint_locked();
@@ -649,8 +694,8 @@ class QssdDisk final : public BlockDisk {
         const auto ref=locate(view->value->root,block);
         if(!ref.offset)std::memset(target+done,0,n);
         else {
-          const auto data=decode(ref.offset,view->value->end);
-          std::memcpy(target+done,data.data()+start,n);
+          const auto data=cached_decode(ref.offset,view->value->end);
+          std::memcpy(target+done,data->data()+start,n);
         }
         done+=n;
       }
@@ -676,6 +721,7 @@ class QssdDisk final : public BlockDisk {
       std::uint64_t at=original_end;
       std::vector<Change> changes;
       std::vector<std::pair<std::uint64_t,std::uint64_t>> new_raw;
+      std::vector<std::pair<std::uint64_t,std::shared_ptr<const BlockData>>> prepared_cache;
       const std::uint64_t first=lba*kSectorSize, total=std::uint64_t(count)*kSectorSize;
       std::uint64_t done=0;
       while(done<total){
@@ -683,7 +729,7 @@ class QssdDisk final : public BlockDisk {
         const auto start=static_cast<std::size_t>((first+done)%kBlockSize);
         const auto n=std::min<std::uint64_t>(total-done,kBlockSize-start);
         auto ref=locate(next.root,block);
-        auto data=ref.offset?decode(ref.offset,original_end):
+        auto data=ref.offset?*cached_decode(ref.offset,original_end):
                     std::array<std::uint8_t,kBlockSize>{};
         std::memcpy(data.data()+start,source+done,static_cast<std::size_t>(n));
         const auto hash=digest(data.data(),data.size());
@@ -714,6 +760,7 @@ class QssdDisk final : public BlockDisk {
         const auto record_offset=at;
         at=append(at,kind,block,hash,backref,payload);
         changes.push_back({block,record_offset,kind,hash});
+        prepared_cache.emplace_back(record_offset,std::make_shared<const BlockData>(data));
         next.root=replace(next.root,block,8,Ref{record_offset});
         if(kind==Raw)new_raw.emplace_back(hash,record_offset);
         done+=n;
@@ -734,6 +781,10 @@ class QssdDisk final : public BlockDisk {
       // turn a committed guest write into an acknowledged failure or rollback.
       try { for(const auto& entry:new_raw)remember(entry.first,entry.second); }
       catch(const std::exception&) {dedup_.clear();dedup_fifo_.clear();}
+      // Discardable cache mutations cannot invalidate an already fsynced
+      // and published guest transaction.
+      try {for(const auto& entry:prepared_cache)cache_insert(entry.first,entry.second);}
+      catch(const std::exception&){}
       return true;
     }catch(const std::exception&){
       // Discard any uncommitted append. A failed write is never acknowledged.
