@@ -218,17 +218,15 @@ final class VmWorker {
     void setForeground(boolean visible) {
         worker.post(() -> {
             foreground = visible;
-            if (visible) schedule(0);
-            else {
-                worker.removeCallbacks(slice);
-                if (running && handle != 0) {
-                    try {
-                        publishState(true);
-                    } catch (RuntimeException | LinkageError error) {
-                        report(error);
-                    }
+            if (!visible) worker.removeCallbacks(slice);
+            if (running && handle != 0 && !isTerminal()) {
+                try {
+                    publishState(!visible);
+                } catch (RuntimeException | LinkageError error) {
+                    report(error);
                 }
             }
+            if (visible) schedule(0);
         });
     }
 

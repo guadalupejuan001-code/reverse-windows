@@ -213,6 +213,8 @@ jobs:
           elif ram["spill_mode"] == "unavailable":
               assert ram["spill_limit_bytes"] == 0 and ram["spill_error"], ram
           PY
+          adb shell input keyevent KEYCODE_HOME
+          adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity"
           adb shell input keyevent KEYCODE_ENTER
           wait_for_state halted
           snapshot="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ultimo-diagnostico.json"
