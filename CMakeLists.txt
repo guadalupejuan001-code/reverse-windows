@@ -82,10 +82,15 @@ if(BUILD_TESTING)
     "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_lock_rmw_test.cpp")
   target_link_libraries(reverse_windows_lock_rmw_test PRIVATE reverse_windows_component_headers)
   add_test(NAME reverse_windows_lock_rmw COMMAND reverse_windows_lock_rmw_test)
-  add_executable(reverse_windows_x86_long_null_ss_test
-    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_long_null_ss_test.cpp")
-  target_link_libraries(reverse_windows_x86_long_null_ss_test PRIVATE reverse_windows_component_headers)
-  add_test(NAME reverse_windows_x86_long_null_ss COMMAND reverse_windows_x86_long_null_ss_test)
+  foreach(cpu_test IN ITEMS x86_long_null_ss x86_far_transfer64 x86_system64)
+    add_executable(reverse_windows_${cpu_test}_test
+      "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/${cpu_test}_test.cpp")
+    target_link_libraries(reverse_windows_${cpu_test}_test PRIVATE reverse_windows_component_headers)
+    add_test(NAME reverse_windows_${cpu_test} COMMAND reverse_windows_${cpu_test}_test)
+  endforeach()
+  add_executable(reverse_windows_x64_optical_qssd_test tests/x64_optical_qssd_test.cpp)
+  target_link_libraries(reverse_windows_x64_optical_qssd_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_x64_optical_qssd COMMAND reverse_windows_x64_optical_qssd_test)
 
   foreach(fpu_test IN ITEMS x86_sse_fp32 x86_sse2_packed_oracle x86_c09r1_stage5_cvt_fxsr
             x86_sse_legacy_forms x86_mmx x86_x87_arithmetic_oracle x86_x87_state)

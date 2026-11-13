@@ -136,7 +136,7 @@ class PcMotherboardC06 {
   bool powered_off_=false;
   bool ferr_was_asserted_=false;
   std::uint64_t ticks_=0,irq_delivered_=0,pit_irqs_=0,apic_irqs_=0;
-  std::uint32_t apic_tpr_=0,apic_svr_=0xff,apic_lvt_timer_=0x10000;
+  std::uint32_t apic_svr_=0xff,apic_lvt_timer_=0x10000;
   std::uint32_t apic_timer_reload_=0,apic_timer_counter_=0,apic_divider_=0x3;
   std::bitset<256> lapic_pending_;
   std::uint32_t lapic_in_service_=0,ioapic_select_=0;
@@ -168,7 +168,7 @@ class PcMotherboardC06 {
     ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=0;
     if(ata_)ata_->reset();
     if(optical_)optical_->reset();
-    apic_tpr_=0;apic_svr_=0xff;apic_lvt_timer_=0x10000;
+    pc_.cpu.set_apic_task_priority(0);apic_svr_=0xff;apic_lvt_timer_=0x10000;
     apic_timer_reload_=apic_timer_counter_=0;apic_divider_=3;
     lapic_pending_.reset();lapic_in_service_=0;ioapic_select_=0;
     io_redir_low_.fill(0x10000U);io_redir_high_.fill(0);
@@ -351,7 +351,7 @@ class PcMotherboardC06 {
       switch(r) {
         case 0x20:return 0; // LAPIC ID 0
         case 0x30:return 0x00030014U; // local APIC version; bounded LVT subset
-        case 0x80:return apic_tpr_;
+        case 0x80:return pc_.cpu.apic_task_priority();
         case 0xb0:return 0; // EOI write-only
         case 0xf0:return apic_svr_;
         case 0x320:return apic_lvt_timer_;
@@ -384,7 +384,7 @@ class PcMotherboardC06 {
     if(base>=kLocalApic&&base<kLocalApic+4096){
       const auto r=unsigned(base-kLocalApic);
       switch(r){
-        case 0x80:apic_tpr_=v&0xffU;return true;
+        case 0x80:pc_.cpu.set_apic_task_priority(std::uint8_t(v));return true;
         case 0xb0:lapic_in_service_=0;return true;
         case 0xf0:apic_svr_=v&0x1ffU;return true;
         case 0x320:
@@ -478,7 +478,7 @@ class PcMotherboardC06 {
     if(cpu.fault||!cpu.flag(cosmic_pc::Cpu::IF))return;
     if(lapic_on()&&!lapic_in_service_){
       const auto request=highest_lapic_request();
-      if(request&&(*request&0xf0U)>(apic_tpr_&0xf0U)){
+      if(request&&(*request&0xf0U)>(cpu.apic_task_priority()&0xf0U)){
         if(cpu.raise_external_irq(*request)){
           lapic_in_service_=*request;lapic_pending_.reset(*request);
           ++apic_irqs_;++irq_delivered_;

@@ -464,6 +464,99 @@ void queued_lapic_requests_guest(){
   need(pc.cpu.regs[Cpu::ESP]==0x190000,"queued LAPIC interrupts did not restore the guest stack");
   std::cout<<"C06_LAPIC_QUEUED_IRQ_PASS timer=0x42 keyboard=0x31\n";
 }
+void cr8_lapic_priority_guest(){
+  PcMachine pc(16*1024*1024);
+  pc.boot_long_mode_demo();
+  auto& cpu=pc.cpu;
+  for(unsigned i=0;i<5000&&!cpu.is_long_mode();++i){
+    if(cpu.step()==cosmic_pc::StepResult::Faulted)
+      throw std::runtime_error(cpu.fault->describe());
+  }
+  need(cpu.is_long_mode(),"CR8 fixture did not execute an actual transition to long mode");
+  PcMotherboardC06 board(pc);
+  constexpr std::uint32_t apic=0xfee00000, entry=0xa000, handler=0x13000, stack=0x190000;
+  constexpr std::uint8_t vector=0x42;
+  cpu.write64(0x2000+(apic>>30)*8,0x4003);
+  cpu.write64(0x4000+((apic>>21)&511)*8,std::uint64_t(apic)|0x83);
+  cpu.idtr={0x1000,0x15000};
+  cpu.write64(cpu.idtr.base+16*vector, (handler&0xffffU)|
+      (std::uint64_t(cpu.segments[Cpu::CS])<<16)|(0x8eULL<<40)|
+      (std::uint64_t(handler>>16)<<48));
+  cpu.write64(cpu.idtr.base+16*vector+8,0);
+  code(cpu,handler,{
+      0xc6,0x04,0x25,0x00,0x90,0x00,0x00,vector, // MOV byte [0x9000], vector
+      0x50,0xb8,0xb0,0x00,0xe0,0xfe,             // PUSH RAX; MOV EAX,LAPIC EOI
+      0xc7,0x00,0x00,0x00,0x00,0x00,0x58,0x48,0xcf // EOI; POP RAX; IRETQ
+  });
+  std::vector<std::uint8_t> guest{0xfa};
+  const auto write_reg=[&](std::uint32_t address,std::uint32_t value){
+    emit(guest,{0xbf});
+    for(unsigned i=0;i<4;++i)guest.push_back(std::uint8_t(address>>(8*i)));
+    emit(guest,{0xc7,0x07});
+    for(unsigned i=0;i<4;++i)guest.push_back(std::uint8_t(value>>(8*i)));
+  };
+  write_reg(apic+0x80,0xab);
+  emit(guest,{
+      0x45,0x0f,0x20,0x00,      // MOV R8,CR8; ModR/M MOD bits are ignored.
+      0xb8,0x05,0x00,0x00,0x00, // MOV EAX,5
+      0x44,0x0f,0x22,0xc0,      // MOV CR8,RAX
+      0x8b,0x17                 // MOV EDX,[RDI], the same LAPIC TPR.
+  });
+  write_reg(apic+0xf0,0x1ff);
+  write_reg(apic+0x320,vector);
+  write_reg(apic+0x380,3);
+  emit(guest,{0xfb,0x90}); // STI; clear the one-instruction interrupt shadow.
+  const auto wait_ip=entry+guest.size();
+  emit(guest,{0xeb,0xfe});
+  code(cpu,entry,guest);
+  cpu.eip=entry;
+  cpu.regs[Cpu::ESP]=stack;
+  run(pc,100);
+  need(cpu.eip==wait_ip && cpu.regs[Cpu::R8]==0xa && cpu.regs[Cpu::EDX]==0x50,
+       "CR8 and LAPIC MMIO must share priority, and a CR8 write must clear low TPR bits");
+  need(board.evidence().apic_irqs==0&&cpu.read8(0x9000)==0,
+       "CR8 must hold a pending lower-priority LAPIC timer interrupt");
+  code(cpu,static_cast<std::uint32_t>(wait_ip),{0x31,0xc0,0x44,0x0f,0x22,0xc0,0xf4});
+  run(pc,64);
+  need(cpu.halted&&board.evidence().apic_irqs==1&&cpu.read8(0x9000)==vector&&
+       cpu.regs[Cpu::ESP]==stack,
+       "lowering CR8 must release the pending IRQ and IRETQ must restore the stack");
+
+  cpu.idtr={0,0};
+  cpu.set_apic_task_priority(0x70);
+  const auto expect_fault=[&](std::initializer_list<std::uint8_t> bytes,
+                              cosmic_pc::FaultCode expected){
+    code(cpu,entry,bytes);cpu.eip=entry;cpu.halted=false;cpu.fault.reset();
+    const auto before=cpu.regs;
+    need(cpu.step()==cosmic_pc::StepResult::Faulted&&cpu.fault->code==expected&&
+         cpu.fault->error_code==0&&cpu.eip==entry&&cpu.regs==before&&
+         cpu.apic_task_priority()==0x70,
+         "invalid MOV control-register operation changed guest state or exception class");
+  };
+  cpu.regs[Cpu::EAX]=1ULL<<40;
+  expect_fault({0x44,0x0f,0x22,0xc0},cosmic_pc::FaultCode::ProtectionFault);
+  expect_fault({0x44,0x0f,0x20,0xc8},cosmic_pc::FaultCode::InvalidInstruction);
+  expect_fault({0xf0,0x44,0x0f,0x22,0xc0},cosmic_pc::FaultCode::InvalidInstruction);
+
+  // Enter actual ring 3 with a user-accessible identity mapping via IRETQ.
+  cpu.write64(0x1000,0x2007);cpu.write64(0x2000,0x3007);cpu.write64(0x3000,0x87);
+  cpu.gdtr={0x2f,0x14000};
+  cpu.write64(0x14018,0x00af9b000000ffffULL);
+  cpu.write64(0x14020,0x00affb000000ffffULL);
+  cpu.write64(0x14028,0x00cff3000000ffffULL);
+  code(cpu,entry,{0x6a,0x2b,0x68,0x00,0x00,0x1a,0x00,0x6a,0x02,
+                  0x6a,0x23,0x68,0x00,0xa1,0x00,0x00,0x48,0xcf});
+  cpu.eip=entry;cpu.fault.reset();
+  for(unsigned i=0;i<6;++i)need(cpu.step()==cosmic_pc::StepResult::Executed,"ring 3 entry failed");
+  need(cpu.cpl()==3&&cpu.eip==0xa100,"CPL3 test did not enter guest ring 3");
+  code(cpu,0xa100,{0x44,0x0f,0x20,0xc0});
+  need(cpu.step()==cosmic_pc::StepResult::Faulted&&
+       cpu.fault->code==cosmic_pc::FaultCode::ProtectionFault&&cpu.fault->error_code==0&&
+       cpu.apic_task_priority()==0x70,"CPL3 must not access CR8");
+  pc.boot_long_mode_demo();
+  need(cpu.apic_task_priority()==0&&cpu.read32(apic+0x80)==0,"reset retained a previous CR8/TPR value");
+  std::cout<<"C06_CR8_LAPIC_TPR_PASS mmio=1 pending_irq=1 precise_faults=1 reset=1\n";
+}
 }
 int main(){
   try{
@@ -478,6 +571,7 @@ int main(){
     ioapic_lapic_guest();
     ps2_keyboard_guest();
     queued_lapic_requests_guest();
+    cr8_lapic_priority_guest();
     std::cout<<"REVERSE_WINDOWS_C06_MOTHERBOARD_PASS checks="<<checks
              <<" windows_booted=false full_acpi=false full_apic=false\n";
     return 0;
