@@ -1,4 +1,4 @@
-name: C07 Real PCI ATA QSSD and C00-C06 guest regressions
+name: C08 QSSD checkpoints and C00-C07 guest regressions
 on:
   push:
     branches: [main, "feature/**"]
@@ -78,6 +78,53 @@ jobs:
             REVERSE_WINDOWS_C07_REAL_ATA_PASS; do
             grep -q "$marker" build/reverse-windows-c07-ata.log
           done
+      - name: Verify C08 checkpoint, corruption, crash, compact and C07 ATA compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_c08_maintenance_test | tee build/reverse-windows-c08-maintenance.log
+          grep -q 'C08_ATOMIC_COMPACTION_PASS' build/reverse-windows-c08-maintenance.log
+          grep -q 'C08_CHECKPOINT_CRASH_REPLAY_PASS' build/reverse-windows-c08-maintenance.log
+          grep -q 'REVERSE_WINDOWS_C08_MAINTENANCE_PASS' build/reverse-windows-c08-maintenance.log
+      - name: Measure RAW vs QSSD with equal fsync semantics (no performance threshold)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_c08_benchmark | tee build/reverse-windows-c08-benchmark.jsonl
+          grep -q 'REVERSE_WINDOWS_C08_BENCHMARK_PASS' build/reverse-windows-c08-benchmark.jsonl
+          python3 - <<'PY'
+          import json,math,pathlib
+          output=pathlib.Path("build/reverse-windows-c08-benchmark.jsonl")
+          line=next(x for x in output.read_text().splitlines() if x.startswith("{"))
+          metrics=json.loads(line)
+          assert metrics["schema"]=="reverse-windows-c08-benchmark-v1"
+          assert metrics["raw_fsync_after_every_write"] and metrics["qssd_fsync_after_every_commit"]
+          assert metrics["warm_cache_not_dropped"] and metrics["single_run_not_a_speed_claim"]
+          for key in ("raw_write_ms","qssd_write_ms","raw_read_ms",
+                      "qssd_read_ms","qssd_full_open_ms","qssd_index_open_ms",
+                      "checkpoint_build_ms","compact_ms"):
+              assert math.isfinite(metrics[key]) and metrics[key]>=0, key
+          assert metrics["qssd_journal_after"]<=metrics["qssd_journal_before"]
+          assert metrics["qssd_cache_resident_bytes"]<=512*1024
+          assert not metrics["windows_booted"]
+          pathlib.Path("build/c08-measured-results.json").write_text(json.dumps(metrics,indent=2)+"\n")
+          print("C08_BENCHMARK_JSON_VALIDATED results_are_host_specific=1")
+          PY
+      - name: Smoke test offline maintenance CLI without Windows ISO
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_boot_probe --demo-x64 --steps 200000 \
+            --ram-mib 2048 --resident-mib 256 \
+            --qssd-disk build/c08-cli-smoke.rqvd --create-qssd-gib 1 > /dev/null
+          ./build/reverse_windows_boot_probe --qssd-checkpoint \
+            --qssd-disk build/c08-cli-smoke.rqvd | tee build/c08-cli-checkpoint.json
+          ./build/reverse_windows_boot_probe --qssd-compact \
+            --qssd-disk build/c08-cli-smoke.rqvd | tee build/c08-cli-compact.json
+          grep -q '"qssd_maintenance":"checkpoint"' build/c08-cli-checkpoint.json
+          grep -q '"qssd_maintenance":"compact"' build/c08-cli-compact.json
+          test -f build/c08-cli-smoke.rqvd.rqix
+          echo C08_CLI_OFFLINE_MAINTENANCE_PASS
       - name: Replay protected16 group-6 through real El Torito synthetic ISO
         run: |
           g++ -std=c++17 -O0 -pthread -Ideps/mundo-X/native/include deps/mundo-X/pc-android/native/tests/pc_group6_iso_test.cpp -o build/iso-protected16-group6
@@ -95,4 +142,9 @@ jobs:
             build/reverse-windows-x64.json
             build/reverse-windows-c06-motherboard.log
             build/reverse-windows-c07-ata.log
+            build/reverse-windows-c08-maintenance.log
+            build/reverse-windows-c08-benchmark.jsonl
+            build/c08-measured-results.json
+            build/c08-cli-checkpoint.json
+            build/c08-cli-compact.json
           if-no-files-found: warn

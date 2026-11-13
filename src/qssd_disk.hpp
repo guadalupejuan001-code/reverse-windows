@@ -11,10 +11,17 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
+#include <limits>
+#include <shared_mutex>
+#include <atomic>
+#include <chrono>
+#include <sys/file.h>
 #include <filesystem>
 #include <fcntl.h>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -32,6 +39,20 @@ class QssdDisk final : public BlockDisk {
     std::uint64_t logical_bytes, physical_bytes, commits, raw_blocks;
     std::uint64_t zero_blocks, pattern_blocks, deduplicated_blocks, qssd_serial;
   };
+  struct RecoveryStats {
+    bool used_checkpoint=false;
+    std::uint64_t replayed_records=0, checkpoint_blocks=0;
+    std::uint64_t verified_prefix_bytes=0;
+  };
+  struct CompactResult {
+    std::uint64_t before_bytes=0, after_bytes=0, live_blocks=0;
+    std::uint64_t old_commits=0, compact_commits=0, generation=0;
+    bool replaced=false, checkpoint_saved=false;
+  };
+  struct CacheStats {
+    std::uint64_t hits=0, misses=0, resident_blocks=0, resident_bytes=0;
+  };
+
 
  private:
   // Immutable 16-way radix nodes allow COW block-index updates in O(log16 blocks).
@@ -55,13 +76,28 @@ class QssdDisk final : public BlockDisk {
   struct Change { std::uint64_t block, offset; Kind kind; std::uint64_t digest; };
 
   static constexpr std::size_t kHeader=64, kRecHeader=40, kRecFooter=16;
+  static constexpr std::size_t kIndexHeader=112, kIndexEntry=16;
+  static constexpr std::uint64_t kFNVStart=14695981039346656037ULL;
+
   static constexpr std::size_t kDedupWindow=4096;
+  static constexpr std::size_t kReadCacheBlocks=128; // 512 KiB bounded data
   int fd_=-1;
-  std::uint64_t capacity_=0, committed_end_=kHeader;
+  std::filesystem::path path_;
+  std::uint64_t capacity_=0, committed_end_=kHeader, generation_=0;
+  RecoveryStats recovery_{};
   std::mutex writer_;
+  // Readers can observe immutable qSSD epochs while the journal appends.
+  // Maintenance is offline, so no live-fd replacement is performed.
+
   qssd::StateBus<Epoch> states_{Epoch{}, 32};
   std::deque<std::pair<std::uint64_t,std::uint64_t>> dedup_fifo_;
   std::unordered_map<std::uint64_t,std::vector<std::uint64_t>> dedup_;
+  using BlockData=std::array<std::uint8_t,kBlockSize>;
+  mutable std::mutex cache_mutex_;
+  mutable std::unordered_map<std::uint64_t,std::shared_ptr<const BlockData>> read_cache_;
+  mutable std::deque<std::uint64_t> read_fifo_;
+  mutable std::atomic<std::uint64_t> cache_hits_{0},cache_misses_{0};
+
 
   static std::uint32_t u32(const std::uint8_t* p) {
     std::uint32_t v=0;
@@ -79,11 +115,40 @@ class QssdDisk final : public BlockDisk {
   static void put64(std::uint8_t* p, std::uint64_t v) {
     for(unsigned i=0;i<8;++i)p[i]=std::uint8_t(v>>(i*8));
   }
-  static std::uint64_t digest(const std::uint8_t* p,std::size_t n) {
-    std::uint64_t h=14695981039346656037ULL;
+  static std::uint64_t digest_update(std::uint64_t h,const std::uint8_t* p,std::size_t n) {
     for(std::size_t i=0;i<n;++i){h^=p[i];h*=1099511628211ULL;}
     return h;
   }
+  static std::uint64_t digest(const std::uint8_t* p,std::size_t n) {
+    return digest_update(kFNVStart,p,n);
+  }
+  static std::uint64_t fd_digest(int fd,std::uint64_t end) {
+    std::array<std::uint8_t,65536> page{};
+    auto h=kFNVStart;
+    for(std::uint64_t pos=0;pos<end;) {
+      const auto chunk=std::size_t(std::min<std::uint64_t>(end-pos,page.size()));
+      read_all(fd,pos,page.data(),chunk);
+      h=digest_update(h,page.data(),chunk);
+      pos+=chunk;
+    }
+    return h;
+  }
+  static void fsync_parent(const std::filesystem::path& path) {
+    auto parent=path.parent_path();
+    if(parent.empty())parent=".";
+    int dir=::open(parent.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if(dir<0)throw std::system_error(errno,std::generic_category(),"QSSD open parent for sync");
+    const bool ok=::fsync(dir)==0;
+    const int error=errno;
+    ::close(dir);
+    if(!ok)throw std::system_error(error,std::generic_category(),"QSSD directory sync");
+  }
+  static std::filesystem::path temp_name(const std::filesystem::path& path,const char* suffix) {
+    static std::atomic<unsigned long long> counter{0};
+    return path.string()+suffix+"."+std::to_string(::getpid())+"."+
+           std::to_string(counter.fetch_add(1,std::memory_order_relaxed));
+  }
+
   static void check_path(const std::filesystem::path& p) {
     if(p.empty()||p.extension()!=".rqvd")
       throw std::invalid_argument("QSSD disk must be an explicit .rqvd regular file");
@@ -117,6 +182,20 @@ class QssdDisk final : public BlockDisk {
       node=node->children[(block>>(level*4))&15];
     }
     return node?node->ref:Ref{};
+  }
+  template<class Visitor>
+  static void each_live(NodePtr node,unsigned level,std::uint64_t prefix,Visitor& visit) {
+    if(!node)return;
+    if(level==0) {
+      if(node->ref.offset)visit(prefix,node->ref.offset);
+      return;
+    }
+    const auto shift=(level-1U)*4U;
+    for(unsigned index=0;index<16;++index) {
+      if(node->children[index])
+        each_live(node->children[index],level-1,
+                  prefix|(std::uint64_t(index)<<shift),visit);
+    }
   }
   static NodePtr replace(NodePtr node,std::uint64_t block,int level,Ref ref) {
     auto next=std::make_shared<Node>(node?*node:Node{});
@@ -176,7 +255,7 @@ class QssdDisk final : public BlockDisk {
       throw std::runtime_error("QSSD decoded block digest differs");
     return data;
   }
-  std::uint64_t append(std::uint64_t at,Kind kind,std::uint64_t block,
+  static std::uint64_t append_to(int fd,std::uint64_t at,Kind kind,std::uint64_t block,
                        std::uint64_t hash,std::uint64_t reference,
                        const std::vector<std::uint8_t>& payload) {
     std::vector<std::uint8_t> bytes(kRecHeader+payload.size()+kRecFooter);
@@ -191,8 +270,41 @@ class QssdDisk final : public BlockDisk {
     std::memcpy(end,"QEND",4);
     put32(end+4,static_cast<std::uint32_t>(bytes.size()));
     put64(end+8,digest(bytes.data(),kRecHeader+payload.size()));
-    write_all(fd_,at,bytes.data(),bytes.size());
+    write_all(fd,at,bytes.data(),bytes.size());
     return at+bytes.size();
+  }
+  void cache_insert(std::uint64_t off,std::shared_ptr<const BlockData> data) const {
+    std::lock_guard<std::mutex> guard(cache_mutex_);
+    if(read_cache_.find(off)!=read_cache_.end())return;
+    if(read_fifo_.size()>=kReadCacheBlocks) {
+      const auto old=read_fifo_.front();read_fifo_.pop_front();
+      read_cache_.erase(old);
+    }
+    read_cache_.emplace(off,std::move(data));
+    read_fifo_.push_back(off);
+  }
+  std::shared_ptr<const BlockData> cached_decode(std::uint64_t off,
+                                                  std::uint64_t limit) const {
+    {
+      std::lock_guard<std::mutex> guard(cache_mutex_);
+      const auto found=read_cache_.find(off);
+      if(found!=read_cache_.end()){
+        cache_hits_.fetch_add(1,std::memory_order_relaxed);
+        return found->second;
+      }
+    }
+    // The digest of the record is checked on first decode and refs only
+    // name immutable append-only offsets. A published offset is never reused.
+    auto decoded=std::make_shared<const BlockData>(decode(off,limit));
+    cache_misses_.fetch_add(1,std::memory_order_relaxed);
+    cache_insert(off,decoded);
+    return decoded;
+  }
+
+  std::uint64_t append(std::uint64_t at,Kind kind,std::uint64_t block,
+                       std::uint64_t hash,std::uint64_t reference,
+                       const std::vector<std::uint8_t>& payload) {
+    return append_to(fd_,at,kind,block,hash,reference,payload);
   }
   void remember(std::uint64_t hash,std::uint64_t off) {
     dedup_[hash].push_back(off);
@@ -207,6 +319,142 @@ class QssdDisk final : public BlockDisk {
       }
     }
   }
+  // A disposable sidecar index. It is never trusted without matching the
+  // generation, full committed journal prefix hash, index checksum, and every
+  // referenced live block. Corrupt sidecar -> full journal replay.
+  std::optional<Epoch> read_checkpoint(std::uint64_t volume_size) {
+    const auto path=path_.string()+".rqix";
+    const int index=::open(path.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW);
+    if(index<0)return {};
+    std::optional<Epoch> loaded;
+    try {
+      struct stat stat{};
+      if(::fstat(index,&stat)!=0||!S_ISREG(stat.st_mode)||
+         stat.st_size<static_cast<off_t>(kIndexHeader))
+        throw std::runtime_error("QSSD index unavailable/incomplete");
+      std::array<std::uint8_t,kIndexHeader> head{};
+      read_all(index,0,head.data(),head.size());
+      const auto cutoff=u64(head.data()+32);
+      const auto count=u64(head.data()+80);
+      if(std::memcmp(head.data(),"RQIX0001",8)!=0||
+         u64(head.data()+8)!=1||u64(head.data()+16)!=capacity_||
+         u64(head.data()+24)!=generation_||
+         cutoff<kHeader||cutoff>volume_size||
+         count>capacity_/kBlockSize||
+         count>(std::uint64_t(stat.st_size)-kIndexHeader)/kIndexEntry||
+         std::uint64_t(stat.st_size)!=kIndexHeader+count*kIndexEntry)
+        throw std::runtime_error("QSSD checkpoint does not match the volume");
+      if(cutoff>kHeader) {
+        if(cutoff<kHeader+kRecHeader+kRecFooter)
+          throw std::runtime_error("QSSD checkpoint has no transaction");
+        const auto end_record=record_at(cutoff-kRecHeader-kRecFooter,cutoff);
+        if(!end_record||end_record->kind!=Commit||
+           end_record->next!=cutoff||end_record->block!=u64(head.data()+40))
+          throw std::runtime_error("QSSD checkpoint is not anchored at a valid commit");
+      }else if(u64(head.data()+40)!=0||count!=0) {
+        throw std::runtime_error("QSSD empty checkpoint contains committed state");
+      }
+      // The streaming digest scans ALL bytes prior to cutoff. Unlike checking
+      // only active refs, this rejects overwritten-but-corrupt journal history.
+      if(fd_digest(fd_,cutoff)!=u64(head.data()+88))
+        throw std::runtime_error("QSSD checkpoint prefix journal digest mismatch");
+      recovery_.verified_prefix_bytes=cutoff;
+      const auto expected_index_hash=u64(head.data()+96);
+      put64(head.data()+96,0);
+      auto checksum=digest(head.data(),head.size());
+      Epoch state{};
+      state.end=cutoff;
+      state.commits=u64(head.data()+40);
+      state.raw=u64(head.data()+48);
+      state.zeros=u64(head.data()+56);
+      state.patterns=u64(head.data()+64);
+      state.refs=u64(head.data()+72);
+      std::uint64_t previous=0;
+      for(std::uint64_t i=0;i<count;++i) {
+        std::array<std::uint8_t,kIndexEntry> entry{};
+        read_all(index,kIndexHeader+i*kIndexEntry,entry.data(),entry.size());
+        checksum=digest_update(checksum,entry.data(),entry.size());
+        const auto block=u64(entry.data()),off=u64(entry.data()+8);
+        if(block>=capacity_/kBlockSize||(i&&block<=previous)||
+           off<kHeader||off>=cutoff)
+          throw std::runtime_error("QSSD checkpoint references invalid guest block");
+        const auto rec=record_at(off,cutoff);
+        if(!rec||rec->kind==Commit||rec->block!=block)
+          throw std::runtime_error("QSSD checkpoint references non-block record");
+        (void)decode(off,cutoff);
+        state.root=replace(state.root,block,8,Ref{off});
+        if(rec->kind==Raw)remember(rec->digest,off);
+        previous=block;
+      }
+      if(checksum!=expected_index_hash)
+        throw std::runtime_error("QSSD checkpoint index checksum mismatch");
+      recovery_.checkpoint_blocks=count;
+      recovery_.used_checkpoint=true;
+      loaded=std::move(state);
+    }catch(const std::exception&){
+      dedup_.clear();dedup_fifo_.clear();
+      recovery_.used_checkpoint=false;
+      recovery_.checkpoint_blocks=0;
+      recovery_.verified_prefix_bytes=0;
+    }
+    ::close(index);
+    return loaded;
+  }
+  bool save_checkpoint_locked() {
+    // Caller owns writer_ and has a fully fsynced journal transaction.
+    const auto view=states_.snapshot();
+    const auto& state=*view->value;
+    const auto target=std::filesystem::path(path_.string()+".rqix");
+    const auto temp=temp_name(target,".tmp");
+    int out=::open(temp.c_str(),O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
+    if(out<0)return false;
+    bool published=false;
+    try {
+      std::array<std::uint8_t,kIndexHeader> header{};
+      std::memcpy(header.data(),"RQIX0001",8);
+      put64(header.data()+8,1);
+      put64(header.data()+16,capacity_);
+      put64(header.data()+24,generation_);
+      put64(header.data()+32,state.end);
+      put64(header.data()+40,state.commits);
+      put64(header.data()+48,state.raw);
+      put64(header.data()+56,state.zeros);
+      put64(header.data()+64,state.patterns);
+      put64(header.data()+72,state.refs);
+      put64(header.data()+88,fd_digest(fd_,state.end));
+      write_all(out,0,header.data(),header.size());
+      std::uint64_t count=0;
+      auto append_entry=[&](std::uint64_t block,std::uint64_t offset){
+        if(count>capacity_/kBlockSize)
+          throw std::runtime_error("QSSD checkpoint block count invalid");
+        std::array<std::uint8_t,kIndexEntry> entry{};
+        put64(entry.data(),block);
+        put64(entry.data()+8,offset);
+        write_all(out,kIndexHeader+count*kIndexEntry,entry.data(),entry.size());
+        ++count;
+      };
+      each_live(state.root,8,0,append_entry);
+      put64(header.data()+80,count);
+      // checksum over header with index_hash=0 and all ordered entries
+      write_all(out,0,header.data(),header.size());
+      const auto hash=fd_digest(out,kIndexHeader+count*kIndexEntry);
+      put64(header.data()+96,hash);
+      write_all(out,0,header.data(),header.size());
+      if(::fsync(out)!=0)
+        throw std::system_error(errno,std::generic_category(),"QSSD index fsync");
+      ::close(out);out=-1;
+      if(::rename(temp.c_str(),target.c_str())!=0)
+        throw std::system_error(errno,std::generic_category(),"QSSD index atomic publish");
+      published=true;
+      fsync_parent(target);
+      return true;
+    }catch(const std::exception&){
+      if(out>=0)::close(out);
+      if(!published)(void)::unlink(temp.c_str());
+      return false; // a failed index is a performance miss, never data loss
+    }
+  }
+
   void replay() {
     const auto sz=file_size();
     if(sz<kHeader)throw std::runtime_error("QSSD truncated volume header");
@@ -217,14 +465,21 @@ class QssdDisk final : public BlockDisk {
        u64(head.data()+32)!=digest(head.data(),32))
       throw std::runtime_error("QSSD invalid volume header");
     capacity_=u64(head.data()+16);
+    generation_=u64(head.data()+40); // old C03 images have zero generation
+    if(generation_ && u64(head.data()+48)!=digest(head.data(),48))
+      throw std::runtime_error("QSSD compacted generation/header checksum mismatch");
     if(capacity_<kGiB||capacity_>16384*kGiB||capacity_%kBlockSize)
       throw std::runtime_error("QSSD volume logical size invalid");
-    auto state=Epoch{};
-    std::uint64_t pos=kHeader, last_commit=kHeader;
+    recovery_={};
+    dedup_fifo_.clear();dedup_.clear();
+    const auto checkpoint=read_checkpoint(sz);
+    auto state=checkpoint?*checkpoint:Epoch{};
+    std::uint64_t pos=state.end, last_commit=state.end;
     std::vector<Change> pending;
     while(pos<sz){
       auto record=record_at(pos,sz);
       if(!record)break; // interrupted tail is never a published transaction
+      ++recovery_.replayed_records;
       if(record->kind==Commit) {
         if(pending.empty()||record->block!=state.commits+1||
            record->reference!=pending.size())
@@ -260,6 +515,118 @@ class QssdDisk final : public BlockDisk {
   }
 
  public:
+  // Offline maintenance. The original descriptor stays open and locked until
+  // the independently verified new .rqvd has been fsynced and atomically
+  // renamed on the SAME filesystem. Only live guest blocks are retained.
+  // The temporary image has a new generation; stale .rqix indexes cannot
+  // claim its address space. Optional fault injection is strictly for tests.
+  static CompactResult compact(const std::filesystem::path& path,
+                               bool inject_abort_before_rename=false) {
+    check_path(path);
+    CompactResult result{};
+    const auto temp=std::filesystem::path(temp_name(path,".c08-staging").string()+".rqvd");
+    bool renamed=false;
+    try {
+      {
+        QssdDisk original(path);
+        const auto original_view=original.states_.snapshot();
+        const auto root=original_view->value->root;
+        const auto old_end=original_view->value->end;
+        result.before_bytes=old_end;
+        result.old_commits=original_view->value->commits;
+        if(original.generation_==UINT64_MAX)
+          throw std::runtime_error("QSSD generation exhausted");
+        result.generation=original.generation_+1;
+        int out=::open(temp.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
+        if(out<0)throw std::system_error(errno,std::generic_category(),"QSSD compact temp create");
+        try {
+          std::array<std::uint8_t,kHeader> head{};
+          read_all(original.fd_,0,head.data(),head.size());
+          put64(head.data()+40,result.generation);
+          put64(head.data()+48,digest(head.data(),48));
+          write_all(out,0,head.data(),head.size());
+          std::uint64_t position=kHeader, committed=0;
+          unsigned staged=0;
+          auto finish_batch=[&](){
+            if(!staged)return;
+            position=append_to(out,position,Commit,committed+1,0,staged,{});
+            ++committed;staged=0;
+          };
+          auto transfer=[&](std::uint64_t block,std::uint64_t offset){
+            const auto data=original.decode(offset,old_end);
+            // An all-zero block is indistinguishable from an absent block and
+            // can be safely removed from the compacted sparse map.
+            if(std::all_of(data.begin(),data.end(),[](auto v){return v==0;}))
+              return;
+            std::vector<std::uint8_t> payload;
+            Kind kind=Raw;
+            for(unsigned period=1;period<=32;++period) {
+              bool repeating=true;
+              for(std::size_t i=period;i<kBlockSize;++i)
+                if(data[i]!=data[i%period]) {repeating=false;break;}
+              if(repeating) {
+                kind=Pattern;payload.assign(data.begin(),data.begin()+period);
+                break;
+              }
+            }
+            if(kind==Raw)payload.assign(data.begin(),data.end());
+            position=append_to(out,position,kind,block,digest(data.data(),data.size()),0,payload);
+            ++result.live_blocks;
+            if(++staged==128)finish_batch(); // replay bound: <=128 per commit
+          };
+          each_live(root,8,0,transfer);
+          finish_batch();
+          result.compact_commits=committed;
+          result.after_bytes=position;
+          if(::fsync(out)!=0)
+            throw std::system_error(errno,std::generic_category(),"QSSD compact file fsync");
+          ::close(out);out=-1;
+        }catch(...){
+          ::close(out);
+          throw;
+        }
+        // Independently re-open, replay every new commit and compare the
+        // complete decoded bytes of every previously live block before rename.
+        {
+          QssdDisk candidate(temp);
+          if(candidate.capacity_!=original.capacity_ ||
+             candidate.generation_!=result.generation ||
+             candidate.file_size()!=result.after_bytes)
+            throw std::runtime_error("QSSD compact candidate metadata mismatch");
+          std::array<std::uint8_t,kBlockSize> actual{};
+          auto verify=[&](std::uint64_t block,std::uint64_t offset) {
+            const auto expected=original.decode(offset,old_end);
+            if(!candidate.read_bytes(block*kBlockSize,actual.data(),actual.size()) ||
+               actual!=expected)
+              throw std::runtime_error("QSSD compact candidate differs from guest block state");
+          };
+          each_live(root,8,0,verify);
+        }
+        if(inject_abort_before_rename)
+          throw std::runtime_error("C08 injected crash point: before atomic compact rename");
+        // Detect unexpected replacement of the original path since open.
+        struct stat handle{},name{};
+        if(::fstat(original.fd_,&handle)!=0||
+           ::lstat(path.c_str(),&name)!=0||
+           handle.st_dev!=name.st_dev||handle.st_ino!=name.st_ino)
+          throw std::runtime_error("QSSD source image changed during offline compact");
+        if(::rename(temp.c_str(),path.c_str())!=0)
+          throw std::system_error(errno,std::generic_category(),"QSSD compact rename");
+        renamed=true;
+        fsync_parent(path); // durable name publication; old/new are each valid
+        result.replaced=true;
+      }
+      // The obsolete checkpoint has a DIFFERENT generation. Generating a new
+      // checkpoint is optional: failure cannot invalidate a verified image.
+      QssdDisk after(path);
+      result.checkpoint_saved=after.checkpoint();
+      return result;
+    }catch(...){
+      if(!renamed)(void)::unlink(temp.c_str());
+      throw;
+    }
+  }
+
   static void create(const std::filesystem::path& path,std::uint64_t gib) {
     check_path(path);
     if(gib<1||gib>16384)throw std::invalid_argument("QSSD supported logical capacity is 1 GiB .. 16 TiB");
@@ -281,11 +648,13 @@ class QssdDisk final : public BlockDisk {
     ::close(fd);
     (void)complete;
   }
-  explicit QssdDisk(const std::filesystem::path& path) {
+  explicit QssdDisk(const std::filesystem::path& path) : path_(path) {
     check_path(path);
     fd_=::open(path.c_str(),O_RDWR|O_CLOEXEC|O_NOFOLLOW);
     if(fd_<0)throw std::system_error(errno,std::generic_category(),"QSSD open");
     try{
+      if(::flock(fd_,LOCK_EX|LOCK_NB)!=0)
+        throw std::runtime_error("QSSD volume already mounted for writing or maintenance");
       struct stat st{};
       if(::fstat(fd_,&st)!=0||!S_ISREG(st.st_mode))
         throw std::runtime_error("QSSD volume is not a regular file");
@@ -302,6 +671,20 @@ class QssdDisk final : public BlockDisk {
     return {capacity_,v->value->end,v->value->commits,v->value->raw,
             v->value->zeros,v->value->patterns,v->value->refs,v->serial};
   }
+  RecoveryStats recovery_stats() const {return recovery_;}
+  std::uint64_t generation() const noexcept {return generation_;}
+  CacheStats cache_stats() const {
+    std::lock_guard<std::mutex> hold(cache_mutex_);
+    const auto blocks=std::uint64_t(read_cache_.size());
+    return {cache_hits_.load(std::memory_order_relaxed),
+            cache_misses_.load(std::memory_order_relaxed),blocks,
+            blocks*kBlockSize};
+  }
+  bool checkpoint() {
+    std::lock_guard<std::mutex> hold(writer_);
+    return save_checkpoint_locked();
+  }
+
   bool read_bytes(std::uint64_t offset,std::uint8_t* target,std::size_t size) override {
     if((!target&&size)||offset>capacity_||size>capacity_-offset)return false;
     try{
@@ -314,8 +697,8 @@ class QssdDisk final : public BlockDisk {
         const auto ref=locate(view->value->root,block);
         if(!ref.offset)std::memset(target+done,0,n);
         else {
-          const auto data=decode(ref.offset,view->value->end);
-          std::memcpy(target+done,data.data()+start,n);
+          const auto data=cached_decode(ref.offset,view->value->end);
+          std::memcpy(target+done,data->data()+start,n);
         }
         done+=n;
       }
@@ -341,6 +724,7 @@ class QssdDisk final : public BlockDisk {
       std::uint64_t at=original_end;
       std::vector<Change> changes;
       std::vector<std::pair<std::uint64_t,std::uint64_t>> new_raw;
+      std::vector<std::pair<std::uint64_t,std::shared_ptr<const BlockData>>> prepared_cache;
       const std::uint64_t first=lba*kSectorSize, total=std::uint64_t(count)*kSectorSize;
       std::uint64_t done=0;
       while(done<total){
@@ -348,7 +732,7 @@ class QssdDisk final : public BlockDisk {
         const auto start=static_cast<std::size_t>((first+done)%kBlockSize);
         const auto n=std::min<std::uint64_t>(total-done,kBlockSize-start);
         auto ref=locate(next.root,block);
-        auto data=ref.offset?decode(ref.offset,original_end):
+        auto data=ref.offset?*cached_decode(ref.offset,original_end):
                     std::array<std::uint8_t,kBlockSize>{};
         std::memcpy(data.data()+start,source+done,static_cast<std::size_t>(n));
         const auto hash=digest(data.data(),data.size());
@@ -379,6 +763,7 @@ class QssdDisk final : public BlockDisk {
         const auto record_offset=at;
         at=append(at,kind,block,hash,backref,payload);
         changes.push_back({block,record_offset,kind,hash});
+        prepared_cache.emplace_back(record_offset,std::make_shared<const BlockData>(data));
         next.root=replace(next.root,block,8,Ref{record_offset});
         if(kind==Raw)new_raw.emplace_back(hash,record_offset);
         done+=n;
@@ -399,6 +784,10 @@ class QssdDisk final : public BlockDisk {
       // turn a committed guest write into an acknowledged failure or rollback.
       try { for(const auto& entry:new_raw)remember(entry.first,entry.second); }
       catch(const std::exception&) {dedup_.clear();dedup_fifo_.clear();}
+      // Discardable cache mutations cannot invalidate an already fsynced
+      // and published guest transaction.
+      try {for(const auto& entry:prepared_cache)cache_insert(entry.first,entry.second);}
+      catch(const std::exception&){}
       return true;
     }catch(const std::exception&){
       // Discard any uncommitted append. A failed write is never acknowledged.

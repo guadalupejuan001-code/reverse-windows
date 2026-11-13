@@ -74,6 +74,16 @@ if(BUILD_TESTING)
   target_link_libraries(reverse_windows_c07_cpu_port_test PRIVATE reverse_windows_component_headers)
   add_test(NAME reverse_windows_c07_cpu_real_rep_pio COMMAND reverse_windows_c07_cpu_port_test)
 
+  add_executable(reverse_windows_c08_maintenance_test tests/c08_qssd_maintenance_test.cpp)
+  target_link_libraries(reverse_windows_c08_maintenance_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c08_verified_checkpoint_compaction
+    COMMAND reverse_windows_c08_maintenance_test)
+
+  add_executable(reverse_windows_c08_benchmark tests/c08_raw_vs_qssd_benchmark.cpp)
+  target_link_libraries(reverse_windows_c08_benchmark PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c08_raw_vs_qssd_benchmark
+    COMMAND reverse_windows_c08_benchmark)
+
   set_tests_properties(reverse_windows_real_x86_demo reverse_windows_real_x64_demo
                        reverse_windows_x86_hdd_write_read_persist
                        reverse_windows_qssd_sparse_atomic_reboot_x86
@@ -81,5 +91,7 @@ if(BUILD_TESTING)
                        reverse_windows_c05_real_cpl3_tss
                        reverse_windows_c06_real_motherboard
                        reverse_windows_c07_pci_ata_qssd_pio_irq
-                       reverse_windows_c07_cpu_real_rep_pio PROPERTIES TIMEOUT 120)
+                       reverse_windows_c07_cpu_real_rep_pio
+                       reverse_windows_c08_verified_checkpoint_compaction
+                       reverse_windows_c08_raw_vs_qssd_benchmark PROPERTIES TIMEOUT 120)
 endif()
