@@ -111,6 +111,26 @@ if(BUILD_TESTING)
   # CPU checkout. REVERSE Windows never adds a second SSE interpreter.
   # C09R-1 stage3. Compile genuine guest x86 tests from exact Mundo X
   # dependency. No SIMD/x87 implementation is duplicated in REVERSE Windows.
+  # C09R-1 stage4: compile tests directly from the single canonical
+  # Mundo X dependency. No alternative FPU/SSE2 interpreter is created.
+  add_executable(reverse_windows_c09r1_stage4_mxcsr_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_c09r1_stage4_mxcsr_test.cpp")
+  target_link_libraries(reverse_windows_c09r1_stage4_mxcsr_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c09r1_stage4_daz_ftz_oracles
+    COMMAND reverse_windows_c09r1_stage4_mxcsr_test)
+
+  add_executable(reverse_windows_c09r1_stage4_x87_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_c09r1_stage4_x87_test.cpp")
+  target_link_libraries(reverse_windows_c09r1_stage4_x87_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c09r1_stage4_x87_pc_rc_stack
+    COMMAND reverse_windows_c09r1_stage4_x87_test)
+
+  add_executable(reverse_windows_c09r1_stage4_sse2_misc_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_c09r1_stage4_sse2_misc_test.cpp")
+  target_link_libraries(reverse_windows_c09r1_stage4_sse2_misc_test PRIVATE reverse_windows_component_headers)
+  add_test(NAME reverse_windows_c09r1_stage4_sse2_cmp_shuffle
+    COMMAND reverse_windows_c09r1_stage4_sse2_misc_test)
+
   add_executable(reverse_windows_c09r1_sse2_fp_test
     "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/x86_c09r1_stage3_fp_test.cpp")
   target_link_libraries(reverse_windows_c09r1_sse2_fp_test PRIVATE reverse_windows_component_headers)
@@ -182,5 +202,9 @@ if(BUILD_TESTING)
                        reverse_windows_c09r1_binary64_mxcsr_xm_ud
                        reverse_windows_c09r1_cpl3_tss_fpu_fxsave
                        reverse_windows_c09r1_x87_ieee_to_ext80_oracle
-                       reverse_windows_c09r1_x87_deferred_mf PROPERTIES TIMEOUT 120)
+                       reverse_windows_c09r1_x87_deferred_mf
+                       reverse_windows_c09r1_stage4_daz_ftz_oracles
+                       reverse_windows_c09r1_stage4_x87_pc_rc_stack
+                       reverse_windows_c09r1_stage4_sse2_cmp_shuffle
+                       PROPERTIES TIMEOUT 120)
 endif()
