@@ -6,10 +6,10 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "562f4d9e2e699de6d879f25eb0feb38d1114525a",
+      "commit": "680afd0d42c1f3a5a88260d5d038eb92c2794c7e",
       "checkout": "deps/mundo-X",
-      "role": "canonical-PcMachine-x86-C07-real16-protected32-REP-INSW-OUTSW-and-C06-IRQ-MMIO",
-      "status": "candidate-C07-unmerged-PR89",
+      "role": "canonical-PcMachine-C09-exact-x86-x64-instruction-and-irq-tracing-plus-C07",
+      "status": "candidate-C09-unmerged",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/x86_cpu.hpp",
@@ -18,7 +18,8 @@
         "pc-android/native/tests/x86_idt_c04_test.cpp",
         "pc-android/native/tests/x86_cpl_c05_test.cpp",
         "pc-android/native/tests/x86_bus_c06_test.cpp",
-        "pc-android/native/tests/x86_port_pio_c07_test.cpp"
+        "pc-android/native/tests/x86_port_pio_c07_test.cpp",
+        "pc-android/native/tests/x86_trace_c09_test.cpp"
       ]
     },
     {
