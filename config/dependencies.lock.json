@@ -6,10 +6,10 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "ad801ea2a4e80ca6e08023a19a6b640c04e1e166",
+      "commit": "242f8369ebed754926e43bd6a07b2a452645de39",
       "checkout": "deps/mundo-X",
-      "role": "canonical-Mundo-X-C09R1-stage3-SSE2-binary64-MXCSR-x87-80bit-FPU-exceptions-CPUID-off",
-      "status": "candidate-C09R1-stage3-unmerged",
+      "role": "canonical-Mundo-X-C09R1-stage4-SSE2-DAZ-FTZ-CMPPD-x87-PC-RC-stack-CVT-CPUID-off",
+      "status": "candidate-C09R1-stage4-unmerged",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/x86_cpu.hpp",
@@ -27,7 +27,11 @@
         "pc-android/native/tests/x86_c09r1_stage3_fp_test.cpp",
         "pc-android/native/tests/x86_c09r1_stage3_ring3_test.cpp",
         "pc-android/native/tests/x86_c09r1_stage3_x87_precision_test.cpp",
-        "pc-android/native/tests/x86_c09r1_stage3_x87_mf_test.cpp"
+        "pc-android/native/tests/x86_c09r1_stage3_x87_mf_test.cpp",
+        "pc-android/native/tests/x86_c09r1_stage4_mxcsr_test.cpp",
+        "pc-android/native/tests/x86_c09r1_stage4_x87_test.cpp",
+        "pc-android/native/tests/x86_c09r1_stage4_sse2_misc_test.cpp",
+        "pc-android/native/tests/x86_c09r1_stage4_packed_cvt_test.cpp"
       ]
     },
     {
