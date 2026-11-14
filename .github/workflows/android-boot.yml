@@ -181,16 +181,17 @@ jobs:
           adb logcat -c
           adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity" --ez com.reversewindows.android.SELF_TEST true
           build_fields="\"app_version\":\"$ANDROID_VERSION\",\"app_version_code\":$ANDROID_VERSION_CODE,\"application_id\":\"$ANDROID_APP_ID\",\"mundo_x_sha\":\"$MUNDO_X_SHA\""
+          snapshot="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ultimo-diagnostico.json"
           wait_for_state() {
             local expected="$1"
             for attempt in {1..50}; do
-              if adb logcat -d -s ReverseWindows:I '*:S' > "$log" &&
-                grep -Fq "$build_fields,\"schema\":\"reverse-windows-android-session-v1\",\"source\":\"self-test\",\"status\":\"$expected\"" "$log"; then
+              if adb exec-out run-as "$ANDROID_APP_ID" cat files/ultimo-diagnostico.json > "$snapshot" &&
+                grep -Fq "$build_fields,\"schema\":\"reverse-windows-android-session-v1\",\"source\":\"self-test\",\"status\":\"$expected\"" "$snapshot"; then
                 return 0
               fi
               sleep 1
             done
-            cat "$log"
+            cat "$snapshot"
             return 1
           }
           wait_for_window_focus() {
@@ -211,17 +212,13 @@ jobs:
             return 1
           }
           wait_for_state waiting_key
-          python3 - "$log" <<'PY'
+          python3 - "$snapshot" <<'PY'
           import json
           import pathlib
           import sys
 
-          sessions = [
-              json.loads(line[line.index('{"app_version"'):])
-              for line in pathlib.Path(sys.argv[1]).read_text().splitlines()
-              if '{"app_version"' in line and 'reverse-windows-android-session-v1' in line
-          ]
-          ram = sessions[-1]["ram_profile"]
+          report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          ram = report["ram_profile"]
           assert ram["resident_bytes"] <= ram["backing_budget_bytes"], ram
           assert ram["spilled_bytes"] == 0 and ram["spill_writes"] == 0, ram
           assert ram["spill_mode"] in {"file", "disabled", "unavailable"}, ram
@@ -239,9 +236,7 @@ jobs:
           wait_for_window_focus guest
           adb shell input keyevent KEYCODE_ENTER
           wait_for_state halted
-          snapshot="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ultimo-diagnostico.json"
           adb shell am force-stop "$ANDROID_APP_ID"
-          adb exec-out run-as "$ANDROID_APP_ID" cat files/ultimo-diagnostico.json > "$snapshot"
           python3 - "$snapshot" <<'PY'
           import json
           import pathlib
