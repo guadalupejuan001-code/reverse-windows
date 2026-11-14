@@ -84,12 +84,14 @@
     {
       "key": "gpu_virtual",
       "repository": "guadalupejuan001-code/GPU-VIRTUAL",
-      "commit": "dd89b4c2ba8cb7908bb8f0bb9eb8f20b75ead7d9",
+      "commit": "3161cdfa0f405f27e86af43e3cdb540c5f1e10d4",
       "checkout": "deps/GPU-VIRTUAL",
-      "role": "C12-plus-physical-work-authority-PR8",
-      "status": "candidate-unmerged-PR8",
+      "role": "C12.1-periodic-output-wide-XI-and-physical-work",
+      "status": "candidate-GPU-VIRTUAL-PR8-and-PR9",
       "required_paths": [
         "include/ejecucion_gpu.hpp",
+        "include/relaciones_gpu.hpp",
+        "include/transformacion_reversible.hpp",
         "include/trabajo_fisico.hpp",
         "tests/physical_work_authority.cpp"
       ]

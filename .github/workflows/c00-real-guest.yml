@@ -33,11 +33,11 @@ jobs:
           ref: d3c00aceca27fe17fa2a91e2c433ee56dc353826
           path: deps/mundo-X
           persist-credentials: false
-      - name: Checkout GPU-VIRTUAL C12 plus physical work authority
+      - name: Checkout GPU-VIRTUAL C12.1 plus physical work authority
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/GPU-VIRTUAL
-          ref: dd89b4c2ba8cb7908bb8f0bb9eb8f20b75ead7d9
+          ref: 3161cdfa0f405f27e86af43e3cdb540c5f1e10d4
           path: deps/GPU-VIRTUAL
           persist-credentials: false
       - name: Checkout QSSD current StateBus plus graphics revisions
@@ -281,11 +281,23 @@ jobs:
           assert report['ether_xi_memory_aperture']
           assert report['gpu_virtual_vga_delta']
           assert report['gpu_vga_delta_upload_bytes']==4
+          assert report['gpu_virtual_compute_words']==4294967296
+          assert report['gpu_virtual_compute_sum_u64']=="9223372034707292160"
+          assert report['gpu_virtual_compute_evaluated_words']==0
+          assert report['gpu_virtual_xi_bits']==1024
           assert report['gpu_full_frame_bytes']==4000
           assert report['qssd_graphics_serial']==3
           assert 'REVERSE_WINDOWS_C09R_READINESS_PASS' in lines[-1]
           print('C09R_USER_TECH_REAL_HARDWARE_AUDIT_PASS windows_ran=false')
           PY
+      - name: Measure exact GPU Virtual calculation on the host CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O3 -Wall -Wextra -Wpedantic -Werror -pthread \
+            -I deps/GPU-VIRTUAL/include -isystem deps/mundo-X/native/include \
+            tests/gpu_calculo_benchmark.cpp -o build/gpu-calculo-benchmark
+          ./build/gpu-calculo-benchmark | tee build/gpu-calculo-benchmark.txt
       - name: Trace authentic CPU and BIOS execution from a SYNTHETIC El Torito ISO
         shell: bash
         run: |
@@ -433,6 +445,7 @@ jobs:
             build/c09-quota-diagnosis.json
             build/c09-hardware-trace.log
             build/c09r-hardware-audit.jsonl
+            build/gpu-calculo-benchmark.txt
             build/c02-cpu-conformance.log
             build/c03-boot-evidence.json
             build/c03-bios-disk.log
