@@ -17,6 +17,14 @@ typedef struct PrimeAdapter {
     BOOLEAN powered;
 } PrimeAdapter;
 
+typedef struct PrimeDevice {
+    PrimeAdapter* gpu;
+} PrimeDevice;
+
+typedef struct PrimeContext {
+    PrimeDevice* device;
+} PrimeContext;
+
 static NTSTATUS prime_add(PDEVICE_OBJECT physical, PVOID* context) {
     PrimeAdapter* gpu = ExAllocatePoolWithTag(NonPagedPoolNx, sizeof(*gpu), PRIME_POOL_TAG);
     if (!gpu) return STATUS_INSUFFICIENT_RESOURCES;
@@ -64,7 +72,7 @@ static NTSTATUS prime_map(PrimeAdapter* gpu, PCM_RESOURCE_LIST resources) {
             bar->u.Memory.Start, RWGPU_BAR_BYTES, FALSE, FALSE, MmNonCached, &mapped);
         if (!NT_SUCCESS(status)) return status;
         gpu->bar = mapped;
-        const ULONG needed = RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_DMA;
+        const ULONG needed = RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_DMA | RWGPU_CAP_COLOR_ALPHA;
         if (!mapped || rwgpu_read(gpu->bar, RWGPU_REG_MAGIC) != RWGPU_MAGIC ||
             rwgpu_read(gpu->bar, RWGPU_REG_ABI) != RWGPU_ABI ||
             (rwgpu_read(gpu->bar, RWGPU_REG_CAPS) & needed) != needed)
@@ -179,6 +187,46 @@ static VOID prime_dpc(PVOID context) { UNREFERENCED_PARAMETER(context); }
 static VOID prime_reset(PVOID context) { UNREFERENCED_PARAMETER(context); }
 static VOID prime_unload(VOID) {}
 
+static NTSTATUS APIENTRY prime_create_device(HANDLE adapter, DXGKARG_CREATEDEVICE* args) {
+    PrimeDevice* device = ExAllocatePoolWithTag(NonPagedPoolNx, sizeof(*device), PRIME_POOL_TAG);
+    if (!device) return STATUS_INSUFFICIENT_RESOURCES;
+    device->gpu = adapter;
+    args->hDevice = device;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS APIENTRY prime_destroy_device(HANDLE device) {
+    ExFreePoolWithTag(device, PRIME_POOL_TAG);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS APIENTRY prime_create_context(HANDLE device, DXGKARG_CREATECONTEXT* args) {
+    if (args->NodeOrdinal != 0 || args->PrivateDriverDataSize != 0) return STATUS_INVALID_PARAMETER;
+    PrimeContext* context = ExAllocatePoolWithTag(NonPagedPoolNx, sizeof(*context), PRIME_POOL_TAG);
+    if (!context) return STATUS_INSUFFICIENT_RESOURCES;
+    context->device = device;
+    RtlZeroMemory(&args->ContextInfo, sizeof(args->ContextInfo));
+    args->ContextInfo.DmaBufferSize = PAGE_SIZE;
+    args->ContextInfo.AllocationListSize = 1;
+    args->hContext = context;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS APIENTRY prime_destroy_context(HANDLE context) {
+    ExFreePoolWithTag(context, PRIME_POOL_TAG);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS APIENTRY prime_node(HANDLE adapter, UINT ordinal, DXGKARG_GETNODEMETADATA* out) {
+    UNREFERENCED_PARAMETER(adapter);
+    if (ordinal != 0) return STATUS_INVALID_PARAMETER;
+    const WCHAR name[] = L"PrimeVGC";
+    RtlZeroMemory(out, sizeof(*out));
+    out->EngineType = DXGK_ENGINE_TYPE_3D;
+    RtlCopyMemory(out->FriendlyName, name, sizeof(name));
+    return STATUS_SUCCESS;
+}
+
 static VOID prime_adapter_info(PrimeAdapter* gpu, RwGpuWddmAdapter* out) {
     const RwGpuWddmAdapter info = {{RWGPU_WDDM_MAGIC, RWGPU_WDDM_ABI, RWGPU_WDDM_QUERY, sizeof(info)},
         rwgpu_read_wide(gpu->bar, RWGPU_REG_LOGICAL_LO), (RWGPU_DEVICE_ID << 16) | RWGPU_VENDOR_ID,
@@ -189,7 +237,8 @@ static VOID prime_adapter_info(PrimeAdapter* gpu, RwGpuWddmAdapter* out) {
 static NTSTATUS APIENTRY prime_query(HANDLE adapter, const DXGKARG_QUERYADAPTERINFO* args) {
     PrimeAdapter* gpu = adapter;
     if (args->Type == DXGKQAITYPE_UMDRIVERPRIVATE) {
-        if (args->OutputDataSize != sizeof(RwGpuWddmAdapter)) return STATUS_INVALID_PARAMETER;
+        if (!args->pOutputData || args->OutputDataSize != sizeof(RwGpuWddmAdapter))
+            return STATUS_INVALID_PARAMETER;
         prime_lock(gpu);
         const BOOLEAN ready = gpu->bar && gpu->powered;
         if (ready) prime_adapter_info(gpu, args->pOutputData);
@@ -197,7 +246,8 @@ static NTSTATUS APIENTRY prime_query(HANDLE adapter, const DXGKARG_QUERYADAPTERI
         return ready ? STATUS_SUCCESS : STATUS_DEVICE_NOT_READY;
     }
     if (args->Type == DXGKQAITYPE_DRIVERCAPS) {
-        if (args->OutputDataSize < sizeof(DXGK_DRIVERCAPS)) return STATUS_BUFFER_TOO_SMALL;
+        if (!args->pOutputData || args->OutputDataSize < sizeof(DXGK_DRIVERCAPS))
+            return STATUS_BUFFER_TOO_SMALL;
         DXGK_DRIVERCAPS* caps = args->pOutputData;
         RtlZeroMemory(caps, sizeof(*caps));
         caps->WDDMVersion = DXGKDDI_WDDMv1_3;
@@ -208,9 +258,9 @@ static NTSTATUS APIENTRY prime_query(HANDLE adapter, const DXGKARG_QUERYADAPTERI
     return STATUS_NOT_SUPPORTED;
 }
 
-static NTSTATUS prime_draw(PrimeAdapter* gpu, const RwGpuWddmFrame* frame, PUCHAR data) {
+static NTSTATUS prime_draw(PrimeAdapter* gpu, RwGpuWddmFrame* frame, PUCHAR data) {
     uint32_t vertices, pixels;
-    if (!rwgpu_wddm_frame_size(frame, &vertices, &pixels) || vertices > gpu->dmaBytes)
+    if (frame->draw_ticket || !rwgpu_wddm_frame_size(frame, &vertices, &pixels) || vertices > gpu->dmaBytes)
         return STATUS_INVALID_PARAMETER;
     if (!rwgpu_read(gpu->bar, RWGPU_REG_BUS_MASTER)) return STATUS_DEVICE_NOT_READY;
     const uint64_t bus = (uint64_t)gpu->bus.QuadPart;
@@ -219,8 +269,9 @@ static NTSTATUS prime_draw(PrimeAdapter* gpu, const RwGpuWddmFrame* frame, PUCHA
     rwgpu_write(gpu->bar, RWGPU_REG_WIDTH, frame->width);
     rwgpu_write(gpu->bar, RWGPU_REG_HEIGHT, frame->height);
     rwgpu_write(gpu->bar, RWGPU_REG_CLEAR_RGBA, frame->clear_rgba);
-    NTSTATUS status = rwgpu_submit(gpu->bar, RWGPU_DRAW_RAM, bus, 0, vertices);
+    NTSTATUS status = rwgpu_submit(gpu->bar, RWGPU_DRAW_RAM, bus, RWGPU_DRAW_COLOR_ALPHA, vertices);
     if (!NT_SUCCESS(status)) return status;
+    const ULONG ticket = rwgpu_read(gpu->bar, RWGPU_REG_COMPLETED);
     for (ULONG offset = 0; offset < pixels;) {
         const ULONG remaining = pixels - offset;
         const ULONG chunk = remaining < gpu->dmaBytes ? remaining : gpu->dmaBytes;
@@ -231,6 +282,7 @@ static NTSTATUS prime_draw(PrimeAdapter* gpu, const RwGpuWddmFrame* frame, PUCHA
         RtlCopyMemory(data + vertices + offset, gpu->dma, chunk);
         offset += chunk;
     }
+    frame->draw_ticket = ticket;
     return STATUS_SUCCESS;
 }
 
@@ -242,6 +294,10 @@ static NTSTATUS APIENTRY prime_escape(HANDLE adapter, const DXGKARG_ESCAPE* args
     if (header.magic != RWGPU_WDDM_MAGIC || header.version != RWGPU_WDDM_ABI ||
         header.bytes != args->PrivateDriverDataSize) return STATUS_INVALID_PARAMETER;
     PrimeAdapter* gpu = adapter;
+    const PrimeDevice* device = args->hDevice;
+    const PrimeContext* context = args->hContext;
+    if ((device && device->gpu != gpu) || (context && (!device || context->device != device)))
+        return STATUS_INVALID_PARAMETER;
     prime_lock(gpu);
     NTSTATUS status = STATUS_DEVICE_NOT_READY;
     if (gpu->bar && gpu->powered && gpu->dma) {
@@ -255,6 +311,7 @@ static NTSTATUS APIENTRY prime_escape(HANDLE adapter, const DXGKARG_ESCAPE* args
             RwGpuWddmFrame frame;
             RtlCopyMemory(&frame, args->pPrivateDriverData, sizeof(frame));
             status = prime_draw(gpu, &frame, (PUCHAR)args->pPrivateDriverData + sizeof(frame));
+            if (NT_SUCCESS(status)) RtlCopyMemory(args->pPrivateDriverData, &frame, sizeof(frame));
         }
     }
     prime_unlock(gpu);
@@ -279,8 +336,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     ddi.DxgkDdiResetDevice = prime_reset;
     ddi.DxgkDdiUnload = prime_unload;
     ddi.DxgkDdiQueryAdapterInfo = prime_query;
+    ddi.DxgkDdiCreateDevice = prime_create_device;
+    ddi.DxgkDdiDestroyDevice = prime_destroy_device;
+    ddi.DxgkDdiCreateContext = prime_create_context;
+    ddi.DxgkDdiDestroyContext = prime_destroy_context;
+    ddi.DxgkDdiGetNodeMetadata = prime_node;
     ddi.DxgkDdiEscape = prime_escape;
-    // Registration and driver-private submission only. The Direct3D path
-    // still requires resource, paging and scheduler DDIs and a matching UMD.
     return DxgkInitialize(driver, registry, &ddi);
 }

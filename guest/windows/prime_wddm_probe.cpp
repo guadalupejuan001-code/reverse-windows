@@ -57,7 +57,7 @@ int main() {
     } adapter{open.hAdapter};
 
     RwGpuWddmAdapter info{{RWGPU_WDDM_MAGIC, RWGPU_WDDM_ABI, RWGPU_WDDM_QUERY, sizeof(info)}};
-    constexpr auto caps = RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_DMA;
+    constexpr auto caps = RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_DMA | RWGPU_CAP_COLOR_ALPHA;
     if (!escape(adapter.handle, &info, sizeof(info)) ||
         info.pci_id != ((RWGPU_DEVICE_ID << 16) | RWGPU_VENDOR_ID) ||
         info.logical_vram_bytes != RWGPU_LOGICAL_BYTES || (info.capabilities & caps) != caps)
@@ -71,11 +71,14 @@ int main() {
     }};
     constexpr UINT bytes = sizeof(RwGpuWddmFrame) + sizeof(vertices) + width * height * 4;
     const RwGpuWddmFrame frame{{RWGPU_WDDM_MAGIC, RWGPU_WDDM_ABI, RWGPU_WDDM_DRAW, bytes},
-                              width, height, clear, static_cast<std::uint32_t>(vertices.size())};
+                              width, height, clear, static_cast<std::uint32_t>(vertices.size()), 0};
     std::vector<std::uint8_t> data(bytes);
     std::memcpy(data.data(), &frame, sizeof(frame));
     std::memcpy(data.data() + sizeof(frame), vertices.data(), sizeof(vertices));
     if (!escape(adapter.handle, data.data(), bytes)) return 1;
+    RwGpuWddmFrame completed{};
+    std::memcpy(&completed, data.data(), sizeof(completed));
+    if (!completed.draw_ticket) return 1;
 
     const std::uint8_t* pixels = data.data() + sizeof(frame) + sizeof(vertices);
     const auto color = [&](unsigned x, unsigned y) {

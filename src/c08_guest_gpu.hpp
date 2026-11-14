@@ -203,7 +203,8 @@ class GuestGpuC08 {
       case RWGPU_REG_CAPS:
         return RWGPU_CAP_VRAM | RWGPU_CAP_DIRECT_VRAM | RWGPU_CAP_SUM_INDICES
 #ifdef REVERSE_WINDOWS_GLES_GUEST
-            | RWGPU_CAP_TRIANGLES | RWGPU_CAP_DRAW_VRAM | RWGPU_CAP_COLOR_DMA | RWGPU_CAP_DRAW_RAM
+            | RWGPU_CAP_TRIANGLES | RWGPU_CAP_DRAW_VRAM | RWGPU_CAP_COLOR_DMA |
+              RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_ALPHA
 #endif
             ;
       case RWGPU_REG_STATUS: return status_;
@@ -367,9 +368,10 @@ class GuestGpuC08 {
     const auto display = pc_.video_info();
     const auto width = params_[3], height = params_[4], clear = params_[5];
     const auto present = flags == RWGPU_DRAW_PRESENT_VBE;
+    const auto alpha = flags == RWGPU_DRAW_COLOR_ALPHA;
     if (bytes % (3 * sizeof(RwGpuVertex)) ||
         bytes > RWGPU_MAX_VERTICES * sizeof(RwGpuVertex) ||
-        flags > RWGPU_DRAW_PRESENT_VBE || !width || !height ||
+        flags > RWGPU_DRAW_COLOR_ALPHA || !width || !height ||
         (present && (!display.graphics || width != display.width || height != display.height)) ||
         width > RWGPU_MAX_WIDTH || height > RWGPU_MAX_HEIGHT) return RWGPU_INVALID;
     if (op == RWGPU_DRAW_RAM && !(pci_command_ & 4U)) return RWGPU_UNAVAILABLE;
@@ -387,7 +389,7 @@ class GuestGpuC08 {
       std::memcpy(vertices_.data(), stage_.data(), bytes);
     }
     const auto plan = std::make_shared<const xgpu::GuestTrianglePlan>(planner_.plan(vertices_));
-    auto receipt = renderer_.render(*plan, width, height, clear, bgrx_);
+    auto receipt = renderer_.render(*plan, width, height, clear, bgrx_, alpha);
     // Return the actual readback to the canonical guest display. C07 observes
     // this physical write the same way as BIOS or ordinary guest pixel stores.
     if (present) pc_.cpu.memory.write_block(display.physical_address, bgrx_.data(), bgrx_.size());

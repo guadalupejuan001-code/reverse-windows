@@ -48,13 +48,16 @@ std::array<std::uint32_t, checks.size()> render_d3d11(IDXGIAdapter1* adapter = n
     ComPtr<ID3D11Device> d;
     ComPtr<ID3D11DeviceContext> c;
     const auto type = adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_WARP;
-    check(D3D11CreateDevice(adapter, type, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+    constexpr D3D_FEATURE_LEVEL feature = D3D_FEATURE_LEVEL_9_1;
+    check(D3D11CreateDevice(adapter, type, nullptr, 0, adapter ? &feature : nullptr, adapter ? 1 : 0,
+                            D3D11_SDK_VERSION,
                             &d, nullptr, &c), "D3D11 device");
     auto vs = compile("struct V {float4 p : SV_Position; float4 c : COLOR0;};"
                       "V main(float4 p : POSITION0, float4 c : COLOR0) {V v;v.p=p;v.c=c;return v;}",
-                      "vs_4_0");
+                      adapter ? "vs_4_0_level_9_1" : "vs_4_0");
     auto ps = compile("struct V {float4 p : SV_Position; float4 c : COLOR0;};"
-                      "float4 main(V i) : SV_Target0 {return i.c;}", "ps_4_0");
+                      "float4 main(V i) : SV_Target0 {return i.c;}",
+                      adapter ? "ps_4_0_level_9_1" : "ps_4_0");
     ComPtr<ID3D11VertexShader> vertex;
     ComPtr<ID3D11PixelShader> pixel;
     check(d->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &vertex), "vertex shader");
@@ -132,6 +135,7 @@ std::array<std::uint32_t, checks.size()> render_d3d11(IDXGIAdapter1* adapter = n
         std::memcpy(&pixels[i], sample, sizeof(pixels[i]));
     }
     c->Unmap(output.Get(), 0);
+    check(d->GetDeviceRemovedReason(), "D3D device status after readback");
     return pixels;
 }
 

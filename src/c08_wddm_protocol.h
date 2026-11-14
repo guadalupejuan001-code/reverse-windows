@@ -1,11 +1,11 @@
 #pragma once
 #include "c08_gpu_protocol.h"
 
-// Driver-private WDDM commands. Neither packet contains a user pointer or an
-// address that can be used for DMA. Draw output follows the vertices in the
-// same packet and is returned only after the GPU finishes the render.
+// Driver-private WDDM commands. The packets contain no user pointer or DMA
+// address. Draw output is BGRA and follows the vertices in the same packet.
+// The same request returns its PCI command ticket to the caller.
 #define RWGPU_WDDM_MAGIC UINT32_C(0x31445752)
-#define RWGPU_WDDM_ABI 1u
+#define RWGPU_WDDM_ABI 2u
 enum RwGpuWddmCommand { RWGPU_WDDM_QUERY = 1, RWGPU_WDDM_DRAW = 2 };
 
 typedef struct RwGpuWddmHeader {
@@ -20,7 +20,7 @@ typedef struct RwGpuWddmAdapter {
 
 typedef struct RwGpuWddmFrame {
   RwGpuWddmHeader header;
-  uint32_t width, height, clear_rgba, vertex_count;
+  uint32_t width, height, clear_rgba, vertex_count, draw_ticket;
 } RwGpuWddmFrame;
 
 static inline int rwgpu_wddm_frame_size(const RwGpuWddmFrame* frame,

@@ -268,7 +268,7 @@ void verify(const std::filesystem::path& volume) {
     // The developer miniport submits the same bounded RAM render used here.
     constexpr unsigned frame_bytes = sizeof(RwGpuWddmFrame) + sizeof(vertices) + color_bytes;
     RwGpuWddmFrame frame{{RWGPU_WDDM_MAGIC, RWGPU_WDDM_ABI, RWGPU_WDDM_DRAW, frame_bytes},
-                        width, height, clear, sizeof(vertices) / sizeof(vertices[0])};
+                        width, height, clear, sizeof(vertices) / sizeof(vertices[0]), 0};
     uint32_t encoded_bytes = 0, output_bytes = 0;
     require(rwgpu_wddm_frame_size(&frame, &encoded_bytes, &output_bytes) &&
             encoded_bytes == sizeof(vertices) && output_bytes == color_bytes,
@@ -307,6 +307,23 @@ void verify(const std::filesystem::path& volume) {
     require(pc.cpu.read32(0xe030) == RWGPU_OK && pc.cpu.read32(0xe034) == RWGPU_OK &&
             pc.cpu.read32(0xe038) == 0x000a141eU && !pc.cpu.memory.write_watch()->pending(),
             "Offscreen draw did not return exact BGRX or changed the boot display");
+    Guest32 alpha;
+    alpha.write(moved_bar + RWGPU_REG_CLEAR_RGBA, 0x741e140aU);
+    alpha.direct_command(RWGPU_DRAW_RAM, 18, source, RWGPU_DRAW_COLOR_ALPHA, sizeof(vertices));
+    alpha.read(moved_bar + RWGPU_REG_STATUS, 0xe068);
+    alpha.read(moved_bar + RWGPU_REG_COMPLETED, 0xe06c);
+    alpha.direct_command(RWGPU_READ_COLOR_RAM, 19, 0, color_target, 32 * 32 * 4);
+    alpha.read(moved_bar + RWGPU_REG_STATUS, 0xe070);
+    alpha.direct_command(RWGPU_DRAW_RAM, 20, source, RWGPU_DRAW_PRESENT_VBE | RWGPU_DRAW_COLOR_ALPHA,
+                         sizeof(vertices));
+    alpha.read(moved_bar + RWGPU_REG_STATUS, 0xe074);
+    alpha.run(pc);
+    require(pc.cpu.read32(0xe068) == RWGPU_OK && pc.cpu.read32(0xe06c) == 18 &&
+            pc.cpu.read32(0xe070) == RWGPU_OK && pc.cpu.read32(0xe074) == RWGPU_INVALID &&
+            pc.cpu.read32(color_target + (32 * 32 - 1) * 4) == 0x740a141eU &&
+            pc.cpu.read32(color_target + (16 * 32 + 16) * 4) == 0xffff0000U &&
+            !pc.cpu.memory.write_watch()->pending(),
+            "WDDM offscreen readback must preserve alpha without changing the boot display");
 #else
     require(pc.cpu.read32(0xe024) == RWGPU_UNAVAILABLE && pc.cpu.read32(0xe028) == 10,
             "Headless build must disclose its absent renderer");
