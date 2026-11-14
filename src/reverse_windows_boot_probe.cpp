@@ -112,6 +112,8 @@ Options parse(int argc, char** argv) {
             throw std::invalid_argument("QSSD maintenance requires only --qssd-disk PATH.rqvd");
     }
     if (out.ram_mib < 2) throw std::invalid_argument("Mundo X PC requires at least 2 MiB logical RAM");
+    const auto vram_path = reverse_windows::GpuVram::sidecar(
+        out.qssd_path.empty() ? out.disk_path : out.qssd_path);
     if (!out.trace_path.empty()) {
         if (out.source==Options::Source::QssdCompact ||
             out.source==Options::Source::QssdCheckpoint)
@@ -120,8 +122,9 @@ Options parse(int argc, char** argv) {
         const auto trace = std::filesystem::weakly_canonical(out.trace_path);
         if (std::filesystem::exists(trace) || trace==std::filesystem::weakly_canonical(out.iso_path) ||
             (!out.disk_path.empty() && trace==std::filesystem::weakly_canonical(out.disk_path)) ||
-            (!out.qssd_path.empty() && trace==std::filesystem::weakly_canonical(out.qssd_path)))
-            throw std::invalid_argument("Trace path exists or aliases a guest ISO/disk; refuse overwrite");
+            (!out.qssd_path.empty() && trace==std::filesystem::weakly_canonical(out.qssd_path)) ||
+            (!vram_path.empty() && trace==std::filesystem::weakly_canonical(vram_path)))
+            throw std::invalid_argument("Trace path exists or aliases guest media; refuse overwrite");
     }
     if (out.create_disk_gib && out.disk_path.empty()) throw std::invalid_argument("--create-disk-gib requires --disk PATH.rvdisk");
     if (out.create_qssd_gib && out.qssd_path.empty()) throw std::invalid_argument("--create-qssd-gib requires --qssd-disk PATH.rqvd");
@@ -129,11 +132,13 @@ Options parse(int argc, char** argv) {
     if (out.source == Options::Source::Disk && out.disk_path.empty() && out.qssd_path.empty()) throw std::invalid_argument("--boot-hdd requires --disk or --qssd-disk");
     if (!out.evidence_path.empty()) {
         const auto evidence = std::filesystem::weakly_canonical(out.evidence_path);
-        for (const auto* input : {&out.iso_path, &out.disk_path, &out.qssd_path, &out.trace_path}) {
-            if (input->empty()) continue;
-            if (evidence == std::filesystem::weakly_canonical(*input) ||
-                (std::filesystem::exists(evidence) && std::filesystem::exists(*input) &&
-                 std::filesystem::equivalent(evidence, *input)))
+        for (const auto& input : {std::filesystem::path(out.iso_path), std::filesystem::path(out.disk_path),
+                                 std::filesystem::path(out.qssd_path), std::filesystem::path(out.trace_path),
+                                 vram_path}) {
+            if (input.empty()) continue;
+            if (evidence == std::filesystem::weakly_canonical(input) ||
+                (std::filesystem::exists(evidence) && std::filesystem::exists(input) &&
+                 std::filesystem::equivalent(evidence, input)))
                 throw std::invalid_argument("Evidence path aliases a guest medium or trace");
         }
     }
@@ -233,7 +238,9 @@ int main(int argc, char** argv) {
         if (disk) hdd = std::make_unique<reverse_windows::BiosHardDisk>(pc, *disk);
         // One canonical guest CPU. The motherboard wraps its existing I/O hooks
         // after boot firmware and QSSD are mounted, and stays alive until exit.
-        reverse_windows::PcMotherboardC06 motherboard(pc,disk.get(),read_iso,optical_bytes);
+        const auto vram_path = reverse_windows::GpuVram::sidecar(
+            opts.qssd_path.empty() ? opts.disk_path : opts.qssd_path);
+        reverse_windows::PcMotherboardC06 motherboard(pc,disk.get(),read_iso,optical_bytes,vram_path);
         const auto initial_disk_commits=qdisk ? qdisk->stats().commits : 0;
         if (opts.profile_every) {
             motherboard.enable_ps2_keyboard();

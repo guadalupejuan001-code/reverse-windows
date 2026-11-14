@@ -1,5 +1,7 @@
 # GPU C01 · Base PCI de REVERSE Windows
 
+La interfaz actual del dispositivo se describe en [GPU C02](GPU_C02_VRAM_120GB.md). Este documento conserva la descripción de la revisión de C01.
+
 El ciclo conecta el motor de GPU Virtual C12.1 con un dispositivo al que un programa invitado puede acceder. Parte del candidato de cálculo de la PR #35 y usa las revisiones del lockfile.
 
 ## Dispositivo

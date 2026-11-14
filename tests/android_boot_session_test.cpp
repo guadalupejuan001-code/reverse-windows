@@ -367,6 +367,11 @@ int main(int argc, char** argv) {
                 "El Torito guest did not detect QSSD and return to the real-mode BIOS prompt", 1);
       frame = capture_cells(session);
       progress = session.diagnostic();
+      require(progress.find("\"gpu_vram\":{\"logical_bytes\":120000000000,"
+                            "\"qssd_persistence_configured\":true,\"qssd_journal_bytes_mounted\":0}") !=
+                  std::string::npos &&
+                  !std::filesystem::exists(reverse_windows::GpuVram::sidecar(disk)),
+              "The Android VM must configure full VRAM and create the volume only on demand");
       require(counter(progress, "session_steps") == counter(progress, "instructions") &&
                   counter(progress, "session_steps") > 0,
               "Before the first restart, session and CPU steps must match");
