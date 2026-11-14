@@ -1,6 +1,6 @@
 # REVERSE Windows Prime C08
 
-El adaptador de render PCI `00:03.0` tiene identificación experimental `1b36:c083`, clase `0302` y un BAR de 512 KiB con registros, comandos y un área de transferencia de 256 KiB. ACPI publica el rango PCI y el firmware excluye el rango de la RAM utilizable en E820. El controlador del invitado selecciona su dirección mediante el BAR y habilita la decodificación. Un reinicio reinicializa el dispositivo y conserva los datos de las páginas ya confirmadas por QSSD.
+El adaptador de render PCI `00:03.0` tiene identificación experimental `1b36:c083`, clase `0302` y un BAR de 512 KiB con registros, comandos y un área de transferencia de 256 KiB. ACPI publica el rango PCI y el firmware excluye el rango de la RAM utilizable en E820. El controlador del invitado selecciona la dirección del BAR y habilita la decodificación. Los tickets de la cola son consecutivos desde 1. Un reinicio reinicializa el dispositivo y conserva los datos de las páginas ya confirmadas por QSSD.
 
 GPU Virtual C12.2 valida y agrupa los triángulos en orden de dibujo. Descarta los que están completamente fuera de un plano de recorte y preserva los que cortan una arista. REgraphics crea un destino GLES2 con profundidad, traduce el intervalo de profundidad Direct3D al de GLES y devuelve BGRX de arriba hacia abajo. QSSD retiene el plan de geometría confirmado. Cuando el invitado pide presentar en el modo VBE activo, C07 detecta los píxeles resultantes como cualquier otra modificación del framebuffer.
 

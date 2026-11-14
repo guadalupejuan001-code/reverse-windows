@@ -43,6 +43,10 @@ class GuestGpuC08 {
     probe_bar_ = false;
     stage_.clear();
     gpu_ns_.reset();
+    renderer_name_.clear();
+    hardware_ = false;
+    host_ns_ = backend_ns_ = 0;
+    source_triangles_ = drawn_triangles_ = vertex_bytes_ = presented_bytes_ = 0;
 #ifdef REVERSE_WINDOWS_GLES_GUEST
     color_.clear();
 #endif
@@ -94,7 +98,10 @@ class GuestGpuC08 {
       return true;
     }
     const auto reg = offset & ~3u;
-    if (reg < RWGPU_REG_OFFSET_LO || reg > RWGPU_REG_DOORBELL) return true;
+    if (reg < RWGPU_REG_OFFSET_LO || reg > RWGPU_REG_DOORBELL) {
+      pending_ = {};
+      return true;
+    }
     if (offset % 4 == 0) pending_ = {reg, 0, 0};
     if (reg != pending_.reg || offset % 4 != pending_.written) {
       pending_ = {};
@@ -178,7 +185,9 @@ class GuestGpuC08 {
 
   void dispatch(std::uint32_t op) noexcept {
     const auto ticket = params_.back();
-    if (ticket == 0 || ticket == completed_) { status_ = RWGPU_INVALID; return; }
+    auto next_ticket = completed_ + 1;
+    if (!next_ticket) next_ticket = 1;
+    if (ticket != next_ticket) { status_ = RWGPU_INVALID; return; }
     status_ = RWGPU_BAD_COMMAND;
     try {
       if (op >= RWGPU_WRITE && op <= RWGPU_READ_COLOR) {

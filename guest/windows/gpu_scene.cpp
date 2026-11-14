@@ -97,11 +97,18 @@ std::array<std::uint32_t, checks.size()> reference() {
     raster.DepthClipEnable = TRUE;
     ComPtr<ID3D11RasterizerState> state;
     check(d->CreateRasterizerState(&raster, &state), "D3D rasterizer");
+    D3D11_DEPTH_STENCIL_DESC depth_options{};
+    depth_options.DepthEnable = TRUE;
+    depth_options.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    depth_options.DepthFunc = D3D11_COMPARISON_LESS;
+    ComPtr<ID3D11DepthStencilState> depth_state;
+    check(d->CreateDepthStencilState(&depth_options, &depth_state), "D3D depth test");
     const D3D11_VIEWPORT viewport{0, 0, width, height, 0, 1};
     c->RSSetState(state.Get());
     c->RSSetViewports(1, &viewport);
     ID3D11RenderTargetView* views[]{color_view.Get()};
     c->OMSetRenderTargets(1, views, depth_view.Get());
+    c->OMSetDepthStencilState(depth_state.Get(), 0);
     const float background[]{10 / 255.f, 20 / 255.f, 30 / 255.f, 1};
     c->ClearRenderTargetView(color_view.Get(), background);
     c->ClearDepthStencilView(depth_view.Get(), D3D11_CLEAR_DEPTH, 1, 0);
@@ -149,7 +156,11 @@ void verify_guest(const std::array<std::uint32_t, checks.size()>& expected) {
     for (std::size_t i = 0; i < checks.size(); ++i) {
         const auto* p = result.data() + (checks[i][1] * width + checks[i][0]) * 4;
         const auto color = 0xff000000U | (std::uint32_t(p[0]) << 16) | (std::uint32_t(p[1]) << 8) | p[2];
-        if (color != expected[i]) throw std::runtime_error("REgraphics differs from Direct3D oracle");
+        if (color != expected[i]) {
+            std::fprintf(stderr, "PCI color (%u,%u) %08x expected %08x\n",
+                         checks[i][0], checks[i][1], color, expected[i]);
+            throw std::runtime_error("REgraphics differs from Direct3D oracle");
+        }
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - start).count();
@@ -162,7 +173,11 @@ int main(int argc, char** argv) {
     try {
         const auto samples = reference();
         for (std::size_t i = 0; i < checks.size(); ++i) {
-            if (samples[i] != checks[i][2]) throw std::runtime_error("Direct3D fixture differs from pixel oracle");
+            if (samples[i] != checks[i][2]) {
+                std::fprintf(stderr, "D3D11 color (%u,%u) %08x expected %08x\n",
+                             checks[i][0], checks[i][1], samples[i], checks[i][2]);
+                throw std::runtime_error("Direct3D fixture differs from pixel oracle");
+            }
         }
         std::printf("PRIME_C08_DIRECT3D_REFERENCE_PASS pixels=%zu device=WARP\n", checks.size());
         if (argc == 2 && std::string_view(argv[1]) == "--reference") return 0;

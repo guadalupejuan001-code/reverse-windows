@@ -112,7 +112,7 @@ class AcpiC06 {
       word_range(1,3,primary_ide_control,1);
     }
     if(pci_mmio) {
-      // DWordMemory, consumer min/max fixed, positive decode, read/write.
+      // DWordMemory produced by PCI0, fixed min/max, positive decode, read/write.
       const auto at = aml.size();
       aml.insert(aml.end(), {0x87, 0x17, 0x00, 0x00, 0x0c, 0x01});
       aml.resize(at + 26, 0);
