@@ -10,6 +10,7 @@ import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
 import android.util.AtomicFile;
 import android.util.Log;
+import android.view.Choreographer;
 
 import org.json.JSONObject;
 
@@ -19,7 +20,6 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 final class VmWorker {
     interface Listener {
@@ -36,13 +36,13 @@ final class VmWorker {
         final int width;
         final int height;
         final byte[] text;
-        final int[] pixels;
+        final int[] video;
 
-        Frame(int width, int height, byte[] text, int[] pixels) {
-            this.width = width;
-            this.height = height;
-            this.text = text;
-            this.pixels = pixels;
+        Frame(int[] video, byte[] text) {
+            this.width = video[0];
+            this.height = video[1];
+            this.text = video.length == 2 ? text.clone() : null;
+            this.video = this.text == null ? video : null;
         }
     }
 
@@ -58,15 +58,12 @@ final class VmWorker {
     private static final int MAX_SLICE_STEPS = 16384;
     private static final long TARGET_SLICE_NS = 8_000_000L;
     private static final long HALTED_POLL_DELAY_MS = 35;
-    private static final long FRAME_INTERVAL_MS = 100;
     private static final long STATUS_INTERVAL_MS = 350;
     private static final long DIAGNOSTIC_INTERVAL_MS = 5_000;
     // Newer Android versions no longer send the running-low trim levels.
     private static final long RAM_SAMPLE_INTERVAL_MS = 10_000;
     private static final long RAM_RECLAIM_INTERVAL_MS = 16;
     private static final String DIAGNOSTIC_FILE = "ultimo-diagnostico.json";
-    private static final int MAX_FRAME_WIDTH = 960;
-    private static final int MAX_FRAME_HEIGHT = 720;
 
     private final Context context;
     private final ContentResolver resolver;
@@ -76,28 +73,23 @@ final class VmWorker {
     private final HandlerThread thread = new HandlerThread("reverse-windows-vm");
     private final Handler worker;
     private final Handler main = new Handler(Looper.getMainLooper());
-    private final AtomicBoolean framePending = new AtomicBoolean();
     private final byte[] textCells = new byte[4000];
 
     private volatile boolean released;
-    private long handle;
+    private volatile boolean foreground = true;
+    private volatile long handle;
     private int outcome;
     private int sliceSteps = INITIAL_SLICE_STEPS;
     private boolean running;
-    private boolean foreground = true;
     private boolean debugSelfTest;
-    private long lastFrame;
     private long lastStatus;
     private long lastDiagnosticSave;
     private long sessionStarted;
     private long stepNanos;
     private long frameNanos;
     private long statusNanos;
-    private int[] graphics;
-    private int graphicsWidth;
-    private int graphicsHeight;
-    private boolean forceFrame;
-    private boolean retryFrame;
+    private boolean frameRequested; // Worker owns the capture until the UI applies or discards it.
+    private boolean videoDirty;
     private String lastLoggedStatus = "";
     private String lastDiagnostic = "";
     private String persistedDiagnostic = "";
@@ -195,7 +187,6 @@ final class VmWorker {
                 debugSelfTest = debug;
                 lastLoggedStatus = "";
                 lastDiagnostic = "";
-                retryFrame = false;
                 String path = source == NativeMachine.BOOT_SELF_TEST ? "" : disk.getAbsolutePath();
                 if (source == NativeMachine.BOOT_ISO) {
                     if (iso == null) throw new IOException("Elige primero una imagen ISO.");
@@ -214,13 +205,13 @@ final class VmWorker {
                 lastDiagnosticSave = 0;
                 sessionStarted = SystemClock.elapsedRealtime();
                 stepNanos = frameNanos = statusNanos = 0;
-                lastFrame = 0;
-                forceFrame = true;
+                videoDirty = true;
                 running = true;
                 publishState(true);
                 reclaimRam = false;
                 nextRamSample = 0;
                 if (foreground) scheduleRam(RAM_SAMPLE_INTERVAL_MS);
+                requestFrame();
                 schedule(0);
             } catch (IOException | RuntimeException | LinkageError error) {
                 report(error);
@@ -246,6 +237,7 @@ final class VmWorker {
                 reclaimRam = false;
                 nextRamSample = 0;
                 scheduleRam(0);
+                requestFrame();
                 schedule(0);
             }
         });
@@ -267,6 +259,7 @@ final class VmWorker {
             worker.removeCallbacks(slice);
             if (running) schedule(0);
             try {
+                requestFrame();
                 publishState(true);
             } catch (RuntimeException | LinkageError error) {
                 report(error);
@@ -279,6 +272,7 @@ final class VmWorker {
             if (handle == 0 || !running || isTerminal()) return;
             try {
                 boolean wokeBios = NativeMachine.key(handle, ascii, scan, pressed);
+                requestFrame();
                 if (outcome == NativeMachine.WAITING_KEY && wokeBios) {
                     outcome = NativeMachine.RUNNING;
                     schedule(0);
@@ -355,7 +349,9 @@ final class VmWorker {
         try {
             int previous = outcome;
             long started = SystemClock.elapsedRealtimeNanos();
-            outcome = NativeMachine.step(handle, sliceSteps);
+            int updated = NativeMachine.step(handle, sliceSteps);
+            outcome = updated & ~NativeMachine.STEP_VIDEO_DIRTY;
+            videoDirty = (updated & NativeMachine.STEP_VIDEO_DIRTY) != 0;
             long elapsed = Math.max(1, SystemClock.elapsedRealtimeNanos() - started);
             stepNanos += elapsed;
             if (outcome == NativeMachine.RUNNING) {
@@ -364,10 +360,7 @@ final class VmWorker {
                         Math.min(MAX_SLICE_STEPS, (sliceSteps + estimate) / 2));
             }
             long now = SystemClock.uptimeMillis();
-            if (now - lastFrame >= FRAME_INTERVAL_MS || outcome != previous || forceFrame) {
-                publishFrame();
-                lastFrame = now;
-            }
+            requestFrame();
             if (now - lastStatus >= STATUS_INTERVAL_MS || outcome != previous)
                 publishState(isTerminal());
             if (isTerminal()) running = false;
@@ -377,50 +370,70 @@ final class VmWorker {
         }
     }
 
-    private void publishFrame() {
-        if (!framePending.compareAndSet(false, true)) {
-            retryFrame = true;
+    private void requestFrame() {
+        if (released || !foreground || handle == 0 || frameRequested || !videoDirty) return;
+        long session = handle;
+        frameRequested = true;
+        if (!main.post(() -> {
+            if (released || !foreground || handle != session) {
+                worker.post(() -> finishFrame(session, false));
+                return;
+            }
+            Choreographer.getInstance().postFrameCallback(
+                    frameTime -> worker.post(() -> captureFrame(session)));
+        })) frameRequested = false;
+    }
+
+    private void captureFrame(long session) {
+        if (released || handle != session) return;
+        if (!foreground) {
+            finishFrame(session, false);
             return;
         }
-        retryFrame = false;
-        boolean posted = false;
         long started = SystemClock.elapsedRealtimeNanos();
         try {
-            int[] info = NativeMachine.videoInfo(handle);
-            if (info == null || info.length != 3 || info[0] <= 0 || info[1] <= 0) return;
-            Frame frame;
-            if (info[2] == 0) {
-                int copied = NativeMachine.copyText(handle, textCells);
-                if (copied == 0 && !forceFrame) return;
-                frame = new Frame(info[0], info[1], textCells, null);
-            } else {
-                double scale = Math.min(1.0, Math.min((double) MAX_FRAME_WIDTH / info[0],
-                        (double) MAX_FRAME_HEIGHT / info[1]));
-                int width = Math.max(1, (int) (info[0] * scale));
-                int height = Math.max(1, (int) (info[1] * scale));
-                if (graphics == null || graphicsWidth != width || graphicsHeight != height) {
-                    graphics = new int[width * height];
-                    graphicsWidth = width;
-                    graphicsHeight = height;
-                }
-                NativeMachine.copyGraphics(handle, width, height, graphics);
-                frame = new Frame(width, height, null, graphics);
+            int[] video = NativeMachine.captureVideo(session, textCells);
+            videoDirty = false;
+            if (video == null) {
+                finishFrame(session, false);
+                return;
             }
-            forceFrame = false;
-            posted = main.post(() -> {
+            Frame frame = new Frame(video, textCells);
+            if (!main.post(() -> {
+                boolean applied = false;
                 try {
-                    if (!released) listener.onFrame(frame);
+                    if (!released && foreground && handle == session) {
+                        listener.onFrame(frame);
+                        applied = true;
+                    }
                 } finally {
-                    framePending.set(false);
-                    // The final frame may have changed while Android was presenting the prior one.
-                    worker.post(() -> {
-                        if (retryFrame && handle != 0) publishFrame();
-                    });
+                    final boolean retry = !applied;
+                    worker.post(() -> finishFrame(session, retry));
                 }
-            });
+            })) {
+                frameRequested = false;
+                NativeMachine.retryVideo(session);
+                videoDirty = true;
+            }
+        } catch (RuntimeException | LinkageError error) {
+            frameRequested = false;
+            report(error);
         } finally {
             frameNanos += SystemClock.elapsedRealtimeNanos() - started;
-            if (!posted) framePending.set(false);
+        }
+    }
+
+    private void finishFrame(long session, boolean retry) {
+        if (released || handle != session) return;
+        frameRequested = false;
+        try {
+            if (retry) {
+                NativeMachine.retryVideo(session);
+                videoDirty = true;
+            }
+            requestFrame();
+        } catch (RuntimeException | LinkageError error) {
+            report(error);
         }
     }
 
@@ -487,7 +500,8 @@ final class VmWorker {
         worker.removeCallbacks(slice);
         worker.removeCallbacks(ramMaintenance);
         running = false;
-        retryFrame = false;
+        frameRequested = false;
+        videoDirty = false;
         if (handle == 0) return;
         long current = handle;
         handle = 0;
