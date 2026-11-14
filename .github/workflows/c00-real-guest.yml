@@ -143,6 +143,8 @@ jobs:
           grep -q 'C06_APIC_TSC_HLT_PASS' build/reverse-windows-c06-motherboard.log
           grep -q 'C06_CR8_LAPIC_TPR_PASS' build/reverse-windows-c06-motherboard.log
           grep -q 'PRIME_C05_PCI_ENUMERATION_PASS profiles=4 slots=32' build/reverse-windows-c06-motherboard.log
+          grep -q 'PRIME_GPU_C01_PCI_GUEST_PASS copy=1 indexed_values=4294967296 sum=9223372034707292160 relocate=1 reset=1 mode=x86' build/reverse-windows-c06-motherboard.log
+          grep -q 'PRIME_GPU_C01_PCI_GUEST_PASS copy=1 indexed_values=4294967296 sum=9223372034707292160 relocate=1 reset=1 mode=x64' build/reverse-windows-c06-motherboard.log
           grep -q 'PRIME_C05_ACPI_SCI_PASS route=pic' build/reverse-windows-c06-motherboard.log
           grep -q 'PRIME_C05_ACPI_SCI_PASS route=ioapic' build/reverse-windows-c06-motherboard.log
           grep -q 'PRIME_C05_PIT_CALIBRATION_PASS' build/reverse-windows-c06-motherboard.log
