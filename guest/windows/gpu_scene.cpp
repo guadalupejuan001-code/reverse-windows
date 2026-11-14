@@ -3,6 +3,7 @@
 #include <winioctl.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
+#include <dxgi1_2.h>
 #include <wrl/client.h>
 #include "gpu_transport.h"
 #include <array>
@@ -43,12 +44,12 @@ ComPtr<ID3DBlob> compile(const char* program, const char* target) {
     return shader;
 }
 
-std::array<std::uint32_t, checks.size()> reference() {
-    // Independent D3D11 WARP reference, even on runners without a display GPU.
+std::array<std::uint32_t, checks.size()> render_d3d11(IDXGIAdapter1* adapter = nullptr) {
     ComPtr<ID3D11Device> d;
     ComPtr<ID3D11DeviceContext> c;
-    check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
-                            &d, nullptr, &c), "D3D11 WARP");
+    const auto type = adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_WARP;
+    check(D3D11CreateDevice(adapter, type, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+                            &d, nullptr, &c), "D3D11 device");
     auto vs = compile("struct V {float4 p : SV_Position; float4 c : COLOR0;};"
                       "V main(float4 p : POSITION0, float4 c : COLOR0) {V v;v.p=p;v.c=c;return v;}",
                       "vs_4_0");
@@ -168,11 +169,37 @@ void verify_guest(const std::array<std::uint32_t, checks.size()>& expected) {
     std::printf("PRIME_C08_WINDOWS_PCI_SCENE_PASS oracle=D3D11-WARP compared_pixels=%zu roundtrip_us=%lld\n",
                 checks.size(), static_cast<long long>(elapsed));
 }
+
+ComPtr<IDXGIAdapter1> find_prime_adapter() {
+    ComPtr<IDXGIFactory1> factory;
+    check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "DXGI factory");
+    for (UINT index = 0;; ++index) {
+        ComPtr<IDXGIAdapter1> adapter;
+        const auto result = factory->EnumAdapters1(index, &adapter);
+        if (result == DXGI_ERROR_NOT_FOUND) return {};
+        check(result, "Enumerate DXGI adapter");
+        DXGI_ADAPTER_DESC1 info{};
+        check(adapter->GetDesc1(&info), "Read DXGI adapter identity");
+        if (info.VendorId == RWGPU_VENDOR_ID && info.DeviceId == RWGPU_DEVICE_ID &&
+            !(info.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) return adapter;
+    }
+}
 } // namespace
 
 int main(int argc, char** argv) {
     try {
-        const auto samples = reference();
+        if (argc == 2 && std::string_view(argv[1]) == "--wddm") {
+            const auto adapter = find_prime_adapter();
+            if (!adapter) {
+                std::fprintf(stderr, "PRIME_C08_WDDM_ADAPTER_ABSENT pci=1b36:c083\n");
+                return 3;
+            }
+            if (render_d3d11(adapter.Get()) != render_d3d11())
+                throw std::runtime_error("WDDM rendering differs from the Direct3D oracle");
+            std::printf("PRIME_C08_WDDM_SCENE_PASS pci=1b36:c083 pixels=%zu\n", checks.size());
+            return 0;
+        }
+        const auto samples = render_d3d11();
         for (std::size_t i = 0; i < checks.size(); ++i) {
             if (samples[i] != checks[i][2]) {
                 std::fprintf(stderr, "D3D11 color (%u,%u) %08x expected %08x\n",
@@ -182,7 +209,7 @@ int main(int argc, char** argv) {
         }
         std::printf("PRIME_C08_DIRECT3D_REFERENCE_PASS pixels=%zu device=WARP\n", checks.size());
         if (argc == 2 && std::string_view(argv[1]) == "--reference") return 0;
-        if (argc != 1) throw std::runtime_error("Usage: prime_gpu_scene [--reference]");
+        if (argc != 1) throw std::runtime_error("Usage: prime_gpu_scene [--reference | --wddm]");
         verify_guest(samples);
         return 0;
     } catch (const std::exception& error) {

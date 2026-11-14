@@ -42,5 +42,5 @@ Invoke-Checked $linker @('/nologo','/driver','/subsystem:native','/machine:x64',
 Copy-Item (Join-Path $PSScriptRoot 'ReversePrimeGpu.inf') $out -Force
 Invoke-Checked $compiler @('/nologo','/std:c++17','/EHsc','/W4','/O2','/MT',
     "/Fo$(Join-Path $out 'gpu_scene.obj')","/Fe$(Join-Path $out 'prime_gpu_scene.exe')",
-    $scene,'d3d11.lib','d3dcompiler.lib')
+    $scene,'dxgi.lib','d3d11.lib','d3dcompiler.lib')
 Invoke-Checked (Join-Path $out 'prime_gpu_scene.exe') @('--reference')
