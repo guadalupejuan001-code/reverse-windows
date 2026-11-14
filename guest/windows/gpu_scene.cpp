@@ -49,10 +49,11 @@ std::array<std::uint32_t, checks.size()> reference() {
     ComPtr<ID3D11DeviceContext> c;
     check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
                             &d, nullptr, &c), "D3D11 WARP");
-    auto vs = compile("struct V {float4 p : SV_Position; float4 c : COLOR;};"
-                      "V main(float4 p : POSITION, float4 c : COLOR) {V v;v.p=p;v.c=c;return v;}",
+    auto vs = compile("struct V {float4 p : SV_Position; float4 c : COLOR0;};"
+                      "V main(float4 p : POSITION0, float4 c : COLOR0) {V v;v.p=p;v.c=c;return v;}",
                       "vs_4_0");
-    auto ps = compile("float4 main(float4 c : COLOR) : SV_Target {return c;}", "ps_4_0");
+    auto ps = compile("struct V {float4 p : SV_Position; float4 c : COLOR0;};"
+                      "float4 main(V i) : SV_Target0 {return i.c;}", "ps_4_0");
     ComPtr<ID3D11VertexShader> vertex;
     ComPtr<ID3D11PixelShader> pixel;
     check(d->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &vertex), "vertex shader");
