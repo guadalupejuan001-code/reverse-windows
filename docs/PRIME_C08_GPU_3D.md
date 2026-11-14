@@ -1,0 +1,19 @@
+# REVERSE Windows Prime C08
+
+El adaptador de render PCI `00:03.0` tiene identificación experimental `1b36:c083`, clase `0302` y un BAR de 512 KiB con registros, comandos y un área de transferencia de 256 KiB. ACPI publica el rango PCI y el firmware excluye el rango de la RAM utilizable en E820. El controlador del invitado selecciona su dirección mediante el BAR y habilita la decodificación. Un reinicio reinicializa el dispositivo y conserva los datos de las páginas ya confirmadas por QSSD.
+
+GPU Virtual C12.2 valida y agrupa los triángulos en orden de dibujo. Descarta los que están completamente fuera de un plano de recorte y preserva los que cortan una arista. REgraphics crea un destino GLES2 con profundidad, traduce el intervalo de profundidad Direct3D al de GLES y devuelve BGRX de arriba hacia abajo. QSSD retiene el plan de geometría confirmado. Cuando el invitado pide presentar en el modo VBE activo, C07 detecta los píxeles resultantes como cualquier otra modificación del framebuffer.
+
+## Capacidad y mediciones
+
+El dispositivo publica **120.000.000.000 bytes lógicos**. Se usa un volumen QSSD disperso de 112 GiB como respaldo de las páginas de 4 KiB. La prueba del adaptador escribe, recupera y vuelve a abrir la última página del intervalo. El tamaño real del respaldo, los bytes de vértices, el tiempo de preparación y lectura, el temporizador del renderizador y su identificación de hardware son observaciones distintas en `guest_gpu`. Con una GPU física, `gpu_query_ns` exige una consulta válida de `GL_EXT_disjoint_timer_query`; un resultado de Mesa por software mide solo ese backend.
+
+La ruta de aceptación nativa ejecuta un invitado x86 protegido con descubrimiento PCI, tamaño y reasignación del BAR, comandos al límite de VRAM, y dibujo con superposición, recorte y verificación de píxeles. Lee también el destino 3D con un comando de transferencia separado. Los drivers y recursos Android se compilan en ARM64. La cifra de FPS depende de una ejecución en el teléfono.
+
+## Invitado Windows
+
+`guest/windows/build.ps1` compila el transporte PCI de Windows x64 y ejecuta `prime_gpu_scene.exe --reference` desde un entorno de compilación x64 de Visual Studio. El ejecutable renderiza la escena de referencia mediante Direct3D 11 WARP y comprueba cuatro puntos elegidos por color, oclusión, recorte y fondo. Su ejecución normal solicita la misma escena al controlador PCI propio y compara la salida con la referencia. El controlador solo acepta esta operación de render acotada. Usa el recurso BAR traducido que entrega PnP.
+
+El paquete del transporte sale sin firmar y su prueba en CI se limita a compilarlo y ejecutar la referencia D3D del host Windows. La prueba normal del invitado requiere el sistema instalado y un paquete de controlador firmado para su entorno de prueba. El cierre de compatibilidad para apps Direct3D requiere el miniport de render WDDM y un UMD que el runtime pueda cargar, con asignaciones, contexto, DMA, completados y capacidades compatibles. La habilitación de DXGI, Direct3D a través de WDDM y la aceleración física en el Samsung permanecen pendientes.
+
+[Arquitectura de WDDM](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/windows-vista-and-later-display-driver-model-architecture) · [Envío de comandos](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/submitting-a-command-buffer) · [Recursos PCI traducidos](https://learn.microsoft.com/en-us/windows-hardware/drivers/wdf/raw-and-translated-resources).

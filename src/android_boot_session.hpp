@@ -96,7 +96,8 @@ class AndroidBootSession final {
   AndroidBootSession(std::filesystem::path disk, unsigned create_gib,
                      BootSource source, int iso_fd=-1, std::uint64_t iso_bytes=0,
                      RamProfile profile=kDefaultRamProfile,
-                     const std::filesystem::path& ram_cache={})
+                     const std::filesystem::path& ram_cache={},
+                     const std::filesystem::path& graphics_vram={})
       : source_(source), pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_), vbe_(pc_) {
     if (disk.empty() && (create_gib || source != BootSource::SelfTest))
       throw std::invalid_argument("Selecciona o crea un disco QSSD para iniciar.");
@@ -135,9 +136,10 @@ class AndroidBootSession final {
       board_ = std::make_unique<PcMotherboardC06>(pc_, disk_.get(),
           [reader = iso_](auto offset, auto* target, auto count) {
             return reader->read(offset, target, count);
-          }, iso_->size());
+          }, iso_->size(), graphics_vram);
     } else {
-      board_ = std::make_unique<PcMotherboardC06>(pc_, disk_.get());
+      board_ = std::make_unique<PcMotherboardC06>(
+          pc_, disk_.get(), AtapiCdrom::Reader{}, 0, graphics_vram);
     }
     board_->enable_ps2_keyboard();
     if (source != BootSource::SelfTest) pc_.enable_guest_restart();
@@ -481,6 +483,10 @@ class AndroidBootSession final {
         << vga_serial_ << ",\"planned_update_bytes\":" << vga_transfer_bytes_
         << "},\"vbe\":";
     vbe_.write_json(out);
+    if (const auto* gpu = board_->attached_gpu()) {
+      out << ",\"guest_gpu\":";
+      gpu->write_json(out);
+    }
     out << ",\"machine\":" << pc_.json() << '}';
     return out.str();
   }

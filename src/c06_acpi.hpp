@@ -74,7 +74,7 @@ class AcpiC06 {
     table[at+3]=std::uint8_t(access);
     u64(table,at+4,port);
   }
-  static std::vector<std::uint8_t> dsdt_aml(bool ide) {
+  static std::vector<std::uint8_t> dsdt_aml(bool ide, bool pci_mmio) {
     // Name(\_S5, Package(){5, 5}).
     std::vector<std::uint8_t> aml{0x08,0x5c,'_','S','5','_',0x12,0x06,0x02,0x0a,0x05,0x0a,0x05};
     const auto finish_large_package=[&](std::size_t length_offset){
@@ -111,6 +111,17 @@ class AcpiC06 {
       word_range(1,3,secondary_ide_control,1);
       word_range(1,3,primary_ide_control,1);
     }
+    if(pci_mmio) {
+      // DWordMemory, consumer min/max fixed, positive decode, read/write.
+      const auto at = aml.size();
+      aml.insert(aml.end(), {0x87, 0x17, 0x00, 0x00, 0x0c, 0x01});
+      aml.resize(at + 26, 0);
+      const auto base = cosmic_pc::PcMachine::kPciMmioBase;
+      const auto bytes = cosmic_pc::PcMachine::kPciMmioBytes;
+      u32(aml, at + 10, static_cast<std::uint32_t>(base));
+      u32(aml, at + 14, static_cast<std::uint32_t>(base + bytes - 1));
+      u32(aml, at + 22, static_cast<std::uint32_t>(bytes));
+    }
     aml.insert(aml.end(),{0x79,0x00}); // EndTag. IDE uses fixed IRQ14/15.
     aml[resource_start-1]=std::uint8_t(aml.size()-resource_start);
     finish_large_package(crs_length);
@@ -132,7 +143,7 @@ class AcpiC06 {
   }
 
  public:
-  static void install(cosmic_pc::Cpu& cpu,bool ide) {
+  static void install(cosmic_pc::Cpu& cpu,bool ide,bool pci_mmio=false) {
     if(cpu.memory.size()<0x100000)throw std::runtime_error("ACPI BIOS RAM unavailable");
     // RSDP 2.0: ACPI 1.0 prefix plus 64-bit XSDT pointer and full checksum.
     std::vector<std::uint8_t> rsdp(36,0);
@@ -186,7 +197,7 @@ class AcpiC06 {
     u32(madt,68,sci_irq);u16(madt,72,0x0f); // Active-low, level-triggered.
     publish(cpu,madt_address,std::move(madt));
 
-    const auto aml=dsdt_aml(ide);
+    const auto aml=dsdt_aml(ide,pci_mmio);
     auto dsdt=table("DSDT",36+aml.size(),2);
     std::copy(aml.begin(),aml.end(),dsdt.begin()+36);
     publish(cpu,dsdt_address,std::move(dsdt));

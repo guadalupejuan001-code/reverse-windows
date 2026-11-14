@@ -3,6 +3,7 @@
 // PCI configuration / 8259 PIC / PIT channel0 / RTC CMOS / ACPI PM register
 // model / a bounded LAPIC and IOAPIC register subset. Not a chipset clone.
 #include "c06_acpi.hpp"
+#include "c08_guest_gpu.hpp"
 #include "c07_ata.hpp"
 #include "atapi_cdrom.hpp"
 #include "pc_machine.hpp"
@@ -136,6 +137,8 @@ class PcMotherboardC06 {
   Pic master_{},slave_{};
   std::unique_ptr<AtaC07> ata_;
   std::unique_ptr<AtapiCdrom> optical_;
+  std::unique_ptr<GuestGpuC08> gpu_;
+  bool prior_pci_reservation_=false;
   std::array<std::uint8_t,256> ata_cfg_{};
   std::uint64_t ata_irq_delivered_=0;
   Pit pit_{},pit2_{};
@@ -192,6 +195,7 @@ class PcMotherboardC06 {
     ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=sci_irqs_=0;
     if(ata_)ata_->reset();
     if(optical_)optical_->reset();
+    if(gpu_)gpu_->reset();
     pc_.cpu.set_apic_task_priority(0);
     apic_svr_=0xff;apic_ldr_=0;apic_dfr_=0xffffffffU;apic_esr_=apic_errors_=0;
     apic_icr_low_=apic_icr_high_=0;
@@ -218,7 +222,7 @@ class PcMotherboardC06 {
     }
     // After a real PcMachine::reset, firmware RAM is new; republish the
     // same discovered tables and keep their E820-reserved addresses.
-    AcpiC06::install(pc_.cpu,ide_present());
+    AcpiC06::install(pc_.cpu,ide_present(),bool(gpu_));
   }
   bool ide_present()const noexcept{return bool(ata_)||bool(optical_);}
   static bool ide_port(std::uint16_t port) noexcept {
@@ -231,11 +235,13 @@ class PcMotherboardC06 {
            (p>=AcpiC06::pci_config_ports&&p<AcpiC06::pci_config_ports+8)||
            (p>=AcpiC06::pm_event_port&&p<AcpiC06::pm_timer_port+4);
   }
-  std::array<std::uint8_t,256>* selected_pci(){
+  unsigned selected_pci_device() const noexcept {
     if(!(pci_selector_ & 0x80000000U) ||
        ((pci_selector_>>16)&255U)!=0 || ((pci_selector_>>8)&7U)!=0)
-      return nullptr;
-    const unsigned dev=(pci_selector_>>11)&31;
+      return 32;
+    return (pci_selector_>>11)&31;
+  }
+  std::array<std::uint8_t,256>* selected_pci(unsigned dev){
     if(dev==0)return &host_cfg_;
     if(dev==1)return &isa_cfg_;
     if(dev==2&&ide_present())return &ata_cfg_;
@@ -244,9 +250,14 @@ class PcMotherboardC06 {
   std::optional<std::uint32_t> pci_read(std::uint16_t p,unsigned width){
     if(p==0xcf8&&width==4)return pci_selector_;
     if(p>=0xcfc&&p+width<=0xd00&&(width==1||width==2||width==4)){
-      const auto config=selected_pci();
       const unsigned offset=(pci_selector_&0xfcU)+(p-0xcfc);
       if(offset+width>256)return part_mask(width);
+      const auto dev=selected_pci_device();
+      if (gpu_ && dev==GuestGpuC08::pci_device) {
+        const auto value=gpu_->config_word(offset&~3U);
+        return (value>>((offset&3U)*8))&part_mask(width);
+      }
+      const auto config=selected_pci(dev);
       std::uint32_t value=0;
       for(unsigned i=0;i<width;++i)
         value|=std::uint32_t(config?(*config)[offset+i]:0xff)<<(i*8);
@@ -257,10 +268,15 @@ class PcMotherboardC06 {
   bool pci_write(std::uint16_t p,unsigned width,std::uint32_t value){
     if(p==0xcf8&&width==4){pci_selector_=value;return true;}
     if(p>=0xcfc&&p+width<=0xd00&&(width==1||width==2||width==4)){
-      const auto config=selected_pci();
-      if(!config)return true; // non-existent devices ignore writes
       const unsigned offset=(pci_selector_&0xfcU)+(p-0xcfc);
       if(offset+width>256)return true;
+      const auto dev=selected_pci_device();
+      if(gpu_ && dev==GuestGpuC08::pci_device) {
+        if(gpu_->config_write(offset,width,value))pc_.cpu.memory.invalidate_page_tables();
+        return true;
+      }
+      const auto config=selected_pci(dev);
+      if(!config)return true; // non-existent devices ignore writes
       // Fixed-function bridges implement only the low decode bits. IDE
       // has compatibility I/O ports and no memory BARs or bus mastering.
       for(unsigned i=0;i<width;++i){
@@ -411,6 +427,7 @@ class PcMotherboardC06 {
       return start<base+4096U && (start>=base || length>base-start);
     };
     return length && (overlaps(kLocalApic) || overlaps(kIoApic) ||
+        (gpu_ && gpu_->claims(start,length)) ||
         (prior_mmio_claim_ && (!prior_mmio_range_claim_ || prior_mmio_range_claim_(start,length))));
   }
   static unsigned highest_vector(const std::bitset<256>& vectors) {
@@ -743,10 +760,12 @@ class PcMotherboardC06 {
 
  public:
   explicit PcMotherboardC06(cosmic_pc::PcMachine& machine, BlockDisk* disk=nullptr,
-                            AtapiCdrom::Reader optical={}, std::uint64_t optical_bytes=0):pc_(machine){
+                            AtapiCdrom::Reader optical={}, std::uint64_t optical_bytes=0,
+                            const std::filesystem::path& graphics_vram={}):pc_(machine){
     if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_isa_irq(14);});
     if(optical)optical_=std::make_unique<AtapiCdrom>(
         std::move(optical),optical_bytes,[this](){signal_isa_irq(15);});
+    if(!graphics_vram.empty())gpu_=std::make_unique<GuestGpuC08>(pc_,graphics_vram);
     // The machine must be booted/mounted first. ACPI goes into reserved BIOS
     // memory and is never presented by E820 as allocatable guest RAM.
     prior_in_=pc_.cpu.in_hook;prior_out_=pc_.cpu.out_hook;
@@ -762,6 +781,8 @@ class PcMotherboardC06 {
     prior_idle_advance_=pc_.device_idle_advance_hook;
     prior_reset_=pc_.device_reset_hook;
     reset_devices();
+    prior_pci_reservation_=pc_.pci_mmio_reserved();
+    if(gpu_)pc_.reserve_pci_mmio(true);
     pc_.cpu.in_hook=[this](std::uint16_t p,unsigned w){
       if(keyboard_&&(p==0x60||p==0x64))return io_read(p,w);
       if(owned_port(p))return io_read(p,w);
@@ -783,17 +804,19 @@ class PcMotherboardC06 {
       };
     }
     pc_.cpu.mmio_claim_hook=[this](std::uint64_t a){
-      return mmio_claim(a)||(prior_mmio_claim_&&prior_mmio_claim_(a));
+      return mmio_claim(a)||(gpu_&&gpu_->claims(a))||(prior_mmio_claim_&&prior_mmio_claim_(a));
     };
     pc_.cpu.mmio_range_claim_hook=[this](std::uint64_t start,std::size_t length){
       return mmio_range_claim(start,length);
     };
     pc_.cpu.mmio_read_hook=[this](std::uint64_t a){
       if(mmio_claim(a))return mmio_byte(a);
+      if(gpu_&&gpu_->claims(a))return std::optional<std::uint8_t>(gpu_->read(a));
       return prior_mmio_read_?prior_mmio_read_(a):std::nullopt;
     };
     pc_.cpu.mmio_write_hook=[this](std::uint64_t a,std::uint8_t v){
       if(mmio_claim(a))return mmio_write(a,v);
+      if(gpu_&&gpu_->claims(a))return gpu_->write(a,v);
       return prior_mmio_write_&&prior_mmio_write_(a,v);
     };
     pc_.device_step_hook=[this](){
@@ -813,6 +836,7 @@ class PcMotherboardC06 {
   ~PcMotherboardC06(){
     // Never leave a hook pointing at a destroyed motherboard instance.
     pc_.cpu.set_local_apic_present(prior_local_apic_);
+    pc_.reserve_pci_mmio(prior_pci_reservation_);
     pc_.cpu.set_x87_ignne(false);
     pc_.cpu.in_hook=std::move(prior_in_);
     pc_.cpu.out_hook=std::move(prior_out_);
@@ -848,6 +872,7 @@ class PcMotherboardC06 {
     return keyboard_&&keyboard_->inject(code,pressed);
   }
   AtaC07* attached_ata(){return ata_.get();}
+  const GuestGpuC08* attached_gpu() const noexcept {return gpu_.get();}
   const AtaC07* attached_ata()const{return ata_.get();}
   const AtapiCdrom* attached_atapi()const{return optical_.get();}
   bool optical_attached()const{return bool(optical_);}

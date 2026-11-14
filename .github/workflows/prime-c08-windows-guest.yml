@@ -1,0 +1,35 @@
+name: Prime C08 Windows guest graphics transport and Direct3D reference
+
+on:
+  pull_request:
+    paths: ["guest/windows/**", "src/c08_gpu_protocol.h", ".github/workflows/prime-c08-windows-guest.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  c08-windows-reference:
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Build x64 guest transport and execute D3D11 WARP oracle
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'Visual Studio x64 toolchain unavailable' }
+          & "$vs\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          & .\guest\windows\build.ps1 -OutDir "$env:RUNNER_TEMP\prime-c08-windows"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prime-c08-windows-unsigned-guest
+          path: |
+            ${{ runner.temp }}/prime-c08-windows/ReversePrimeGpu.inf
+            ${{ runner.temp }}/prime-c08-windows/ReversePrimeGpu.sys
+            ${{ runner.temp }}/prime-c08-windows/prime_gpu_scene.exe
+          if-no-files-found: error
