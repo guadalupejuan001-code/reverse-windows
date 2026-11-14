@@ -33,6 +33,7 @@ class AndroidBootSession final {
   };
   static constexpr RamProfile kDefaultRamProfile{2048ULL * 1024 * 1024, 256ULL * 1024 * 1024};
   static constexpr std::uint64_t kMaxResidentBytes = 1024ULL * 1024 * 1024;
+  static constexpr std::uint64_t kMinResidentBytes = 16ULL * 1024 * 1024;
 
   static RamProfile ram_profile(std::uint64_t available_bytes, std::uint64_t low_threshold,
                                 bool low_memory) {
@@ -40,7 +41,7 @@ class AndroidBootSession final {
     const auto headroom = available_bytes > low_threshold ? available_bytes - low_threshold : 0;
     const auto backing = (headroom / 2) / cosmic_pc::MemoryFabric::kPageSize *
                          cosmic_pc::MemoryFabric::kPageSize;
-    if (low_memory || backing < 16 * MiB)
+    if (low_memory || backing < kMinResidentBytes)
       throw std::runtime_error("Android tiene poca RAM disponible para iniciar el equipo virtual.");
     // Keep room above Android's low-memory threshold for the handset. The
     // 4 GiB address space is selected only when more backing is available.
@@ -48,6 +49,40 @@ class AndroidBootSession final {
         ? cosmic_pc::PcMachine::kMaxPhysicalBytes : kDefaultRamProfile.physical_bytes;
     return {static_cast<std::size_t>(physical),
             static_cast<std::size_t>(std::min({backing, physical, kMaxResidentBytes}))};
+  }
+
+  void sample_ram_pressure(std::uint64_t available, std::uint64_t threshold, bool low_memory) {
+    const auto& memory = pc_.cpu.memory;
+    constexpr auto page = cosmic_pc::MemoryFabric::kPageSize;
+    const auto headroom = available > threshold ? available - threshold : 0;
+    // Android's available RAM already reflects the VM's resident payload.
+    // Add that payload back before dividing the combined headroom.
+    const auto half = std::min(headroom, 2 * kMaxResidentBytes) / 2 + memory.allocated_bytes() / 2;
+    const auto limit = std::min(memory.size(), kMaxResidentBytes);
+    const auto floor = std::min(limit, kMinResidentBytes);
+    const auto target = low_memory ? floor : std::clamp<std::uint64_t>(half / page * page, floor, limit);
+    const auto old_target = pressure_.target ? pressure_.target : memory.budget_bytes();
+    const auto delta = std::max(old_target, target) - std::min(old_target, target);
+    pressure_.low_memory = low_memory;
+    if (low_memory || delta >= 8 * 1024 * 1024 || target == floor)
+      pressure_.target = target;
+    else
+      pressure_.target = old_target;
+  }
+
+  bool maintain_ram_budget() {
+    if (!pressure_.target) return false;
+    using Adjustment = cosmic_pc::SparseRam::BudgetAdjustment;
+    const auto started = std::chrono::steady_clock::now();
+    try {
+      pressure_.status = pc_.cpu.memory.adjust_payload_budget(pressure_.target, 128);
+      pressure_.error.clear();
+    } catch (const std::exception& error) {
+      pressure_.status = Adjustment::Blocked;
+      pressure_.error = error.what();
+    }
+    pressure_.maintenance_time += std::chrono::steady_clock::now() - started;
+    return pressure_.status == Adjustment::Reclaiming;
   }
 
   AndroidBootSession(std::filesystem::path disk, unsigned create_gib,
@@ -344,7 +379,7 @@ class AndroidBootSession final {
       out << "null";
     }
     out << ",\"ram_profile\":";
-    write_ram_profile(out, pc_, spill_);
+    write_ram_profile(out, pc_, spill_, &pressure_);
     const auto gate_work = pc_.quantum_session->gate_work_stats();
     const auto& boot_work = pc_.boot_acceleration();
     out << ",\"ether_next\":{\"quantum_gates_in\":" << gate_work.input_gates
@@ -428,6 +463,14 @@ class AndroidBootSession final {
   }
 
  private:
+  struct RamPressure {
+    std::uint64_t target = 0;
+    bool low_memory = false;
+    cosmic_pc::SparseRam::BudgetAdjustment status = cosmic_pc::SparseRam::BudgetAdjustment::Applied;
+    std::string error;
+    std::chrono::steady_clock::duration maintenance_time{};
+  };
+
   struct SpillInfo {
     AndroidRamBacking* file = nullptr; // Owned by the same PcMachine's MemoryFabric.
     std::uint64_t limit = 0;
@@ -461,12 +504,27 @@ class AndroidBootSession final {
   }
 
   static void write_ram_profile(std::ostream& out, const cosmic_pc::PcMachine& pc,
-                                const SpillInfo& spill) {
+                                const SpillInfo& spill, const RamPressure* pressure = nullptr) {
     const auto metrics = pc.cpu.memory.metrics();
+    using Adjustment = cosmic_pc::SparseRam::BudgetAdjustment;
     out << "{\"address_space_bytes\":" << pc.cpu.memory.size()
         << ",\"usable_bytes\":" << pc.usable_ram_bytes()
         << ",\"backing_budget_bytes\":" << pc.cpu.memory.budget_bytes()
         << ",\"resident_bytes\":" << metrics.allocated_bytes
+        << ",\"resident_metadata_bytes\":" << metrics.metadata_bytes
+        << ",\"pattern_pages\":" << metrics.pattern_pages
+        << ",\"sparse_word_pages\":" << metrics.sparse_word_pages;
+    if (pressure && pressure->target) {
+      const auto status = pressure->status == Adjustment::Applied ? "applied" :
+                          pressure->status == Adjustment::Reclaiming ? "reclaiming" : "blocked";
+      out << ",\"pressure_target_bytes\":" << pressure->target
+          << ",\"pressure_status\":" << cosmic_pc::PcMachine::quote(status)
+          << ",\"android_low_memory\":" << (pressure->low_memory ? "true" : "false")
+          << ",\"pressure_error\":" << cosmic_pc::PcMachine::quote(pressure->error)
+          << ",\"pressure_maintenance_us\":"
+          << std::chrono::duration_cast<std::chrono::microseconds>(pressure->maintenance_time).count();
+    }
+    out
         << ",\"spill_mode\":" << cosmic_pc::PcMachine::quote(spill.state)
         << ",\"spill_error\":" << cosmic_pc::PcMachine::quote(spill.detail)
         << ",\"spill_limit_bytes\":" << spill.limit
@@ -636,6 +694,7 @@ class AndroidBootSession final {
   std::optional<std::string> previous_boot_profile_;
   cosmic_pc::PcMachine pc_;
   SpillInfo spill_;
+  RamPressure pressure_;
   std::shared_ptr<OpticalReader> iso_;
   std::unique_ptr<QssdDisk> disk_;
   std::unique_ptr<BiosHardDisk> bios_disk_;
