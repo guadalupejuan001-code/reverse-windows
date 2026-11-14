@@ -252,8 +252,8 @@ final class VmWorker {
         worker.post(() -> {
             if (handle == 0 || !running || isTerminal()) return;
             try {
-                NativeMachine.key(handle, ascii, scan, pressed);
-                if (outcome == NativeMachine.WAITING_KEY && pressed) {
+                boolean wokeBios = NativeMachine.key(handle, ascii, scan, pressed);
+                if (outcome == NativeMachine.WAITING_KEY && wokeBios) {
                     outcome = NativeMachine.RUNNING;
                     schedule(0);
                 }

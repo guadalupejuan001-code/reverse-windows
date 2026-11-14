@@ -33,6 +33,9 @@ class Ps2Keyboard final {
   bool needs_irq() const noexcept { return (config_ & 1) && has_data() && !signaled_; }
   void mark_irq() noexcept { signaled_ = true; }
 
+  // Real-mode guests can enable IRQ1 or explicitly request scan data for polling.
+  bool guest_uses_scancodes() const noexcept { return (config_ & 1) || scanning_requested_; }
+
   std::uint8_t read_data() {
     auto& queue = responses_.empty() ? keys_ : responses_;
     if (queue.empty()) return 0xff;
@@ -76,7 +79,7 @@ class Ps2Keyboard final {
         return respond({0xfa});
       case 0xee: return respond({0xee}); // Echo.
       case 0xf2: return respond({0xfa, 0xab, 0x83});
-      case 0xf4: enabled_ = true; return respond({0xfa});
+      case 0xf4: enabled_ = true; scanning_requested_ = true; return respond({0xfa});
       case 0xf5: defaults(); enabled_ = false; return respond({0xfa});
       case 0xf6: defaults(); enabled_ = true; return respond({0xfa});
       case 0xfe: return respond({last_byte_});
@@ -107,6 +110,7 @@ class Ps2Keyboard final {
 
   void defaults() {
     scan_set_ = 2;
+    scanning_requested_ = false;
     keys_.clear();
   }
 
@@ -118,7 +122,7 @@ class Ps2Keyboard final {
   std::deque<std::uint8_t> keys_, responses_;
   std::uint8_t config_ = 4, controller_pending_ = 0, scan_set_ = 2;
   std::uint8_t parameter_ = 0, last_byte_ = 0xfe;
-  bool enabled_ = true, signaled_ = false;
+  bool enabled_ = true, signaled_ = false, scanning_requested_ = false;
 };
 
 } // namespace reverse_windows

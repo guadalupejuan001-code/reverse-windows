@@ -721,6 +721,9 @@ class PcMotherboardC06 {
   // worker. PC's canonical run loop calls this once per guest step.
   void advance_one(){poll();}
   void enable_ps2_keyboard(){keyboard_.emplace();}
+  bool guest_uses_ps2_scancodes()const noexcept {
+    return keyboard_&&keyboard_->guest_uses_scancodes();
+  }
   bool inject_ps2_key(unsigned code,bool pressed){
     return keyboard_&&keyboard_->inject(code,pressed);
   }

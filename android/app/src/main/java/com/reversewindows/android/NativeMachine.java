@@ -61,7 +61,7 @@ final class NativeMachine {
                                            boolean lowMemory, String ramCacheDirectory);
     static native void close(long handle);
     static native int step(long handle, int instructions);
-    static native void key(long handle, int ascii, int scanCode, boolean pressed);
+    static native boolean key(long handle, int ascii, int scanCode, boolean pressed);
     static native void flush(long handle);
     static native String diagnostic(long handle);
     static native int[] videoInfo(long handle);
