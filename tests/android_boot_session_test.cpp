@@ -1,4 +1,6 @@
 #include "android_boot_session.hpp"
+#include "long_mode_guest.hpp"
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <fcntl.h>
@@ -237,6 +239,46 @@ void verify_real_mode_ps2(const std::filesystem::path& path, bool via_irq) {
   require(screen(capture_cells(session)).front() == 'K', "Keyboard input reached the wrong guest interface");
 }
 
+void verify_arm64_session(const std::filesystem::path& path) {
+  auto boot = cosmic_pc::long_mode_boot_disk();
+  const std::array<std::uint8_t, 6> signature{0x48,0xb8,0x01,0,0,0};
+  const auto start = std::search(boot.begin(), boot.end(), signature.begin(), signature.end());
+  require(start != boot.end(), "Long-mode boot sector entry changed");
+  // Redirect the canonical boot sector after it enables long mode.
+  constexpr unsigned loop_offset = 0x160, destination = 0x7c00 + loop_offset;
+  const std::uint8_t handoff[] = {0xbb,std::uint8_t(destination),std::uint8_t(destination >> 8),0,0,0xff,0xe3};
+  std::copy(std::begin(handoff), std::end(handoff), start);
+  const std::uint8_t guest[]{
+      0xbe,0xa0,0x7d,0,0,                    // ESI = first chain node.
+      0x41,0xbe,0xe0,0x7d,0,0,               // R14D = end of chain.
+      0x48,0x8b,0x36,0x49,0x3b,0xf6,0x75,0xf8,
+      0xfa,0xf4};
+  std::copy(std::begin(guest), std::end(guest), boot.begin() + loop_offset);
+  for (unsigned offset = 0x1a0; offset < 0x1e0; offset += 8) {
+    boot[offset] = std::uint8_t(0x7c00 + offset + 8);
+    boot[offset + 1] = std::uint8_t((0x7c00 + offset + 8) >> 8);
+  }
+  Session::create_disk(path, 1);
+  {
+    reverse_windows::QssdDisk disk(path);
+    require(disk.write(0, 1, boot.data()) && disk.flush(), "Could not persist long-mode test sector");
+  }
+  Session session(path, 0, Session::BootSource::Disk);
+  for (unsigned steps = 0; steps < 6000 && !session.is_stopped(); steps += 256) {
+    if (session.step(256) == Session::Step::Fault)
+      throw std::runtime_error(session.diagnostic());
+  }
+  const auto info = session.diagnostic();
+  require(session.is_stopped() && info.find("\"cpu_mode\":\"long64\"") != std::string::npos,
+          "The Android native session did not execute the long-mode QSSD guest");
+  const auto arm64 = info.find("\"ether_arm64\":{");
+  require(arm64 != std::string::npos, "C03 counts are missing from the Android diagnostic");
+  const auto native_steps = counter(info.substr(arm64), "guest_steps");
+  require(cosmic_pc::Cpu::ether_arm64_host() ? native_steps >= 12 : native_steps == 0,
+          "Android native session selected the wrong launch path");
+  std::cout << "PRIME_C03_NATIVE_SESSION_PASS translated_steps=" << native_steps << '\n';
+}
+
 void write_evidence(const std::filesystem::path& path, const VgaCells& cells,
                     const std::string& before, const std::string& after) {
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -265,6 +307,7 @@ int main(int argc, char** argv) {
     verify_ram_spill(dir.path);
     verify_real_mode_ps2(dir.path / "keyboard-irq.rqvd", true);
     verify_real_mode_ps2(dir.path / "keyboard-poll.rqvd", false);
+    verify_arm64_session(dir.path / "ether-arm64.rqvd");
     const auto disk = dir.path / "android-test.rqvd";
     const auto fixture = dir.path / "boot.iso";
     std::filesystem::copy_file(argv[1], fixture);

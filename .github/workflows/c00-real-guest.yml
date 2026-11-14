@@ -72,6 +72,7 @@ jobs:
           ctest --test-dir build --output-on-failure -V \
             -R '^reverse_windows_(pc_bios_keyboard|android_bios_iso_qssd|c06_real_motherboard)$' \
             | tee build/prime-bios-keyboard.log
+          grep -q 'PRIME_C03_NATIVE_SESSION_PASS translated_steps=' build/prime-bios-keyboard.log
       - name: Verify Prime C02 timing and checkpoint evidence
         shell: bash
         run: |
