@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+typedef _Return_type_success_(return >= 0) LONG NTSTATUS;
 #include <d3dkmthk.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>

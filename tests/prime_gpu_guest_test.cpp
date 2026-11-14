@@ -1,5 +1,6 @@
 #include "android_boot_session.hpp"
 #include "c08_guest_gpu.hpp"
+#include "c08_wddm_protocol.h"
 #include <array>
 #include <chrono>
 #include <filesystem>
@@ -264,20 +265,42 @@ void verify(const std::filesystem::path& volume) {
     require(first.find("\"source_triangles\":4,\"submitted_triangles\":3,\"vertex_bytes\":180") !=
             std::string::npos && first.find("\"graphics_serial\":2") != std::string::npos,
             "GPU Virtual did not select and version the exact 3D work");
+    // The developer miniport submits the same bounded RAM render used here.
+    constexpr unsigned frame_bytes = sizeof(RwGpuWddmFrame) + sizeof(vertices) + color_bytes;
+    RwGpuWddmFrame frame{{RWGPU_WDDM_MAGIC, RWGPU_WDDM_ABI, RWGPU_WDDM_DRAW, frame_bytes},
+                        width, height, clear, sizeof(vertices) / sizeof(vertices[0])};
+    uint32_t encoded_bytes = 0, output_bytes = 0;
+    require(rwgpu_wddm_frame_size(&frame, &encoded_bytes, &output_bytes) &&
+            encoded_bytes == sizeof(vertices) && output_bytes == color_bytes,
+            "WDDM frame packet does not match its vertices and color payload");
+    frame.header.bytes -= 1;
+    require(!rwgpu_wddm_frame_size(&frame, &encoded_bytes, &output_bytes), "Truncated frame packet accepted");
+    frame.header.bytes += 1;
+    frame.width = UINT32_MAX;
+    require(!rwgpu_wddm_frame_size(&frame, &encoded_bytes, &output_bytes), "Oversized frame packet accepted");
+
     Guest32 repeat;
-    repeat.copy(moved_bar + RWGPU_STAGE_OFFSET, source, sizeof(vertices));
-    repeat.command(RWGPU_DRAW, 13, RWGPU_DRAW_PRESENT_VBE, sizeof(vertices));
+    repeat.cfg_write(4, 2);
+    repeat.direct_command(RWGPU_DRAW_RAM, 13, source, RWGPU_DRAW_PRESENT_VBE, sizeof(vertices));
+    repeat.read(moved_bar + RWGPU_REG_STATUS, 0xe060);
+    repeat.cfg_write(4, 6);
+    repeat.direct_command(RWGPU_DRAW_RAM, 14, moved_bar, RWGPU_DRAW_PRESENT_VBE, sizeof(vertices));
+    repeat.read(moved_bar + RWGPU_REG_STATUS, 0xe064);
+    repeat.direct_command(RWGPU_DRAW_RAM, 15, source, RWGPU_DRAW_PRESENT_VBE, sizeof(vertices));
     repeat.read(moved_bar + RWGPU_REG_STATUS, 0xe02c);
     repeat.run(pc);
-    require(pc.cpu.read32(0xe02c) == RWGPU_OK && mirror.capture(width, height).empty(),
-            "Identical GPU output should not be retransmitted by C07");
+    require(pc.cpu.read32(0xe060) == RWGPU_UNAVAILABLE && pc.cpu.read32(0xe064) == RWGPU_INVALID &&
+            pc.cpu.read32(0xe02c) == RWGPU_OK && mirror.capture(width, height).empty(),
+            "RAM draw must reject invalid DMA and preserve the exact C07 frame");
+    pc.cpu.memory.read_block(pc.video_info().physical_address, via_dma.data(), via_dma.size());
+    require(via_dma == via_vbe, "Render from guest memory differs from render from VRAM");
     std::cout << "PRIME_C08_REGRAPHICS_PASS " << gpu_stats(*board.attached_gpu()) << '\n';
     Guest32 offscreen;
     offscreen.write(moved_bar + RWGPU_REG_WIDTH, 32);
     offscreen.write(moved_bar + RWGPU_REG_HEIGHT, 32);
-    offscreen.command(RWGPU_DRAW, 14, 0, 0);
+    offscreen.command(RWGPU_DRAW, 16, 0, 0);
     offscreen.read(moved_bar + RWGPU_REG_STATUS, 0xe030);
-    offscreen.command(RWGPU_READ_COLOR, 15, (32 * 32 - 1) * 4, 4);
+    offscreen.command(RWGPU_READ_COLOR, 17, (32 * 32 - 1) * 4, 4);
     offscreen.read(moved_bar + RWGPU_REG_STATUS, 0xe034);
     offscreen.read(moved_bar + RWGPU_STAGE_OFFSET, 0xe038);
     offscreen.run(pc);

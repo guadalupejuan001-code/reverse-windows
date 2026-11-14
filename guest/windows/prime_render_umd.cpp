@@ -1,7 +1,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <dxgi.h>
+typedef _Return_type_success_(return >= 0) LONG NTSTATUS;
+#pragma warning(push)
+#pragma warning(disable : 4201)
 #include <d3d10umddi.h>
+#pragma warning(pop)
 #include "../../src/c08_wddm_protocol.h"
 
 namespace {

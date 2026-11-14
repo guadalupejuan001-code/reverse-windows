@@ -8,7 +8,7 @@ GPU Virtual C12.3 valida y agrupa los triángulos en orden de dibujo. Descarta l
 
 El dispositivo publica **120.000.000.000 bytes lógicos** respaldados por páginas dispersas de 4 KiB en QSSD. Los volúmenes nuevos usan la capacidad exacta. Los volúmenes anteriores de 112 GiB se abren con el mismo límite visible para el invitado. Android abre el respaldo C08 existente y reutiliza el respaldo junto al disco de PrimeVGC cuando es el único disponible. El tamaño real del respaldo, los bytes de vértices, el tiempo de preparación y lectura, el temporizador del renderizador y su identificación de hardware se registran en `guest_gpu`. En hardware, `gpu_query_ns` depende de una consulta válida de `GL_EXT_disjoint_timer_query`.
 
-La prueba del invitado x86 verifica descubrimiento PCI, tamaño y reasignación del BAR, el límite de VRAM y el dibujo de geometría subida directamente a VRAM. Comprueba píxeles, profundidad y recorte, después repite por el comando de dibujo original. Las órdenes de transferencia por ventana intermedia conservan su límite de 15 páginas y su prueba de 7,5 MiB.
+La prueba del invitado x86 verifica descubrimiento PCI, tamaño y reasignación del BAR, el límite de VRAM y el dibujo de geometría subida directamente a VRAM. Comprueba píxeles, profundidad y recorte. Repite el mismo dibujo desde RAM y compara el framebuffer completo. Las órdenes de transferencia por ventana intermedia conservan su límite de 15 páginas y su prueba de 7,5 MiB.
 
 ## PrimeVGC en el adaptador C08
 
@@ -22,8 +22,9 @@ Los registros de C08 conservan la ABI 1. Los bits de capacidad nuevos anuncian e
 | `SUM_INDICES` (8) | Conteo de 64 bits, hasta 2³² índices | Suma exacta en los registros de resultado |
 | `DRAW_VRAM` (9) | Vértices en VRAM lógica | REgraphics y presentación VBE opcional |
 | `READ_COLOR_RAM` (10) | Último destino BGRX renderizado | RAM física del invitado |
+| `DRAW_RAM` (11) | Vértices en RAM física del invitado | REgraphics y presentación VBE opcional |
 
-Las órdenes directas usan `OFFSET` para el origen, `AUX` para el destino y `LENGTH_HI:LENGTH` para el tamaño o conteo. `DRAW_VRAM` usa `AUX` para los indicadores de presentación. Todas las órdenes usan la misma secuencia de tickets. Las transferencias con RAM requieren PCI Bus Master y descartan los rangos reservados. PrimeVGC C03 amplía a **8 MiB** el tamaño máximo anunciado por orden directa. Las escrituras admiten hasta 2.048 páginas modificadas, incluido el desplazamiento inicial. Las órdenes de 512 KiB siguen disponibles.
+Las órdenes directas usan `OFFSET` para el origen, `AUX` para el destino y `LENGTH_HI:LENGTH` para el tamaño o conteo. `DRAW_VRAM` y `DRAW_RAM` usan `AUX` para los indicadores de presentación. Todas las órdenes usan la misma secuencia de tickets. Las transferencias con RAM requieren PCI Bus Master y descartan los rangos reservados. PrimeVGC C03 amplía a **8 MiB** el tamaño máximo anunciado por orden directa. Las escrituras admiten hasta 2.048 páginas modificadas, incluido el desplazamiento inicial. Las órdenes de 512 KiB siguen disponibles.
 
 PrimeVGC conserva hasta 8 MiB de páginas residentes. Si las páginas solicitadas están contiguas en la caché, el dispositivo copia directamente a RAM del invitado y registra esos bytes en `resident_download_bytes`. Android libera y deshabilita esa caché durante la presión de memoria.
 
@@ -39,6 +40,12 @@ El mismo núcleo C12.3 conserva la exportación periódica y la transformación 
 
 La ejecución normal de `prime_gpu_scene.exe` comprueba y usa DMA en el transporte WDM. Envía un bloque denso a la VRAM, recoge los mismos bytes, solicita el dibujo desde VRAM y compara los píxeles que el adaptador entrega directamente a RAM del invitado. El controlador solicita a Windows un búfer DMA común de hasta 8 MiB y comunica su tamaño efectivo. Las aplicaciones pasan desplazamientos lógicos de VRAM. El controlador programa únicamente la dirección DMA asignada por Windows. La bandera `--staged` prueba la ruta de compatibilidad del BAR.
 
-El paquete del transporte sale sin firmar. La prueba normal del invitado requiere el sistema instalado y un paquete de controlador firmado para su entorno de prueba. El cierre de compatibilidad para apps Direct3D requiere el miniport de render WDDM y un UMD que el runtime pueda cargar, con asignaciones, contexto, DMA, completados y capacidades compatibles. `prime_gpu_scene.exe --wddm` exige el adaptador 1b36:c083 como dispositivo DXGI y repite la escena mediante Direct3D. CI comprueba que esa prueba rechaza otros adaptadores. La habilitación de DXGI, Direct3D a través de WDDM y la aceleración física en el Samsung permanecen pendientes.
+### Desarrollo del miniport de render
+
+`ReversePrimeRender.inf` describe un paquete de desarrollo separado del transporte WDM. Ambos corresponden al mismo dispositivo PCI y ofrecen controladores alternativos. El miniport usa el BAR traducido de Dxgkrnl y un búfer DMA común asignado por Windows. Su comando privado transporta triángulos a REgraphics y devuelve BGRX a través de ese búfer. La prueba x86 ejecuta las órdenes PCI y comprueba el rechazo de DMA deshabilitado y de rangos reservados.
+
+`prime_wddm_probe.exe` abre el adaptador por LUID y comprueba identificación y píxeles mediante `D3DKMTEscape`. Esa prueba requiere un Windows invitado con el miniport cargado. El UMD valida el contrato de identificación del adaptador y devuelve un error de capacidad al crear un dispositivo Direct3D. Quedan pendientes las asignaciones y contextos de WDDM, la programación y los completados, y la traducción de recursos y shaders en el UMD.
+
+Los paquetes de compilación salen sin firmar. `prime_gpu_scene.exe --wddm` sigue siendo la prueba de aceptación Direct3D. Exige el adaptador 1b36:c083 como dispositivo DXGI y repite la escena mediante Direct3D. CI comprueba que ambas pruebas rechacen un equipo sin dicho adaptador. Quedan pendientes la instalación en Windows invitado y la aceleración física medida en el Samsung.
 
 [Arquitectura de WDDM](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/windows-vista-and-later-display-driver-model-architecture) · [Envío de comandos](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/submitting-a-command-buffer) · [Recursos PCI traducidos](https://learn.microsoft.com/en-us/windows-hardware/drivers/wdf/raw-and-translated-resources).
