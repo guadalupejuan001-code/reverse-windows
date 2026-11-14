@@ -57,13 +57,14 @@ def ata_identify() -> bytes:
     code += b"\xfb\xf4\xfa"  # STI; HLT; CLI, woken by the queued drive IRQ.
     code += b"\x83\x3d\x98\x03\x00\x00\x01" + expect_equal()  # IRQ14 ran once.
     code += b"\x66\xba\xf7\x01\xec\x3c\x58" + expect_equal()  # Ready + DRQ.
-    code += b"\xbf\x00\x0a\x00\x00\xb9\x00\x01\x00\x00"  # EDI=0A00, ECX=256
+    # Keep the destination clear of the boot code, IRQ tables and BIOS probe.
+    code += b"\xbf\x00\x20\x00\x00\xb9\x00\x01\x00\x00"  # EDI=2000, ECX=256
     code += b"\x66\xba\xf0\x01\xfc\xf3\x66\x6d"  # CLD; REP INSW from 1F0.
-    code += b"\x66\x83\x3d\x00\x0a\x00\x00\x40" + expect_equal()  # ATA fixed disk.
-    code += b"\x66\xa1\xa6\x0a\x00\x00\x66\x25\x00\xc4\x66\x3d\x00\x44" + expect_equal()
-    code += b"\xa1\xc8\x0a\x00\x00\x3b\x05\x30\x01\x00\x00" + expect_equal()
-    code += b"\xa1\xcc\x0a\x00\x00\x3b\x05\x34\x01\x00\x00" + expect_equal()
-    code += b"\x81\x3d\x36\x0a\x00\x00\x45\x52\x45\x56" + expect_equal()  # ATA word-swapped REVE.
+    code += b"\x66\x83\x3d\x00\x20\x00\x00\x40" + expect_equal()  # ATA fixed disk.
+    code += b"\x66\xa1\xa6\x20\x00\x00\x66\x25\x00\xc4\x66\x3d\x00\x44" + expect_equal()
+    code += b"\xa1\xc8\x20\x00\x00\x3b\x05\x30\x01\x00\x00" + expect_equal()
+    code += b"\xa1\xcc\x20\x00\x00\x3b\x05\x34\x01\x00\x00" + expect_equal()
+    code += b"\x81\x3d\x36\x20\x00\x00\x45\x52\x45\x56" + expect_equal()  # ATA word-swapped REVE.
     code += b"\x66\xba\xf7\x01\xec\x3c\x50" + expect_equal()  # DRQ cleared.
     code += b"\x89\xda"  # Restore boot CD drive in DL from EBX before returning real16.
     code += b"\xea\x92\x08\x00\x00\x50\x00"  # JMP FAR 0050:0892 (protected16)
@@ -181,6 +182,10 @@ def image() -> bytearray:
     iso[start + 0xD00 : start + 0xD00 + len(detected)] = detected
     iso[start + 0xD20 : start + 0xD20 + len(prompt)] = prompt
     code += b"\x0e\x07"  # PUSH CS; POP ES.
+    # After the protected-mode IRQ test, replay the same real-mode call site
+    # that stopped the user's boot. The guest verifies that AH=10h reads it.
+    code += b"\xea\x21\x0a\x00\x20"  # JMP FAR 2000:0A21.
+    keyboard_return = 0x40 + len(code)
     code += show_line(0xD00, len(detected), 1, 0x0A)
     code += show_line(0xD20, len(prompt), 3, 0x07)
     code += bytes((
@@ -204,6 +209,18 @@ def image() -> bytearray:
         program[jump] = failure - jump - 1
     assert 0x40 + len(program) <= 0x100  # Keep the boot code clear of the DAPs.
     iso[start + 0x40 : start + 0x40 + len(program)] = program
+    keyboard_probe = (
+        b"\xb8\x00\x05\xb9\x20\x00"   # MOV AX,0500; MOV CX,0020.
+        b"\xcd\x16\x3c\x00"           # INT 16h at 2000:0A27; CMP AL,00.
+        + expect_equal()
+        + b"\xe4\x64\xa8\x01"           # No PS/2 controller byte for a BIOS queue write.
+        + expect_equal()
+        + b"\xb4\x10\xcd\x16\x3d\x20\x00"  # Read and compare AX with 0020.
+        + expect_equal()
+        + b"\xea" + struct.pack("<HH", keyboard_return, 0x2000)
+    )
+    # This follows the temporary protected-mode IDT.
+    iso[start + 0xA21 : start + 0xA21 + len(keyboard_probe)] = keyboard_probe
     readback = real_ata_readback()
     iso[start + 0xE00 : start + 0xE00 + len(readback)] = readback
     for pointer, lba in ((0x100, 29), (0x110, 0)):

@@ -341,7 +341,8 @@ int main(int argc, char** argv) {
     std::cout << "REVERSE_WINDOWS_ANDROID_BIOS_ISO_QSSD_PASS "
                  "synthetic_iso=true protected32_ia32_tsc=true protected32_lock_or=true "
                  "protected16_to_real16=true bios_edd=true pci_ide=true ata_identify_words=256 irq14=1 "
-                 "qssd_logical_bytes=68719476736 bios_key=true guest_vga=true read_only_preflight=true "
+                 "qssd_logical_bytes=68719476736 bios_key=true bios_key_store_0500=true "
+                 "guest_vga=true read_only_preflight=true "
                  "bios_write_ata_readback_bytes=512 mismatched_capacity_rejected=true "
                  "guest_restart=true persistent_reboot=true\n";
     return 0;

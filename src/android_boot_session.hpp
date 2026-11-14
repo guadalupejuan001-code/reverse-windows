@@ -247,10 +247,7 @@ class AndroidBootSession final {
       throw std::invalid_argument("Código de teclado BIOS inválido.");
     if (board_->evidence().powered_off) return;
     if (pc_.cpu.is_real_mode()) {
-      const auto scan = static_cast<std::uint8_t>(scancode);
-      const bool modifier = scan == 0x2a || scan == 0x36 || scan == 0x1d || scan == 0x38;
-      if (pressed && (ascii || (scancode && !modifier)))
-        pc_.key(static_cast<std::uint8_t>(ascii), scan);
+      pc_.key_event(static_cast<std::uint8_t>(ascii), scancode, pressed);
     } else if (scancode) {
       (void)board_->inject_ps2_key(scancode, pressed);
     }

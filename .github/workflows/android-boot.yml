@@ -26,6 +26,9 @@ permissions:
 
 jobs:
   android:
+    # Prime's component cycles run the native suite. Android packaging
+    # resumes when a completed Prime revision is selected for release.
+    if: ${{ !startsWith(github.head_ref || github.ref_name, 'feature/windows-prime-') }}
     name: Android ${{ matrix.abi }}
     runs-on: ubuntu-24.04
     timeout-minutes: 35

@@ -6,12 +6,14 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "41e1fe83116d6a0c3a8c64eb2f97d1ca45ed7ec4",
+      "commit": "b3667b21fdbe1479e6ea3f4efdd9e2e5787de877",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
-      "status": "candidate-vga-alt-fonts-and-scalar-boot-profile",
+      "status": "candidate-prime-c01-bios-keyboard",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
+        "pc-android/native/pc_bios_keyboard.hpp",
+        "pc-android/native/tests/pc_bios_keyboard_test.cpp",
         "pc-android/native/vga_bios_font.hpp",
         "pc-android/native/boot_hotspots.hpp",
         "pc-android/native/sparse_ram.hpp",
