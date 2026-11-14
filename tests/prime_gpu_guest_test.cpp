@@ -322,8 +322,10 @@ void verify(const std::filesystem::path& volume) {
             pc.cpu.read32(0xe070) == RWGPU_OK && pc.cpu.read32(0xe074) == RWGPU_INVALID &&
             pc.cpu.read32(color_target + (32 * 32 - 1) * 4) == 0x740a141eU &&
             pc.cpu.read32(color_target + (16 * 32 + 16) * 4) == 0xffff0000U &&
+            gpu_stats(*board.attached_gpu()).find("\"alpha_draw_ticket\":18,") != std::string::npos &&
             !pc.cpu.memory.write_watch()->pending(),
             "WDDM offscreen readback must preserve alpha without changing the boot display");
+    std::cout << "PRIME_C08_BGRA_DMA_PASS alpha_ticket=18 vbe_stores=0 " << gpu_stats(*board.attached_gpu()) << '\n';
 #else
     require(pc.cpu.read32(0xe024) == RWGPU_UNAVAILABLE && pc.cpu.read32(0xe028) == 10,
             "Headless build must disclose its absent renderer");

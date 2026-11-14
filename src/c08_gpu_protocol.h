@@ -52,8 +52,8 @@ enum RwGpuCaps {
 };
 // DRAW uses OFFSET as flags. DRAW_VRAM and DRAW_RAM use OFFSET as the source
 // in VRAM or guest physical RAM and AUX as flags. READ_COLOR and READ_COLOR_RAM
-// address the last tightly packed, top-down BGRX8888 draw. READ_COLOR_RAM uses
-// AUX for the physical RAM target.
+// address the last tightly packed, top-down draw. READ_COLOR_RAM uses AUX for
+// the physical RAM target.
 #define RWGPU_DRAW_PRESENT_VBE UINT64_C(1)
 // Offscreen output with real alpha, in BGRA order. VBE remains BGRX.
 #define RWGPU_DRAW_COLOR_ALPHA UINT64_C(2)

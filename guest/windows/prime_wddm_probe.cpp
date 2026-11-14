@@ -64,7 +64,7 @@ int main() {
         return 1;
 
     constexpr unsigned width = 96, height = 64;
-    constexpr std::uint32_t red = 0xff0000ff, green = 0xff00ff00, clear = 0xff1e140a;
+    constexpr std::uint32_t red = 0x800000ff, green = 0xff00ff00, clear = 0x741e140a;
     const std::array<RwGpuVertex, 6> vertices{{
         {-.7f,-.55f,.2f,1,red}, {.7f,-.55f,.2f,1,red}, {0,.65f,.2f,1,red},
         {-.8f,-.7f,.8f,1,green}, {.8f,-.7f,.8f,1,green}, {0,.85f,.8f,1,green}
@@ -83,13 +83,13 @@ int main() {
     const std::uint8_t* pixels = data.data() + sizeof(frame) + sizeof(vertices);
     const auto color = [&](unsigned x, unsigned y) {
         const auto* p = pixels + (y * width + x) * 4;
-        return 0xff000000U | (std::uint32_t(p[0]) << 16) | (std::uint32_t(p[1]) << 8) | p[2];
+        return (std::uint32_t(p[3]) << 24) | (std::uint32_t(p[0]) << 16) | (std::uint32_t(p[1]) << 8) | p[2];
     };
     if (color(width / 2, height / 2) != red || color(width / 2, 7) != green ||
         color(width - 1, height - 1) != clear) {
-        std::fprintf(stderr, "PrimeVGC WDDM bridge returned unexpected BGRX pixels\n");
+        std::fprintf(stderr, "PrimeVGC WDDM bridge returned unexpected BGRA pixels\n");
         return 1;
     }
-    std::printf("PRIME_C08_WDDM_BRIDGE_PASS pci=1b36:c083 vram=%llu pixels=%u\n",
-                static_cast<unsigned long long>(info.logical_vram_bytes), width * height);
+    std::printf("PRIME_C08_WDDM_BRIDGE_PASS pci=1b36:c083 vram=%llu ticket=%u samples=3\n",
+                static_cast<unsigned long long>(info.logical_vram_bytes), completed.draw_ticket);
 }

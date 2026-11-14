@@ -33,6 +33,22 @@ $shared = Join-Path $header.Directory.Parent.FullName 'shared'
 $sdkUm = Join-Path (Join-Path $env:WindowsSdkDir 'Include') (Join-Path $env:WindowsSDKVersion.TrimEnd('\') 'um')
 $wdkUm = Join-Path $header.Directory.Parent.FullName 'um'
 $graphicsInclude = @("/I$sdkUm", "/I$wdkUm", "/I$shared", "/I$($header.Directory.FullName)")
+
+$infTool = Get-ChildItem -Path $wdk -Recurse -Filter 'Inf2Cat.exe' |
+    Where-Object { $_.Directory.Name -in @('x86', 'x64') } | Select-Object -First 1
+if (!$infTool) {
+    $infTool = Get-ChildItem -Path (Join-Path $env:WindowsSdkDir 'bin') -Recurse -Filter 'Inf2Cat.exe' |
+        Where-Object { $_.Directory.Name -in @('x86', 'x64') } | Select-Object -First 1
+}
+if (!$infTool) { throw 'Inf2Cat.exe is required to generate the package catalogs' }
+
+function New-DriverPackage([string]$Name, [string[]]$Files, [string]$Catalog) {
+    $folder = (New-Item -Path (Join-Path $out $Name) -ItemType Directory -Force).FullName
+    foreach ($file in $Files) { Copy-Item $file $folder -Force }
+    Invoke-Checked $infTool.FullName @("/driver:$folder", '/os:10_X64', '/uselocaltime')
+    if (!(Test-Path (Join-Path $folder $Catalog))) { throw "Missing catalog $Catalog" }
+}
+
 $obj = Join-Path $out 'gpu_transport.obj'
 $driver = Join-Path $out 'ReversePrimeGpu.sys'
 Invoke-Checked $compiler @('/nologo','/c','/TC','/std:c17','/W4','/O2','/GS','/kernel',
@@ -42,7 +58,6 @@ Invoke-Checked $linker @('/nologo','/driver','/subsystem:native','/machine:x64',
     '/nodefaultlib','/incremental:no','/dynamicbase','/nxcompat','/integritycheck',
     "/out:$driver", "/libpath:$($lib.Directory.FullName)", $obj,
     'ntoskrnl.lib','hal.lib','wdmsec.lib','BufferOverflowFastFailK.lib')
-Copy-Item (Join-Path $PSScriptRoot 'ReversePrimeGpu.inf') $out -Force
 Invoke-Checked $compiler @('/nologo','/std:c++17','/EHsc','/W4','/O2','/MT',
     "/Fo$(Join-Path $out 'gpu_scene.obj')","/Fe$(Join-Path $out 'prime_gpu_scene.exe')",
     $scene,'dxgi.lib','d3d11.lib','d3dcompiler.lib')
@@ -75,4 +90,6 @@ $probe = Join-Path $PSScriptRoot 'prime_wddm_probe.cpp'
 Invoke-Checked $compiler (@('/nologo','/std:c++17','/EHsc','/W4','/O2','/MT',
     "/Fo$(Join-Path $out 'prime_wddm_probe.obj')","/Fe$(Join-Path $out 'prime_wddm_probe.exe')",
     $probe, 'dxgi.lib', 'gdi32.lib') + $graphicsInclude)
-Copy-Item (Join-Path $PSScriptRoot 'ReversePrimeRender.inf') $out -Force
+New-DriverPackage 'wdm-package' @($driver, (Join-Path $PSScriptRoot 'ReversePrimeGpu.inf')) 'ReversePrimeGpu.cat'
+New-DriverPackage 'wddm-package' @($miniportSys, $umdDll,
+    (Join-Path $PSScriptRoot 'ReversePrimeRender.inf')) 'ReversePrimeRender.cat'

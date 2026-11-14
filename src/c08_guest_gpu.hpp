@@ -52,6 +52,7 @@ class GuestGpuC08 {
     renderer_name_.clear();
     hardware_ = false;
     host_ns_ = backend_ns_ = 0;
+    alpha_draw_ticket_ = 0;
     source_triangles_ = drawn_triangles_ = vertex_bytes_ = presented_bytes_ = 0;
 #ifdef REVERSE_WINDOWS_GLES_GUEST
     color_.clear();
@@ -145,6 +146,7 @@ class GuestGpuC08 {
         << ",\"draw_requests\":" << commands_[RWGPU_DRAW] + commands_[RWGPU_DRAW_VRAM] + commands_[RWGPU_DRAW_RAM]
         << ",\"vram_draw_requests\":" << commands_[RWGPU_DRAW_VRAM]
         << ",\"ram_draw_requests\":" << commands_[RWGPU_DRAW_RAM] << ",\"draws\":" << draws_
+        << ",\"alpha_draw_ticket\":" << alpha_draw_ticket_
         << ",\"color_reads\":" << commands_[RWGPU_READ_COLOR] + commands_[RWGPU_READ_COLOR_RAM]
         << ",\"color_dma_reads\":" << commands_[RWGPU_READ_COLOR_RAM]
         << ",\"source_triangles\":" << source_triangles_ << ",\"submitted_triangles\":" << drawn_triangles_
@@ -175,6 +177,7 @@ class GuestGpuC08 {
   std::array<std::uint32_t, 7> params_{};
   std::array<std::uint32_t, 3> direct_params_{};
   std::uint32_t pci_command_ = 0, bar_ = pci_window_start, status_ = RWGPU_IDLE, completed_ = 0;
+  std::uint32_t alpha_draw_ticket_ = 0;
   Partial pending_{};
   bool probe_bar_ = false;
   std::vector<std::uint8_t> stage_, transfer_;
@@ -396,6 +399,7 @@ class GuestGpuC08 {
     work_.publish(plan, plan->revision, plan->revision);
     bgrx_.swap(color_);
     ++draws_;
+    if (alpha) alpha_draw_ticket_ = params_.back();
     source_triangles_ = plan->source_triangles;
     drawn_triangles_ = plan->vertices.size() / 3;
     vertex_bytes_ = receipt.vertex_bytes;
