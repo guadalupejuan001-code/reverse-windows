@@ -449,6 +449,8 @@ class AndroidBootSession final {
         << ",\"write_sectors\":" << counts.write_sectors << ",\"flushes\":" << counts.flushes
         << "},\"irq\":{\"ticks\":" << platform.ticks << ",\"delivered\":" << platform.irq_delivered
         << ",\"irq14\":" << platform.ata_irqs << ",\"lapic_delivered\":" << platform.apic_irqs
+        << ",\"sci_delivered\":" << platform.sci_irqs
+        << ",\"virtual_clock_hz\":" << cosmic_pc::PcMachine::kVirtualCyclesPerSecond
         << ",\"halted_with_if\":" << (pc_.cpu.halted && pc_.cpu.flag(cosmic_pc::Cpu::IF) ? "true" : "false")
         << ",\"lapic_global_enabled\":" << (interrupts.global_enabled ? "true" : "false")
         << ",\"lapic_software_enabled\":" << (interrupts.software_enabled ? "true" : "false")

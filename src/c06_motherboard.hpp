@@ -28,7 +28,7 @@ class PcMotherboardC06 {
   struct Evidence {
     std::uint64_t ticks,irq_delivered,pit_irqs,apic_irqs;
     bool pci_present,acpi_installed,powered_off;
-    std::uint64_t ata_irqs=0;
+    std::uint64_t ata_irqs=0,sci_irqs=0;
   };
   struct InterruptState {
     bool global_enabled, software_enabled;
@@ -88,10 +88,11 @@ class PcMotherboardC06 {
     bool command(std::uint8_t v){
       if((v>>6)!=0)return false; // channel0 only
       if(((v>>4)&3)==0){latch=std::uint16_t(counter);latch_valid=true;read_phase=0;return true;}
-      access=(v>>4)&3;mode=(v>>1)&7;
-      if(mode==6)mode=2;if(mode==7)mode=3;
-      if(mode!=2&&mode!=3)return false;
-      phase=0;read_phase=0;latch_valid=false;return true;
+      auto selected_mode=(v>>1)&7U;
+      if(selected_mode>=6)selected_mode-=4;
+      if((v&1)|| (selected_mode!=0&&selected_mode!=2&&selected_mode!=3))return false;
+      access=(v>>4)&3;mode=selected_mode;
+      enabled=false;phase=0;read_phase=0;latch_valid=false;return true;
     }
     void commit(std::uint16_t raw){reload=raw?raw:65536U;counter=reload;enabled=true;}
     void data(std::uint8_t value){
@@ -109,10 +110,10 @@ class PcMotherboardC06 {
       return result;
     }
     bool tick(){
-      if(!enabled)return false;
       if(counter) --counter;
       if(counter)return false;
-      counter=reload;
+      if(mode==0)enabled=false;
+      else counter=reload;
       return true;
     }
   };
@@ -128,20 +129,25 @@ class PcMotherboardC06 {
   std::function<void()> prior_tick_;
   std::function<unsigned(unsigned)> prior_batch_limit_;
   std::function<void(unsigned)> prior_batch_advance_;
+  std::function<unsigned(unsigned)> prior_idle_advance_;
   std::function<void()> prior_reset_;
   Pic master_{},slave_{};
   std::unique_ptr<AtaC07> ata_;
   std::unique_ptr<AtapiCdrom> optical_;
   std::array<std::uint8_t,256> ata_cfg_{};
   std::uint64_t ata_irq_delivered_=0;
-  Pit pit_{};
+  Pit pit_{},pit2_{};
+  unsigned pit_phase_=0;
+  std::uint8_t speaker_control_=0;
   std::uint32_t pci_selector_=0;
   std::uint8_t cmos_index_=0,rtc_b_=2;
   std::array<std::uint8_t,256> host_cfg_{},isa_cfg_{};
   std::uint16_t pm_control_=0x0001; // SCI_EN: firmware starts in ACPI mode.
+  std::uint16_t pm_status_=0,pm_enable_=0;
+  bool sci_active_=false;
   bool powered_off_=false;
   bool ferr_was_asserted_=false;
-  std::uint64_t ticks_=0,irq_delivered_=0,pit_irqs_=0,apic_irqs_=0;
+  std::uint64_t ticks_=0,irq_delivered_=0,pit_irqs_=0,apic_irqs_=0,sci_irqs_=0;
   static constexpr std::uint32_t kLvtMasked=1U<<16;
   static constexpr unsigned kTimer=0,kLint0=3,kLint1=4,kError=5;
   std::uint32_t apic_svr_=0xff,apic_ldr_=0,apic_dfr_=0xffffffffU;
@@ -151,7 +157,7 @@ class PcMotherboardC06 {
   std::uint32_t apic_timer_reload_=0,apic_divider_=0;
   std::uint64_t apic_timer_cycles_=0;
   std::bitset<256> lapic_pending_,lapic_in_service_,lapic_pending_level_,lapic_in_service_level_;
-  std::bitset<256> lapic_pending_ata_;
+  std::bitset<256> lapic_pending_ata_,lapic_pending_sci_;
   bool prior_local_apic_=false;
   std::uint32_t ioapic_select_=0;
   std::array<std::uint32_t,24> io_redir_low_{},io_redir_high_{};
@@ -172,15 +178,16 @@ class PcMotherboardC06 {
     b.fill(0);
     config32(b,0,(std::uint32_t(device)<<16)|0x1b36U); // synthetic vendor
     b[8]=1;b[10]=type;b[11]=0x06; // host/ISA bridge class
-    b[0x0e]=0; // multifunction=0; no storage devices declared before C07
+    b[0x0e]=0; // Single-function bridge.
   }
   void reset_devices(){
     if(keyboard_) keyboard_->reset();
     master_=Pic{};slave_=Pic{};slave_.vector=0x70;
-    pit_=Pit{};pci_selector_=0;
+    pit_=Pit{};pit2_=Pit{};pit_phase_=0;speaker_control_=0;pci_selector_=0;
     cmos_index_=0;rtc_b_=2;pm_control_=0x0001;powered_off_=false;
+    pm_status_=pm_enable_=0;sci_active_=false;
     ferr_was_asserted_=false;pc_.cpu.set_x87_ignne(false);
-    ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=0;
+    ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=sci_irqs_=0;
     if(ata_)ata_->reset();
     if(optical_)optical_->reset();
     pc_.cpu.set_apic_task_priority(0);
@@ -190,13 +197,14 @@ class PcMotherboardC06 {
     apic_timer_reload_=apic_divider_=0;apic_timer_cycles_=0;
     lapic_pending_.reset();lapic_in_service_.reset();
     lapic_pending_level_.reset();lapic_in_service_level_.reset();lapic_pending_ata_.reset();
+    lapic_pending_sci_.reset();
     ioapic_select_=0;
     io_redir_low_.fill(0x10000U);io_redir_high_.fill(0);
     io_remote_vector_.fill(0);
     mmio_pending_={};
     build_config(host_cfg_,0x0001,0x00);
     build_config(isa_cfg_,0x0002,0x01);
-    if(ata_ || optical_){
+    if(ide_present()){
       ata_cfg_.fill(0);
       config32(ata_cfg_,0,(0xc071U<<16)|0x1b36U); // synthetic C07 PCI IDE
       ata_cfg_[4]=1; // PCI I/O space decode enabled
@@ -208,13 +216,16 @@ class PcMotherboardC06 {
     }
     // After a real PcMachine::reset, firmware RAM is new; republish the
     // same discovered tables and keep their E820-reserved addresses.
-    AcpiC06::install(pc_.cpu);
+    AcpiC06::install(pc_.cpu,ide_present());
+  }
+  bool ide_present()const noexcept{return bool(ata_)||bool(optical_);}
+  static bool ide_port(std::uint16_t port) noexcept {
+    return (port>=AcpiC06::primary_ide_ports&&port<AcpiC06::primary_ide_ports+8)||
+           port==AcpiC06::primary_ide_control||AtapiCdrom::handles(port);
   }
   bool owned_port(std::uint16_t p) const {
-    if(ata_ && ata_->handles(p) && (ata_cfg_[4]&1U))return true;
-    if(optical_ && optical_->handles(p) && (ata_cfg_[4]&1U))return true;
-    return p==0x20||p==0x21||p==0xa0||p==0xa1||
-           (p>=0x40&&p<=0x43)||(p>=0x70&&p<=0x71)||
+    return ide_port(p)||p==0x20||p==0x21||p==0xa0||p==0xa1||
+           (p>=0x40&&p<=0x43)||p==0x61||(p>=0x70&&p<=0x71)||
            (p>=AcpiC06::pci_config_ports&&p<AcpiC06::pci_config_ports+8)||
            (p>=AcpiC06::pm_event_port&&p<AcpiC06::pm_timer_port+4);
   }
@@ -225,7 +236,7 @@ class PcMotherboardC06 {
     const unsigned dev=(pci_selector_>>11)&31;
     if(dev==0)return &host_cfg_;
     if(dev==1)return &isa_cfg_;
-    if(dev==2&&(ata_||optical_))return &ata_cfg_;
+    if(dev==2&&ide_present())return &ata_cfg_;
     return nullptr;
   }
   std::optional<std::uint32_t> pci_read(std::uint16_t p,unsigned width){
@@ -248,11 +259,11 @@ class PcMotherboardC06 {
       if(!config)return true; // non-existent devices ignore writes
       const unsigned offset=(pci_selector_&0xfcU)+(p-0xcfc);
       if(offset+width>256)return true;
-      // PCI vendor/device/class/revision read-only. Only standard command
-      // low two bits are writable for these transparent host/ISA bridges.
+      // Fixed-function bridges implement only the low decode bits. IDE
+      // has compatibility I/O ports and no memory BARs or bus mastering.
       for(unsigned i=0;i<width;++i){
         const unsigned at=offset+i;
-        if(at==4)(*config)[4]=std::uint8_t(value>>(8*i))&3U;
+        if(at==4)(*config)[4]=std::uint8_t(value>>(8*i))&(config==&ata_cfg_?1U:3U);
       }
       return true;
     }
@@ -291,12 +302,19 @@ class PcMotherboardC06 {
       if(status&1U)return prior_in_(p,width);
       return keyboard_->read_data();
     }
-    if(ata_&&ata_->handles(p)&&(ata_cfg_[4]&1U))return ata_->input(p,width);
-    if(optical_&&optical_->handles(p)&&(ata_cfg_[4]&1U))return optical_->input(p,width);
+    if(ide_port(p)){
+      if(ata_cfg_[4]&1U){
+        if(ata_&&ata_->handles(p))return ata_->input(p,width);
+        if(optical_&&optical_->handles(p))return optical_->input(p,width);
+      }
+      return UINT32_MAX; // Inactive or empty channel: open bus.
+    }
     if(p>=AcpiC06::pci_config_ports&&p<AcpiC06::pci_config_ports+8)return pci_read(p,width);
-    if(p==AcpiC06::pm_timer_port&&width==4)return std::uint32_t(ticks_&0x00ffffffU);
+    if(p==AcpiC06::pm_timer_port&&width==4)return pm_timer();
     if(p==AcpiC06::pm_control_port&&width==2)return pm_control_;
-    if((p==AcpiC06::pm_event_port||p==AcpiC06::pm_event_port+2)&&width==2)return 0;
+    if(p==AcpiC06::pm_event_port&&(width==2||width==4))
+      return pm_status_|(width==4?std::uint32_t(pm_enable_)<<16:0);
+    if(p==AcpiC06::pm_event_port+2&&width==2)return pm_enable_;
     if(width!=1)return std::nullopt;
     switch(p){
       case 0x20:return master_.status();
@@ -304,6 +322,13 @@ class PcMotherboardC06 {
       case 0xa0:return slave_.status();
       case 0xa1:return slave_.mask;
       case 0x40:return pit_.read();
+      case 0x42:return pit2_.read();
+      case 0x61:{
+        const bool gate=(speaker_control_&1)!=0;
+        const bool out=pit2_.mode==0 ? !pit2_.enabled :
+            !gate||!pit2_.enabled||pit2_.counter>pit2_.reload/2;
+        return speaker_control_|(out?0x20U:0U)|(((ticks_/54U)&1U)?0x10U:0U);
+      }
       case 0x70:return cmos_index_;
       case 0x71:return cmos();
       default:return std::nullopt;
@@ -318,16 +343,33 @@ class PcMotherboardC06 {
       else keyboard_->controller_data(data);
       return true;
     }
-    if(ata_&&ata_->handles(p)&&(ata_cfg_[4]&1U))return ata_->output(p,width,value);
-    if(optical_&&optical_->handles(p)&&(ata_cfg_[4]&1U))return optical_->output(p,width,value);
+    if(ide_port(p)){
+      if(ata_cfg_[4]&1U){
+        if(ata_&&ata_->handles(p))return ata_->output(p,width,value);
+        if(optical_&&optical_->handles(p))return optical_->output(p,width,value);
+      }
+      return width==1||width==2||width==4; // No device receives the command.
+    }
     if(p>=AcpiC06::pci_config_ports&&p<AcpiC06::pci_config_ports+8)return pci_write(p,width,value);
     if(p==AcpiC06::pm_control_port&&width==2){
       pm_control_=std::uint16_t((value&0x1c00U)|0x0001U); // SLP_TYP and read-only SCI_EN.
-      if((value&0x2000)&&((value>>10)&7)==5)powered_off_=true;
+      if((value&0x2000)&&((value>>10)&7)==5){
+        powered_off_=true;
+        pc_.power_off();
+      }
       return true;
     }
-    if((p==AcpiC06::pm_event_port||p==AcpiC06::pm_event_port+2)&&width==2)
-      return true; // no SCI generated, event mask values are not retained
+    if(p==AcpiC06::pm_event_port&&(width==2||width==4)){
+      pm_status_&=~std::uint16_t(value&1U); // TMR_STS is write-one-to-clear.
+      if(width==4)pm_enable_=std::uint16_t((value>>16)&1U);
+      update_sci();
+      return true;
+    }
+    if(p==AcpiC06::pm_event_port+2&&width==2){
+      pm_enable_=std::uint16_t(value&1U);
+      update_sci();
+      return true;
+    }
     if(width!=1)return false;
     const auto b=std::uint8_t(value);
     switch(p){
@@ -338,10 +380,17 @@ class PcMotherboardC06 {
         return true;
       case 0x20:master_.command(b);return true;
       case 0x21:master_.data(b);return true;
-      case 0xa0:slave_.command(b);return true;
+      case 0xa0:slave_.command(b);update_sci();return true;
       case 0xa1:slave_.data(b);return true;
       case 0x40:pit_.data(b);return true;
-      case 0x43:return pit_.command(b);
+      case 0x42:pit2_.data(b);return true;
+      case 0x43:
+        if((b>>6)==2) return pit2_.command(b&0x3fU);
+        return pit_.command(b);
+      case 0x61:
+        if(!(speaker_control_&1)&&(b&1)&&pit2_.mode!=0&&pit2_.enabled)pit2_.counter=pit2_.reload;
+        speaker_control_=b&3U;
+        return true;
       case 0x70:cmos_index_=b;return true;
       case 0x71:
         if((cmos_index_&0x7fU)==0x0b && (b&~std::uint8_t{0x06})==0) {
@@ -460,6 +509,7 @@ class PcMotherboardC06 {
         case 0xf0:
           apic_svr_=v&0x1ffU;
           if(!lapic_on())for(auto& lvt:apic_lvt_)lvt|=kLvtMasked;
+          if(sci_active_)deliver_sci();
           return true;
         case 0x280:apic_esr_=std::exchange(apic_errors_,0);return true;
         case 0x300:return send_local_ipi(v);
@@ -481,6 +531,7 @@ class PcMotherboardC06 {
         const unsigned pin=(ioapic_select_-0x10)/2;
         if(ioapic_select_&1)io_redir_high_[pin]=v&0xff000000U;
         else io_redir_low_[pin]=v&0x1afffU;
+        if(pin==AcpiC06::sci_irq&&sci_active_)deliver_sci();
         return true;
       }
       return false;
@@ -509,6 +560,9 @@ class PcMotherboardC06 {
     if(!lapic_on())return 0;
     const auto vector=highest_vector(lapic_pending_);
     return (vector&0xf0U)>(processor_priority()&0xf0U)?vector:0;
+  }
+  bool interrupt_pending()const {
+    return (pic_connected()&&master_.pending())||deliverable_lapic_vector();
   }
   bool lapic_destination(std::uint32_t command,std::uint32_t destination) const {
     const auto id=destination>>24;
@@ -542,11 +596,15 @@ class PcMotherboardC06 {
     if(!lapic_in_service_level_.test(vector))return;
     lapic_in_service_level_.reset(vector);
     for(auto& remote:io_remote_vector_)if(remote==vector)remote=0;
+    if(sci_active_)deliver_sci();
   }
   void signal_isa_irq(unsigned line) {
     // Keep the legacy PIC edge even when the guest uses the I/O APIC.
     if(line>=8)slave_.irr|=std::uint8_t(1U<<(line-8));
     else master_.irr|=std::uint8_t(1U<<line);
+    route_ioapic(line);
+  }
+  void route_ioapic(unsigned line) {
     const auto redirect=io_redir_low_[line];
     const unsigned vector=redirect&255U,mode=(redirect>>8)&7U;
     if(lapic_on()&&!(redirect&(1U<<16))&&mode<=1&&
@@ -560,7 +618,25 @@ class PcMotherboardC06 {
       }
       lapic_pending_.set(vector);
       if(line==14)lapic_pending_ata_.set(vector);
+      if(line==AcpiC06::sci_irq)lapic_pending_sci_.set(vector);
     }
+  }
+  void deliver_sci() {
+    const auto mask=std::uint8_t(1U<<(AcpiC06::sci_irq-8));
+    if(sci_active_&&!(slave_.isr&mask))slave_.irr|=mask;
+    route_ioapic(AcpiC06::sci_irq);
+  }
+  void update_sci() {
+    sci_active_=(pm_status_&pm_enable_&1U)!=0;
+    if(sci_active_)deliver_sci();
+    else slave_.irr&=std::uint8_t(~(1U<<(AcpiC06::sci_irq-8)));
+  }
+  std::uint32_t pm_timer()const noexcept {
+    return std::uint32_t(ticks_)&AcpiC06::pm_timer_mask;
+  }
+  static constexpr unsigned kPitClockDivider=cosmic_pc::PcMachine::kPitClockDivider;
+  unsigned pm_timer_edge_in()const noexcept {
+    return AcpiC06::pm_timer_half_period-(pm_timer()&(AcpiC06::pm_timer_half_period-1));
   }
   void poll(){
     ++ticks_;
@@ -569,10 +645,21 @@ class PcMotherboardC06 {
     if(ferr&&!ferr_was_asserted_)signal_isa_irq(13);
     if(!ferr&&ferr_was_asserted_)cpu.set_x87_ignne(false);
     ferr_was_asserted_=ferr;
-    if(pit_.tick()){
-      ++pit_irqs_;
-      signal_isa_irq(0);
+    if(++pit_phase_==kPitClockDivider){
+      pit_phase_=0;
+      if(pit_.enabled&&pit_.tick()){
+        ++pit_irqs_;
+        signal_isa_irq(0);
+      }
+      if((speaker_control_&1)&&pit2_.enabled)pit2_.tick();
     }
+    if((ticks_&(AcpiC06::pm_timer_half_period-1))==0){
+      pm_status_|=1U;
+      update_sci();
+    }
+    // A level interrupt stays asserted if the guest enables its LAPIC
+    // after the PM event arose.
+    if(sci_active_&&(io_redir_low_[AcpiC06::sci_irq]&0x8000U))deliver_sci();
     if(keyboard_&&keyboard_->needs_irq()&&!(prior_in_(0x64,1).value_or(0)&1U)){
       signal_isa_irq(1);
       keyboard_->mark_irq();
@@ -599,6 +686,8 @@ class PcMotherboardC06 {
         lapic_pending_level_.reset(vector);
         if(lapic_pending_ata_[vector])++ata_irq_delivered_;
         lapic_pending_ata_.reset(vector);
+        if(lapic_pending_sci_[vector])++sci_irqs_;
+        lapic_pending_sci_.reset(vector);
         ++apic_irqs_;++irq_delivered_;
       }
       return;
@@ -613,6 +702,7 @@ class PcMotherboardC06 {
         if(cpu.raise_external_irq(std::uint8_t(slave_.vector+sn))){
           slave_.accepted(sn);master_.accepted(2);
           ++irq_delivered_;if(sn==6)++ata_irq_delivered_;
+          if(sn==AcpiC06::sci_irq-8)++sci_irqs_;
         }
       }else if(cpu.raise_external_irq(std::uint8_t(master_.vector+n))){
         master_.accepted(n);++irq_delivered_;
@@ -625,17 +715,28 @@ class PcMotherboardC06 {
   unsigned batch_limit(unsigned steps) const {
     if(prior_tick_ || powered_off_ || pc_.cpu.x87_ferr_asserted()!=ferr_was_asserted_ ||
        (keyboard_&&keyboard_->needs_irq()) ||
-       (pc_.cpu.flag(cosmic_pc::Cpu::IF) &&
-        ((pic_connected()&&master_.pending())||deliverable_lapic_vector()))) return 1;
-    if(pit_.enabled) steps=std::min(steps,std::max(1U,pit_.counter));
+       (pc_.cpu.flag(cosmic_pc::Cpu::IF)&&interrupt_pending())) return 1;
+    if(pit_.enabled)steps=std::min(steps,pit_.counter*kPitClockDivider-pit_phase_);
+    if((speaker_control_&1)&&pit2_.enabled)
+      steps=std::min(steps,pit2_.counter*kPitClockDivider-pit_phase_);
+    steps=std::min(steps,pm_timer_edge_in());
     if(pc_.cpu.apic_global_enabled()&&apic_timer_cycles_&&apic_timer_cycles_<steps)
       steps=unsigned(apic_timer_cycles_);
     return steps;
   }
   void advance_batch(unsigned extra_steps) {
     ticks_+=extra_steps;
-    if(pit_.enabled) pit_.counter-=extra_steps;
+    const auto pit_elapsed=pit_phase_+extra_steps;
+    if(pit_.enabled)pit_.counter-=pit_elapsed/kPitClockDivider;
+    if((speaker_control_&1)&&pit2_.enabled)pit2_.counter-=pit_elapsed/kPitClockDivider;
+    pit_phase_=pit_elapsed%kPitClockDivider;
     if(pc_.cpu.apic_global_enabled()&&apic_timer_cycles_)apic_timer_cycles_-=extra_steps;
+  }
+  unsigned advance_idle(unsigned max_extra) {
+    if(!pc_.cpu.halted||!pc_.cpu.flag(cosmic_pc::Cpu::IF))return 0;
+    const auto extra=batch_limit(max_extra+1)-1;
+    advance_batch(extra);
+    return extra;
   }
 
  public:
@@ -654,6 +755,7 @@ class PcMotherboardC06 {
     prior_tick_=pc_.device_step_hook;
     prior_batch_limit_=pc_.device_batch_limit_hook;
     prior_batch_advance_=pc_.device_batch_advance_hook;
+    prior_idle_advance_=pc_.device_idle_advance_hook;
     prior_reset_=pc_.device_reset_hook;
     reset_devices();
     pc_.cpu.in_hook=[this](std::uint16_t p,unsigned w){
@@ -686,6 +788,7 @@ class PcMotherboardC06 {
     };
     pc_.device_batch_limit_hook=[this](unsigned steps){return batch_limit(steps);};
     pc_.device_batch_advance_hook=[this](unsigned steps){advance_batch(steps);};
+    pc_.device_idle_advance_hook=[this](unsigned steps){return advance_idle(steps);};
     pc_.device_reset_hook=[this](){
       if(prior_reset_)prior_reset_();
       reset_devices();
@@ -706,12 +809,13 @@ class PcMotherboardC06 {
     pc_.device_step_hook=std::move(prior_tick_);
     pc_.device_batch_limit_hook=std::move(prior_batch_limit_);
     pc_.device_batch_advance_hook=std::move(prior_batch_advance_);
+    pc_.device_idle_advance_hook=std::move(prior_idle_advance_);
     pc_.device_reset_hook=std::move(prior_reset_);
   }
   PcMotherboardC06(const PcMotherboardC06&)=delete;
   PcMotherboardC06& operator=(const PcMotherboardC06&)=delete;
   Evidence evidence()const{
-    return {ticks_,irq_delivered_,pit_irqs_,apic_irqs_,true,true,powered_off_,ata_irq_delivered_};
+    return {ticks_,irq_delivered_,pit_irqs_,apic_irqs_,true,true,powered_off_,ata_irq_delivered_,sci_irqs_};
   }
   InterruptState interrupt_state()const{
     return {pc_.cpu.apic_global_enabled(),lapic_on(),highest_vector(lapic_pending_),
