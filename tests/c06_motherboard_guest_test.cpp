@@ -128,7 +128,8 @@ void rep_boot_with_pit_guest(bool local_apic){
   need(check(false)==check(true),"batched timer delivery crossed a guest interrupt deadline");
 }
 void paged_boot_batches_with_timer(){
-  const auto check=[](bool accelerate,bool scan){
+  enum class Fixture { Rep, Scan, Arm64 };
+  const auto check=[](bool accelerate,Fixture fixture,unsigned deadline){
     PcMachine pc(16*1024*1024);
     pc.boot_long_mode_demo();run(pc,12000);
     auto& cpu=pc.cpu;
@@ -136,6 +137,7 @@ void paged_boot_batches_with_timer(){
     PcMotherboardC06 board(pc);
     pc.enable_boot_acceleration(accelerate);
     cpu.enable_page_translation_cache(accelerate);
+    cpu.enable_ether_arm64_blocks(accelerate && fixture == Fixture::Arm64);
     pc.enable_boot_hotspots();
     constexpr auto apic=Cpu::kLocalApicAddress;
     // Map the APIC for the guest handler. The address remains MMIO.
@@ -155,11 +157,18 @@ void paged_boot_batches_with_timer(){
         0xc7,0x00,0,0,0,0,0x58,0x48,0xcf});
     cpu.write32(apic+0xf0,0x1ff);
     cpu.write32(apic+0x320,0x42);
-    cpu.write32(apic+0x380,307);
+    cpu.write32(apic+0x380,deadline);
     cpu.eip=entry;cpu.halted=false;
     cpu.regs[Cpu::ESP]=0x7000;
     cpu.eflags=2|Cpu::IF;
-    if(scan) {
+    if (fixture == Fixture::Arm64) {
+      code(cpu,entry,{0x48,0x8b,0x36,0x49,0x3b,0xf6,0x75,0xf8,0xfa,0xf4});
+      constexpr unsigned chain = 1024;
+      for (unsigned n = 0; n < chain; ++n)
+        cpu.write64(into + n * 8, into + (n + 1) * 8);
+      cpu.regs[Cpu::ESI] = into;
+      cpu.regs[Cpu::R14] = into + chain * 8;
+    } else if(fixture == Fixture::Scan) {
       code(cpu,entry,{0x44,0x8d,0x40,0x01,0x48,0xff,0xc2,0x41,0x8b,0xc0,
                       0x41,0x89,0x81,0xd8,0x2e,0,0,0x80,0x3a,0xe8,0x75,0xea,0xfa,0xf4});
       cpu.memory.fill(into,0x8c,total);
@@ -176,16 +185,23 @@ void paged_boot_batches_with_timer(){
     const auto initial_steps = cpu.instructions;
     for(unsigned slice=0;slice<40&&!cpu.halted;++slice)run(pc,4091);
     const auto interrupted=cpu.read64(log+8);
+    const auto last_ip = fixture == Fixture::Scan ? 20 : fixture == Fixture::Arm64 ? 6 : 0;
     need(cpu.halted&&cpu.regs[Cpu::ESP]==0x7000&&board.evidence().irq_delivered==1&&
-        interrupted>=entry&&interrupted<=entry+(scan?20:0),"paged guest lost the live timer boundary");
-    if(scan) {
+        interrupted>=entry&&interrupted<=entry+last_ip,"paged guest lost the live timer boundary");
+    if (fixture == Fixture::Arm64) {
+      need(cpu.regs[Cpu::ESI] == cpu.regs[Cpu::R14] &&
+           (!accelerate || !Cpu::ether_arm64_host() ||
+            pc.boot_acceleration().arm64_block_steps > 2900),
+           "ARM64 blocks did not finish the same pointer chain with the live LAPIC");
+    } else if(fixture == Fixture::Scan) {
       need(cpu.regs[Cpu::EDX]==into+total-1&&cpu.read32(0xc000)==total&&
           (!accelerate||pc.boot_acceleration().scan_loop_steps>47000),"x64 scan did not finish or batch");
     }else{
       need(cpu.regs[Cpu::ECX]==0&&cpu.read8(into+total-1)==0x5a&&
           (!accelerate||pc.boot_acceleration().paged_rep_elements>8100),"paged REP did not finish or batch");
     }
-    const auto batched = pc.boot_acceleration().rep_elements + pc.boot_acceleration().scan_loop_steps;
+    const auto batched = pc.boot_acceleration().rep_elements + pc.boot_acceleration().scan_loop_steps +
+        pc.boot_acceleration().arm64_block_steps;
     const auto count_steps = [&](const cosmic_pc::BootHotspots& profile) {
       std::ostringstream result;
       profile.write_json(result);
@@ -206,12 +222,14 @@ void paged_boot_batches_with_timer(){
     return std::array<std::uint64_t,5>{interrupted,cpu.read32(log),cpu.instructions,
         cpu.eflags,board.evidence().ticks};
   };
-  for(bool scan:{false,true}){
-    const auto scalar=check(false,scan);
-    const auto accelerated=check(true,scan);
-    need(scalar==accelerated,"paged acceleration changed the timer boundary or guest result");
+  for(const auto fixture:{Fixture::Rep,Fixture::Scan,Fixture::Arm64}){
+    for (const auto deadline : {307U, 308U}) {
+      const auto scalar=check(false,fixture,deadline);
+      const auto accelerated=check(true,fixture,deadline);
+      need(scalar==accelerated,"paged acceleration changed the timer boundary or guest result");
+    }
   }
-  std::cout<<"ETHER_PAGED_BATCH_IRQ_PASS rep=1 byte_scan=1\n";
+  std::cout<<"ETHER_PAGED_BATCH_IRQ_PASS rep=1 byte_scan=1 arm64="<<Cpu::ether_arm64_host()<<'\n';
 }
 void shift_boot_with_pit_guest(){
   const auto check=[](bool accelerate,std::uint8_t period_low){
