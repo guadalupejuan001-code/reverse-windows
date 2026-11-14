@@ -3,6 +3,7 @@
 #include "bios_hard_disk.hpp"
 #include "boot_profile.hpp"
 #include "qssd_disk.hpp"
+#include "storage_profile.hpp"
 #include "c06_motherboard.hpp"
 #include "c09_guest_trace.hpp"
 #include "c09r_guest_vga_fabric.hpp"
@@ -306,6 +307,8 @@ int main(int argc, char** argv) {
             if (platform.ticks == before && !pc.waiting_key) break;
         }
         std::ostringstream performance;
+        performance << ",\"storage_io\":";
+        reverse_windows::write_storage_profile(performance,pc,hdd.get(),motherboard.attached_ata(),qdisk);
         performance << ",\"ether_arm64\":";
         reverse_windows::write_ether_arm64(performance, pc.cpu);
         if (opts.profile_every && !profile)

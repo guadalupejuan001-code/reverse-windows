@@ -209,7 +209,8 @@ void run_device(const std::string& path) {
     need(pc.cpu.read16(0xa000+83*2)==0x7400&&pc.cpu.read16(0xa000+86*2)==0x3400&&
          pc.cpu.read16(0xa000+87*2)==0x4000,"IDENTIFY LBA48 and FLUSH capabilities are invalid");
     need(pc.cpu.read16(0xa000+49*2)==0x0200&&pc.cpu.read16(0xa000+53*2)==0&&
-         pc.cpu.read16(0xa000+47*2)==0x8000&&pc.cpu.read16(0xa000+106*2)==0x4000,
+         pc.cpu.read16(0xa000+47*2)==0x8010&&pc.cpu.read16(0xa000+59*2)==0x0100&&
+         pc.cpu.read16(0xa000+106*2)==0x4000,
          "IDENTIFY should describe 512-byte sectors and claim only supported PIO operations");
     need(pc.cpu.read32(0xa000+60*2)==0x0fffffffU,
          "IDENTIFY LBA28 capacity limit incorrect");

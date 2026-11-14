@@ -145,6 +145,11 @@ if(BUILD_TESTING)
   add_executable(reverse_windows_qssd_disk_test tests/qssd_disk_guest_test.cpp)
   target_link_libraries(reverse_windows_qssd_disk_test PRIVATE reverse_windows_component_headers)
   add_test(NAME reverse_windows_qssd_sparse_atomic_reboot_x86 COMMAND reverse_windows_qssd_disk_test)
+  add_executable(reverse_windows_prime_qssd_guest_test tests/prime_qssd_guest_test.cpp)
+  target_link_libraries(reverse_windows_prime_qssd_guest_test PRIVATE reverse_windows_component_headers)
+  target_compile_options(reverse_windows_prime_qssd_guest_test PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/O2,-O2>)
+  add_test(NAME reverse_windows_prime_qssd_guest COMMAND reverse_windows_prime_qssd_guest_test)
+  set_tests_properties(reverse_windows_prime_qssd_guest PROPERTIES TIMEOUT 90)
   # Compile the authentic x86 guest IDT test from the pinned Mundo X CPU
   # source, not a duplicated/shadow implementation in REVERSE Windows.
   add_executable(reverse_windows_c04_guest_idt
