@@ -6,6 +6,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
@@ -172,6 +173,7 @@ void paged_boot_batches_with_timer(){
       cpu.regs[Cpu::EAX]=0x5a;
       cpu.regs[Cpu::ECX]=total;
     }
+    const auto initial_steps = cpu.instructions;
     for(unsigned slice=0;slice<40&&!cpu.halted;++slice)run(pc,4091);
     const auto interrupted=cpu.read64(log+8);
     need(cpu.halted&&cpu.regs[Cpu::ESP]==0x7000&&board.evidence().irq_delivered==1&&
@@ -183,6 +185,24 @@ void paged_boot_batches_with_timer(){
       need(cpu.regs[Cpu::ECX]==0&&cpu.read8(into+total-1)==0x5a&&
           (!accelerate||pc.boot_acceleration().paged_rep_elements>8100),"paged REP did not finish or batch");
     }
+    const auto batched = pc.boot_acceleration().rep_elements + pc.boot_acceleration().scan_loop_steps;
+    const auto count_steps = [&](const cosmic_pc::BootHotspots& profile) {
+      std::ostringstream result;
+      profile.write_json(result);
+      return result.str();
+    };
+    const auto total_profile = count_steps(*pc.boot_hotspots());
+    const auto scalar_profile = count_steps(*pc.boot_scalar_hotspots());
+    const auto observed = [](std::uint64_t steps) {
+      return "\"observed_steps\":" + std::to_string(steps) + ",";
+    };
+    // The setup and software timer probes completed before sampling began.
+    need(total_profile.find(observed(cpu.instructions - initial_steps)) != std::string::npos &&
+             scalar_profile.find(observed(cpu.instructions - initial_steps - batched)) != std::string::npos,
+         "Scalar sampling must exclude every completed batch and keep the logical total");
+    need(scalar_profile.find("\"sampled_step_ns\":") != std::string::npos &&
+             (accelerate || scalar_profile.find("\"estimated_sample_ns\":") != std::string::npos),
+         "Scalar hotspots must report sampled execution duration");
     return std::array<std::uint64_t,5>{interrupted,cpu.read32(log),cpu.instructions,
         cpu.eflags,board.evidence().ticks};
   };

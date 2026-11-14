@@ -35,9 +35,9 @@ jobs:
         abi: [arm64-v8a, x86_64]
     env:
       ANDROID_ABI: ${{ matrix.abi }}
-      ANDROID_APP_ID: com.reversewindows.android.ether.r025
-      ANDROID_VERSION: "0.1.15"
-      ANDROID_VERSION_CODE: "16"
+      ANDROID_APP_ID: com.reversewindows.android.ether.r026
+      ANDROID_VERSION: "0.1.16"
+      ANDROID_VERSION_CODE: "17"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -193,6 +193,23 @@ jobs:
             cat "$log"
             return 1
           }
+          wait_for_window_focus() {
+            local expected="$1" focus
+            for attempt in {1..30}; do
+              focus=$(adb shell dumpsys window | sed -n '/mCurrentFocus=Window{/p')
+              if [[ -n "$focus" ]]; then
+                if [[ "$expected" == guest && "$focus" == *" $ANDROID_APP_ID/"* ]]; then
+                  return 0
+                fi
+                if [[ "$expected" == other && "$focus" != *" $ANDROID_APP_ID/"* ]]; then
+                  return 0
+                fi
+              fi
+              sleep 1
+            done
+            printf 'Window focus did not reach %s: %s\n' "$expected" "$focus" >&2
+            return 1
+          }
           wait_for_state waiting_key
           python3 - "$log" <<'PY'
           import json
@@ -213,8 +230,13 @@ jobs:
           elif ram["spill_mode"] == "unavailable":
               assert ram["spill_limit_bytes"] == 0 and ram["spill_error"], ram
           PY
+          # Home and Activity launch return before Android moves window focus.
+          # Verify both transitions so the Enter key reaches the resumed guest.
+          wait_for_window_focus guest
           adb shell input keyevent KEYCODE_HOME
+          wait_for_window_focus other
           adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity"
+          wait_for_window_focus guest
           adb shell input keyevent KEYCODE_ENTER
           wait_for_state halted
           snapshot="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ultimo-diagnostico.json"
