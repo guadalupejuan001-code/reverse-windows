@@ -6,6 +6,7 @@
 #include "boot_profile.hpp"
 #include "c09r_guest_vga_fabric.hpp"
 #include "qssd_disk.hpp"
+#include "storage_profile.hpp"
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -378,6 +379,8 @@ class AndroidBootSession final {
     } else {
       out << "null";
     }
+    out << ",\"storage_io\":";
+    write_storage_profile(out, pc_, bios_disk_.get(), ata, disk_.get());
     out << ",\"ram_profile\":";
     write_ram_profile(out, pc_, spill_, &pressure_);
     const auto gate_work = pc_.quantum_session->gate_work_stats();

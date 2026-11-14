@@ -122,6 +122,8 @@ class PcMotherboardC06 {
   std::optional<Ps2Keyboard> keyboard_;
   std::function<std::optional<std::uint32_t>(std::uint16_t,unsigned)> prior_in_;
   std::function<bool(std::uint16_t,unsigned,std::uint32_t)> prior_out_;
+  decltype(cosmic_pc::Cpu::pio_batch_limit_hook) prior_pio_batch_limit_;
+  decltype(cosmic_pc::Cpu::pio_batch_transfer_hook) prior_pio_batch_transfer_;
   std::function<bool(std::uint64_t)> prior_mmio_claim_;
   std::function<bool(std::uint64_t,std::size_t)> prior_mmio_range_claim_;
   std::function<std::optional<std::uint8_t>(std::uint64_t)> prior_mmio_read_;
@@ -748,6 +750,8 @@ class PcMotherboardC06 {
     // The machine must be booted/mounted first. ACPI goes into reserved BIOS
     // memory and is never presented by E820 as allocatable guest RAM.
     prior_in_=pc_.cpu.in_hook;prior_out_=pc_.cpu.out_hook;
+    prior_pio_batch_limit_=pc_.cpu.pio_batch_limit_hook;
+    prior_pio_batch_transfer_=pc_.cpu.pio_batch_transfer_hook;
     prior_mmio_claim_=pc_.cpu.mmio_claim_hook;
     prior_mmio_range_claim_=pc_.cpu.mmio_range_claim_hook;
     prior_mmio_read_=pc_.cpu.mmio_read_hook;
@@ -768,6 +772,16 @@ class PcMotherboardC06 {
       if(p==0xf0||owned_port(p))return io_write(p,w,v);
       return prior_out_&&prior_out_(p,w,v);
     };
+    if(ata_){
+      pc_.cpu.pio_batch_limit_hook=[this](std::uint16_t p,unsigned width,bool input,unsigned count){
+        if(p==AtaC07::kData&&(ata_cfg_[4]&1U))return ata_->pio_batch_limit(width,input,count);
+        return 0U;
+      };
+      pc_.cpu.pio_batch_transfer_hook=[this](std::uint16_t p,unsigned width,bool input,
+                                             std::uint8_t* data,unsigned count){
+        return p==AtaC07::kData&&(ata_cfg_[4]&1U)&&ata_->pio_batch_transfer(width,input,data,count);
+      };
+    }
     pc_.cpu.mmio_claim_hook=[this](std::uint64_t a){
       return mmio_claim(a)||(prior_mmio_claim_&&prior_mmio_claim_(a));
     };
@@ -802,6 +816,8 @@ class PcMotherboardC06 {
     pc_.cpu.set_x87_ignne(false);
     pc_.cpu.in_hook=std::move(prior_in_);
     pc_.cpu.out_hook=std::move(prior_out_);
+    pc_.cpu.pio_batch_limit_hook=std::move(prior_pio_batch_limit_);
+    pc_.cpu.pio_batch_transfer_hook=std::move(prior_pio_batch_transfer_);
     pc_.cpu.mmio_claim_hook=std::move(prior_mmio_claim_);
     pc_.cpu.mmio_range_claim_hook=std::move(prior_mmio_range_claim_);
     pc_.cpu.mmio_read_hook=std::move(prior_mmio_read_);

@@ -4,6 +4,7 @@
 #include "pc_machine.hpp"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -18,6 +19,11 @@ namespace reverse_windows {
 // continues through the original PcMachine BIOS handler, unmodified.
 class BiosHardDisk {
  public:
+  struct Transfers {
+    std::uint64_t reads=0, writes=0, read_bytes=0, written_bytes=0, bulk_copies=0;
+    std::chrono::nanoseconds guest_ram{}, backend_read{}, backend_write{};
+  };
+  const Transfers& transfers() const noexcept { return transfers_; }
   BiosHardDisk(cosmic_pc::PcMachine& pc, BlockDisk& disk)
       : pc_(pc), disk_(disk), previous_(pc.cpu.interrupt_hook) {
     if (!previous_) throw std::invalid_argument("PcMachine BIOS handler is missing");
@@ -69,17 +75,28 @@ class BiosHardDisk {
         !guest_span(cpu, guest_physical, std::uint64_t(count) * 512))
       return false;
 
-    std::vector<std::uint8_t> bytes(std::size_t(count) * 512);
+    using Clock = std::chrono::steady_clock;
+    const unsigned bytes=unsigned(count)*512;
+    auto started=Clock::now();
     if (is_write) {
-      for (std::size_t i = 0; i < bytes.size(); ++i)
-        bytes[i] = cpu.read8(guest_physical + i);
-      return disk_.write(lba, count, bytes.data());
+      if (cpu.try_read_ram_block(guest_physical, buffer_.data(), bytes)) ++transfers_.bulk_copies;
+      else for (unsigned i=0; i<bytes; ++i) buffer_[i]=cpu.read8(guest_physical+i);
+      transfers_.guest_ram+=Clock::now()-started;
+      started=Clock::now();
+      const auto ok=disk_.write(lba, count, buffer_.data());
+      transfers_.backend_write+=Clock::now()-started;
+      if (ok) { ++transfers_.writes; transfers_.written_bytes+=bytes; }
+      return ok;
     }
-    if (!disk_.read(lba, count, bytes.data())) return false;
-    // The CPU's write journal preserves guest RAM if the current INT step faults.
-    // No data is invented: every byte came from the physical disk image.
-    for (std::size_t i = 0; i < bytes.size(); ++i)
-      cpu.write8(guest_physical + i, bytes[i]);
+    const auto ok=disk_.read(lba, count, buffer_.data());
+    transfers_.backend_read+=Clock::now()-started;
+    if (!ok) return false;
+    started=Clock::now();
+    if (cpu.try_write_ram_block(guest_physical, buffer_.data(), bytes)) ++transfers_.bulk_copies;
+    else for (unsigned i=0; i<bytes; ++i) cpu.write8(guest_physical+i, buffer_[i]);
+    transfers_.guest_ram+=Clock::now()-started;
+    ++transfers_.reads;
+    transfers_.read_bytes+=bytes;
     return true;
   }
 
@@ -190,5 +207,7 @@ class BiosHardDisk {
   cosmic_pc::PcMachine& pc_;
   BlockDisk& disk_;
   std::function<bool(cosmic_pc::Cpu&, std::uint8_t)> previous_;
+  std::array<std::uint8_t,kMaxTransferSectors*512> buffer_;
+  Transfers transfers_{};
 };
 }  // namespace reverse_windows
