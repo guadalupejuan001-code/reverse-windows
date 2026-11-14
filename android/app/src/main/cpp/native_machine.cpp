@@ -2,6 +2,8 @@
 
 #include <jni.h>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -10,6 +12,7 @@
 
 namespace {
 using Session = reverse_windows::AndroidBootSession;
+constexpr jint kVideoDirty = 0x100; // Kept in sync with NativeMachine.STEP_VIDEO_DIRTY.
 
 struct Instance {
     explicit Instance(std::unique_ptr<Session> machine) : machine(std::move(machine)) {}
@@ -146,8 +149,9 @@ JNIEXPORT jint JNICALL Java_com_reversewindows_android_NativeMachine_step(
         if (budget <= 0) throw std::invalid_argument("Presupuesto de ejecución inválido.");
         return session(handle, [budget](Session& machine) {
             const auto result = machine.step(static_cast<unsigned>(budget));
-            return result == Session::Step::Halted && machine.is_stopped()
+            const auto outcome = result == Session::Step::Halted && machine.is_stopped()
                 ? jint{4} : static_cast<jint>(result);
+            return outcome | (machine.video_pending() ? kVideoDirty : 0);
         });
     });
 }
@@ -203,55 +207,60 @@ JNIEXPORT jstring JNICALL Java_com_reversewindows_android_NativeMachine_diagnost
     });
 }
 
-JNIEXPORT jintArray JNICALL Java_com_reversewindows_android_NativeMachine_videoInfo(
-        JNIEnv* env, jclass, jlong handle) {
+JNIEXPORT jintArray JNICALL Java_com_reversewindows_android_NativeMachine_captureVideo(
+        JNIEnv* env, jclass, jlong handle, jbyteArray text) {
     return call<jintArray>(env, nullptr, [&] {
-        return session(handle, [env](Session& machine) {
-            const auto info = machine.video_info();
-            const jint dimensions[]{static_cast<jint>(info.width), static_cast<jint>(info.height),
-                                    info.graphics ? 1 : 0};
-            jintArray result = env->NewIntArray(3);
-            if (result) env->SetIntArrayRegion(result, 0, 3, dimensions);
-            return result;
-        });
-    });
-}
-
-JNIEXPORT jint JNICALL Java_com_reversewindows_android_NativeMachine_copyText(
-        JNIEnv* env, jclass, jlong handle, jbyteArray result) {
-    return call<jint>(env, 0, [&] {
-        std::array<std::uint8_t, 4000> bytes{};
-        if (!result || env->GetArrayLength(result) < static_cast<jsize>(bytes.size()))
+        std::array<std::uint8_t, 4000> cells{};
+        if (!text || env->GetArrayLength(text) < static_cast<jsize>(cells.size()))
             throw std::invalid_argument("Buffer VGA insuficiente.");
-        const auto count = session(handle, [&](Session& machine) {
-            return machine.copy_text(bytes.data(), bytes.size());
-        });
-        if (count) env->SetByteArrayRegion(result, 0, static_cast<jsize>(count),
-                                           reinterpret_cast<const jbyte*>(bytes.data()));
-        return static_cast<jint>(count);
-    });
-}
-
-JNIEXPORT void JNICALL Java_com_reversewindows_android_NativeMachine_copyGraphics(
-        JNIEnv* env, jclass, jlong handle, jint width, jint height, jintArray result) {
-    call(env, false, [&] {
-        if (!result || width <= 0 || height <= 0)
-            throw std::invalid_argument("Buffer VBE inválido.");
-        const auto capacity = static_cast<std::size_t>(env->GetArrayLength(result));
-        return session(handle, [&](Session& machine) {
-            jint* pixels = env->GetIntArrayElements(result, nullptr);
-            if (!pixels) throw std::bad_alloc();
+        return session(handle, [&](Session& machine) -> jintArray {
             try {
-                static_assert(sizeof(jint) == sizeof(std::uint32_t), "JNI color size");
-                machine.copy_graphics(reinterpret_cast<std::uint32_t*>(pixels), capacity,
-                                      static_cast<unsigned>(width), static_cast<unsigned>(height));
+                const auto frame = machine.capture_video(cells.data(), cells.size());
+                if (!frame.graphics && !frame.text_bytes) return nullptr;
+                const jint dimensions[]{static_cast<jint>(frame.width), static_cast<jint>(frame.height),
+                                         static_cast<jint>(xgpu::FramebufferWorkAuthority::kStripeHeight)};
+                const auto words = frame.graphics ? frame.graphics->size() : 0;
+                const auto header = frame.graphics ? 3 : 2;
+                if (words > std::size_t(std::numeric_limits<jsize>::max()) - header)
+                    throw std::length_error("Actualización de video demasiado grande.");
+                auto result = env->NewIntArray(static_cast<jsize>(words + header));
+                if (!result) {
+                    machine.retry_video();
+                    return nullptr;
+                }
+                if (frame.graphics) {
+                    auto* out = env->GetPrimitiveArrayCritical(result, nullptr);
+                    if (!out) {
+                        machine.retry_video();
+                        return nullptr;
+                    }
+                    static_assert(sizeof(jint) == sizeof(std::uint32_t), "JNI color size");
+                    std::memcpy(out, dimensions, sizeof(dimensions));
+                    std::memcpy(static_cast<jint*>(out) + header, frame.graphics->data(),
+                                words * sizeof(jint));
+                    env->ReleasePrimitiveArrayCritical(result, out, 0);
+                } else {
+                    env->SetIntArrayRegion(result, 0, 2, dimensions);
+                    env->SetByteArrayRegion(text, 0, static_cast<jsize>(frame.text_bytes),
+                                            reinterpret_cast<const jbyte*>(cells.data()));
+                }
+                if (env->ExceptionCheck()) {
+                    machine.retry_video();
+                    return nullptr;
+                }
+                return result;
             } catch (...) {
-                env->ReleaseIntArrayElements(result, pixels, JNI_ABORT);
+                machine.retry_video();
                 throw;
             }
-            env->ReleaseIntArrayElements(result, pixels, 0);
-            return true;
         });
+    });
+}
+
+JNIEXPORT void JNICALL Java_com_reversewindows_android_NativeMachine_retryVideo(
+        JNIEnv* env, jclass, jlong handle) {
+    call(env, false, [&] {
+        return session(handle, [](Session& machine) { machine.retry_video(); return true; });
     });
 }
 

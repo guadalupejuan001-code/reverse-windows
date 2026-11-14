@@ -14,6 +14,7 @@ final class NativeMachine {
     static final int HALTED = 2;
     static final int FAULT = 3;
     static final int STOPPED = 4;
+    static final int STEP_VIDEO_DIRTY = 0x100;
 
     static {
         System.loadLibrary("reverse_windows_android");
@@ -74,7 +75,6 @@ final class NativeMachine {
     static native boolean key(long handle, int ascii, int scanCode, boolean pressed);
     static native void flush(long handle);
     static native String diagnostic(long handle);
-    static native int[] videoInfo(long handle);
-    static native int copyText(long handle, byte[] cells);
-    static native void copyGraphics(long handle, int width, int height, int[] argb);
+    static native int[] captureVideo(long handle, byte[] text);
+    static native void retryVideo(long handle);
 }

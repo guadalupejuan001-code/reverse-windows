@@ -5,6 +5,7 @@
 #include "c06_motherboard.hpp"
 #include "boot_profile.hpp"
 #include "c09r_guest_vga_fabric.hpp"
+#include "guest_vbe_fabric.hpp"
 #include "qssd_disk.hpp"
 #include "storage_profile.hpp"
 #include <algorithm>
@@ -32,6 +33,12 @@ class AndroidBootSession final {
     std::size_t physical_bytes;
     std::size_t backing_bytes;
   };
+  struct VideoUpdate {
+    unsigned width = 0, height = 0;
+    std::size_t text_bytes = 0;
+    const std::vector<std::uint32_t>* graphics = nullptr;
+  };
+  static constexpr unsigned kMaxVideoWidth = 960, kMaxVideoHeight = 720;
   static constexpr RamProfile kDefaultRamProfile{2048ULL * 1024 * 1024, 256ULL * 1024 * 1024};
   static constexpr std::uint64_t kMaxResidentBytes = 1024ULL * 1024 * 1024;
   static constexpr std::uint64_t kMinResidentBytes = 16ULL * 1024 * 1024;
@@ -90,7 +97,7 @@ class AndroidBootSession final {
                      BootSource source, int iso_fd=-1, std::uint64_t iso_bytes=0,
                      RamProfile profile=kDefaultRamProfile,
                      const std::filesystem::path& ram_cache={})
-      : source_(source), pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_) {
+      : source_(source), pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_), vbe_(pc_) {
     if (disk.empty() && (create_gib || source != BootSource::SelfTest))
       throw std::invalid_argument("Selecciona o crea un disco QSSD para iniciar.");
     spill_ = configure_spill(pc_, ram_cache);
@@ -312,16 +319,17 @@ class AndroidBootSession final {
   }
 
   cosmic_pc::PcVideoInfo video_info() const noexcept { return pc_.video_info(); }
+  bool video_pending() const noexcept { return pc_.cpu.memory.write_watch()->pending(); }
 
   std::size_t copy_text(std::uint8_t* target, std::size_t capacity) {
     if (!target || capacity < presented_text_.size())
       throw std::invalid_argument("Buffer VGA insuficiente.");
-    if (pc_.video_info().graphics) {
-      text_visible_ = false;
-      return 0;
-    }
+    if (pc_.video_info().graphics) return 0;
+    const auto& watch = *pc_.cpu.memory.write_watch();
+    if (text_visible_ && !watch.pending()) return 0;
+    const bool new_mode = watch.full();
     const auto frame = vga_.capture();
-    const bool refresh = !text_visible_ || frame.changed_cells;
+    const bool refresh = !text_visible_ || new_mode || frame.changed_cells;
     if (frame.full_snapshot) {
       presented_text_ = frame.complete;
     } else {
@@ -333,29 +341,37 @@ class AndroidBootSession final {
     vga_serial_ = frame.qssd_serial;
     vga_transfer_bytes_ = frame.transferred_bytes;
     text_visible_ = true;
+    vbe_.require_full();
+    pc_.cpu.memory.acknowledge_write_watch();
     if (!refresh) return 0;
     std::memcpy(target, presented_text_.data(), presented_text_.size());
     return presented_text_.size();
   }
 
-  void copy_graphics(std::uint32_t* target, std::size_t capacity,
-                     unsigned width, unsigned height) {
+  VideoUpdate capture_video(std::uint8_t* text, std::size_t capacity) {
     const auto info = pc_.video_info();
-    if (!info.graphics || !target || !width || !height ||
-        width > info.width || height > info.height || width > capacity / height)
-      throw std::invalid_argument("Tamaño de presentación VBE inválido.");
+    if (!info.graphics)
+      return {info.width, info.height, copy_text(text, capacity), nullptr};
     text_visible_ = false;
-    video_row_.resize(std::size_t(info.width) * 4);
-    for (unsigned y = 0; y < height; ++y) {
-      const auto source_y = y * info.height / height;
-      pc_.copy_video_rgba(0, source_y, info.width, 1, video_row_.data(), video_row_.size());
-      for (unsigned x = 0; x < width; ++x) {
-        const auto i = std::size_t(x * info.width / width) * 4;
-        target[std::size_t(y) * width + x] = 0xff000000U |
-            (std::uint32_t(video_row_[i]) << 16U) |
-            (std::uint32_t(video_row_[i + 1]) << 8U) | video_row_[i + 2];
+    auto width = info.width;
+    auto height = info.height;
+    if (width > kMaxVideoWidth || height > kMaxVideoHeight) {
+      if (std::uint64_t(width) * kMaxVideoHeight >= std::uint64_t(height) * kMaxVideoWidth) {
+        height = std::max(1U, height * kMaxVideoWidth / width);
+        width = kMaxVideoWidth;
+      } else {
+        width = std::max(1U, width * kMaxVideoHeight / height);
+        height = kMaxVideoHeight;
       }
     }
+    const auto& packet = vbe_.capture(width, height);
+    return {width, height, 0, packet.empty() ? nullptr : &packet};
+  }
+
+  void retry_video() noexcept {
+    text_visible_ = false;
+    vbe_.require_full();
+    pc_.cpu.memory.invalidate_write_watch();
   }
 
   std::string diagnostic() const {
@@ -463,7 +479,9 @@ class AndroidBootSession final {
         << ",\"lapic_timer_count\":" << interrupts.timer_count
         << "},\"vga\":{\"qssd_graphics_serial\":"
         << vga_serial_ << ",\"planned_update_bytes\":" << vga_transfer_bytes_
-        << "},\"machine\":" << pc_.json() << '}';
+        << "},\"vbe\":";
+    vbe_.write_json(out);
+    out << ",\"machine\":" << pc_.json() << '}';
     return out.str();
   }
 
@@ -705,8 +723,8 @@ class AndroidBootSession final {
   std::unique_ptr<BiosHardDisk> bios_disk_;
   std::unique_ptr<PcMotherboardC06> board_;
   GuestVgaFabricC09R vga_;
+  GuestVbeFabric vbe_;
   std::array<std::uint8_t, 4000> presented_text_{};
-  std::vector<std::uint8_t> video_row_;
   bool text_visible_ = false;
   std::uint64_t vga_serial_ = 0;
   std::uint64_t vga_transfer_bytes_ = 0;

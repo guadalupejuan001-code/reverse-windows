@@ -40,7 +40,13 @@ final class GuestMonitor extends View {
     private final byte[] cells = new byte[4000];
     private final char[] row = new char[80];
     private boolean hasText;
-    private Bitmap bitmap;
+    // Each strip keeps its own Bitmap generation. Canvas can reuse the
+    // textures of strips which received no pixels in this guest update.
+    private Bitmap[] videoStripes;
+    private int videoWidth;
+    private int videoHeight;
+    private int videoStripeHeight;
+    private final RectF stripeFrame = new RectF();
 
     GuestMonitor(Context context, Input input) {
         super(context);
@@ -54,13 +60,37 @@ final class GuestMonitor extends View {
         if (update.text != null) {
             System.arraycopy(update.text, 0, cells, 0, cells.length);
             hasText = true;
-            discardBitmap();
+            discardVideo();
         } else {
-            if (bitmap == null || bitmap.getWidth() != update.width || bitmap.getHeight() != update.height) {
-                discardBitmap();
-                bitmap = Bitmap.createBitmap(update.width, update.height, Bitmap.Config.ARGB_8888);
+            int[] video = update.video; // width, height, stripe height, count, then rectangles
+            if (videoStripes == null || videoWidth != update.width || videoHeight != update.height ||
+                    videoStripeHeight != video[2]) {
+                videoWidth = update.width;
+                videoHeight = update.height;
+                videoStripeHeight = video[2];
+                videoStripes = new Bitmap[(videoHeight + videoStripeHeight - 1) / videoStripeHeight];
             }
-            bitmap.setPixels(update.pixels, 0, update.width, 0, 0, update.width, update.height);
+            int offset = 4;
+            for (int i = 0; i < video[3]; ++i) {
+                int x = video[offset++];
+                int y = video[offset++];
+                int width = video[offset++];
+                int height = video[offset++];
+                int end = y + height;
+                while (y < end) {
+                    int stripe = y / videoStripeHeight;
+                    int top = stripe * videoStripeHeight;
+                    int stripeHeight = Math.min(videoStripeHeight, videoHeight - top);
+                    int rows = Math.min(end - y, top + stripeHeight - y);
+                    if (videoStripes[stripe] == null) {
+                        videoStripes[stripe] = Bitmap.createBitmap(
+                                videoWidth, stripeHeight, Bitmap.Config.ARGB_8888);
+                    }
+                    videoStripes[stripe].setPixels(video, offset, width, x, y - top, width, rows);
+                    offset += width * rows;
+                    y += rows;
+                }
+            }
             hasText = false;
         }
         invalidate();
@@ -68,13 +98,13 @@ final class GuestMonitor extends View {
 
     void reset() {
         hasText = false;
-        discardBitmap();
+        discardVideo();
         Arrays.fill(cells, (byte) 0);
         invalidate();
     }
 
-    private void discardBitmap() {
-        bitmap = null;
+    private void discardVideo() {
+        videoStripes = null;
     }
 
     @Override
@@ -83,10 +113,23 @@ final class GuestMonitor extends View {
         canvas.drawColor(0xff080b10);
         if (hasText) {
             drawTextMode(canvas);
-        } else if (bitmap != null) {
-            fit(bitmap.getWidth(), bitmap.getHeight());
+        } else if (videoStripes != null) {
+            fit(videoWidth, videoHeight);
+            canvas.save();
+            canvas.clipRect(frame);
+            canvas.translate(frame.left, frame.top);
+            canvas.scale(frame.width() / videoWidth, frame.height() / videoHeight);
             paint.setFilterBitmap(false);
-            canvas.drawBitmap(bitmap, null, frame, paint);
+            paint.setAntiAlias(false);
+            for (int i = 0; i < videoStripes.length; ++i) {
+                Bitmap stripe = videoStripes[i];
+                if (stripe == null) continue;
+                int top = i * videoStripeHeight;
+                stripeFrame.set(0, top, videoWidth, top + stripe.getHeight());
+                canvas.drawBitmap(stripe, null, stripeFrame, paint);
+            }
+            paint.setAntiAlias(true);
+            canvas.restore();
         } else {
             paint.setColor(0xff81909f);
             paint.setTextAlign(Paint.Align.CENTER);

@@ -6,12 +6,13 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "d3c00aceca27fe17fa2a91e2c433ee56dc353826",
+      "commit": "cdfa3b01bb2ee9b0aa7feb17d3eeaa0b77813bb0",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
-      "status": "candidate-prime-c06-qssd-io",
+      "status": "candidate-prime-c07-visible-video-writes",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
+        "pc-android/native/pc_video.hpp",
         "pc-android/native/pc_bios_keyboard.hpp",
         "pc-android/native/tests/pc_bios_keyboard_test.cpp",
         "pc-android/native/vga_bios_font.hpp",
@@ -84,12 +85,13 @@
     {
       "key": "gpu_virtual",
       "repository": "guadalupejuan001-code/GPU-VIRTUAL",
-      "commit": "dd89b4c2ba8cb7908bb8f0bb9eb8f20b75ead7d9",
+      "commit": "44ce659a17985862e1fedb79cf2db69e25bf0296",
       "checkout": "deps/GPU-VIRTUAL",
-      "role": "C12-plus-physical-work-authority-PR8",
-      "status": "candidate-unmerged-PR8",
+      "role": "C12.1-physical-and-framebuffer-work-authority",
+      "status": "candidate-prime-c07-gpu-virtual",
       "required_paths": [
         "include/ejecucion_gpu.hpp",
+        "VERSION",
         "include/trabajo_fisico.hpp",
         "tests/physical_work_authority.cpp"
       ]
