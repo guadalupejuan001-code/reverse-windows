@@ -292,6 +292,15 @@ jobs:
           assert 'REVERSE_WINDOWS_C09R_READINESS_PASS' in lines[-1]
           print('C09R_USER_TECH_REAL_HARDWARE_AUDIT_PASS windows_ran=false')
           PY
+      - name: Measure dense VRAM transfers from the x64 guest
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O3 -DNDEBUG -frounding-math -pthread \
+            -I src -I deps/mundo-X/pc-android/native -I deps/mundo-X/native/include \
+            -I deps/GPU-VIRTUAL/include -I deps/Virtual-qSSD-/include \
+            tests/gpu_vram_transfer_test.cpp -o build/gpu-vram-transfer-release
+          ./build/gpu-vram-transfer-release | tee build/prime-gpu-vram-transfer.log
+          grep -q 'PRIME_GPU_C02_VRAM_PASS logical_bytes=120000000000 last_byte=119999999999' build/prime-gpu-vram-transfer.log
       - name: Measure exact GPU Virtual calculation on the host CPU
         shell: bash
         run: |

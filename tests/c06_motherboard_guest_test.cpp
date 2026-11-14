@@ -733,7 +733,7 @@ void gpu_pci_guest(bool long_mode){
   config_write(0x10,relocated|0xfU);
   config_read(0x10,7);
   snapshot(relocated+Gpu::kAbi,8); // BAR programmed, PCI decode still off.
-  // A word write to the command register may enable memory decode only.
+  // A word write enables memory decode and bus mastering.
   select(0x04);
   emit(guest,{0x66,0xb8,7,0,0x66,0xef});
   config_read(0x04,9);
@@ -741,28 +741,45 @@ void gpu_pci_guest(bool long_mode){
   snapshot(relocated+Gpu::kAbi,11);
   snapshot(relocated+Gpu::kCapabilities,12);
   snapshot(relocated+Gpu::kStatus,13);
-  write(relocated+Gpu::kData,0x11223344U);
-  write(relocated+Gpu::kData+4,0xa1b2c3d4U);
-  write(relocated+Gpu::kSource,1);
-  write(relocated+Gpu::kDestination,9);
+  constexpr unsigned from=0x110000, into=0x120000;
+  constexpr auto capacity=reverse_windows::GpuVram::kBytes;
+  constexpr auto last=capacity-4;
+  write(from,0x11223344U);
+  write(from+4,0xa1b2c3d4U);
+  write(relocated+Gpu::kSource,from+1);
+  write(relocated+Gpu::kDestination,UINT32_MAX-3);
   write(relocated+Gpu::kCountLow,6);
-  write(relocated+Gpu::kDoorbell,Gpu::Copy);
+  write(relocated+Gpu::kDoorbell,Gpu::Upload);
   snapshot(relocated+Gpu::kStatus,14);
   snapshot(relocated+Gpu::kResultLow,15);
-  snapshot(relocated+Gpu::kData+8,16);
-  snapshot(relocated+Gpu::kData+12,17);
-  write(relocated+Gpu::kSource,9);
-  write(relocated+Gpu::kDestination,10);
+  write(relocated+Gpu::kSource,UINT32_MAX-3);
+  write(relocated+Gpu::kDestination,into+1);
+  write(relocated+Gpu::kDoorbell,Gpu::Download);
+  snapshot(into,16);
+  snapshot(into+4,17);
+  write(relocated+Gpu::kDestination,UINT32_MAX-2);
   write(relocated+Gpu::kCountLow,5);
   write(relocated+Gpu::kDoorbell,Gpu::Copy);
-  snapshot(relocated+Gpu::kData+8,18);
-  snapshot(relocated+Gpu::kData+12,19);
-  write(relocated+Gpu::kSource,Gpu::kDataBytes-1);
-  write(relocated+Gpu::kDoorbell,Gpu::Copy);
+  write(relocated+Gpu::kDestination,into+1);
+  write(relocated+Gpu::kCountLow,6);
+  write(relocated+Gpu::kDoorbell,Gpu::Download);
+  snapshot(into,18);
+  snapshot(into+4,19);
+  write(relocated+Gpu::kSource,from);
+  write(relocated+Gpu::kDestination,std::uint32_t(last));
+  write(relocated+Gpu::kDestinationHigh,std::uint32_t(last>>32));
+  write(relocated+Gpu::kDoorbell,Gpu::Upload);
   snapshot(relocated+Gpu::kStatus,20);
   snapshot(relocated+Gpu::kResultLow,21);
-  snapshot(relocated+Gpu::kData+8,22);
-  snapshot(relocated+Gpu::kData+12,23);
+  write(relocated+Gpu::kCountLow,4);
+  write(relocated+Gpu::kDoorbell,Gpu::Upload);
+  snapshot(relocated+Gpu::kStatus,22);
+  write(relocated+Gpu::kSource,std::uint32_t(last));
+  write(relocated+Gpu::kSourceHigh,std::uint32_t(last>>32));
+  write(relocated+Gpu::kDestination,into+8);
+  write(relocated+Gpu::kDestinationHigh,0);
+  write(relocated+Gpu::kDoorbell,Gpu::Download);
+  snapshot(into+8,23);
   write(relocated+Gpu::kCountLow,0);
   write(relocated+Gpu::kCountHigh,1);
   write(relocated+Gpu::kDoorbell,Gpu::SumIndices);
@@ -777,10 +794,19 @@ void gpu_pci_guest(bool long_mode){
   write(relocated+Gpu::kDoorbell,0xffU);
   snapshot(relocated+Gpu::kStatus,30);
   config_write(0x04,0);
-  write(relocated+Gpu::kData,0);
   snapshot(relocated+Gpu::kAbi,31);
   config_write(0x04,2);
-  snapshot(relocated+Gpu::kData,32);
+  write(relocated+Gpu::kCountLow,4);
+  write(relocated+Gpu::kCountHigh,0);
+  write(relocated+Gpu::kDoorbell,Gpu::Download);
+  snapshot(relocated+Gpu::kStatus,32);
+  write(relocated+Gpu::kDestination,AcpiC06::dsdt_address);
+  config_write(0x04,6);
+  write(relocated+Gpu::kDoorbell,Gpu::Download);
+  snapshot(relocated+Gpu::kStatus,37);
+  snapshot(AcpiC06::dsdt_address,38);
+  snapshot(relocated+Gpu::kVramLow,35);
+  snapshot(relocated+Gpu::kVramHigh,36);
   config_write(0x10,0x110000U); // Cannot shadow ordinary guest RAM.
   write(0x110000U,0x89abcdefU);
   snapshot(0x110000U,33);
@@ -788,35 +814,44 @@ void gpu_pci_guest(bool long_mode){
   emit(guest,{0xf4});
   code(cpu,entry,guest);
   cpu.eip=entry;
-  run(pc,400);
+  run(pc,600);
   const auto value=[&](unsigned index){return cpu.read32(output+4*index);};
   need(cpu.halted && value(0)==0xc101fffeU && value(1)==0x03800001U &&
        value(2)==UINT32_MAX && value(3)==0,"guest did not discover the expected PCI display function");
   need(value(4)==base && value(5)==0xfffff000U && value(6)==0 && value(7)==relocated &&
-       value(8)==UINT32_MAX && value(9)==2 && value(10)==UINT32_MAX &&
-       value(11)==1 && value(12)==3 && value(13)==Gpu::Idle,
+       value(8)==UINT32_MAX && value(9)==6 && value(10)==UINT32_MAX &&
+       value(11)==2 && value(12)==0xf && value(13)==Gpu::Idle,
        "PCI BAR probing, relocation or memory decode failed");
   need(value(14)==Gpu::Done && value(15)==6 && value(16)==0x11223300U &&
        value(17)==0x00b2c3d4U && value(18)==0x22333300U && value(19)==0x00c3d411U,
-       "guest byte copy or overlapping copy lost data");
-  need(value(20)==Gpu::InvalidRange && value(21)==0 && value(22)==value(18) &&
-       value(23)==value(19),"invalid copy modified the data aperture or retained a stale result");
+       "transfer or overlapping VRAM copy lost data across the 4 GiB boundary");
+  need(value(20)==Gpu::InvalidRange && value(21)==0 &&
+       value(22)==Gpu::Done && value(23)==0x11223344U &&
+       ((std::uint64_t(value(36))<<32)|value(35))==120'000'000'000ULL,
+       "capacity registers or last VRAM bytes incorrect");
   const auto sum=(std::uint64_t{value(26)}<<32)|value(25);
   need(value(24)==Gpu::Done && sum==9'223'372'034'707'292'160ULL &&
        value(27)==Gpu::InvalidRange && value(28)==0 && value(29)==0 &&
        value(30)==Gpu::UnknownCommand,"guest GPU Virtual reduction or command errors are wrong");
-  need(value(31)==UINT32_MAX && value(32)==0x11223344U &&
-       value(33)==0x89abcdefU && value(34)==UINT32_MAX,
-       "disabled or out-of-window decode changed device or RAM");
+  need(value(31)==UINT32_MAX && value(32)==Gpu::Unavailable &&
+       value(33)==0x89abcdefU && value(34)==UINT32_MAX &&
+       value(37)==Gpu::InvalidRange && value(38)==0x54445344U,
+       "PCI decode, DMA permission or firmware isolation failed");
 
   boot(); // Reboot the same machine with this board still attached.
   guest={0xfa};
   config_read(0x10,0);
   config_read(0x04,1);
-  config_write(0x04,2);
-  snapshot(base+Gpu::kData,2);
+  config_write(0x04,6);
   snapshot(base+Gpu::kStatus,3);
   snapshot(base+Gpu::kResultLow,4);
+  write(into,0xffffffffU);
+  write(base+Gpu::kSource,std::uint32_t(last));
+  write(base+Gpu::kSourceHigh,std::uint32_t(last>>32));
+  write(base+Gpu::kDestination,into);
+  write(base+Gpu::kCountLow,4);
+  write(base+Gpu::kDoorbell,Gpu::Download);
+  snapshot(into,2);
   emit(guest,{0xf4});
   code(cpu,entry,guest);
   cpu.eip=entry;

@@ -36,6 +36,8 @@ class QssdDisk final : public BlockDisk {
   enum class Access { ReadWrite, ReadOnly };
   static constexpr std::uint64_t kSectorSize = 512, kBlockSize = 4096;
   static constexpr std::uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
+  static constexpr std::size_t kMaxTransactionBlocks = 128;
+  static constexpr std::size_t kMaxTransactionBytes = kMaxTransactionBlocks * kBlockSize;
   struct Stats {
     std::uint64_t logical_bytes, physical_bytes, commits, raw_blocks;
     std::uint64_t zero_blocks, pattern_blocks, deduplicated_blocks, qssd_serial;
@@ -590,7 +592,7 @@ class QssdDisk final : public BlockDisk {
         pending.clear();
         last_commit=record->next;
       } else {
-        if(record->block>=capacity_/kBlockSize||pending.size()>=128)
+        if(record->block>=capacity_/kBlockSize||pending.size()>=kMaxTransactionBlocks)
           throw std::runtime_error("QSSD journal record address/count invalid");
         const auto data=decode(*record,sz);
         const auto word=record->kind==Zero?0:xor_rule(data,record->kind==Pattern?record->payload.size():0);
@@ -656,7 +658,7 @@ class QssdDisk final : public BlockDisk {
                 data.begin()+(period?period:data.size()));
             position=append_to(out,position,kind,block,digest(data.data(),data.size()),0,payload);
             ++result.live_blocks;
-            if(++staged==128)finish_batch(); // replay bound: <=128 per commit
+            if(++staged==kMaxTransactionBlocks)finish_batch();
           };
           each_live(root,8,0,transfer);
           finish_batch();
@@ -712,8 +714,13 @@ class QssdDisk final : public BlockDisk {
   }
 
   static void create(const std::filesystem::path& path,std::uint64_t gib) {
-    check_path(path);
     if(gib<1||gib>16384)throw std::invalid_argument("QSSD supported logical capacity is 1 GiB .. 16 TiB");
+    create_bytes(path,gib*kGiB);
+  }
+  static void create_bytes(const std::filesystem::path& path,std::uint64_t bytes) {
+    check_path(path);
+    if(bytes<kGiB||bytes>16384*kGiB||bytes%kBlockSize)
+      throw std::invalid_argument("QSSD capacity must be block aligned and within 1 GiB .. 16 TiB");
     const auto name=path.string();
     int fd=::open(name.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
     if(fd<0)throw std::system_error(errno,std::generic_category(),"QSSD create without overwrite");
@@ -722,11 +729,12 @@ class QssdDisk final : public BlockDisk {
       std::array<std::uint8_t,kHeader> head{};
       std::memcpy(head.data(),"RQVD0001",8);
       put64(head.data()+8,1);
-      put64(head.data()+16,gib*kGiB);
+      put64(head.data()+16,bytes);
       put64(head.data()+24,kBlockSize);
       put64(head.data()+32,digest(head.data(),32));
       write_all(fd,0,head.data(),head.size());
       if(::fsync(fd)!=0)throw std::system_error(errno,std::generic_category(),"QSSD create sync");
+      fsync_parent(path);
       complete=true;
     }catch(...){::close(fd);::unlink(name.c_str());throw;}
     ::close(fd);
@@ -822,7 +830,14 @@ class QssdDisk final : public BlockDisk {
   }
 
   bool write(std::uint64_t lba,std::uint16_t count,const std::uint8_t* source) override {
-    if(access_==Access::ReadOnly||!source||!count||count>127||lba>sectors()||count>sectors()-lba)return false;
+    if(!count||count>127||lba>sectors()||count>sectors()-lba)return false;
+    return write_bytes(lba*kSectorSize,std::size_t(count)*kSectorSize,source);
+  }
+
+  bool write_bytes(std::uint64_t first,std::size_t total,const std::uint8_t* source) {
+    if(access_==Access::ReadOnly||first>capacity_||total>capacity_-first||
+       total>kMaxTransactionBytes-first%kBlockSize||(!source&&total))return false;
+    if(!total)return true;
     std::lock_guard<std::mutex> hold(writer_);
     bool appending=false;
     try{
@@ -832,7 +847,6 @@ class QssdDisk final : public BlockDisk {
       struct RawCandidate {std::uint64_t hash,offset,word_xor;std::shared_ptr<const BlockData> data;};
       std::vector<RawCandidate> new_raw;
       std::vector<std::pair<std::uint64_t,std::shared_ptr<const BlockData>>> prepared_cache;
-      const std::uint64_t first=lba*kSectorSize, total=std::uint64_t(count)*kSectorSize;
       const auto block_count=(first%kBlockSize+total+kBlockSize-1)/kBlockSize;
       std::vector<std::uint8_t> journal;
       journal.reserve(block_count*(kRecHeader+kBlockSize+kRecFooter)+kRecHeader+kRecFooter);

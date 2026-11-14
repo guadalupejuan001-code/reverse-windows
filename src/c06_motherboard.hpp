@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <ctime>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -143,7 +144,7 @@ class PcMotherboardC06 {
   unsigned pit_phase_=0;
   std::uint8_t speaker_control_=0;
   std::uint32_t pci_selector_=0;
-  GpuPciC01 gpu_{};
+  GpuPciC01 gpu_;
   std::uint8_t cmos_index_=0,rtc_b_=2;
   std::array<std::uint8_t,256> host_cfg_{},isa_cfg_{};
   std::uint16_t pm_control_=0x0001; // SCI_EN: firmware starts in ACPI mode.
@@ -206,7 +207,7 @@ class PcMotherboardC06 {
     io_redir_low_.fill(0x10000U);io_redir_high_.fill(0);
     io_remote_vector_.fill(0);
     mmio_pending_={};
-    gpu_=GpuPciC01{};
+    gpu_.reset();
     build_config(host_cfg_,0x0001,0x00);
     build_config(isa_cfg_,0x0002,0x01);
     if(ide_present()){
@@ -756,7 +757,9 @@ class PcMotherboardC06 {
 
  public:
   explicit PcMotherboardC06(cosmic_pc::PcMachine& machine, BlockDisk* disk=nullptr,
-                            AtapiCdrom::Reader optical={}, std::uint64_t optical_bytes=0):pc_(machine){
+                            AtapiCdrom::Reader optical={}, std::uint64_t optical_bytes=0,
+                            std::filesystem::path vram_path={}, std::filesystem::path vram_scratch={})
+      :pc_(machine),gpu_(machine.cpu,std::move(vram_path),std::move(vram_scratch)){
     if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_isa_irq(14);});
     if(optical)optical_=std::make_unique<AtapiCdrom>(
         std::move(optical),optical_bytes,[this](){signal_isa_irq(15);});
@@ -848,6 +851,8 @@ class PcMotherboardC06 {
   }
   PcMotherboardC06(const PcMotherboardC06&)=delete;
   PcMotherboardC06& operator=(const PcMotherboardC06&)=delete;
+  const GpuPciC01& gpu() const noexcept { return gpu_; }
+  void release_vram_cache() noexcept { gpu_.release_cache(); }
   Evidence evidence()const{
     return {ticks_,irq_delivered_,pit_irqs_,apic_irqs_,true,true,powered_off_,ata_irq_delivered_,sci_irqs_};
   }

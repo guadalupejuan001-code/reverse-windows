@@ -53,6 +53,7 @@ class AndroidBootSession final {
   }
 
   void sample_ram_pressure(std::uint64_t available, std::uint64_t threshold, bool low_memory) {
+    if (low_memory) board_->release_vram_cache();
     const auto& memory = pc_.cpu.memory;
     constexpr auto page = cosmic_pc::MemoryFabric::kPageSize;
     const auto headroom = available > threshold ? available - threshold : 0;
@@ -124,13 +125,15 @@ class AndroidBootSession final {
       bios_disk_ = std::make_unique<BiosHardDisk>(pc_, *disk_);
       initial_disk_commits_ = disk_->stats().commits;
     }
+    const auto vram_path = GpuVram::sidecar(disk);
     if (iso_) {
       board_ = std::make_unique<PcMotherboardC06>(pc_, disk_.get(),
           [reader = iso_](auto offset, auto* target, auto count) {
             return reader->read(offset, target, count);
-          }, iso_->size());
+          }, iso_->size(), vram_path, ram_cache);
     } else {
-      board_ = std::make_unique<PcMotherboardC06>(pc_, disk_.get());
+      board_ = std::make_unique<PcMotherboardC06>(pc_, disk_.get(), AtapiCdrom::Reader{},
+            0, vram_path, ram_cache);
     }
     board_->enable_ps2_keyboard();
     if (source != BootSource::SelfTest) pc_.enable_guest_restart();
@@ -463,6 +466,9 @@ class AndroidBootSession final {
         << ",\"lapic_timer_count\":" << interrupts.timer_count
         << "},\"vga\":{\"qssd_graphics_serial\":"
         << vga_serial_ << ",\"planned_update_bytes\":" << vga_transfer_bytes_
+        << "},\"gpu_vram\":{\"logical_bytes\":" << GpuVram::kBytes
+        << ",\"qssd_persistence_configured\":" << (board_->gpu().durable() ? "true" : "false")
+        << ",\"qssd_journal_bytes_mounted\":" << board_->gpu().journal_bytes()
         << "},\"machine\":" << pc_.json() << '}';
     return out.str();
   }
