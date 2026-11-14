@@ -41,16 +41,18 @@ enum RwGpuRegister {
 enum RwGpuCommand {
   RWGPU_WRITE = 1, RWGPU_READ = 2, RWGPU_DRAW = 3, RWGPU_READ_COLOR = 4,
   RWGPU_UPLOAD = 5, RWGPU_DOWNLOAD = 6, RWGPU_COPY = 7, RWGPU_SUM_INDICES = 8,
-  RWGPU_DRAW_VRAM = 9, RWGPU_READ_COLOR_RAM = 10
+  RWGPU_DRAW_VRAM = 9, RWGPU_READ_COLOR_RAM = 10, RWGPU_DRAW_RAM = 11
 };
 enum RwGpuStatus { RWGPU_IDLE = 0, RWGPU_OK = 1, RWGPU_BAD_COMMAND = 2,
                   RWGPU_INVALID = 3, RWGPU_UNAVAILABLE = 4, RWGPU_FAILED = 5 };
 enum RwGpuCaps {
   RWGPU_CAP_VRAM = 1, RWGPU_CAP_TRIANGLES = 2, RWGPU_CAP_DIRECT_VRAM = 4,
-  RWGPU_CAP_SUM_INDICES = 8, RWGPU_CAP_DRAW_VRAM = 16, RWGPU_CAP_COLOR_DMA = 32
+  RWGPU_CAP_SUM_INDICES = 8, RWGPU_CAP_DRAW_VRAM = 16, RWGPU_CAP_COLOR_DMA = 32,
+  RWGPU_CAP_DRAW_RAM = 64
 };
-// DRAW uses OFFSET as flags. DRAW_VRAM uses OFFSET as the VRAM source and AUX
-// as flags. READ_COLOR and READ_COLOR_RAM address the last tightly packed,
+// DRAW uses OFFSET as flags. DRAW_VRAM and DRAW_RAM use OFFSET as the source
+// in VRAM or guest physical RAM and AUX as flags. READ_COLOR and READ_COLOR_RAM address the last
+// tightly packed,
 // top-down BGRX8888 draw. READ_COLOR_RAM uses AUX for the physical RAM target.
 #define RWGPU_DRAW_PRESENT_VBE UINT64_C(1)
 

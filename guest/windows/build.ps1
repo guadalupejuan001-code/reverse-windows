@@ -30,6 +30,9 @@ $lib = Get-ChildItem -Path $wdk -Recurse -Filter 'ntoskrnl.lib' |
     Where-Object { $_.Directory.Name -eq 'x64' } | Select-Object -First 1
 if (!$header -or !$lib) { throw 'Pinned WDK kernel headers/libraries missing' }
 $shared = Join-Path $header.Directory.Parent.FullName 'shared'
+$sdkUm = Join-Path (Join-Path $env:WindowsSdkDir 'Include') (Join-Path $env:WindowsSDKVersion.TrimEnd('\') 'um')
+$wdkUm = Join-Path $header.Directory.Parent.FullName 'um'
+$graphicsInclude = @("/I$sdkUm", "/I$wdkUm", "/I$shared", "/I$($header.Directory.FullName)")
 $obj = Join-Path $out 'gpu_transport.obj'
 $driver = Join-Path $out 'ReversePrimeGpu.sys'
 Invoke-Checked $compiler @('/nologo','/c','/TC','/std:c17','/W4','/O2','/GS','/kernel',
@@ -44,3 +47,26 @@ Invoke-Checked $compiler @('/nologo','/std:c++17','/EHsc','/W4','/O2','/MT',
     "/Fo$(Join-Path $out 'gpu_scene.obj')","/Fe$(Join-Path $out 'prime_gpu_scene.exe')",
     $scene,'dxgi.lib','d3d11.lib','d3dcompiler.lib')
 Invoke-Checked (Join-Path $out 'prime_gpu_scene.exe') @('--reference')
+
+# The display package is separate from the working command transport.
+$miniport = Join-Path $PSScriptRoot 'prime_render_kmd.c'
+$miniportObj = Join-Path $out 'prime_render_kmd.obj'
+$miniportSys = Join-Path $out 'ReversePrimeRender.sys'
+Invoke-Checked $compiler @('/nologo','/c','/TC','/std:c17','/W4','/O2','/GS','/kernel',
+    '/D_AMD64_', '/DAMD64', '/D_WIN64', '/DNTDDI_VERSION=0x0A000000', '/D_WIN32_WINNT=0x0A00',
+    '/DDXGKDDI_INTERFACE_VERSION=DXGKDDI_INTERFACE_VERSION_WDDM1_3',
+    "/I$($header.Directory.FullName)", "/I$shared", "/Fo$miniportObj", $miniport)
+Invoke-Checked $linker @('/nologo','/driver','/subsystem:native','/machine:x64','/entry:GsDriverEntry',
+    '/nodefaultlib','/incremental:no','/dynamicbase','/nxcompat','/integritycheck',
+    "/out:$miniportSys", "/libpath:$($lib.Directory.FullName)", $miniportObj,
+    'ntoskrnl.lib','hal.lib','displib.lib','BufferOverflowFastFailK.lib')
+
+$umd = Join-Path $PSScriptRoot 'prime_render_umd.cpp'
+Invoke-Checked $compiler (@('/nologo','/std:c++17','/W4','/O2','/MT','/LD',
+    "/Fo$(Join-Path $out 'prime_render_umd.obj')","/Fe$(Join-Path $out 'ReversePrimeRenderUmd.dll')",
+    "/Fd$(Join-Path $out 'prime_render_umd.pdb')") + $graphicsInclude + @($umd))
+$probe = Join-Path $PSScriptRoot 'prime_wddm_probe.cpp'
+Invoke-Checked $compiler (@('/nologo','/std:c++17','/EHsc','/W4','/O2','/MT',
+    "/Fo$(Join-Path $out 'prime_wddm_probe.obj')","/Fe$(Join-Path $out 'prime_wddm_probe.exe')",
+    $probe, 'dxgi.lib', 'gdi32.lib') + $graphicsInclude)
+Copy-Item (Join-Path $PSScriptRoot 'ReversePrimeRender.inf') $out -Force

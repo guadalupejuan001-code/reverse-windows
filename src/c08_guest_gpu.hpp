@@ -142,8 +142,9 @@ class GuestGpuC08 {
         << ",\"vram_copies\":" << commands_[RWGPU_COPY] << ",\"index_sums\":" << commands_[RWGPU_SUM_INDICES]
         << ",\"status\":" << status_ << ",\"ticket\":" << completed_
         << ",\"writes\":" << commands_[RWGPU_WRITE] << ",\"reads\":" << commands_[RWGPU_READ]
-        << ",\"draw_requests\":" << commands_[RWGPU_DRAW] + commands_[RWGPU_DRAW_VRAM]
-        << ",\"vram_draw_requests\":" << commands_[RWGPU_DRAW_VRAM] << ",\"draws\":" << draws_
+        << ",\"draw_requests\":" << commands_[RWGPU_DRAW] + commands_[RWGPU_DRAW_VRAM] + commands_[RWGPU_DRAW_RAM]
+        << ",\"vram_draw_requests\":" << commands_[RWGPU_DRAW_VRAM]
+        << ",\"ram_draw_requests\":" << commands_[RWGPU_DRAW_RAM] << ",\"draws\":" << draws_
         << ",\"color_reads\":" << commands_[RWGPU_READ_COLOR] + commands_[RWGPU_READ_COLOR_RAM]
         << ",\"color_dma_reads\":" << commands_[RWGPU_READ_COLOR_RAM]
         << ",\"source_triangles\":" << source_triangles_ << ",\"submitted_triangles\":" << drawn_triangles_
@@ -164,7 +165,7 @@ class GuestGpuC08 {
   xgpu::GuestTriangleWork planner_;
   using RenderPlan = std::shared_ptr<const xgpu::GuestTrianglePlan>;
   qssd::GraphicsWorkMemory<RenderPlan> work_;
-  std::array<std::uint64_t, RWGPU_READ_COLOR_RAM + 1> commands_{};
+  std::array<std::uint64_t, RWGPU_DRAW_RAM + 1> commands_{};
   std::uint64_t draws_ = 0, source_triangles_ = 0, drawn_triangles_ = 0;
   std::uint64_t vertex_bytes_ = 0, presented_bytes_ = 0, host_ns_ = 0, backend_ns_ = 0;
   std::uint64_t result_ = 0, resident_download_bytes_ = 0;
@@ -202,7 +203,7 @@ class GuestGpuC08 {
       case RWGPU_REG_CAPS:
         return RWGPU_CAP_VRAM | RWGPU_CAP_DIRECT_VRAM | RWGPU_CAP_SUM_INDICES
 #ifdef REVERSE_WINDOWS_GLES_GUEST
-            | RWGPU_CAP_TRIANGLES | RWGPU_CAP_DRAW_VRAM | RWGPU_CAP_COLOR_DMA
+            | RWGPU_CAP_TRIANGLES | RWGPU_CAP_DRAW_VRAM | RWGPU_CAP_COLOR_DMA | RWGPU_CAP_DRAW_RAM
 #endif
             ;
       case RWGPU_REG_STATUS: return status_;
@@ -229,15 +230,15 @@ class GuestGpuC08 {
     if (ticket != next_ticket) { status_ = RWGPU_INVALID; return; }
     result_ = 0;
     try {
-      if (op >= RWGPU_WRITE && op <= RWGPU_READ_COLOR_RAM) ++commands_[op];
+      if (op >= RWGPU_WRITE && op <= RWGPU_DRAW_RAM) ++commands_[op];
       const auto offset = wide(params_[0], params_[1]);
       const auto auxiliary = wide(direct_params_[0], direct_params_[1]);
       const auto count = wide(params_[2], direct_params_[2]);
       switch (op) {
         case RWGPU_WRITE: case RWGPU_READ: status_ = staged_transfer(op, offset, params_[2]); break;
-        case RWGPU_DRAW: status_ = draw(offset, params_[2], std::nullopt); break;
-        case RWGPU_DRAW_VRAM:
-          status_ = count > UINT32_MAX ? unsigned(RWGPU_INVALID) : draw(auxiliary, params_[2], offset);
+        case RWGPU_DRAW: status_ = draw(op, offset, params_[2], 0); break;
+        case RWGPU_DRAW_VRAM: case RWGPU_DRAW_RAM:
+          status_ = count > UINT32_MAX ? unsigned(RWGPU_INVALID) : draw(op, auxiliary, params_[2], offset);
           break;
         case RWGPU_READ_COLOR: status_ = read_color(offset, params_[2]); break;
         case RWGPU_READ_COLOR_RAM: status_ = read_color_ram(offset, auxiliary, count); break;
@@ -358,7 +359,7 @@ class GuestGpuC08 {
 #endif
   }
 
-  unsigned draw(std::uint64_t flags, unsigned bytes, std::optional<std::uint64_t> vram_offset) {
+  unsigned draw(unsigned op, std::uint64_t flags, unsigned bytes, std::uint64_t offset) {
 #ifdef REVERSE_WINDOWS_GLES_GUEST
     static_assert(sizeof(RwGpuVertex) == sizeof(xgpu::GuestVertex) &&
                   RWGPU_MAX_VERTICES == xgpu::GuestTriangleWork::max_vertices);
@@ -367,14 +368,20 @@ class GuestGpuC08 {
     const auto width = params_[3], height = params_[4], clear = params_[5];
     const auto present = flags == RWGPU_DRAW_PRESENT_VBE;
     if (bytes % (3 * sizeof(RwGpuVertex)) ||
-        (vram_offset ? !GpuVram::valid_range(*vram_offset, bytes) : bytes > stage_.size()) ||
         bytes > RWGPU_MAX_VERTICES * sizeof(RwGpuVertex) ||
         flags > RWGPU_DRAW_PRESENT_VBE || !width || !height ||
         (present && (!display.graphics || width != display.width || height != display.height)) ||
         width > RWGPU_MAX_WIDTH || height > RWGPU_MAX_HEIGHT) return RWGPU_INVALID;
+    if (op == RWGPU_DRAW_RAM && !(pci_command_ & 4U)) return RWGPU_UNAVAILABLE;
+    if ((op == RWGPU_DRAW_RAM && !ordinary_ram(offset, bytes)) ||
+        (op == RWGPU_DRAW_VRAM && !GpuVram::valid_range(offset, bytes)) ||
+        (op == RWGPU_DRAW && bytes > stage_.size())) return RWGPU_INVALID;
     vertices_.resize(bytes / sizeof(RwGpuVertex));
-    if (vram_offset) {
-      const auto read = memory_.read(*vram_offset, reinterpret_cast<std::uint8_t*>(vertices_.data()), bytes);
+    auto* vertex_data = reinterpret_cast<std::uint8_t*>(vertices_.data());
+    if (op == RWGPU_DRAW_RAM) {
+      pc_.cpu.memory.read_block(offset, vertex_data, bytes);
+    } else if (op == RWGPU_DRAW_VRAM) {
+      const auto read = memory_.read(offset, vertex_data, bytes);
       if (read != GpuVram::Result::Complete) return result_status(read);
     } else if (bytes) {
       std::memcpy(vertices_.data(), stage_.data(), bytes);
@@ -399,7 +406,7 @@ class GuestGpuC08 {
         std::chrono::steady_clock::now() - start).count();
     return RWGPU_OK;
 #else
-    (void)flags; (void)bytes; (void)vram_offset;
+    (void)op; (void)flags; (void)bytes; (void)offset;
     return RWGPU_UNAVAILABLE;
 #endif
   }

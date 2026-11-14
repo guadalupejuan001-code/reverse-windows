@@ -2,6 +2,7 @@
 #include <devioctl.h>
 #include <wdmsec.h>
 #include "gpu_transport.h"
+#include "gpu_pci_registers.h"
 
 typedef struct RwGpuDevice {
     PDEVICE_OBJECT lower;
@@ -60,11 +61,11 @@ static NTSTATUS forward_locked(RwGpuDevice* state, PIRP irp) {
 }
 
 static ULONG reg_read(RwGpuDevice* state, ULONG offset) {
-    return READ_REGISTER_ULONG((volatile ULONG*)(state->bar + offset));
+    return rwgpu_read(state->bar, offset);
 }
 
 static VOID reg_write(RwGpuDevice* state, ULONG offset, ULONG value) {
-    WRITE_REGISTER_ULONG((volatile ULONG*)(state->bar + offset), value);
+    rwgpu_write(state->bar, offset, value);
 }
 
 static VOID lock_device(RwGpuDevice* state) {
@@ -183,29 +184,12 @@ static NTSTATUS dispatch_pnp(PDEVICE_OBJECT dev, PIRP irp) {
     return forward_locked(state, irp);
 }
 
-static VOID write_wide(RwGpuDevice* state, ULONG reg, uint64_t value) {
-    reg_write(state, reg, (ULONG)value);
-    reg_write(state, reg + sizeof(ULONG), (ULONG)(value >> 32));
-}
-
 static uint64_t read_wide(RwGpuDevice* state, ULONG reg) {
-    const ULONG low = reg_read(state, reg), high = reg_read(state, reg + sizeof(ULONG));
-    return ((uint64_t)high << 32) | low;
+    return rwgpu_read_wide(state->bar, reg);
 }
 
 static NTSTATUS transfer(RwGpuDevice* state, ULONG op, uint64_t offset, uint64_t aux, ULONG count) {
-    ULONG ticket = reg_read(state, RWGPU_REG_COMPLETED) + 1;
-    if (!ticket) ticket = 1;
-    write_wide(state, RWGPU_REG_OFFSET_LO, offset);
-    write_wide(state, RWGPU_REG_AUX_LO, aux);
-    reg_write(state, RWGPU_REG_LENGTH, count);
-    reg_write(state, RWGPU_REG_LENGTH_HI, 0);
-    reg_write(state, RWGPU_REG_TICKET, ticket);
-    reg_write(state, RWGPU_REG_DOORBELL, op);
-    if (reg_read(state, RWGPU_REG_COMPLETED) != ticket) return STATUS_DEVICE_DATA_ERROR;
-    const ULONG status = reg_read(state, RWGPU_REG_STATUS);
-    if (status == RWGPU_OK) return STATUS_SUCCESS;
-    return status == RWGPU_UNAVAILABLE ? STATUS_DEVICE_NOT_READY : STATUS_DEVICE_DATA_ERROR;
+    return rwgpu_submit(state->bar, op, offset, aux, count);
 }
 
 static VOID set_scene(RwGpuDevice* state, const RwGpuDrawRequest* cmd) {

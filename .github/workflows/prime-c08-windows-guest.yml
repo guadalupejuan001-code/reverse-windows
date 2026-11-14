@@ -2,7 +2,7 @@ name: Prime C08 Windows guest graphics transport and Direct3D reference
 
 on:
   pull_request:
-    paths: ["guest/windows/**", "src/c08_gpu_protocol.h", ".github/workflows/prime-c08-windows-guest.yml"]
+    paths: ["guest/windows/**", "src/c08_gpu_protocol.h", "src/c08_wddm_protocol.h", ".github/workflows/prime-c08-windows-guest.yml"]
   workflow_dispatch:
 
 permissions:
@@ -17,7 +17,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - name: Build x64 guest transport and execute D3D11 WARP oracle
+      - name: Build x64 guest drivers and execute D3D11 WARP oracle
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -34,6 +34,14 @@ jobs:
           if ($process.ExitCode -ne 3 -or $output -notmatch 'PRIME_C08_WDDM_ADAPTER_ABSENT') {
             throw 'WDDM acceptance must reject every host adapter on this runner'
           }
+          $log = "$dir\wddm-bridge-check.txt"
+          $process = Start-Process -FilePath "$dir\prime_wddm_probe.exe" `
+            -RedirectStandardError $log -NoNewWindow -Wait -PassThru
+          $output = Get-Content $log -Raw
+          $output
+          if ($process.ExitCode -ne 3 -or $output -notmatch 'PRIME_C08_WDDM_BRIDGE_ADAPTER_ABSENT') {
+            throw 'The PrimeVGC miniport probe must reject every host adapter on this runner'
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: prime-c08-windows-unsigned-guest
@@ -41,4 +49,8 @@ jobs:
             ${{ runner.temp }}/prime-c08-windows/ReversePrimeGpu.inf
             ${{ runner.temp }}/prime-c08-windows/ReversePrimeGpu.sys
             ${{ runner.temp }}/prime-c08-windows/prime_gpu_scene.exe
+            ${{ runner.temp }}/prime-c08-windows/ReversePrimeRender.inf
+            ${{ runner.temp }}/prime-c08-windows/ReversePrimeRender.sys
+            ${{ runner.temp }}/prime-c08-windows/ReversePrimeRenderUmd.dll
+            ${{ runner.temp }}/prime-c08-windows/prime_wddm_probe.exe
           if-no-files-found: error
