@@ -3,6 +3,7 @@
 #include "android_ram_backing.hpp"
 #include "bios_hard_disk.hpp"
 #include "c06_motherboard.hpp"
+#include "boot_profile.hpp"
 #include "c09r_guest_vga_fabric.hpp"
 #include "qssd_disk.hpp"
 #include <algorithm>
@@ -85,6 +86,7 @@ class AndroidBootSession final {
     }
     if (disk_) {
       bios_disk_ = std::make_unique<BiosHardDisk>(pc_, *disk_);
+      initial_disk_commits_ = disk_->stats().commits;
     }
     if (iso_) {
       board_ = std::make_unique<PcMotherboardC06>(pc_, disk_.get(),
@@ -98,7 +100,7 @@ class AndroidBootSession final {
     if (source != BootSource::SelfTest) pc_.enable_guest_restart();
     pc_.enable_boot_acceleration();
     pc_.cpu.enable_page_translation_cache();
-    if (source == BootSource::Iso) pc_.enable_boot_hotspots();
+    if (source != BootSource::SelfTest) start_boot_profile();
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     pc_.cpu.enable_ether_next();
 #endif
@@ -224,7 +226,11 @@ class AndroidBootSession final {
   }
 
   Step step(unsigned budget) {
-    if (!is_stopped()) pc_.run(budget);
+    if (!is_stopped()) {
+      const auto slice = boot_profile_ ? boot_profile_->budget(budget, pc_) : budget;
+      pc_.run(slice);
+      if (boot_profile_) boot_profile_->after_run(pc_, *board_);
+    }
     if (!pc_.cpu.fault && pc_.host_error.empty() &&
         pc_.guest_restart() != cosmic_pc::PcMachine::GuestRestart::None) {
       const auto steps = pc_.cpu.instructions;
@@ -331,7 +337,8 @@ class AndroidBootSession final {
       const auto stats = disk_->stats();
       out << "{\"logical_bytes\":" << stats.logical_bytes
           << ",\"physical_bytes\":" << stats.physical_bytes
-          << ",\"commits\":" << stats.commits << ",\"generation\":" << disk_->generation() << '}';
+          << ",\"commits\":" << stats.commits << ",\"initial_commits\":" << initial_disk_commits_
+          << ",\"generation\":" << disk_->generation() << '}';
     } else {
       out << "null";
     }
@@ -368,6 +375,18 @@ class AndroidBootSession final {
     if (const auto& hotspots = pc_.boot_scalar_hotspots()) {
       out << ",\"boot_scalar_hotspots\":";
       hotspots->write_json(out);
+    }
+    if (boot_profile_) {
+      out << ",\"boot_profile_phase\":" << restarts_
+          << ",\"boot_profile_session_start_steps\":" << previous_boot_steps_;
+      out << ",\"boot_profile\":";
+      boot_profile_->write_json(out, pc_, *board_);
+      out << ",\"boot_time_samples\":";
+      pc_.boot_timing()->write_json(out);
+      out << ",\"boot_code_regions\":";
+      pc_.boot_regions()->write_json(out);
+      if (previous_boot_profile_)
+        out << ",\"previous_boot_profile\":" << *previous_boot_profile_;
     }
     const auto& mode = pc_.boot_mode_progress();
     out << ",\"boot_progress\":{\"handed_off\":" << (pc_.cpu.instructions ? "true" : "false")
@@ -479,6 +498,27 @@ class AndroidBootSession final {
       throw std::runtime_error("El invitado de prueba no confirmó la capacidad ATA del QSSD.");
   }
 
+  void start_boot_profile() {
+    pc_.enable_boot_hotspots();
+    pc_.enable_boot_timing();
+    boot_profile_.emplace(BootProfile::kDefaultCheckpointSteps);
+    boot_profile_->begin(pc_, *board_);
+  }
+
+  std::string completed_boot_profile() const {
+    std::ostringstream out;
+    out << "{\"source\":\"" << source_name() << "\",\"phase\":" << restarts_
+        << ",\"session_start_steps\":" << previous_boot_steps_
+        << ",\"boot_profile\":";
+    boot_profile_->write_json(out, pc_, *board_);
+    out << ",\"boot_time_samples\":";
+    pc_.boot_timing()->write_json(out);
+    out << ",\"boot_code_regions\":";
+    pc_.boot_regions()->write_json(out);
+    out << '}';
+    return out.str();
+  }
+
   void restart_guest() {
     using Restart = cosmic_pc::PcMachine::GuestRestart;
     switch (pc_.guest_restart()) {
@@ -501,6 +541,7 @@ class AndroidBootSession final {
       else if (++rapid_restarts_>3)
         throw std::runtime_error("El medio solicitó reinicios repetidos al arrancar.");
 
+      auto completed = boot_profile_ ? std::optional<std::string>(completed_boot_profile()) : std::nullopt;
       if (next==BootSource::Disk) {
         pc_.mount([this](auto off, auto* into, auto count) {
           return disk_->read_bytes(off,into,count);
@@ -514,6 +555,10 @@ class AndroidBootSession final {
       ++restarts_;
       key_routes_.fill(KeyRoute::None);
       text_visible_=false;
+      if (boot_profile_) {
+        previous_boot_profile_ = std::move(completed);
+        boot_profile_->begin(pc_, *board_);
+      }
     } catch (const std::exception& error) { pc_.host_error=error.what(); }
   }
   class OpticalReader {
@@ -582,6 +627,8 @@ class AndroidBootSession final {
   enum class KeyRoute : std::uint8_t { None, Bios, Ps2 };
   BootSource source_;
   std::array<KeyRoute, 512> key_routes_{};
+  std::optional<BootProfile> boot_profile_;
+  std::optional<std::string> previous_boot_profile_;
   cosmic_pc::PcMachine pc_;
   SpillInfo spill_;
   std::shared_ptr<OpticalReader> iso_;
@@ -594,6 +641,7 @@ class AndroidBootSession final {
   bool text_visible_ = false;
   std::uint64_t vga_serial_ = 0;
   std::uint64_t vga_transfer_bytes_ = 0;
+  std::uint64_t initial_disk_commits_ = 0;
   std::uint64_t restarts_ = 0;
   std::uint64_t previous_boot_steps_ = 0;
   unsigned rapid_restarts_ = 0;

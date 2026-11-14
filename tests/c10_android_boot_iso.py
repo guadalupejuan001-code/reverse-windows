@@ -88,7 +88,26 @@ def real_ata_readback() -> bytes:
     return code
 
 
-def image() -> bytearray:
+def profiled_workload() -> bytes:
+    """Mixed protected32 work with deterministic arithmetic, RAM, PIO and REP."""
+    code = b"\x66\xb8\x58\x00\x8e\xd8\x8e\xc0"  # DS/ES=0058, base 20000h.
+    code += b"\xbe\x00\x30\x00\x00\xbf\x00\x40\x00\x00"  # ESI=3000, EDI=4000.
+    code += b"\xb8\x5a\x5a\x5a\x5a\xb9\x00\x04\x00\x00\xf3\xab"  # Fill one page.
+    code += b"\xbe\x00\x40\x00\x00\xbf\x00\x30\x00\x00\xb9\x00\x04\x00\x00\xf3\xa5"
+    code += b"\xbe\x00\x30\x00\x00"  # Sum the copied page's first word.
+    code += b"\xb9\x00\x00\x01\x00\x31\xc0"  # ECX=65536, EAX=0.
+    loop = b"\x03\x06\x48\x40\x85\xc0\x49\x75\xf7"  # ADD, DEC/INC, TEST, DEC, JNZ.
+    code += loop + b"\x3d\x00\x00\x5a\x5a" + expect_equal()  # 65536 * 5a5a5a5a.
+    code += b"\xb9\x00\x40\x00\x00\x66\xba\xf7\x01"  # ECX=16384; DX=ATA status.
+    code += b"\xec\x49\x75\xfc\x3c\x50" + expect_equal()  # Drive idle before IDENTIFY.
+    # The real-mode continuation restores DL from EBX. The work above uses
+    # the same guest, motherboard and boot path as the regular fixture.
+    address = 0x1400
+    code += b"\xe9" + struct.pack("<i", 0x500 - (address + len(code) + 5))
+    return code
+
+
+def image(profile: bool = False) -> bytearray:
     iso = generate()
     start = BOOT * SECTOR
     iso[start : start + 4 * SECTOR] = bytes(4 * SECTOR)
@@ -135,7 +154,7 @@ def image() -> bytearray:
     u32(iso, start + 0x20E, 0)
     u64(iso, start + 0x280 + 0x20, desc(0x20000, 0xFFFF, 0x9A) | (1 << 54))
     u64(iso, start + 0x280 + 0x50, desc(0x20800, 0xFFFF, 0x9A))
-    u64(iso, start + 0x280 + 0x58, desc(0x20000, 0xFFFF, 0x92))
+    u64(iso, start + 0x280 + 0x58, desc(0x20000, 0xFFFF, 0x92) | ((1 << 54) if profile else 0))
 
     read_tsc = bytes((
         0xB9, 1, 0, 0, 0,                 # MOV ECX,1
@@ -151,7 +170,12 @@ def image() -> bytearray:
         0x39, 0xFA,                       # CMP EDX,EDI: same upper half.
     )) + expect_equal() + b"\x29\xf0" + expect_condition(0x77)  # SUB EAX,ESI; JA.
     read_tsc += b"\x3d\x00\x10\x00\x00" + expect_condition(0x76)  # CMP EAX,4096; JBE.
-    read_tsc += b"\xe9" + struct.pack("<i", 0x500 - 0x400 - len(read_tsc) - 5)
+    next_code = 0x500
+    if profile:
+        next_code = 0x1400
+        work = profiled_workload()
+        iso[start + next_code : start + next_code + len(work)] = work
+    read_tsc += b"\xe9" + struct.pack("<i", next_code - 0x400 - len(read_tsc) - 5)
     iso[start + 0x400 : start + 0x400 + len(read_tsc)] = read_tsc
     identify = ata_identify()
     assert len(identify) < 0x200
@@ -239,7 +263,9 @@ def image() -> bytearray:
 
 if __name__ == "__main__":
     path = pathlib.Path(sys.argv[1])
-    fixture = image()
+    if sys.argv[2:] not in ([], ["--profile"]):
+        raise SystemExit("usage: c10_android_boot_iso.py PATH [--profile]")
+    fixture = image(profile=sys.argv[2:] == ["--profile"])
     try:
         with path.open("xb") as output:
             output.write(fixture)

@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/mundo-X
-          ref: b3667b21fdbe1479e6ea3f4efdd9e2e5787de877
+          ref: e4d0bd0fa8e04ec3d4e2c81d6ca13196c0af2876
           path: deps/mundo-X
           persist-credentials: false
       - name: Checkout GPU-VIRTUAL C12 plus physical work authority
@@ -72,6 +72,18 @@ jobs:
           ctest --test-dir build --output-on-failure -V \
             -R '^reverse_windows_(pc_bios_keyboard|android_bios_iso_qssd|c06_real_motherboard)$' \
             | tee build/prime-bios-keyboard.log
+      - name: Verify Prime C02 timing and checkpoint evidence
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          report = json.load(open('build/prime-c02-boot-profile.json'))
+          assert report['host_architecture'] == '${{ matrix.architecture }}'
+          assert report['matching_guest_states'] and report['matching_long_mode_state']
+          assert report['repeat_count'] == 3
+          print('Prime C02', report['host_architecture'], report['fixture_sha256'],
+                report['guest_state']['current']['steps'], report['timing'])
+          PY
       - name: Capture C03 boot and guest VGA evidence
         run: |
           set -euo pipefail
@@ -359,6 +371,7 @@ jobs:
             build/reverse-windows-x64.json
             build/reverse-windows-c06-motherboard.log
             build/prime-bios-keyboard.log
+            build/prime-c02-boot-profile.json
             build/reverse-windows-c07-ata.log
             build/reverse-windows-c08-maintenance.log
             build/reverse-windows-c08-benchmark.jsonl

@@ -1,21 +1,23 @@
 {
   "schema": "reverse-windows-dependency-lock-v1",
-  "recorded_at": "2026-11-13",
+  "recorded_at": "2026-11-14",
   "policy": "exact-commit-only-no-silent-fallback-no-automatic-merge",
   "components": [
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "b3667b21fdbe1479e6ea3f4efdd9e2e5787de877",
+      "commit": "e4d0bd0fa8e04ec3d4e2c81d6ca13196c0af2876",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
-      "status": "candidate-prime-c01-bios-keyboard",
+      "status": "candidate-prime-c02-boot-profile",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/pc_bios_keyboard.hpp",
         "pc-android/native/tests/pc_bios_keyboard_test.cpp",
         "pc-android/native/vga_bios_font.hpp",
         "pc-android/native/boot_hotspots.hpp",
+        "pc-android/native/boot_timing.hpp",
+        "pc-android/native/tests/boot_hotspots_test.cpp",
         "pc-android/native/sparse_ram.hpp",
         "pc-android/native/memory_fabric.hpp",
         "pc-android/native/x86_wide_integer.hpp",

@@ -301,6 +301,12 @@ int main(int argc, char** argv) {
       require(counter(progress, "session_steps") == counter(progress, "instructions") &&
                   counter(progress, "session_steps") > 0,
               "Before the first restart, session and CPU steps must match");
+      require(progress.find("\"boot_profile\":{") != std::string::npos &&
+                  progress.find("\"boot_time_samples\":{") != std::string::npos &&
+                  progress.find("\"boot_code_regions\":{") != std::string::npos &&
+                  counter(progress, "sampled_windows") > 0 &&
+                  counter(progress, "initial_commits") == 0,
+              "ISO profiling must report activity and the initial disk state");
       require(progress.find("\"cpu_mode\":\"real16\"") != std::string::npos,
               "Guest BIOS prompt was reached outside real mode");
       require(progress.find("\"last_mode_from\":\"protected16\",\"last_mode_to\":\"real16\"") != std::string::npos,
@@ -334,6 +340,13 @@ int main(int argc, char** argv) {
               "Guest reboot must preserve the accumulated session steps");
       require(counter(restarted, "iso_read_us") >= counter(progress, "iso_read_us"),
               "Optical read timing must cover the session across the guest reboot");
+      const auto previous = restarted.find("\"previous_boot_profile\":{\"source\":\"iso\",\"phase\":0,");
+      require(previous != std::string::npos &&
+                  counter(restarted, "boot_profile_phase") == 1 &&
+                  counter(restarted, "boot_profile_session_start_steps") ==
+                      counter(restarted, "session_steps") - counter(restarted, "instructions") &&
+                  counter(restarted.substr(previous), "sampled_windows") > 0,
+              "Reboot must retain the ISO timing and start a new QSSD profile");
       for (const auto* marker : {"\"commits\":1", "\"source\":\"qssd\"", "\"restarts\":1",
                                  "\"last_restart\":\"port92\"", "\"atapi_cdrom\":true",
                                  "\"read_sectors\":1", "\"write_sectors\":0"})
@@ -369,6 +382,14 @@ int main(int argc, char** argv) {
               "QSSD did not boot the MBR installed by the ISO guest");
       require(reboot.diagnostic().find("\"source\":\"qssd\"") != std::string::npos,
               "Reboot diagnostic did not identify QSSD");
+      const auto disk_boot = reboot.diagnostic();
+      require(counter(disk_boot, "initial_commits") == 1,
+              "Disk-only session must report the already committed sector as initial state");
+      require(counter(disk_boot, "boot_profile_phase") == 0 &&
+                  counter(disk_boot, "boot_profile_session_start_steps") == 0 &&
+                  counter(disk_boot, "sampled_windows") > 0 &&
+                  disk_boot.find("\"previous_boot_profile\"") == std::string::npos,
+              "A direct QSSD boot must be timed independently of ISO sessions");
     }
     {
       const auto wrong_disk = dir.path / "unexpected-capacity.rqvd";
