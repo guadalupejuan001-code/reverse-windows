@@ -120,6 +120,7 @@ class GuestGpuC08 {
   void write_json(std::ostream& out) const {
     out << "{\"logical_vram_bytes\":" << GraphicsMemory::logical_bytes
         << ",\"qssd_backing_bytes\":" << memory_.backing_bytes()
+        << ",\"qssd_vram_commits\":" << memory_.commits()
         << ",\"stage_bytes\":" << stage_.size()
         << ",\"status\":" << status_ << ",\"ticket\":" << completed_
         << ",\"writes\":" << commands_[RWGPU_WRITE] << ",\"reads\":" << commands_[RWGPU_READ]
@@ -177,6 +178,7 @@ class GuestGpuC08 {
       case RWGPU_REG_FORMAT: return sizeof(RwGpuVertex);
       case RWGPU_REG_MODE_WIDTH: return pc_.video_info().graphics ? pc_.video_info().width : 0;
       case RWGPU_REG_MODE_HEIGHT: return pc_.video_info().graphics ? pc_.video_info().height : 0;
+      case RWGPU_REG_VRAM_BATCH_BYTES: return RWGPU_VRAM_BATCH_BYTES;
       default:
         return reg >= RWGPU_REG_OFFSET_LO && reg < RWGPU_REG_DOORBELL ?
             params_[(reg - RWGPU_REG_OFFSET_LO) / 4] : 0;
@@ -196,8 +198,7 @@ class GuestGpuC08 {
         if (op == RWGPU_DRAW) status_ = draw(offset, params_[2], params_[3], params_[4], params_[5]);
         else if (op == RWGPU_READ_COLOR) status_ = read_color(offset, params_[2]);
         else if (!memory_.available()) status_ = RWGPU_UNAVAILABLE;
-        else if (params_[2] != GraphicsMemory::page_bytes || offset % GraphicsMemory::page_bytes ||
-                 offset > GraphicsMemory::logical_bytes - GraphicsMemory::page_bytes ||
+        else if (!GraphicsMemory::valid_transfer(offset, params_[2]) ||
                  (op == RWGPU_WRITE && stage_.empty())) status_ = RWGPU_INVALID;
         else {
           if (stage_.empty()) stage_.resize(RWGPU_STAGE_BYTES);

@@ -81,6 +81,7 @@ jobs:
           done | tee build/prime-c08-gpu.log
           grep -q '^PRIME_C08_REGRAPHICS_PASS .*"submitted_triangles":3' build/prime-c08-gpu.log
           grep -q '^PRIME_C08_PCI_VRAM_PASS logical_bytes=120000000000 last_byte=119999999999 .* exact=1' build/prime-c08-gpu.log
+          grep -q '^PRIME_C08_VRAM_BATCH_PASS bytes=7864320 .* commits=128 .* exact=1' build/prime-c08-gpu.log
       - name: Record Prime BIOS keyboard and PS/2 regressions
         shell: bash
         run: |

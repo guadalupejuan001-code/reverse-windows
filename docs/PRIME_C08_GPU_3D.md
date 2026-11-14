@@ -8,7 +8,7 @@ GPU Virtual C12.2 valida y agrupa los triángulos en orden de dibujo. Descarta l
 
 El dispositivo publica **120.000.000.000 bytes lógicos**. Se usa un volumen QSSD disperso de 112 GiB como respaldo de las páginas de 4 KiB. La prueba del adaptador escribe, recupera y vuelve a abrir la última página del intervalo. El tamaño real del respaldo, los bytes de vértices, el tiempo de preparación y lectura, el temporizador del renderizador y su identificación de hardware son observaciones distintas en `guest_gpu`. Con una GPU física, `gpu_query_ns` exige una consulta válida de `GL_EXT_disjoint_timer_query`; un resultado de Mesa por software mide solo ese backend.
 
-La ruta de aceptación nativa ejecuta un invitado x86 protegido con descubrimiento PCI, tamaño y reasignación del BAR, comandos al límite de VRAM, y dibujo con superposición, recorte y verificación de píxeles. Lee también el destino 3D con un comando de transferencia separado. Los drivers y recursos Android se compilan en ARM64. La cifra de FPS depende de una ejecución en el teléfono.
+La ruta de aceptación nativa ejecuta un invitado x86 protegido con descubrimiento PCI, tamaño y reasignación del BAR, comandos al límite de VRAM, y dibujo con superposición, recorte y verificación de píxeles. Lee también el destino 3D con un comando de transferencia separado. Cada comando de VRAM puede recibir hasta 15 páginas consecutivas en una confirmación durable. La prueba de transferencia usa 7,5 MiB de datos distintos al final del intervalo y mide escritura durable, reapertura y lectura. Los drivers y recursos Android se compilan en ARM64. La cifra de FPS depende de una ejecución en el teléfono.
 
 ## Invitado Windows
 

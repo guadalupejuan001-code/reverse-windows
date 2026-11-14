@@ -1,6 +1,7 @@
 #include "android_boot_session.hpp"
 #include "c08_guest_gpu.hpp"
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -168,6 +169,15 @@ void verify(const std::filesystem::path& volume) {
     driver.copy(output, moved_bar + RWGPU_STAGE_OFFSET, payload.size());
     driver.command(RWGPU_READ, 3, RWGPU_LOGICAL_BYTES, payload.size());
     driver.read(moved_bar + RWGPU_REG_STATUS, 0xe020);
+    const auto offset = RWGPU_LOGICAL_BYTES - 2 * RWGPU_PAGE_BYTES;
+    const auto size = 2 * RWGPU_PAGE_BYTES;
+    driver.read(moved_bar + RWGPU_REG_VRAM_BATCH_BYTES, 0xe03c);
+    driver.copy(moved_bar + RWGPU_STAGE_OFFSET, source, size);
+    driver.command(RWGPU_WRITE, 4, offset, size);
+    driver.read(moved_bar + RWGPU_REG_STATUS, 0xe040);
+    driver.command(RWGPU_READ, 5, offset, size);
+    driver.read(moved_bar + RWGPU_REG_STATUS, 0xe044);
+    driver.copy(output + size, moved_bar + RWGPU_STAGE_OFFSET, size);
     driver.run(pc);
     require(pc.cpu.read32(0xe000) == GuestGpuC08::pci_id && pc.cpu.read32(0xe004) == 0x03020001 &&
              pc.cpu.read32(0xe008) == ~(RWGPU_BAR_BYTES - 1) &&
@@ -177,6 +187,17 @@ void verify(const std::filesystem::path& volume) {
              pc.cpu.read32(0xe020) == RWGPU_INVALID, "GPU VRAM page commands did not validate");
     pc.cpu.memory.read_block(output, actual.data(), actual.size());
     require(actual == payload, "PCI read did not copy exact 120 GB boundary data");
+    pc.cpu.memory.read_block(output + size, actual.data(), actual.size());
+    require(actual == payload, "Batched PCI read lost the first page");
+    pc.cpu.memory.read_block(output + size + RWGPU_PAGE_BYTES, actual.data(), actual.size());
+    require(pc.cpu.read32(0xe03c) == RWGPU_VRAM_BATCH_BYTES && pc.cpu.read32(0xe040) == RWGPU_OK &&
+            pc.cpu.read32(0xe044) == RWGPU_OK &&
+            actual == std::array<std::uint8_t, RWGPU_PAGE_BYTES>{},
+            "Batched PCI read lost the second page or limit");
+    Guest32 restore_last;
+    restore_last.copy(moved_bar + RWGPU_STAGE_OFFSET, source, payload.size());
+    restore_last.command(RWGPU_WRITE, 6, last_page, payload.size());
+    restore_last.run(pc);
 
     // Real x86 submits near red before far green. Reversing depth semantics
     // therefore produces visibly different pixels. Blue is partly clipped.
@@ -194,12 +215,12 @@ void verify(const std::filesystem::path& volume) {
     draw.write(moved_bar + RWGPU_REG_WIDTH, width);
     draw.write(moved_bar + RWGPU_REG_HEIGHT, height);
     draw.write(moved_bar + RWGPU_REG_CLEAR_RGBA, clear);
-    draw.command(RWGPU_DRAW, 4, RWGPU_DRAW_PRESENT_VBE, sizeof(vertices));
+    draw.command(RWGPU_DRAW, 7, RWGPU_DRAW_PRESENT_VBE, sizeof(vertices));
     draw.read(moved_bar + RWGPU_REG_STATUS, 0xe024);
     draw.read(moved_bar + RWGPU_REG_COMPLETED, 0xe028);
     draw.run(pc);
 #ifdef REVERSE_WINDOWS_GLES_GUEST
-    require(pc.cpu.read32(0xe024) == RWGPU_OK && pc.cpu.read32(0xe028) == 4,
+    require(pc.cpu.read32(0xe024) == RWGPU_OK && pc.cpu.read32(0xe028) == 7,
             "REgraphics did not finish the real guest draw");
     require(rgb(pc, 320, 240) == red && rgb(pc, 320, 63) == green &&
             rgb(pc, 34, 81) == blue && rgb(pc, 639, 479) == clear,
@@ -211,7 +232,7 @@ void verify(const std::filesystem::path& volume) {
             std::string::npos && first.find("\"graphics_serial\":2") != std::string::npos,
             "GPU Virtual did not select and version the exact 3D work");
     Guest32 repeat;
-    repeat.command(RWGPU_DRAW, 5, RWGPU_DRAW_PRESENT_VBE, sizeof(vertices));
+    repeat.command(RWGPU_DRAW, 8, RWGPU_DRAW_PRESENT_VBE, sizeof(vertices));
     repeat.read(moved_bar + RWGPU_REG_STATUS, 0xe02c);
     repeat.run(pc);
     require(pc.cpu.read32(0xe02c) == RWGPU_OK && mirror.capture(width, height).empty(),
@@ -220,9 +241,9 @@ void verify(const std::filesystem::path& volume) {
     Guest32 offscreen;
     offscreen.write(moved_bar + RWGPU_REG_WIDTH, 32);
     offscreen.write(moved_bar + RWGPU_REG_HEIGHT, 32);
-    offscreen.command(RWGPU_DRAW, 6, 0, 0);
+    offscreen.command(RWGPU_DRAW, 9, 0, 0);
     offscreen.read(moved_bar + RWGPU_REG_STATUS, 0xe030);
-    offscreen.command(RWGPU_READ_COLOR, 7, (32 * 32 - 1) * 4, 4);
+    offscreen.command(RWGPU_READ_COLOR, 10, (32 * 32 - 1) * 4, 4);
     offscreen.read(moved_bar + RWGPU_REG_STATUS, 0xe034);
     offscreen.read(moved_bar + RWGPU_STAGE_OFFSET, 0xe038);
     offscreen.run(pc);
@@ -230,7 +251,7 @@ void verify(const std::filesystem::path& volume) {
             pc.cpu.read32(0xe038) == 0x000a141eU && !pc.cpu.memory.write_watch()->pending(),
             "Offscreen draw did not return exact BGRX or changed the boot display");
 #else
-    require(pc.cpu.read32(0xe024) == RWGPU_UNAVAILABLE && pc.cpu.read32(0xe028) == 4,
+    require(pc.cpu.read32(0xe024) == RWGPU_UNAVAILABLE && pc.cpu.read32(0xe028) == 7,
             "Headless build must disclose its absent renderer");
     std::cout << "PRIME_C08_RENDER_UNAVAILABLE no_egl=1\n";
 #endif
@@ -241,12 +262,48 @@ void verify(const std::filesystem::path& volume) {
   actual.fill(255);
   require(reopened.read(last_page, actual.data(), actual.size()) && actual == payload,
           "Reopening QSSD did not recover the final VRAM page");
-  require(reopened.read(last_page - RWGPU_PAGE_BYTES, actual.data(), actual.size()) &&
+  require(reopened.read(last_page - 2 * RWGPU_PAGE_BYTES, actual.data(), actual.size()) &&
             actual == std::array<std::uint8_t, RWGPU_PAGE_BYTES>{},
           "A sparse adjacent page is not zero");
   std::cout << "PRIME_C08_PCI_VRAM_PASS logical_bytes=" << RWGPU_LOGICAL_BYTES
             << " last_byte=" << RWGPU_LOGICAL_BYTES - 1 << " backing_bytes=" << reopened.backing_bytes()
             << " e820=1 acpi=1 restart=1 exact=1\n";
+}
+
+void measure_vram(const std::filesystem::path& path) {
+  constexpr unsigned batch_bytes = RWGPU_VRAM_BATCH_BYTES;
+  constexpr unsigned batches = 128;
+  constexpr auto first = RWGPU_LOGICAL_BYTES - std::uint64_t(batches) * batch_bytes;
+  constexpr std::size_t bytes = std::size_t(batches) * batch_bytes;
+  std::vector<std::uint8_t> expected(bytes), copy(bytes);
+  std::uint32_t state = 0x1431edfa;
+  for (auto& byte : expected) {
+    state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+    byte = state >> 19;
+  }
+  using Clock = std::chrono::steady_clock;
+  std::chrono::nanoseconds durable_time{};
+  std::uint64_t commits = 0;
+  {
+    reverse_windows::GraphicsMemory vram(path);
+    const auto started = Clock::now();
+    for (std::size_t i = 0; i < bytes; i += batch_bytes)
+      require(vram.write(first + i, expected.data() + i, batch_bytes), "Large QSSD VRAM batch write failed");
+    durable_time = Clock::now() - started;
+    commits = vram.commits();
+  }
+  const auto started = Clock::now();
+  reverse_windows::GraphicsMemory vram(path);
+  for (std::size_t i = 0; i < bytes; i += batch_bytes)
+    require(vram.read(first + i, copy.data() + i, batch_bytes), "Large QSSD VRAM batch read failed");
+  const auto reload = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started);
+  require(copy == expected && commits == batches &&
+          !vram.write(first + 1, expected.data(), batch_bytes) &&
+          !vram.read(RWGPU_LOGICAL_BYTES - RWGPU_PAGE_BYTES, copy.data(), batch_bytes),
+          "Batched VRAM failed durability or boundary validation");
+  std::cout << "PRIME_C08_VRAM_BATCH_PASS bytes=" << bytes << " offset=" << first
+            << " commits=" << commits << " write_ns=" << durable_time.count()
+            << " reopen_and_read_ns=" << reload.count() << " exact=1\n";
 }
 }  // namespace
 
@@ -259,6 +316,7 @@ int main() {
       ~RemoveDirectory() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
     } remove{name};
     verify(remove.path / "gpu.rqvd");
+    measure_vram(remove.path / "large-vram.rqvd");
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;

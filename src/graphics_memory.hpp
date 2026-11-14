@@ -15,26 +15,30 @@ class GraphicsMemory {
   static constexpr std::uint64_t page_bytes = QssdDisk::kBlockSize;
   static constexpr std::uint64_t backing_gib = (logical_bytes + QssdDisk::kGiB - 1) / QssdDisk::kGiB;
   static_assert(page_bytes == RWGPU_PAGE_BYTES && logical_bytes % page_bytes == 0);
+  static_assert(RWGPU_VRAM_BATCH_BYTES <= RWGPU_STAGE_BYTES &&
+                RWGPU_VRAM_BATCH_BYTES / QssdDisk::kSectorSize <= 127);
 
   explicit GraphicsMemory(std::filesystem::path path) : path_(std::move(path)) {}
   bool available() const noexcept { return !path_.empty(); }
   bool read(std::uint64_t offset, std::uint8_t* bytes, unsigned count) {
-    if (!valid(offset, count)) return false;
+    if (!valid_transfer(offset, count)) return false;
     return disk().read_bytes(offset, bytes, count);
   }
   bool write(std::uint64_t offset, const std::uint8_t* bytes, unsigned count) {
-    if (!valid(offset, count)) return false;
+    if (!valid_transfer(offset, count)) return false;
     return disk().write(offset / QssdDisk::kSectorSize, count / QssdDisk::kSectorSize, bytes);
   }
   std::uint64_t backing_bytes() const { return disk_ ? disk_->stats().physical_bytes : 0; }
+  std::uint64_t commits() const { return disk_ ? disk_->stats().commits : 0; }
+  static bool valid_transfer(std::uint64_t offset, unsigned count) noexcept {
+    return count && count <= RWGPU_VRAM_BATCH_BYTES && count % page_bytes == 0 &&
+           offset % page_bytes == 0 && offset <= logical_bytes - count;
+  }
 
  private:
   std::filesystem::path path_;
   std::unique_ptr<QssdDisk> disk_;
 
-  static bool valid(std::uint64_t offset, unsigned count) noexcept {
-    return count == page_bytes && offset % page_bytes == 0 && offset <= logical_bytes - page_bytes;
-  }
   QssdDisk& disk() {
     if (!disk_) {
       if (!std::filesystem::exists(path_)) {
