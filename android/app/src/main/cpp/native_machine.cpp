@@ -162,6 +162,28 @@ JNIEXPORT jboolean JNICALL Java_com_reversewindows_android_NativeMachine_key(
     });
 }
 
+JNIEXPORT jboolean JNICALL Java_com_reversewindows_android_NativeMachine_sampleRamPressure(
+        JNIEnv* env, jclass, jlong handle, jlong available, jlong threshold, jboolean low_memory) {
+    return call<jboolean>(env, JNI_FALSE, [&] {
+        if (available < 0 || threshold < 0)
+            throw std::invalid_argument("Android devolvió un perfil de RAM inválido.");
+        return session(handle, [=](Session& machine) -> jboolean {
+            machine.sample_ram_pressure(static_cast<std::uint64_t>(available),
+                    static_cast<std::uint64_t>(threshold), low_memory != JNI_FALSE);
+            return machine.maintain_ram_budget() ? JNI_TRUE : JNI_FALSE;
+        });
+    });
+}
+
+JNIEXPORT jboolean JNICALL Java_com_reversewindows_android_NativeMachine_maintainRamBudget(
+        JNIEnv* env, jclass, jlong handle) {
+    return call<jboolean>(env, JNI_FALSE, [&] {
+        return session(handle, [](Session& machine) -> jboolean {
+            return machine.maintain_ram_budget() ? JNI_TRUE : JNI_FALSE;
+        });
+    });
+}
+
 JNIEXPORT void JNICALL Java_com_reversewindows_android_NativeMachine_flush(
         JNIEnv* env, jclass, jlong handle) {
     call(env, false, [&] {

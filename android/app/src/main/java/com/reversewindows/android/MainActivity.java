@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.ComponentCallbacks2;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
@@ -777,6 +778,13 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     protected void onStop() {
         worker.setForeground(false);
         super.onStop();
+    }
+
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (worker != null && level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND)
+            worker.trimRam();
     }
 
     @Override

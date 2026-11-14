@@ -61,6 +61,8 @@ final class VmWorker {
     private static final long FRAME_INTERVAL_MS = 100;
     private static final long STATUS_INTERVAL_MS = 350;
     private static final long DIAGNOSTIC_INTERVAL_MS = 5_000;
+    private static final long RAM_SAMPLE_INTERVAL_MS = 2_000;
+    private static final long RAM_RECLAIM_INTERVAL_MS = 16;
     private static final String DIAGNOSTIC_FILE = "ultimo-diagnostico.json";
     private static final int MAX_FRAME_WIDTH = 960;
     private static final int MAX_FRAME_HEIGHT = 720;
@@ -99,6 +101,9 @@ final class VmWorker {
     private String lastDiagnostic = "";
     private String persistedDiagnostic = "";
     private final Runnable slice = this::runSlice;
+    private final Runnable ramMaintenance = this::maintainRam;
+    private boolean reclaimRam;
+    private long nextRamSample;
 
     VmWorker(Context context, File disk, Listener listener) {
         this.context = context.getApplicationContext();
@@ -212,6 +217,9 @@ final class VmWorker {
                 forceFrame = true;
                 running = true;
                 publishState(true);
+                reclaimRam = false;
+                nextRamSample = 0;
+                scheduleRam(RAM_SAMPLE_INTERVAL_MS);
                 schedule(0);
             } catch (IOException | RuntimeException | LinkageError error) {
                 report(error);
@@ -230,7 +238,21 @@ final class VmWorker {
                     report(error);
                 }
             }
-            if (visible) schedule(0);
+            if (visible) {
+                reclaimRam = false;
+                nextRamSample = 0;
+                scheduleRam(0);
+                schedule(0);
+            }
+        });
+    }
+
+    void trimRam() {
+        worker.post(() -> {
+            if (foreground || released || handle == 0 || isTerminal()) return;
+            reclaimRam = true;
+            nextRamSample = 0;
+            scheduleRam(0);
         });
     }
 
@@ -296,6 +318,31 @@ final class VmWorker {
             // Rejoin the ordinary queue after each slice so pending controls can run.
             if (delay == 0) worker.post(slice);
             else worker.postDelayed(slice, delay);
+        }
+    }
+
+    private void scheduleRam(long delay) {
+        worker.removeCallbacks(ramMaintenance);
+        if (!released && handle != 0 && !isTerminal())
+            worker.postDelayed(ramMaintenance, delay);
+    }
+
+    private void maintainRam() {
+        if (released || handle == 0 || isTerminal()) return;
+        try {
+            final long now = SystemClock.uptimeMillis();
+            final boolean more;
+            if (now >= nextRamSample) {
+                more = NativeMachine.refreshRamPressure(context, handle, reclaimRam);
+                nextRamSample = now + RAM_SAMPLE_INTERVAL_MS;
+            } else {
+                more = NativeMachine.maintainRamBudget(handle);
+            }
+            scheduleRam(more ? RAM_RECLAIM_INTERVAL_MS :
+                    Math.max(0, nextRamSample - SystemClock.uptimeMillis()));
+        } catch (RuntimeException | LinkageError error) {
+            Log.w(TAG, "No se pudo ajustar el respaldo de RAM", error);
+            scheduleRam(RAM_SAMPLE_INTERVAL_MS);
         }
     }
 
@@ -434,6 +481,7 @@ final class VmWorker {
 
     private void closeMachine() {
         worker.removeCallbacks(slice);
+        worker.removeCallbacks(ramMaintenance);
         running = false;
         retryFrame = false;
         if (handle == 0) return;

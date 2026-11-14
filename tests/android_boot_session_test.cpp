@@ -131,6 +131,27 @@ void verify_ram_spill(const std::filesystem::path& directory) {
     require(demo.diagnostic().find("\"spill_mode\":\"file\"") != std::string::npos &&
                 demo.diagnostic().find("\"backing_budget_bytes\":262144") != std::string::npos,
             "The actual BIOS session must attach the optional spill without inflating its resident limit");
+    constexpr auto threshold = 256 * mib;
+    Session live({}, 0, Session::BootSource::SelfTest, -1, 0, Session::kDefaultRamProfile, cache);
+    const auto boot = live.diagnostic();
+    const auto usable = counter(boot, "usable_bytes");
+    live.sample_ram_pressure(threshold + 8 * mib, threshold, true);
+    require(!live.maintain_ram_budget() &&
+                counter(live.diagnostic(), "backing_budget_bytes") == 16 * mib &&
+                counter(live.diagnostic(), "usable_bytes") == usable,
+            "Android pressure must lower the live backing budget without changing E820 RAM");
+    live.sample_ram_pressure(threshold + 2 * Session::kMaxResidentBytes, threshold, false);
+    require(!live.maintain_ram_budget() &&
+                counter(live.diagnostic(), "backing_budget_bytes") == Session::kMaxResidentBytes &&
+                counter(live.diagnostic(), "address_space_bytes") == 2048ULL * mib &&
+                counter(live.diagnostic(), "usable_bytes") == usable,
+            "Android headroom must restore the budget without switching the active guest to 4 GiB");
+    Session::Step step = Session::Step::Running;
+    for (unsigned i = 0; i < 128 && step == Session::Step::Running; ++i) step = live.step(128);
+    std::array<std::uint8_t, 4000> cells{};
+    require(step == Session::Step::WaitingKey && live.copy_text(cells.data(), cells.size()) == cells.size(),
+            "The BIOS guest must still reach its keyboard prompt after pressure adjustments");
+    std::cout << "PRIME_C04_ANDROID_PRESSURE_PASS low_mib=16 restored_mib=1024 guest_mib=2048\n";
     require(std::filesystem::is_empty(cache), "Session history must not retain temporary RAM files");
   }
   {
@@ -149,6 +170,11 @@ void verify_ram_spill(const std::filesystem::path& directory) {
     require(before.allocated_bytes <= resident && before.spilled_pages >= 12 &&
                 before.backing_writes >= 12 && file_stats->file_payload_bytes() >= 12 * page,
             "PcMachine must cross the resident limit by evicting pages to the real file");
+    using Adjustment = cosmic_pc::SparseRam::BudgetAdjustment;
+    require(pc.cpu.memory.adjust_payload_budget(resident / 2, 2) == Adjustment::Reclaiming &&
+                pc.cpu.memory.adjust_payload_budget(resident / 2, 2) == Adjustment::Applied &&
+                pc.cpu.memory.budget_bytes() == resident / 2,
+            "A populated guest must shrink in bounded batches on the real file");
     for (unsigned index = 0; index < 20; ++index) {
       require(pc.cpu.read32(address + index * page) == 0x50580000U + index &&
                   pc.cpu.read32(address + index * page + page - 4) == 0xdeadc0deU - index,

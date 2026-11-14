@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/mundo-X
-          ref: a983c8f04acdc5a51610b0a6285557b5d4708518
+          ref: 00253c80c08d71a4f316de756d5eb94872432ca7
           path: deps/mundo-X
           persist-credentials: false
       - name: Checkout GPU-VIRTUAL C12 plus physical work authority
@@ -97,6 +97,16 @@ jobs:
           else
             grep -q '^PRIME_C03_ARM64_FALLBACK_PASS ' build/prime-c03-ether-arm64.log
           fi
+      - name: Record Prime C04 RAM, address map and pressure evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir build --output-on-failure -V \
+            -R '^reverse_windows_(sparse_ram|pc_memory|pc_memory_fabric|x86_long_mode|x86_ether_rep_batch|android_bios_iso_qssd)$' \
+            | tee build/prime-c04-ram.log
+          for marker in SPARSE_WORD TRANSLATION REP_FILL ANDROID_PRESSURE; do
+            grep -q "PRIME_C04_${marker}_PASS" build/prime-c04-ram.log
+          done
       - name: Capture BIOS disk boot and guest VGA evidence
         run: |
           set -euo pipefail
@@ -379,7 +389,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: reverse-windows-c03-${{ matrix.architecture }}-evidence
+          name: reverse-windows-c04-${{ matrix.architecture }}-evidence
           path: |
             build/reverse-windows-x64.json
             build/reverse-windows-c06-motherboard.log
@@ -387,6 +397,7 @@ jobs:
             build/prime-c02-boot-profile.json
             build/prime-c03-ether-arm64.log
             build/prime-c03-ether-arm64.json
+            build/prime-c04-ram.log
             build/reverse-windows-c07-ata.log
             build/reverse-windows-c08-maintenance.log
             build/reverse-windows-c08-benchmark.jsonl

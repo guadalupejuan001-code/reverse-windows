@@ -52,6 +52,13 @@ final class NativeMachine {
                 memory != null && memory.lowMemory, ramCache(context));
     }
 
+    static boolean refreshRamPressure(Context context, long handle, boolean reclaimMemory) {
+        ActivityManager.MemoryInfo memory = memoryInfo(context);
+        if (memory == null && !reclaimMemory) return false;
+        return sampleRamPressure(handle, memory == null ? 0 : memory.availMem,
+                memory == null ? 0 : memory.threshold, reclaimMemory || memory.lowMemory);
+    }
+
     static native void createDisk(String qssdPath, int capacityGiB);
     private static native String checkHardwareWithRam(String qssdPath, int isoFd, long isoBytes,
                                                       String isoError, long available, long threshold,
@@ -61,6 +68,9 @@ final class NativeMachine {
                                            boolean lowMemory, String ramCacheDirectory);
     static native void close(long handle);
     static native int step(long handle, int instructions);
+    private static native boolean sampleRamPressure(long handle, long available, long threshold,
+                                                    boolean lowMemory);
+    static native boolean maintainRamBudget(long handle);
     static native boolean key(long handle, int ascii, int scanCode, boolean pressed);
     static native void flush(long handle);
     static native String diagnostic(long handle);

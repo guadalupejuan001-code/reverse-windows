@@ -92,7 +92,7 @@ if(BUILD_TESTING)
   add_test(NAME reverse_windows_lock_rmw COMMAND reverse_windows_lock_rmw_test)
   foreach(cpu_test IN ITEMS x86_long_mode x86_long_null_ss x86_far_transfer64 x86_system64
                             x86_ether_rep_batch x86_ether_shift_loop x86_ram_backing pc_video
-                            pc_bios_keyboard boot_hotspots)
+                            pc_bios_keyboard boot_hotspots sparse_ram pc_memory pc_memory_fabric)
     add_executable(reverse_windows_${cpu_test}_test
       "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/${cpu_test}_test.cpp")
     target_link_libraries(reverse_windows_${cpu_test}_test PRIVATE reverse_windows_component_headers)
