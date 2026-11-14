@@ -49,6 +49,11 @@ jobs:
             ${{ runner.temp }}/prime-c08-windows/ReversePrimeGpu.inf
             ${{ runner.temp }}/prime-c08-windows/ReversePrimeGpu.sys
             ${{ runner.temp }}/prime-c08-windows/prime_gpu_scene.exe
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prime-c08-wddm-development-unsigned
+          path: |
             ${{ runner.temp }}/prime-c08-windows/ReversePrimeRender.inf
             ${{ runner.temp }}/prime-c08-windows/ReversePrimeRender.sys
             ${{ runner.temp }}/prime-c08-windows/ReversePrimeRenderUmd.dll
