@@ -456,7 +456,12 @@ unsigned checksum(Cpu& cpu,std::uint32_t addr,std::uint32_t size){
 }
 void pci_acpi_cmos_guest(){
   PcMachine pc(16*1024*1024);boot32(pc);
-  PcMotherboardC06 board(pc);
+  const std::array<std::uint8_t,2048> sector{};
+  PcMotherboardC06 board(pc,nullptr,[&](auto offset,auto* into,auto bytes){
+    if(offset>sector.size()||bytes>sector.size()-offset)return false;
+    std::copy_n(sector.data()+offset,bytes,into);
+    return true;
+  },sector.size());
   // ACPI RSDP 2.0 + XSDT/RSDT/FADT/MADT/DSDT reside in E820 reserved BIOS ROM.
   std::array<std::uint8_t,8> rsdp_signature{};
   pc.cpu.memory.read_block(0xe0000,rsdp_signature.data(),rsdp_signature.size());
@@ -468,7 +473,7 @@ void pci_acpi_cmos_guest(){
   const auto dsdt_size=pc.cpu.read32(AcpiC06::dsdt_address+4);
   const std::array<std::pair<std::uint32_t,unsigned>,5> tables{{
     {AcpiC06::rsdt_address,44U},{AcpiC06::xsdt_address,52U},
-    {AcpiC06::fadt_address,244U},{AcpiC06::madt_address,64U},
+    {AcpiC06::fadt_address,244U},{AcpiC06::madt_address,AcpiC06::madt_bytes},
     {AcpiC06::dsdt_address,dsdt_size}
   }};
   for(const auto& entry:tables)
@@ -541,13 +546,15 @@ void pci_acpi_cmos_guest(){
           0xa3,0x04,0x90,0,0,
           0xb0,0x0b,0xe6,0x70,0xe4,0x71, // CMOS status B
           0xa2,0x08,0x90,0,0,
-          0xa1,0,0,0x0e,0,        // guest reads "RSD " at E0000
+          0xa1,0,0,0x0e,0,       // guest reads "RSD " at E0000
           0xa3,0x0c,0x90,0,0,
-          0x66,0xba,0x04,0x06,    // MOV DX, 604 ACPI PM1a CNT
+          0x8b,0x1d,0x10,0,0x0e,0, // RSDP -> RSDT address.
+          0x8b,0x5b,0x24,        // RSDT[0] -> FADT address.
+          0x8b,0x53,0x40,        // FADT.pm1a_cnt_blk -> DX.
           0x66,0xed,0x66,0xa3,0x10,0x90,0,0, // SCI_EN after firmware init
           0x66,0xb8,0x00,0x34,    // MOV AX, 3400 (S5 + SLP_EN)
           0x66,0xef,             // OUT DX, AX
-          0x66,0xed,0x66,0xa3,0x12,0x90,0,0, // SCI_EN stays set, SLP_EN is write-only
+          0x66,0xed,0x66,0xa3,0x12,0x90,0,0, // Must not execute after S5.
           0xf4});
   code(pc.cpu,0xa000,p);pc.cpu.eip=0xa000;pc.cpu.halted=false;
   pc.cpu.regs[Cpu::ESP]=0x190000;
@@ -560,10 +567,12 @@ void pci_acpi_cmos_guest(){
   need(pc.cpu.memory[0x9008]==2,"guest CMOS status B does not indicate BCD 24-hour");
   need(pc.cpu.read32(0x900c)==0x20445352U,
        "guest did not discover ACPI RSDP signature via real MOV");
-  need(pc.cpu.read16(0x9010)==1 && pc.cpu.read16(0x9012)==0x1401,
-       "guest ACPI PM1a control did not preserve SCI_EN and SLP_TYP");
-  need(board.evidence().powered_off,
-       "guest ACPI PM1a S5 request not recognized");
+  need(pc.cpu.read16(0x9010)==1&&pc.cpu.read16(0x9012)==0&&pc.status()=="powered_off"&&
+       pc.cpu.in_hook(AcpiC06::pm_control_port,2)==0x1401&&board.evidence().powered_off,
+       "S5 must latch SLP_TYP and stop the guest before the next instruction");
+  const auto off_ticks=board.evidence().ticks;
+  run(pc,100);
+  need(board.evidence().ticks==off_ticks,"Powered-off board must be quiescent");
   pc.cpu.write32(facs+16,2);
   need(pc.cpu.read32(facs+16)==2,"FACS Global Lock is not writable");
   // Reboot the SAME PcMachine while the motherboard remains attached:
@@ -583,6 +592,78 @@ void pci_acpi_cmos_guest(){
   std::cout<<"C06_PCI_ACPI_CMOS_REAL_GUEST_PASS pci=0x"<<std::hex
            <<guest_pci_id<<std::dec<<" tables=5 reboot=PASS\n";
 }
+void prime_pci_inventory() {
+  struct Disk final : reverse_windows::BlockDisk {
+    std::uint64_t bytes()const noexcept override{return 512;}
+    std::uint64_t sectors()const noexcept override{return 1;}
+    bool read_bytes(std::uint64_t,std::uint8_t*,std::size_t)override{return false;}
+    bool read(std::uint64_t,std::uint16_t,std::uint8_t*)override{return false;}
+    bool write(std::uint64_t,std::uint16_t,const std::uint8_t*)override{return false;}
+    bool flush()override{return true;}
+  } disk;
+  const std::array<std::uint8_t,2048> sector{};
+  const auto reader=[&](std::uint64_t offset,std::uint8_t* out,std::size_t count){
+    if(offset>sector.size()||count>sector.size()-offset)return false;
+    std::copy_n(sector.data()+offset,count,out);
+    return true;
+  };
+  for(unsigned media=0;media<4;++media){
+    PcMachine pc(16U<<20);boot32(pc);
+    const bool fixed=(media&1)!=0, optical=(media&2)!=0;
+    PcMotherboardC06 board(pc,fixed?&disk:nullptr,optical?reverse_windows::AtapiCdrom::Reader(reader):
+                           reverse_windows::AtapiCdrom::Reader{},optical?sector.size():0);
+    auto& cpu=pc.cpu;
+    constexpr unsigned entry=0xa000,result=0x9200;
+    // Enumerate all 32 PCI slots with real CF8/CFC accesses. Continue the
+    // same probe through compatibility mode, decode disable and re-enable.
+    std::vector<std::uint8_t> program{
+      0xfa,0xfc,0xbf,0,0x92,0,0,          // CLI; CLD; MOV EDI,result
+      0xbb,0,0,0,0x80,0xb9,0x20,0,0,0,  // EBX=config; ECX=32
+      0x66,0xba,0xf8,0x0c,0x89,0xd8,0xef,
+      0x66,0xba,0xfc,0x0c,0xed,0xab,
+      0x81,0xc3,0,0x08,0,0,0xe2,0xeb};  // next device and LOOP
+    const auto select=[&](std::uint32_t key){
+      emit(program,{0x66,0xba,0xf8,0x0c,0xb8});
+      for(unsigned i=0;i<4;++i)program.push_back(std::uint8_t(key>>(8*i)));
+      emit(program,{0xef,0x66,0xba,0xfc,0x0c});
+    };
+    const auto status=[&](std::uint16_t port){
+      emit(program,{0x66,0xba,std::uint8_t(port),std::uint8_t(port>>8),0xec,0xaa});
+    };
+    select(0x80001008);emit(program,{0xed,0xab}); // Class and programming interface.
+    status(0x1f7);status(0x177);
+    select(0x80001004);emit(program,{0xb0,0x06,0xee,0xec,0xaa});
+    // A command to disabled ports must neither fault nor reach the device.
+    emit(program,{0x66,0xba,0xf7,0x01,0xb0,0xec,0xee});
+    emit(program,{0x66,0xba,0x77,0x01,0xb0,0xa1,0xee});
+    status(0x1f7);status(0x177);
+    select(0x80001004);emit(program,{0xb0,0x07,0xee,0xec,0xaa});
+    status(0x1f7);status(0x177);
+    emit(program,{0xf4});
+    code(cpu,entry,program);cpu.eip=entry;
+    run(pc,600);
+    need(cpu.halted&&cpu.read32(result)==0x00011b36&&cpu.read32(result+4)==0x00021b36&&
+         cpu.read32(result+8)==(media?0xc0711b36U:UINT32_MAX),
+         "PCI IDs must match the mounted storage profile");
+    for(unsigned slot=3;slot<32;++slot)
+      need(cpu.read32(result+4*slot)==UINT32_MAX,"PCI enumeration exposed a phantom device");
+    const auto control=result+32*4;
+    need(cpu.read32(control)==(media?0x01010001U:UINT32_MAX)&&
+         cpu.read8(control+4)==(fixed?0x50:0xff)&&cpu.read8(control+5)==(optical?0x40:0xff)&&
+         cpu.read8(control+6)==(media?0:0xff)&&cpu.read8(control+7)==0xff&&
+         cpu.read8(control+8)==0xff&&cpu.read8(control+9)==(media?1:0xff)&&
+         cpu.read8(control+10)==(fixed?0x50:0xff)&&cpu.read8(control+11)==(optical?0x40:0xff),
+         "IDE configuration, missing channels and PCI I/O decode disagree");
+    need((!fixed||board.attached_ata()->counters().commands==0)&&board.evidence().irq_delivered==0,
+         "PCI decode disable leaked a guest command");
+    const auto aml=AcpiC06::dsdt_address+36;
+    const auto resource_length=aml+13+8+30+9;
+    need(cpu.read8(resource_length)==(media?82:18),
+         "The firmware PCI root must offer IDE I/O resources only with the controller present");
+  }
+  std::cout<<"PRIME_C05_PCI_ENUMERATION_PASS profiles=4 slots=32 open_bus=1 decode_gate=1\n";
+}
+
 void ioapic_lapic_guest(){
   PcMachine pc(16*1024*1024);boot32(pc);
   PcMotherboardC06 board(pc);
@@ -606,6 +687,7 @@ void ioapic_lapic_guest(){
   emit(p,{0xa1,0x30,0,0xe0,0xfe, // MOV EAX, [FEE00030] LAPIC version
           0xa3,0x04,0x91,0,0});  // store version
   emit(p,{0xb8,1,0,0,0,0x0f,0xa2,0x89,0x15,0x08,0x91,0,0, // CPUID.01H
+          0x89,0x1d,0x10,0x91,0,0, // CPUID EBX topology.
           0xb9,0x1b,0,0,0,0x0f,0x32,0xa3,0x0c,0x91,0,0}); // IA32_APIC_BASE
   write_reg(0xfee000f0,0x1ff);   // software enable local APIC
   write_reg(0xfec00000,0x10);   // IOAPIC select redirection0 low
@@ -618,7 +700,9 @@ void ioapic_lapic_guest(){
   run(pc,220);
   need(pc.cpu.read32(0x9104)==0x00050014,
        "guest did not read actual LAPIC MMIO version");
-  need((pc.cpu.read32(0x9108)&(1U<<9))!=0 &&
+  need((pc.cpu.read32(0x9108)&((1U<<28)|(1U<<9)))==(1U<<9) &&
+       (pc.cpu.read32(0x9110)>>16)==1&&pc.cpu.read8(AcpiC06::madt_address+45)==8&&
+       pc.cpu.read8(AcpiC06::madt_address+47)==0&&pc.cpu.read32(0xfee00020)==0&&
        (pc.cpu.read32(0x910c)&0xfffff000U)==pc.cpu.read32(AcpiC06::madt_address+36) &&
        (pc.cpu.read32(0x910c)&0xfffU)==0x900,
        "guest CPUID, IA32_APIC_BASE and MADT must describe the same bootstrap LAPIC");
@@ -753,6 +837,176 @@ void tsc_across_halt(){
   need(short_wait[1]==long_wait[1]&&long_wait[0]==short_wait[0]+(320-32)*64,
        "RDTSC must include halted virtual cycles without counting them as instructions");
   std::cout<<"C06_APIC_TSC_HLT_PASS short="<<short_wait[0]<<" long="<<long_wait[0]<<"\n";
+}
+void prime_acpi_sci_timer() {
+  struct Result {
+    std::array<std::uint64_t,6> values;
+    long long host_us;
+  };
+  const auto exercise=[](bool apic,bool accelerate){
+    PcMachine pc(16U<<20);boot32(pc);
+    const auto start_cycles=pc.cpu.clock_cycles();
+    PcMotherboardC06 board(pc);
+    pc.enable_boot_acceleration(accelerate);
+    auto& cpu=pc.cpu;
+    constexpr unsigned interval=0x800000,entry=0xa000,handler=0x13000,base=0x9200;
+    constexpr auto lapic=std::uint32_t(PcMotherboardC06::kLocalApic);
+    constexpr auto ioapic=std::uint32_t(PcMotherboardC06::kIoApic);
+    const auto fadt=AcpiC06::fadt_address,madt=AcpiC06::madt_address;
+    need(cpu.read16(fadt+46)==9&&cpu.read32(fadt+56)==0x600&&cpu.read32(fadt+76)==0x608&&
+         (cpu.read32(fadt+112)&0x100U)==0&&cpu.read64(fadt+152)==0x600&&
+         cpu.read64(fadt+212)==0x608&&cpu.read8(madt+64)==2&&cpu.read8(madt+65)==10&&
+         cpu.read8(madt+67)==9&&cpu.read32(madt+68)==9&&cpu.read16(madt+72)==0x0f,
+         "FADT and MADT must point to the backed timer, event range and SCI route");
+    const auto store=[](auto& into,unsigned address){
+      emit(into,{0xa3});
+      for(unsigned i=0;i<4;++i)into.push_back(std::uint8_t(address>>(8*i)));
+    };
+    const auto write_mmio=[](auto& into,unsigned address,std::uint32_t value){
+      emit(into,{0xc7,0x05});
+      for(unsigned i=0;i<4;++i)into.push_back(std::uint8_t(address>>(8*i)));
+      for(unsigned i=0;i<4;++i)into.push_back(std::uint8_t(value>>(8*i)));
+    };
+    const auto read_pm_timer=[&](auto& into,unsigned address){
+      emit(into,{0x66,0xba,0x08,0x06,0xed});
+      store(into,address);
+    };
+    cpu.idtr={0x1000,0x15000};cpu.regs[Cpu::ESP]=0x190000;
+    gate(cpu,apic?0x51:0x71,handler);
+    std::vector<std::uint8_t> isr{0x50,0x52,0x66,0xba,0,6,0xed};
+    store(isr,base); // Status + enable, both set when the SCI arrives.
+    read_pm_timer(isr,base+4);
+    emit(isr,{0x66,0xba,0,6,0x66,0xb8,1,0,0x66,0xef,0xed}); // W1C.
+    store(isr,base+8);
+    if(apic)write_mmio(isr,lapic+0xb0,0);
+    else emit(isr,{0xb0,0x20,0xe6,0xa0,0xe6,0x20});
+    emit(isr,{0x5a,0x58,0xcf});
+    code(cpu,handler,isr);
+
+    std::vector<std::uint8_t> guest{0xfa};
+    if(apic){
+      write_mmio(guest,lapic+0xf0,0x1ff);
+      write_mmio(guest,ioapic,0x23);
+      write_mmio(guest,ioapic+0x10,0);
+      write_mmio(guest,ioapic,0x22);
+      write_mmio(guest,ioapic+0x10,0xa051);
+    }else{
+      emit(guest,{0xb0,0xfb,0xe6,0x21,0xb0,0xfd,0xe6,0xa1});
+    }
+    emit(guest,{0x66,0xba,2,6,0x66,0xb8,1,0,0x66,0xef});
+    read_pm_timer(guest,base+12);
+    emit(guest,{0x0f,0x31});
+    store(guest,base+16);
+    emit(guest,{0xfb,0xf4,0x0f,0x31});
+    store(guest,base+20);
+    read_pm_timer(guest,base+24);
+    emit(guest,{0xfa,0xf4});
+    code(cpu,entry,guest);cpu.eip=entry;
+    const auto started=std::chrono::steady_clock::now();
+    for(unsigned remaining=interval+128;remaining;){
+      const auto slice=std::min(9317U,remaining); // Odd slices also exercise clock phase.
+      run(pc,slice);
+      remaining-=slice;
+    }
+    const auto runtime=std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now()-started).count();
+    need(cpu.halted&&!cpu.flag(Cpu::IF)&&cpu.regs[Cpu::ESP]==0x190000&&
+         board.evidence().sci_irqs==1&&board.evidence().irq_delivered==1&&
+         board.evidence().apic_irqs==unsigned(apic)&&cpu.read32(base)==0x00010001&&
+         cpu.read32(base+8)==0x00010000,
+         "The guest SCI handler must receive exactly one event and clear it before EOI");
+    const auto first=cpu.read32(base+12),last=cpu.read32(base+24);
+    const auto irq_timer=cpu.read32(base+4);
+    const auto tsc=cpu.read32(base+20)-cpu.read32(base+16);
+    need(first<64&&irq_timer>=interval&&irq_timer<interval+16&&
+         last>=interval&&last<interval+64&&cpu.clock_cycles()-board.evidence().ticks==start_cycles&&
+         // RDTSC follows the first IN by two cycles. The second IN
+         // follows its RDTSC by three cycles.
+         tsc==std::uint64_t(last-first-5)*Cpu::kTscTicksPerCycle,
+         "The PM clock and RDTSC must agree across STI/HLT (start=" + std::to_string(first) +
+         ", end=" + std::to_string(last) + ", irq=" + std::to_string(irq_timer) +
+         ", tsc=" + std::to_string(tsc) + ", CPU=" + std::to_string(cpu.clock_cycles()) +
+         ", board=" + std::to_string(board.evidence().ticks) + ", initial offset=" +
+         std::to_string(start_cycles) + ")");
+    const auto restored_ticks=board.evidence().ticks;
+    if(accelerate){
+      std::vector<std::uint8_t> again{0xfb,0xf4};
+      read_pm_timer(again,base+28);
+      emit(again,{0xfa,0xf4});
+      constexpr auto wake=entry+0x100;
+      code(cpu,wake,again);cpu.eip=wake;cpu.halted=false;
+      for(unsigned remaining=interval;remaining;){
+        const auto slice=std::min(32000U,remaining);
+        run(pc,slice);
+        remaining-=slice;
+      }
+      need(cpu.halted&&cpu.regs[Cpu::ESP]==0x190000&&board.evidence().sci_irqs==2&&
+           cpu.read32(base+4)<16&&cpu.read32(base+28)<64&&cpu.read32(base+8)==0x00010000,
+           "The 24-bit wrap must raise a second SCI and re-arm after W1C and EOI");
+    }
+    pc.boot_long_mode_demo();
+    need(restored_ticks==interval+128&&board.evidence().sci_irqs==0&&
+         pc.cpu.in_hook(0x600,4)==0&&pc.cpu.in_hook(0x608,4)==0,
+         "Reset must clear the SCI counters, registers and clock");
+    return Result{{{first,last,tsc,irq_timer,restored_ticks,interval}},runtime};
+  };
+  for(const bool apic:{false,true}){
+    const auto scalar=exercise(apic,false),batched=exercise(apic,true);
+    need(scalar.values==batched.values,"Idle batching changed guest SCI or timer evidence");
+    std::cout<<"PRIME_C05_ACPI_SCI_PASS route="<<(apic?"ioapic":"pic")
+             <<" logical_cycles="<<batched.values[4]<<" scalar_us="<<scalar.host_us
+             <<" idle_batched_us="<<batched.host_us<<" w1c=1 wake=1 wrap=1 reset=1\n";
+  }
+}
+void prime_pit_channel2_calibration() {
+  PcMachine pc(16U<<20);boot32(pc);
+  PcMotherboardC06 board(pc);
+  auto& cpu=pc.cpu;
+  constexpr unsigned entry=0xa000,base=0x9200;
+  const std::vector<std::uint8_t> program{
+    0xfa,
+    0x31,0xc0,0xe6,0x61,                   // Disable channel 2 gate.
+    0xb0,0xb0,0xe6,0x43,                   // Channel 2, low/high, mode 0.
+    0xb0,0x00,0xe6,0x42,0xb0,0x10,0xe6,0x42, // A count of 4096 PIT clocks.
+    0xe4,0x61,0xa2,0,0x92,0,0,             // OUT2 is low before the gate rises.
+    0x66,0xba,0x08,0x06,0xed,0xa3,0x04,0x92,0,0, // Read PM clock.
+    0xb0,1,0xe6,0x61,                      // Start decrementing at one third of PM clock.
+    0xe4,0x61,0xa8,0x20,0x74,0xfa,         // Poll actual OUT2 on port 61h.
+    0xa2,1,0x92,0,0,0xed,0xa3,0x08,0x92,0,0,
+    0xf4};
+  code(cpu,entry,program);cpu.eip=entry;
+  run(pc,15000);
+  const auto elapsed=cpu.read32(base+8)-cpu.read32(base+4);
+  need(cpu.halted&&!(cpu.read8(base)&0x21U)&&(cpu.read8(base+1)&0x21U)==0x21U&&
+       elapsed>=4096*3&&elapsed<=4096*3+16&&board.evidence().irq_delivered==0,
+       "PIT channel 2 calibration must measure the board oscillator without issuing an IRQ");
+  std::cout<<"PRIME_C05_PIT_CALIBRATION_PASS pit_counts=4096 pm_delta="<<elapsed
+           <<" irq=0 gate=1\n";
+}
+void prime_bios_clock() {
+  PcMachine pc(16U<<20);
+  pc.boot_demo();
+  PcMotherboardC06 board(pc);
+  auto& cpu=pc.cpu;
+  constexpr unsigned entry=0x1000,bios_period=65536*3,bios_day=0x1800b0;
+  // Capture INT 1Ah AH=00 before and after the wrap, then read it once more.
+  code(cpu,entry,{0x31,0xc0,0xcd,0x1a,0xf4});
+  const auto sample=[&](){
+    cpu.eip=entry;cpu.halted=false;
+    run(pc,3);
+    need(cpu.halted&&!cpu.flag(Cpu::CF),"INT 1Ah must return the current BIOS clock");
+    return (std::uint32_t(cpu.reg16(Cpu::ECX))<<16)|cpu.reg16(Cpu::EDX);
+  };
+  cpu.advance_idle_clock(bios_period);
+  need(sample()==1&&cpu.reg8(Cpu::EAX)==0,"BIOS clock must advance from virtual cycles only");
+  // Seed the elapsed-cycle counter immediately ahead of midnight. No host
+  // delay or billions of guest steps are needed to exercise BIOS rollover.
+  const auto elapsed=std::uint64_t(bios_day)*bios_period-cpu.clock_cycles();
+  cpu.advance_idle_clock(static_cast<unsigned>(elapsed%UINT32_MAX));
+  for(auto cycles=elapsed/UINT32_MAX;cycles;--cycles)cpu.advance_idle_clock(UINT32_MAX);
+  need(sample()==0&&cpu.reg8(Cpu::EAX)==1&&sample()==0&&cpu.reg8(Cpu::EAX)==0,
+       "BIOS midnight flag must clear after the first guest read");
+  std::cout<<"PRIME_C05_BIOS_CLOCK_PASS int1a=1 midnight=1\n";
 }
 void ps2_keyboard_guest(){
   PcMachine pc(16*1024*1024);boot32(pc);
@@ -942,10 +1196,14 @@ int main(){
     optical_irq_wakes_sti_hlt();
     pic_legacy_x87_guest();
     pci_acpi_cmos_guest();
+    prime_pci_inventory();
     ioapic_lapic_guest();
     nested_apic_guest();
     apic_timer_divisor_and_global_enable();
     tsc_across_halt();
+    prime_acpi_sci_timer();
+    prime_pit_channel2_calibration();
+    prime_bios_clock();
     ps2_keyboard_guest();
     queued_lapic_requests_guest();
     cr8_lapic_priority_guest();

@@ -26,8 +26,8 @@ permissions:
 
 jobs:
   prime-android-compile:
-    # Exercise the app and its JNI against the pinned SDK during C04.
-    if: ${{ startsWith(github.head_ref || github.ref_name, 'feature/windows-prime-c04-') }}
+    # Compile Prime revisions against the pinned SDK before packaging.
+    if: ${{ startsWith(github.head_ref || github.ref_name, 'feature/windows-prime-') }}
     name: Prime Android 35 Java and ARM64 JNI
     runs-on: ubuntu-24.04
     timeout-minutes: 20

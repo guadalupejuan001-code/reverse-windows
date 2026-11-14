@@ -6,10 +6,10 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "1a159e0a01e50e77ca9d1f2f4474059e8483e25f",
+      "commit": "6b456de98ddc0beb62dce65f1a20146eb892e61c",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
-      "status": "candidate-prime-c04-ether-ram",
+      "status": "candidate-prime-c05-ether-board",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/pc_bios_keyboard.hpp",

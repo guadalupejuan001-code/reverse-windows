@@ -374,7 +374,9 @@ int main(int argc, char** argv) {
             ",\"motherboard_c06\":{\"pci_config\":true,\"acpi_tables\":true,\"apic_full\":false,\"irq_delivered\":" +
                std::to_string(platform.irq_delivered) + ",\"pit_irqs\":" +
                std::to_string(platform.pit_irqs) + ",\"apic_irqs\":" +
-               std::to_string(platform.apic_irqs) + ",\"ticks\":" +
+               std::to_string(platform.apic_irqs) + ",\"sci_delivered\":" +
+               std::to_string(platform.sci_irqs) + ",\"virtual_clock_hz\":" +
+               std::to_string(cosmic_pc::PcMachine::kVirtualCyclesPerSecond) + ",\"ticks\":" +
                std::to_string(platform.ticks) + "}" +
             performance.str() + ",\"machine\":" + final_json +
             ",\"vga_text\":" + cosmic_pc::PcMachine::quote(pc.screen()) + "}\n";
