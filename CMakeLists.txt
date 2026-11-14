@@ -180,6 +180,16 @@ if(BUILD_TESTING)
   add_test(NAME reverse_windows_prime_gpu_guest COMMAND reverse_windows_prime_gpu_guest_test)
   set_tests_properties(reverse_windows_prime_gpu_guest PROPERTIES TIMEOUT 60
     ENVIRONMENT "EGL_PLATFORM=surfaceless")
+  add_executable(reverse_windows_primevgc_transfer_test tests/gpu_vram_transfer_test.cpp)
+  target_link_libraries(reverse_windows_primevgc_transfer_test PRIVATE reverse_windows_component_headers)
+  target_compile_options(reverse_windows_primevgc_transfer_test PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/O2,-O3>)
+  add_test(NAME reverse_windows_primevgc_transfer COMMAND reverse_windows_primevgc_transfer_test)
+  set_tests_properties(reverse_windows_primevgc_transfer PROPERTIES TIMEOUT 60)
+  add_executable(reverse_windows_primevgc_compute_test tests/gpu_calculo_benchmark.cpp)
+  target_link_libraries(reverse_windows_primevgc_compute_test PRIVATE reverse_windows_component_headers)
+  target_compile_options(reverse_windows_primevgc_compute_test PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/O2,-O3>)
+  add_test(NAME reverse_windows_primevgc_compute COMMAND reverse_windows_primevgc_compute_test)
+  set_tests_properties(reverse_windows_primevgc_compute PROPERTIES TIMEOUT 60)
   # Compile the authentic x86 guest IDT test from the pinned Mundo X CPU
   # source, not a duplicated/shadow implementation in REVERSE Windows.
   add_executable(reverse_windows_c04_guest_idt

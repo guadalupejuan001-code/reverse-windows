@@ -873,6 +873,9 @@ class PcMotherboardC06 {
   }
   AtaC07* attached_ata(){return ata_.get();}
   const GuestGpuC08* attached_gpu() const noexcept {return gpu_.get();}
+  void set_gpu_cache_enabled(bool enabled) noexcept {
+    if (gpu_) gpu_->set_vram_cache_enabled(enabled);
+  }
   const AtaC07* attached_ata()const{return ata_.get();}
   const AtapiCdrom* attached_atapi()const{return optical_.get();}
   bool optical_attached()const{return bool(optical_);}

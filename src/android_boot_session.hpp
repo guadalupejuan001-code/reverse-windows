@@ -69,6 +69,7 @@ class AndroidBootSession final {
     const auto limit = std::min(memory.size(), kMaxResidentBytes);
     const auto floor = std::min(limit, kMinResidentBytes);
     const auto target = low_memory ? floor : std::clamp<std::uint64_t>(half / page * page, floor, limit);
+    board_->set_gpu_cache_enabled(!low_memory && target > floor);
     const auto old_target = pressure_.target ? pressure_.target : memory.budget_bytes();
     const auto delta = std::max(old_target, target) - std::min(old_target, target);
     pressure_.low_memory = low_memory;

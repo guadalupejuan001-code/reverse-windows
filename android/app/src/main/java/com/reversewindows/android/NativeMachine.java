@@ -48,10 +48,14 @@ final class NativeMachine {
     static long open(Context context, String qssdPath, int capacityGiB, int isoFd, long isoBytes,
                      int bootSource) {
         ActivityManager.MemoryInfo memory = memoryInfo(context);
-        String graphicsVram = new File(context.getFilesDir(), "gpu-vram.rqvd").getAbsolutePath();
+        File graphicsVram = new File(context.getFilesDir(), "gpu-vram.rqvd");
+        if (!graphicsVram.exists() && qssdPath != null && !qssdPath.isEmpty()) {
+            File primeVgcVram = new File(qssdPath + ".vram.rqvd");
+            if (primeVgcVram.isFile()) graphicsVram = primeVgcVram;
+        }
         return openWithRam(qssdPath, capacityGiB, isoFd, isoBytes, bootSource,
                 memory == null ? -1 : memory.availMem, memory == null ? 0 : memory.threshold,
-                memory != null && memory.lowMemory, ramCache(context), graphicsVram);
+                memory != null && memory.lowMemory, ramCache(context), graphicsVram.getAbsolutePath());
     }
 
     static boolean refreshRamPressure(Context context, long handle, boolean reclaimMemory) {

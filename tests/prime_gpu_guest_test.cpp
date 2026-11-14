@@ -64,6 +64,13 @@ class Guest32 {
     write(moved_bar + RWGPU_REG_OFFSET_HI, static_cast<std::uint32_t>(address >> 32));
     write(moved_bar + RWGPU_REG_DOORBELL, op);
   }
+  void direct_command(unsigned op, unsigned ticket, std::uint64_t from, std::uint64_t into,
+                      unsigned size) {
+    write(moved_bar + RWGPU_REG_AUX_LO, std::uint32_t(into));
+    write(moved_bar + RWGPU_REG_AUX_HI, std::uint32_t(into >> 32));
+    write(moved_bar + RWGPU_REG_LENGTH_HI, 0);
+    command(op, ticket, from, size);
+  }
   void run(PcMachine& pc) {
     emit({0xf4});
     require(bytes.size() < 0x1000, "Synthetic GPU command guest too large");
@@ -197,7 +204,15 @@ void verify(const std::filesystem::path& volume) {
     Guest32 restore_last;
     restore_last.copy(moved_bar + RWGPU_STAGE_OFFSET, source, payload.size());
     restore_last.command(RWGPU_WRITE, 6, last_page, payload.size());
+    restore_last.direct_command(RWGPU_DOWNLOAD, 7, last_page, 0x1c000, payload.size());
+    restore_last.read(moved_bar + RWGPU_REG_STATUS, 0xe048);
+    restore_last.cfg_write(4, 6);
+    restore_last.direct_command(RWGPU_DOWNLOAD, 8, last_page, 0x1c000, payload.size());
+    restore_last.read(moved_bar + RWGPU_REG_STATUS, 0xe04c);
     restore_last.run(pc);
+    pc.cpu.memory.read_block(0x1c000, actual.data(), actual.size());
+    require(pc.cpu.read32(0xe048) == RWGPU_UNAVAILABLE && pc.cpu.read32(0xe04c) == RWGPU_OK &&
+            actual == payload, "Direct DMA must require bus mastering and use the staged VRAM backing");
 
     // Real x86 submits near red before far green. Reversing depth semantics
     // therefore produces visibly different pixels. Blue is partly clipped.
@@ -211,17 +226,20 @@ void verify(const std::filesystem::path& volume) {
     reverse_windows::GuestVbeFabric mirror(pc);
     (void)mirror.capture(width, height);
     Guest32 draw;
-    draw.copy(moved_bar + RWGPU_STAGE_OFFSET, source, sizeof(vertices));
+    constexpr std::uint64_t geometry_offset = 0x1900000000ULL;
+    draw.direct_command(RWGPU_UPLOAD, 9, source, geometry_offset, RWGPU_PAGE_BYTES);
+    draw.read(moved_bar + RWGPU_REG_STATUS, 0xe050);
     draw.write(moved_bar + RWGPU_REG_WIDTH, width);
     draw.write(moved_bar + RWGPU_REG_HEIGHT, height);
     draw.write(moved_bar + RWGPU_REG_CLEAR_RGBA, clear);
-    draw.command(RWGPU_DRAW, 7, RWGPU_DRAW_PRESENT_VBE, sizeof(vertices));
+    draw.direct_command(RWGPU_DRAW_VRAM, 10, geometry_offset, RWGPU_DRAW_PRESENT_VBE, sizeof(vertices));
     draw.read(moved_bar + RWGPU_REG_STATUS, 0xe024);
     draw.read(moved_bar + RWGPU_REG_COMPLETED, 0xe028);
     draw.run(pc);
+    require(pc.cpu.read32(0xe050) == RWGPU_OK, "Direct upload of 3D vertices failed");
 #ifdef REVERSE_WINDOWS_GLES_GUEST
-    require(pc.cpu.read32(0xe024) == RWGPU_OK && pc.cpu.read32(0xe028) == 7,
-            "REgraphics did not finish the real guest draw");
+    require(pc.cpu.read32(0xe024) == RWGPU_OK && pc.cpu.read32(0xe028) == 10,
+            "REgraphics did not finish the real guest draw from PrimeVGC VRAM");
     require(rgb(pc, 320, 240) == red && rgb(pc, 320, 63) == green &&
             rgb(pc, 34, 81) == blue && rgb(pc, 639, 479) == clear,
             "Guest GPU did not preserve clip position, depth, color or clear");
@@ -232,7 +250,8 @@ void verify(const std::filesystem::path& volume) {
             std::string::npos && first.find("\"graphics_serial\":2") != std::string::npos,
             "GPU Virtual did not select and version the exact 3D work");
     Guest32 repeat;
-    repeat.command(RWGPU_DRAW, 8, RWGPU_DRAW_PRESENT_VBE, sizeof(vertices));
+    repeat.copy(moved_bar + RWGPU_STAGE_OFFSET, source, sizeof(vertices));
+    repeat.command(RWGPU_DRAW, 11, RWGPU_DRAW_PRESENT_VBE, sizeof(vertices));
     repeat.read(moved_bar + RWGPU_REG_STATUS, 0xe02c);
     repeat.run(pc);
     require(pc.cpu.read32(0xe02c) == RWGPU_OK && mirror.capture(width, height).empty(),
@@ -241,9 +260,9 @@ void verify(const std::filesystem::path& volume) {
     Guest32 offscreen;
     offscreen.write(moved_bar + RWGPU_REG_WIDTH, 32);
     offscreen.write(moved_bar + RWGPU_REG_HEIGHT, 32);
-    offscreen.command(RWGPU_DRAW, 9, 0, 0);
+    offscreen.command(RWGPU_DRAW, 12, 0, 0);
     offscreen.read(moved_bar + RWGPU_REG_STATUS, 0xe030);
-    offscreen.command(RWGPU_READ_COLOR, 10, (32 * 32 - 1) * 4, 4);
+    offscreen.command(RWGPU_READ_COLOR, 13, (32 * 32 - 1) * 4, 4);
     offscreen.read(moved_bar + RWGPU_REG_STATUS, 0xe034);
     offscreen.read(moved_bar + RWGPU_STAGE_OFFSET, 0xe038);
     offscreen.run(pc);
@@ -251,22 +270,23 @@ void verify(const std::filesystem::path& volume) {
             pc.cpu.read32(0xe038) == 0x000a141eU && !pc.cpu.memory.write_watch()->pending(),
             "Offscreen draw did not return exact BGRX or changed the boot display");
 #else
-    require(pc.cpu.read32(0xe024) == RWGPU_UNAVAILABLE && pc.cpu.read32(0xe028) == 7,
+    require(pc.cpu.read32(0xe024) == RWGPU_UNAVAILABLE && pc.cpu.read32(0xe028) == 10,
             "Headless build must disclose its absent renderer");
     std::cout << "PRIME_C08_RENDER_UNAVAILABLE no_egl=1\n";
 #endif
     pc.reset();
     require(!pc.cpu.mmio_claim_hook(moved_bar), "Guest reset must turn BAR decode off");
   }
-  reverse_windows::GraphicsMemory reopened(volume);
+  using Vram = reverse_windows::GpuVram;
+  Vram reopened(volume);
   actual.fill(255);
-  require(reopened.read(last_page, actual.data(), actual.size()) && actual == payload,
+  require(reopened.read(last_page, actual.data(), actual.size()) == Vram::Result::Complete && actual == payload,
           "Reopening QSSD did not recover the final VRAM page");
-  require(reopened.read(last_page - 2 * RWGPU_PAGE_BYTES, actual.data(), actual.size()) &&
+  require(reopened.read(last_page - 2 * RWGPU_PAGE_BYTES, actual.data(), actual.size()) == Vram::Result::Complete &&
             actual == std::array<std::uint8_t, RWGPU_PAGE_BYTES>{},
           "A sparse adjacent page is not zero");
   std::cout << "PRIME_C08_PCI_VRAM_PASS logical_bytes=" << RWGPU_LOGICAL_BYTES
-            << " last_byte=" << RWGPU_LOGICAL_BYTES - 1 << " backing_bytes=" << reopened.backing_bytes()
+            << " last_byte=" << RWGPU_LOGICAL_BYTES - 1 << " backing_bytes=" << reopened.journal_bytes()
             << " e820=1 acpi=1 restart=1 exact=1\n";
 }
 
@@ -282,24 +302,28 @@ void measure_vram(const std::filesystem::path& path) {
     byte = state >> 19;
   }
   using Clock = std::chrono::steady_clock;
+  using Vram = reverse_windows::GpuVram;
   std::chrono::nanoseconds durable_time{};
   std::uint64_t commits = 0;
   {
-    reverse_windows::GraphicsMemory vram(path);
+    // Exercise existing C08 installations whose QSSD header rounded to 112 GiB.
+    reverse_windows::QssdDisk::create(path, Vram::kLegacyBackingBytes / reverse_windows::QssdDisk::kGiB);
+    Vram vram(path);
     const auto started = Clock::now();
     for (std::size_t i = 0; i < bytes; i += batch_bytes)
-      require(vram.write(first + i, expected.data() + i, batch_bytes), "Large QSSD VRAM batch write failed");
+      require(vram.write(first + i, expected.data() + i, batch_bytes) == Vram::Result::Complete,
+              "Large QSSD VRAM batch write failed");
     durable_time = Clock::now() - started;
     commits = vram.commits();
   }
   const auto started = Clock::now();
-  reverse_windows::GraphicsMemory vram(path);
+  Vram vram(path);
   for (std::size_t i = 0; i < bytes; i += batch_bytes)
-    require(vram.read(first + i, copy.data() + i, batch_bytes), "Large QSSD VRAM batch read failed");
+    require(vram.read(first + i, copy.data() + i, batch_bytes) == Vram::Result::Complete,
+            "Large QSSD VRAM batch read failed");
   const auto reload = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started);
   require(copy == expected && commits == batches &&
-          !vram.write(first + 1, expected.data(), batch_bytes) &&
-          !vram.read(RWGPU_LOGICAL_BYTES - RWGPU_PAGE_BYTES, copy.data(), batch_bytes),
+          vram.read(RWGPU_LOGICAL_BYTES - RWGPU_PAGE_BYTES, copy.data(), batch_bytes) == Vram::Result::InvalidRange,
           "Batched VRAM failed durability or boundary validation");
   std::cout << "PRIME_C08_VRAM_BATCH_PASS bytes=" << bytes << " offset=" << first
             << " commits=" << commits << " write_ns=" << durable_time.count()

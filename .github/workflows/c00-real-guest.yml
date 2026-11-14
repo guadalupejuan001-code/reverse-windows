@@ -33,11 +33,11 @@ jobs:
           ref: 0af9423a29d65259d71bb5a39f5fe453c1c249f9
           path: deps/mundo-X
           persist-credentials: false
-      - name: Checkout GPU-VIRTUAL C12.2 with guest triangle work authority
+      - name: Checkout GPU-VIRTUAL C12.3 with guest triangle and PrimeVGC compute
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/GPU-VIRTUAL
-          ref: ddb4010b2d30f3ccdd7ec1d64d2b615772e985a8
+          ref: 933bbd7ea7679f661de7188fd4235691ab885567
           path: deps/GPU-VIRTUAL
           persist-credentials: false
       - name: Checkout QSSD current StateBus plus graphics revisions
@@ -64,6 +64,18 @@ jobs:
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri
           cmake -S . -B build -DREVERSE_MUNDO_X_ROOT="$PWD/deps/mundo-X" -DREVERSE_QSSD_ROOT="$PWD/deps/Virtual-qSSD-" -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+      - name: Verify PrimeVGC guest transfers and measure resident bandwidth
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build --parallel 2 --target reverse_windows_primevgc_transfer_test reverse_windows_primevgc_compute_test
+          for sample in 1 2 3; do
+            ./build/reverse_windows_primevgc_transfer_test
+          done | tee build/primevgc-transfer.log
+          grep -q '^PRIME_C08_PRIMEVGC_VRAM_PASS logical_bytes=120000000000 last_byte=119999999999' build/primevgc-transfer.log
+          ./build/reverse_windows_primevgc_compute_test | tee build/primevgc-compute.log
+      - name: Build the remaining native regressions
+        run: |
           cmake --build build --parallel 2
       - name: Execute real x86 and long-mode x64 guest demos
         env:
@@ -79,7 +91,7 @@ jobs:
           for sample in 1 2 3 4; do
             ./build/reverse_windows_prime_gpu_guest_test
           done | tee build/prime-c08-gpu.log
-          grep -q '^PRIME_C08_REGRAPHICS_PASS .*"submitted_triangles":3' build/prime-c08-gpu.log
+          grep -q '^PRIME_C08_REGRAPHICS_PASS .*"vram_draw_requests":1.*"submitted_triangles":3' build/prime-c08-gpu.log
           grep -q '^PRIME_C08_PCI_VRAM_PASS logical_bytes=120000000000 last_byte=119999999999 .* exact=1' build/prime-c08-gpu.log
           grep -q '^PRIME_C08_VRAM_BATCH_PASS bytes=7864320 .* commits=128 .* exact=1' build/prime-c08-gpu.log
       - name: Record Prime BIOS keyboard and PS/2 regressions
@@ -310,6 +322,10 @@ jobs:
           assert report['pci_ata_guest_detected']
           assert report['ether_xi_memory_aperture']
           assert report['gpu_virtual_vga_delta']
+          assert report['gpu_virtual_compute_words']==2**32
+          assert int(report['gpu_virtual_compute_sum_u64'])==(2**32-1)*2**31
+          assert report['gpu_virtual_compute_evaluated_words']==0
+          assert report['gpu_virtual_xi_bits']==1024
           assert report['gpu_vga_delta_upload_bytes']==4
           assert report['gpu_full_frame_bytes']==4000
           assert report['qssd_graphics_serial']==3
@@ -449,6 +465,8 @@ jobs:
             build/prime-c07-vram.log
             build/prime-c07-vbe.log
             build/prime-c08-gpu.log
+            build/primevgc-transfer.log
+            build/primevgc-compute.log
             build/reverse-windows-c07-ata.log
             build/reverse-windows-c08-maintenance.log
             build/reverse-windows-c08-benchmark.jsonl

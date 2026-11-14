@@ -85,15 +85,17 @@
     {
       "key": "gpu_virtual",
       "repository": "guadalupejuan001-code/GPU-VIRTUAL",
-      "commit": "ddb4010b2d30f3ccdd7ec1d64d2b615772e985a8",
+      "commit": "933bbd7ea7679f661de7188fd4235691ab885567",
       "checkout": "deps/GPU-VIRTUAL",
-      "role": "C12.2-physical-framebuffer-and-guest-triangle-work",
-      "status": "candidate-prime-c08-gpu-virtual",
+      "role": "C12.3-physical-framebuffer-guest-triangles-and-PrimeVGC-compute",
+      "status": "candidate-prime-c08-primevgc",
       "required_paths": [
         "include/ejecucion_gpu.hpp",
         "VERSION",
         "include/trabajo_fisico.hpp",
         "include/guest_triangle_work.hpp",
+        "include/relaciones_gpu.hpp",
+        "include/transformacion_reversible.hpp",
         "tests/physical_work_authority.cpp"
       ]
     },
