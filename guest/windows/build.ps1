@@ -32,12 +32,13 @@ if (!$header -or !$lib) { throw 'Pinned WDK kernel headers/libraries missing' }
 $shared = Join-Path $header.Directory.Parent.FullName 'shared'
 $obj = Join-Path $out 'gpu_transport.obj'
 $driver = Join-Path $out 'ReversePrimeGpu.sys'
-Invoke-Checked $compiler @('/nologo','/c','/TC','/std:c17','/W4','/O2','/GS-','/kernel',
+Invoke-Checked $compiler @('/nologo','/c','/TC','/std:c17','/W4','/O2','/GS','/kernel',
     '/D_AMD64_', '/DAMD64', '/D_WIN64', '/DNTDDI_VERSION=0x0A000000', '/D_WIN32_WINNT=0x0A00',
     "/I$($header.Directory.FullName)", "/I$shared", "/I$include", "/Fo$obj", $transport)
-Invoke-Checked $linker @('/nologo','/driver','/subsystem:native','/machine:x64','/entry:DriverEntry',
+Invoke-Checked $linker @('/nologo','/driver','/subsystem:native','/machine:x64','/entry:GsDriverEntry',
     '/nodefaultlib','/incremental:no','/dynamicbase','/nxcompat','/integritycheck',
-    "/out:$driver", "/libpath:$($lib.Directory.FullName)", $obj, 'ntoskrnl.lib','hal.lib','wdmsec.lib')
+    "/out:$driver", "/libpath:$($lib.Directory.FullName)", $obj,
+    'ntoskrnl.lib','hal.lib','wdmsec.lib','BufferOverflowFastFailK.lib')
 Copy-Item (Join-Path $PSScriptRoot 'ReversePrimeGpu.inf') $out -Force
 Invoke-Checked $compiler @('/nologo','/std:c++17','/EHsc','/W4','/O2','/MT',
     "/Fo$(Join-Path $out 'gpu_scene.obj')","/Fe$(Join-Path $out 'prime_gpu_scene.exe')",
