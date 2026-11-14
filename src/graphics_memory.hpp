@@ -22,7 +22,7 @@ class GpuVram {
   static constexpr std::uint64_t kLegacyBackingBytes =
       ((kBytes + QssdDisk::kGiB - 1) / QssdDisk::kGiB) * QssdDisk::kGiB;
   static constexpr std::size_t kPageBytes = QssdDisk::kBlockSize;
-  static constexpr std::size_t kTransferBytes = QssdDisk::kMaxTransactionBytes;
+  static constexpr std::size_t kTransferBytes = QssdDisk::kMaxBulkTransactionBytes;
   static constexpr std::size_t kResidentBytes = 8U * 1024U * 1024U;
   static_assert(kBytes % kPageBytes == 0 && kResidentBytes % kPageBytes == 0 &&
                 kPageBytes == RWGPU_PAGE_BYTES && kTransferBytes == RWGPU_DIRECT_TRANSFER_BYTES);

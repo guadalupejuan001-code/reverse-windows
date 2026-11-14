@@ -4,9 +4,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fcntl.h>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
+#include <string_view>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -16,18 +19,19 @@ using reverse_windows::GuestGpuC08;
 using reverse_windows::PcMotherboardC06;
 using Clock = std::chrono::steady_clock;
 
-constexpr unsigned kCode = 0xa000;
-constexpr std::uint32_t kFrom = 0x0010'0000, kInto = 0x0090'0000;
+constexpr unsigned kCode = 0x20000;
+constexpr std::uint32_t kFrom = 0x0020'0000;
 constexpr std::uint64_t kVram = 108ULL * 1024 * 1024 * 1024;
-constexpr std::size_t kChunk = 512U * 1024, kDataBytes = 8U * 1024 * 1024;
-constexpr unsigned kChunks = kDataBytes / kChunk;
+constexpr std::size_t kMiB = 1024U * 1024U;
+constexpr std::size_t kChunk = 512U * 1024;
+constexpr std::size_t kResidentPayload = 8U * kMiB, kBulkPayload = 256U * kMiB;
 constexpr auto kBar = RWGPU_BAR_DEFAULT;
-static_assert(kVram + kDataBytes < GpuVram::kBytes && kVram % kDataBytes == 0);
+static_assert(kVram + kBulkPayload < GpuVram::kBytes && kVram % kResidentPayload == 0);
 
 class TestDirectory {
  public:
   TestDirectory() {
-    auto pattern = (std::filesystem::temp_directory_path() / "rw-vram-transfer-XXXXXX").string();
+    auto pattern = (std::filesystem::current_path() / "rw-vram-transfer-XXXXXX").string();
     if (!::mkdtemp(pattern.data())) throw std::runtime_error("No temporary VRAM directory");
     path = pattern;
   }
@@ -50,7 +54,7 @@ class TransferGuest {
     pc_.cpu.write64(0x2000+3*8, 0x4003);
     pc_.cpu.write64(0x4000+((page>>21)&0x1ff)*8, page | 0x83U);
     // Map the full guest payload and destination in long mode.
-    for (unsigned index=1; index<16; ++index)
+    for (std::size_t index = 1; index < (pc_.cpu.memory.size() >> 21); ++index)
       pc_.cpu.write64(0x3000+index*8, (index<<21) | 0x83U);
     std::vector<std::uint8_t> init{
       0xfa, 0x66,0xba,0xf8,0x0c, 0xb8,0x04,0x18,0x00,0x80,0xef,
@@ -60,45 +64,51 @@ class TransferGuest {
     run();
     require(pc_.cpu.read32(kBar + RWGPU_REG_ABI) == RWGPU_ABI &&
             (pc_.cpu.read32(kBar + RWGPU_REG_CAPS) & RWGPU_CAP_DIRECT_VRAM) &&
-            pc_.cpu.read32(kBar + RWGPU_REG_DIRECT_MAX) == kChunk,
+            pc_.cpu.read32(kBar + RWGPU_REG_DIRECT_MAX) == GpuVram::kTransferBytes,
             "Direct VRAM transfers are not available on the C08 PCI adapter");
   }
 
-  void prepare(unsigned operation, unsigned batches) {
-    if (batches > kChunks) throw std::invalid_argument("Too many test batches");
+  void prepare(unsigned operation, std::size_t bytes, std::size_t chunk,
+               std::uint64_t vram_offset = kVram, unsigned status = RWGPU_OK) {
+    if (!chunk || bytes % chunk) throw std::invalid_argument("Test transfer is not chunk-aligned");
     std::vector<std::uint8_t> guest{0xfa};
-    for (unsigned batch=0; batch<batches; ++batch) {
-      const auto offset = std::uint64_t(batch) * kChunk;
+    mmio(guest, RWGPU_REG_LENGTH_HI, 0);
+    for (std::size_t offset = 0; offset < bytes; offset += chunk) {
       const bool upload = operation == RWGPU_UPLOAD;
-      const auto vram = kVram + offset;
+      const auto vram = vram_offset + offset;
       const auto from = upload ? kFrom + offset : vram;
-      const auto into = upload ? vram : kInto + offset;
+      const auto into = upload ? vram : kFrom + offset;
       mmio(guest, RWGPU_REG_OFFSET_LO, std::uint32_t(from));
       mmio(guest, RWGPU_REG_OFFSET_HI, std::uint32_t(from >> 32));
       mmio(guest, RWGPU_REG_AUX_LO, std::uint32_t(into));
       mmio(guest, RWGPU_REG_AUX_HI, std::uint32_t(into >> 32));
-      mmio(guest, RWGPU_REG_LENGTH, kChunk);
+      mmio(guest, RWGPU_REG_LENGTH, std::uint32_t(chunk));
       guest.push_back(0xbb); imm(guest, kBar + RWGPU_REG_COMPLETED);
       guest.insert(guest.end(), {0x8b,0x03,0xff,0xc0}); // MOV EAX,[RBX]; INC EAX
       guest.push_back(0xbb); imm(guest, kBar + RWGPU_REG_TICKET);
       guest.insert(guest.end(), {0x89,0x03}); // MOV [RBX],EAX
       mmio(guest, RWGPU_REG_DOORBELL, operation);
       guest.push_back(0xbb); imm(guest, kBar + RWGPU_REG_STATUS);
-      guest.insert(guest.end(),{0x8b,0x03,0x83,0xf8,0x01,0x74,0x01,0xf4});
+      guest.insert(guest.end(), {0x8b,0x03,0x83,0xf8,std::uint8_t(status),0x74,0x01,0xf4});
     }
     stop_ = kCode + guest.size() + 1;
+    steps_ = unsigned(bytes / chunk) * 25 + 64;
     guest.push_back(0xf4);
     load(guest);
   }
 
   void transfer() {
     run();
-    require(pc_.cpu.eip==stop_, "Guest received an incomplete transfer");
+    if (pc_.cpu.eip != stop_)
+      throw std::runtime_error("Guest transfer failed at ticket " +
+          std::to_string(pc_.cpu.read32(kBar + RWGPU_REG_COMPLETED)) + " with status " +
+          std::to_string(pc_.cpu.read32(kBar + RWGPU_REG_STATUS)));
   }
 
  private:
   PcMachine& pc_;
   std::uint64_t stop_=0;
+  unsigned steps_=64;
 
   static void imm(std::vector<std::uint8_t>& guest, std::uint32_t value) {
     for (unsigned i=0;i<4;++i) guest.push_back(std::uint8_t(value>>(8*i)));
@@ -113,7 +123,7 @@ class TransferGuest {
   void run() {
     pc_.cpu.eip=kCode;
     pc_.cpu.halted=false;
-    pc_.run(1024);
+    pc_.run(steps_);
     if (pc_.cpu.fault) throw std::runtime_error(pc_.cpu.fault->describe());
     require(pc_.cpu.halted,"PCI transfer fixture did not finish");
   }
@@ -154,52 +164,90 @@ std::uint32_t submit(PcMachine& pc, unsigned op, std::uint64_t source, std::uint
   return pc.cpu.read32(kBar + RWGPU_REG_STATUS);
 }
 
-void run_transfer_test() {
+void verify_coalesced_reads(const std::filesystem::path& path, std::vector<std::uint8_t>& actual,
+                            const std::vector<std::uint8_t>& expected, std::uint64_t last_epoch) {
+  using reverse_windows::QssdDisk;
+  constexpr auto block_bytes = QssdDisk::kBlockSize;
+  constexpr auto record_bytes = block_bytes + 40 + 16;
+  {
+    QssdDisk volume(path, QssdDisk::Access::ReadOnly);
+    const auto reads = volume.io_stats().read_calls;
+    require(volume.read_bytes(kVram, actual.data(), kChunk) &&
+            std::equal(actual.begin(), actual.begin() + kChunk, expected.begin()) &&
+            volume.io_stats().read_calls - reads == 1,
+            "QSSD must fetch contiguous records with one read and preserve exact bytes");
+    const auto fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    require(fd >= 0, "Cannot open private checksum fixture");
+    const auto changed = std::uint8_t(expected[3 * block_bytes + 31] ^ 1U);
+    const auto offset = last_epoch + 3 * record_bytes + 40 + 31;
+    const auto written = ::pwrite(fd, &changed, 1, static_cast<off_t>(offset));
+    ::close(fd);
+    require(written == 1, "Cannot damage private checksum fixture");
+    std::fill_n(actual.begin(), kChunk, 0x5a);
+    require(!volume.read_bytes(kVram, actual.data(), kChunk) &&
+            std::all_of(actual.begin(), actual.begin() + kChunk, [](auto byte) { return byte == 0x5a; }),
+            "Corrupted raw records must fail before sending their run");
+  }
+  bool rejected = false;
+  try {
+    QssdDisk volume(path, QssdDisk::Access::ReadOnly);
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  require(rejected, "Batched replay accepted a corrupted payload");
+}
+
+void run_transfer_test(std::size_t payload, std::size_t chunk, unsigned passes) {
   TestDirectory directory;
   const auto path = directory.path / "windows.rqvd.vram.rqvd";
-  PcMachine pc(32U * 1024 * 1024);
-  std::vector<std::uint8_t> expected(kDataBytes), actual(kDataBytes);
-  double upload=0, reopened=0, warm=0;
-  std::uint64_t journal=0;
+  PcMachine pc(payload + 16U * kMiB);
+  std::vector<std::uint8_t> expected(payload), actual(payload);
+  double upload = 0, reopened = 0, open = 0, warm = 0;
+  std::uint64_t journal = 0, last_epoch = 64;
+  const auto upload_commits = payload / chunk * passes;
   {
     boot(pc);
     PcMotherboardC06 board(pc,nullptr,{},0,path);
     TransferGuest guest(pc);
     auto elapsed=Clock::duration::zero();
-    guest.prepare(RWGPU_UPLOAD, kChunks);
-    constexpr unsigned passes=3;
+    guest.prepare(RWGPU_UPLOAD, payload, chunk);
+    const auto* gpu = board.attached_gpu();
+    require(gpu, "C08 PCI adapter missing");
     for (unsigned pass=0;pass<passes;++pass) {
       // Unique, non-periodic payload every pass. No size ratios from implicit
       // zeros, deduplication or repeatedly reusing identical QSSD records.
       fill(expected,0x74e93aba023df41bULL+pass);
       pc.cpu.memory.write_block(kFrom,expected.data(),expected.size());
+      if (pass) last_epoch = gpu->vram_journal_bytes();
       const auto start=Clock::now();
       guest.transfer();
       elapsed+=Clock::now()-start;
     }
-    upload=bandwidth(kDataBytes*passes,elapsed);
-    require(board.attached_gpu(), "C08 PCI adapter missing");
-    journal=board.attached_gpu()->vram_journal_bytes();
-    require(journal >= kDataBytes*passes && journal < 2*kDataBytes*passes,
+    upload = bandwidth(payload * passes, elapsed);
+    journal = gpu->vram_journal_bytes();
+    require(journal >= payload * passes && journal < 2 * payload * passes,
             "Journal did not store the dense benchmark payload");
     // A separate logical range exercises the last exact address and the file
     // contains only submitted pages and metadata, even with the large capacity.
     std::vector<std::uint8_t> tail{0xd5,0x29,0x8a,0x28,0x69,0x07,0xb3};
     const auto kLast = GpuVram::kBytes-tail.size();
     pc.cpu.memory.write_block(kFrom,tail.data(),tail.size());
+    guest.prepare(RWGPU_UPLOAD, GpuVram::kTransferBytes, GpuVram::kTransferBytes,
+                  kVram + 1, RWGPU_INVALID);
+    guest.transfer();
     require(submit(pc, RWGPU_UPLOAD, kFrom, kLast, tail.size()) == RWGPU_OK,
             "Writing the final VRAM bytes failed");
     require(submit(pc, RWGPU_UPLOAD, kFrom, kLast, tail.size() + 1) == RWGPU_INVALID &&
             submit(pc, RWGPU_UPLOAD, 0x9ffff, kLast, 2) == RWGPU_INVALID &&
-            submit(pc, RWGPU_COPY, kVram, kVram + 1, kChunk) == RWGPU_INVALID,
+            submit(pc, RWGPU_COPY, kVram, kVram + 1, GpuVram::kTransferBytes) == RWGPU_INVALID,
             "Invalid DMA spans must fail before modifying VRAM");
     const auto separate = kVram - kChunk;
     require(submit(pc, RWGPU_UPLOAD, kFrom, separate, tail.size()) == RWGPU_OK &&
             submit(pc, RWGPU_COPY, separate, separate + 2, tail.size()) == RWGPU_OK &&
-            submit(pc, RWGPU_DOWNLOAD, separate + 2, kInto, tail.size()) == RWGPU_OK,
+            submit(pc, RWGPU_DOWNLOAD, separate + 2, kFrom, tail.size()) == RWGPU_OK,
             "Overlapping VRAM copies must preserve source bytes");
     std::vector<std::uint8_t> copied(tail.size());
-    pc.cpu.memory.read_block(kInto, copied.data(), copied.size());
+    pc.cpu.memory.read_block(kFrom, copied.data(), copied.size());
     require(copied == tail, "VRAM copy changed overlapping bytes");
     constexpr auto domain = std::uint64_t{1} << 32;
     constexpr auto sum = (domain / 2) * (domain - 1);
@@ -216,51 +264,71 @@ void run_transfer_test() {
             volume.read_bytes(volume.bytes()-1,&last,1) && last==0xb3 &&
             !volume.read_bytes(volume.bytes(),&last,1),
             "Cold reopen lost the exact mathematical VRAM limit or final byte");
+    require(volume.stats().commits == upload_commits + 3,
+            "Expected one commit per upload plus the three boundary and overlap writes");
   }
   {
     boot(pc);
     PcMotherboardC06 board(pc,nullptr,{},0,path);
     TransferGuest guest(pc);
-    guest.prepare(RWGPU_DOWNLOAD, kChunks);
+    guest.prepare(RWGPU_DOWNLOAD, payload, chunk);
     // Device reopen and index replay happen on this first read. The host OS
     // may still cache the journal. Keep that distinction explicit.
     auto start=Clock::now();
     guest.transfer();
-    reopened=bandwidth(kDataBytes,Clock::now()-start);
-    pc.cpu.memory.read_block(kInto,actual.data(),actual.size());
+    reopened = bandwidth(payload, Clock::now() - start);
+    pc.cpu.memory.read_block(kFrom, actual.data(), actual.size());
     require(actual==expected,"Dirty or missing payload after re-opening the journal");
-    std::fill(actual.begin(),actual.end(),0);
-    pc.cpu.memory.write_block(kInto,actual.data(),actual.size());
-    constexpr unsigned warm_passes=64;
     const auto* gpu = board.attached_gpu();
     require(gpu, "C08 PCI adapter missing after reopen");
-    const auto before = gpu->resident_download_bytes();
-    start=Clock::now();
-    for (unsigned pass=0;pass<warm_passes;++pass) guest.transfer();
-    warm=bandwidth(kDataBytes*warm_passes,Clock::now()-start);
-    pc.cpu.memory.read_block(kInto,actual.data(),actual.size());
-    require(actual==expected && gpu->resident_download_bytes() - before == kDataBytes * warm_passes,
-            "Resident PCI transfers lost bytes or bypassed the direct path");
-    const auto warm_bytes = gpu->resident_download_bytes();
+
+    const auto prior = gpu->resident_download_bytes();
     board.set_gpu_cache_enabled(false);
-    require(submit(pc, RWGPU_DOWNLOAD, kVram, kInto, kChunk) == RWGPU_OK &&
-            gpu->resident_download_bytes() == warm_bytes, "Pressure did not disable the resident cache");
+    constexpr unsigned open_passes = 3;
+    auto elapsed = Clock::duration::zero();
+    for (unsigned pass = 0; pass < open_passes; ++pass) {
+      pc.cpu.memory.fill(kFrom, 0, payload);
+      start = Clock::now();
+      guest.transfer();
+      elapsed += Clock::now() - start;
+      pc.cpu.memory.read_block(kFrom, actual.data(), actual.size());
+      require(actual == expected, "Open QSSD read changed the payload");
+    }
+    require(gpu->resident_download_bytes() == prior, "Pressure did not disable the resident cache");
+    open = bandwidth(payload * open_passes, elapsed);
+
     board.set_gpu_cache_enabled(true);
-    require(submit(pc, RWGPU_DOWNLOAD, kVram, kInto, kChunk) == RWGPU_OK &&
-            submit(pc, RWGPU_DOWNLOAD, kVram, kInto, kChunk) == RWGPU_OK &&
-            gpu->resident_download_bytes() == warm_bytes + kChunk, "Cache did not recover after pressure");
+    const auto warm_offset = kVram + payload - kResidentPayload;
+    guest.prepare(RWGPU_DOWNLOAD, kResidentPayload, kChunk, warm_offset);
+    guest.transfer(); // Recover the resident cache through the production read.
+    pc.cpu.memory.fill(kFrom, 0, kResidentPayload);
+    constexpr unsigned warm_passes = 64;
+    const auto before = gpu->resident_download_bytes();
+    start = Clock::now();
+    for (unsigned pass = 0; pass < warm_passes; ++pass) guest.transfer();
+    warm = bandwidth(kResidentPayload * warm_passes, Clock::now() - start);
+    pc.cpu.memory.read_block(kFrom, actual.data(), kResidentPayload);
+    require(std::equal(actual.begin(), actual.begin() + kResidentPayload, expected.end() - kResidentPayload) &&
+            gpu->resident_download_bytes() - before == kResidentPayload * warm_passes,
+            "Resident PCI transfers lost bytes or bypassed the direct path");
   }
+  verify_coalesced_reads(path, actual, expected, last_epoch);
   std::cout<<"PRIME_C08_PRIMEVGC_VRAM_PASS logical_bytes=120000000000 last_byte=119999999999 "
-           <<"reopened=1 exact_bytes="<<kDataBytes<<" journal_bytes="<<journal<<'\n'
+           <<"reopened=1 exact_bytes="<<payload<<" journal_bytes="<<journal
+           <<" command_bytes="<<chunk<<" upload_commits="<<upload_commits<<'\n'
            <<std::fixed<<std::setprecision(3)
            <<"PRIME_C08_PRIMEVGC_TRANSFER_GB_PER_S upload_durable="<<upload
-           <<" download_reopened="<<reopened<<" download_resident="<<warm<<'\n';
+           <<" download_reopened="<<reopened<<" download_open="<<open<<" download_resident="<<warm<<'\n';
 }
 }
 
-int main() {
+int main(int argc, char** argv) {
   try {
-    run_transfer_test();
+    const std::string_view mode = argc == 2 ? argv[1] : "";
+    if (argc > 2 || (argc == 2 && mode != "--bulk" && mode != "--bulk-512k"))
+      throw std::invalid_argument("Usage: gpu-vram-transfer [--bulk | --bulk-512k]");
+    run_transfer_test(mode.empty() ? kResidentPayload : kBulkPayload,
+                      mode == "--bulk" ? GpuVram::kTransferBytes : kChunk, mode.empty() ? 3 : 1);
   } catch (const std::exception& error) {
     std::cerr<<"PRIME_C08_PRIMEVGC_VRAM_FAIL "<<error.what()<<'\n';
     return 1;

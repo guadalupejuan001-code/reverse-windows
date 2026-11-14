@@ -235,7 +235,7 @@ class GuestGpuC08 {
         case RWGPU_WRITE: case RWGPU_READ: status_ = staged_transfer(op, offset, params_[2]); break;
         case RWGPU_DRAW: status_ = draw(offset, params_[2], std::nullopt); break;
         case RWGPU_DRAW_VRAM:
-          status_ = count > UINT32_MAX ? RWGPU_INVALID : draw(auxiliary, params_[2], offset);
+          status_ = count > UINT32_MAX ? unsigned(RWGPU_INVALID) : draw(auxiliary, params_[2], offset);
           break;
         case RWGPU_READ_COLOR: status_ = read_color(offset, params_[2]); break;
         case RWGPU_UPLOAD: case RWGPU_DOWNLOAD: case RWGPU_COPY:

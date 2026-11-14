@@ -64,7 +64,7 @@ jobs:
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri
           cmake -S . -B build -DREVERSE_MUNDO_X_ROOT="$PWD/deps/mundo-X" -DREVERSE_QSSD_ROOT="$PWD/deps/Virtual-qSSD-" -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
-      - name: Verify PrimeVGC guest transfers and measure resident bandwidth
+      - name: Verify PrimeVGC guest transfers and measure bulk QSSD bandwidth
         shell: bash
         run: |
           set -euo pipefail
@@ -73,6 +73,12 @@ jobs:
             ./build/reverse_windows_primevgc_transfer_test
           done | tee build/primevgc-transfer.log
           grep -q '^PRIME_C08_PRIMEVGC_VRAM_PASS logical_bytes=120000000000 last_byte=119999999999' build/primevgc-transfer.log
+          for sample in 1 2 3; do
+            ./build/reverse_windows_primevgc_transfer_test --bulk-512k
+            ./build/reverse_windows_primevgc_transfer_test --bulk
+          done | tee build/primevgc-bulk.log
+          grep -q 'exact_bytes=268435456 .*command_bytes=524288 upload_commits=512' build/primevgc-bulk.log
+          grep -q 'exact_bytes=268435456 .*command_bytes=8388608 upload_commits=32' build/primevgc-bulk.log
           ./build/reverse_windows_primevgc_compute_test | tee build/primevgc-compute.log
       - name: Build the remaining native regressions
         run: |
@@ -466,6 +472,7 @@ jobs:
             build/prime-c07-vbe.log
             build/prime-c08-gpu.log
             build/primevgc-transfer.log
+            build/primevgc-bulk.log
             build/primevgc-compute.log
             build/reverse-windows-c07-ata.log
             build/reverse-windows-c08-maintenance.log
