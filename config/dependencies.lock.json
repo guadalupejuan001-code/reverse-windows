@@ -6,7 +6,7 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "1e517341a99b5b1c0a00e7a01122c5fe0c2cafbb",
+      "commit": "e4d0bd0fa8e04ec3d4e2c81d6ca13196c0af2876",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
       "status": "candidate-prime-c02-boot-profile",
@@ -17,6 +17,7 @@
         "pc-android/native/vga_bios_font.hpp",
         "pc-android/native/boot_hotspots.hpp",
         "pc-android/native/boot_timing.hpp",
+        "pc-android/native/tests/boot_hotspots_test.cpp",
         "pc-android/native/sparse_ram.hpp",
         "pc-android/native/memory_fabric.hpp",
         "pc-android/native/x86_wide_integer.hpp",

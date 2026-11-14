@@ -189,6 +189,54 @@ std::string screen(const VgaCells& cells) {
   return output;
 }
 
+void verify_real_mode_ps2(const std::filesystem::path& path, bool via_irq) {
+  // Keep IF clear so an IRQ1-enabled controller can be polled too. The
+  // motherboard regression exercises actual IRQ delivery and return.
+  std::vector<std::uint8_t> code{0xfa}; // CLI
+  if (via_irq) {
+    const std::uint8_t configure[] = {0xb0, 0x60, 0xe6, 0x64, 0xb0, 0x05, 0xe6, 0x60};
+    code.insert(code.end(), std::begin(configure), std::end(configure));
+  } else {
+    const std::uint8_t start[] = {0xb0, 0xf4, 0xe6, 0x60, 0xe4, 0x60};
+    code.insert(code.end(), std::begin(start), std::end(start));
+  }
+  // Check real scan-set 2 bytes for an extended make and break.
+  for (const std::uint8_t expected : {0xe0, 0x6b, 0xe0, 0xf0, 0x6b}) {
+    const std::uint8_t entry[] = {
+        0xe4, 0x64, 0xa8, 0x01, 0x74, 0xfa,       // Poll while the output buffer is empty.
+        0xe4, 0x60, 0x3c, expected, 0x74, 0x02, 0xfa, 0xf4};
+    code.insert(code.end(), std::begin(entry), std::end(entry));
+  }
+  // A separate Enter goes through a blocking BIOS call even though the
+  // controller is configured. Neither the arrow nor Enter is delivered twice.
+  const std::uint8_t wait[] = {
+      0xb4, 0x00, 0xcd, 0x16, 0x3d, 0x0d, 0x1c, 0x74, 0x02, 0xfa, 0xf4,
+      0xe4, 0x64, 0xa8, 0x01, 0x74, 0x02, 0xfa, 0xf4,
+      0xb8, 'K', 0x0e, 0xcd, 0x10, 0xfa, 0xf4};
+  code.insert(code.end(), std::begin(wait), std::end(wait));
+  std::array<std::uint8_t, 512> boot{};
+  std::copy(code.begin(), code.end(), boot.begin());
+  boot[510] = 0x55;
+  boot[511] = 0xaa;
+  Session::create_disk(path, 1);
+  {
+    reverse_windows::QssdDisk disk(path);
+    require(disk.write(0, 1, boot.data()) && disk.flush(), "Could not persist the keyboard test sector");
+  }
+  Session session(path, 0, Session::BootSource::Disk);
+  require(session.step(64) == Session::Step::Running, "Guest stopped before its PS/2 poll");
+  require(!session.key(0, 0xe04b, true) && !session.key(0, 0xe04b, false),
+          "Raw PS/2 input reported a BIOS wakeup");
+  run_until(session, Session::Step::WaitingKey, "Real-mode guest never received its PS/2 make and break");
+  require(!session.key(0, 0x2a, true) && !session.key(0, 0x2a, false),
+          "A modifier alone woke a waiting BIOS call");
+  require(!session.key(13, 0x1c, false) && session.key(13, 0x1c, true) &&
+              !session.key(13, 0x1c, false),
+          "Only the BIOS make code may wake INT 16h");
+  run_until(session, Session::Step::Halted, "Guest did not finish after receiving Enter through INT 16h");
+  require(screen(capture_cells(session)).front() == 'K', "Keyboard input reached the wrong guest interface");
+}
+
 void write_evidence(const std::filesystem::path& path, const VgaCells& cells,
                     const std::string& before, const std::string& after) {
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -215,6 +263,8 @@ int main(int argc, char** argv) {
     require(argc == 2 || argc == 3, "Pass the synthetic BIOS fixture and optional evidence path");
     const TestDiskDirectory dir;
     verify_ram_spill(dir.path);
+    verify_real_mode_ps2(dir.path / "keyboard-irq.rqvd", true);
+    verify_real_mode_ps2(dir.path / "keyboard-poll.rqvd", false);
     const auto disk = dir.path / "android-test.rqvd";
     const auto fixture = dir.path / "boot.iso";
     std::filesystem::copy_file(argv[1], fixture);
@@ -290,6 +340,13 @@ int main(int argc, char** argv) {
               "Guest reboot must preserve the accumulated session steps");
       require(counter(restarted, "iso_read_us") >= counter(progress, "iso_read_us"),
               "Optical read timing must cover the session across the guest reboot");
+      const auto previous = restarted.find("\"previous_boot_profile\":{\"source\":\"iso\",\"phase\":0,");
+      require(previous != std::string::npos &&
+                  counter(restarted, "boot_profile_phase") == 1 &&
+                  counter(restarted, "boot_profile_session_start_steps") ==
+                      counter(restarted, "session_steps") - counter(restarted, "instructions") &&
+                  counter(restarted.substr(previous), "sampled_windows") > 0,
+              "Reboot must retain the ISO timing and start a new QSSD profile");
       for (const auto* marker : {"\"commits\":1", "\"source\":\"qssd\"", "\"restarts\":1",
                                  "\"last_restart\":\"port92\"", "\"atapi_cdrom\":true",
                                  "\"read_sectors\":1", "\"write_sectors\":0"})
@@ -325,8 +382,14 @@ int main(int argc, char** argv) {
               "QSSD did not boot the MBR installed by the ISO guest");
       require(reboot.diagnostic().find("\"source\":\"qssd\"") != std::string::npos,
               "Reboot diagnostic did not identify QSSD");
-      require(counter(reboot.diagnostic(), "initial_commits") == 1,
+      const auto disk_boot = reboot.diagnostic();
+      require(counter(disk_boot, "initial_commits") == 1,
               "Disk-only session must report the already committed sector as initial state");
+      require(counter(disk_boot, "boot_profile_phase") == 0 &&
+                  counter(disk_boot, "boot_profile_session_start_steps") == 0 &&
+                  counter(disk_boot, "sampled_windows") > 0 &&
+                  disk_boot.find("\"previous_boot_profile\"") == std::string::npos,
+              "A direct QSSD boot must be timed independently of ISO sessions");
     }
     {
       const auto wrong_disk = dir.path / "unexpected-capacity.rqvd";
@@ -350,6 +413,7 @@ int main(int argc, char** argv) {
                  "synthetic_iso=true protected32_ia32_tsc=true protected32_lock_or=true "
                  "protected16_to_real16=true bios_edd=true pci_ide=true ata_identify_words=256 irq14=1 "
                  "qssd_logical_bytes=68719476736 bios_key=true bios_key_store_0500=true "
+                 "real_mode_ps2_irq_enabled=true real_mode_ps2_explicit_polling=true "
                  "guest_vga=true read_only_preflight=true "
                  "bios_write_ata_readback_bytes=512 mismatched_capacity_rejected=true "
                  "guest_restart=true persistent_reboot=true\n";

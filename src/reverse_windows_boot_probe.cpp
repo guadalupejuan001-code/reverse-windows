@@ -233,7 +233,7 @@ int main(int argc, char** argv) {
         if (opts.profile_every) {
             motherboard.enable_ps2_keyboard();
             pc.enable_boot_acceleration();
-            if (opts.source == Options::Source::Iso) pc.enable_boot_hotspots();
+            if (opts.source == Options::Source::Iso) pc.enable_boot_hotspots(true, false);
             pc.cpu.enable_page_translation_cache();
 #if defined(MUNDO_X_PC_ETHER_NEXT)
             pc.cpu.enable_ether_next();

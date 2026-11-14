@@ -118,10 +118,18 @@ def run_probe(probe, iso, disk, timed, start=32768, interval=32768, stop=None):
 
 
 def sample_long_mode(probe):
-    run = subprocess.run([
+    command = [
         str(probe), "--demo-x64", "--profile-from", "3140", "--profile-every", "4096", "--steps", "50000",
-    ], capture_output=True, text=True, timeout=10, check=True)
-    report = json.loads(run.stdout)
+    ]
+    def run_profile(args):
+        run = subprocess.run(args, capture_output=True, text=True, timeout=10, check=True)
+        return json.loads(run.stdout)
+
+    control = run_profile(command + ["--profile-counts-only"])
+    report = run_profile(command)
+    check("boot_time_samples" not in control and "boot_code_regions" not in control and
+          guest_state(report) == guest_state(control) and report["machine"] == control["machine"],
+          "paging or guest state changed when timing was enabled in long mode")
     profile, timing = report["boot_profile"], report["boot_time_samples"]
     check(profile["start"]["mode"] == profile["current"]["mode"] == "long64" and
           report["machine"]["status"] == "halted" and
@@ -188,6 +196,7 @@ def main():
         "timing": timing,
         "sample_reports": samples,
         "long_mode_sample": sample_long_mode(probe),
+        "matching_long_mode_state": True,
     }
     if args.evidence:
         args.evidence.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")

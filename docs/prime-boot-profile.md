@@ -1,6 +1,6 @@
 # Prime C02 · perfil de arranque
 
-La prueba nativa mide el mismo tramo del invitado El Torito con y sin cronómetro. El disco QSSD de 64 GiB lógicos se crea vacío en cada pasada. El invitado copia RAM con `REP`, ejecuta aritmética, consulta el controlador IDE, recibe IRQ14 y llega al prompt de teclado verificado en C01. Una segunda prueba toma muestras en `long64` con paginación activa.
+La prueba nativa mide el mismo tramo del invitado El Torito con y sin muestreo de tiempos interno. El disco QSSD de 64 GiB lógicos se crea vacío en cada pasada. El invitado copia RAM con `REP`, ejecuta aritmética, consulta el controlador IDE, recibe IRQ14 y llega al prompt de teclado verificado en C01. Una segunda prueba repite la comparación en `long64` con paginación activa.
 
 ```sh
 python3 tests/prime_boot_profile.py build/reverse_windows_boot_probe \
@@ -17,7 +17,9 @@ build/reverse_windows_boot_probe --iso ./guest.iso \
   --steps 500000 --evidence ./profile-run.json
 ```
 
-`--profile-from`, `--profile-until` y `--profile-every` usan pasos lógicos x86, incluidos los elementos de `REP`. `--steps` limita los ticks de la placa. El ejecutable devuelve código 3 si el invitado se detiene antes de `--profile-until`. Para una pasada de control, usar `--profile-counts-only` y un disco inicial equivalente. Si el invitado lee el reloj del BIOS, recibe entrada o arranca desde un disco con otros datos, comprobar el estado antes de comparar tiempos.
+`--profile-from`, `--profile-until` y `--profile-every` usan pasos lógicos x86, incluidos los elementos de `REP`. `--steps` limita los ticks de la placa. El ejecutable devuelve código 3 si el invitado se detiene antes de `--profile-until`. Para una pasada de control, usar `--profile-counts-only` y un disco inicial equivalente. Ambas pasadas usan los mismos límites de lote y mantienen el reloj exterior. Si el invitado lee el reloj del BIOS, recibe entrada o arranca desde un disco con otros datos, comprobar el estado antes de comparar tiempos.
+
+El diagnóstico de Android perfila el inicio por ISO y por QSSD. `boot_profile_phase` y `boot_profile_session_start_steps` identifican el tramo activo en los pasos acumulados de la sesión. Tras un reinicio, `previous_boot_profile` conserva el último tramo completo con su origen, puntos de comparación y tiempos. Los puntos describen el estado observado en la prueba.
 
 | Campo | Qué mide |
 | --- | --- |

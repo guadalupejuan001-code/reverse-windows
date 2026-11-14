@@ -100,12 +100,7 @@ class AndroidBootSession final {
     if (source != BootSource::SelfTest) pc_.enable_guest_restart();
     pc_.enable_boot_acceleration();
     pc_.cpu.enable_page_translation_cache();
-    if (source == BootSource::Iso) {
-      pc_.enable_boot_hotspots();
-      pc_.enable_boot_timing();
-      boot_profile_.emplace(BootProfile::kDefaultCheckpointSteps);
-      boot_profile_->begin(pc_, *board_);
-    }
+    if (source != BootSource::SelfTest) start_boot_profile();
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     pc_.cpu.enable_ether_next();
 #endif
@@ -253,15 +248,26 @@ class AndroidBootSession final {
         (pc_.cpu.halted && !pc_.cpu.flag(cosmic_pc::Cpu::IF));
   }
 
-  void key(unsigned ascii, unsigned scancode, bool pressed) {
+  bool key(unsigned ascii, unsigned scancode, bool pressed) {
     if (ascii > 255 || (scancode > 255 && (scancode & ~255U) != 0xe000U))
       throw std::invalid_argument("Código de teclado BIOS inválido.");
-    if (board_->evidence().powered_off) return;
-    if (pc_.cpu.is_real_mode()) {
+    if (is_stopped() || pc_.cpu.fault || !pc_.host_error.empty()) return false;
+    const bool was_waiting = pc_.waiting_key;
+    auto& held_route = key_routes_[(scancode & 0xffU) + (scancode > 0xff ? 256 : 0)];
+    auto route = held_route;
+    // Keep a key's make, repeat and break on the same interface even when
+    // the guest changes mode or switches between BIOS and controller input.
+    if (pressed && route == KeyRoute::None)
+      route = pc_.cpu.is_real_mode() && (was_waiting || !board_->guest_uses_ps2_scancodes())
+          ? KeyRoute::Bios : KeyRoute::Ps2;
+    if (!pressed) held_route = KeyRoute::None;
+    if (route == KeyRoute::Bios) {
       pc_.key_event(static_cast<std::uint8_t>(ascii), scancode, pressed);
-    } else if (scancode) {
-      (void)board_->inject_ps2_key(scancode, pressed);
+      if (pressed) held_route = route;
+    } else if (route == KeyRoute::Ps2 && scancode && board_->inject_ps2_key(scancode, pressed)) {
+      if (pressed) held_route = route;
     }
+    return was_waiting && !pc_.waiting_key;
   }
 
   void flush() {
@@ -371,12 +377,16 @@ class AndroidBootSession final {
       hotspots->write_json(out);
     }
     if (boot_profile_) {
+      out << ",\"boot_profile_phase\":" << restarts_
+          << ",\"boot_profile_session_start_steps\":" << previous_boot_steps_;
       out << ",\"boot_profile\":";
       boot_profile_->write_json(out, pc_, *board_);
       out << ",\"boot_time_samples\":";
       pc_.boot_timing()->write_json(out);
       out << ",\"boot_code_regions\":";
       pc_.boot_regions()->write_json(out);
+      if (previous_boot_profile_)
+        out << ",\"previous_boot_profile\":" << *previous_boot_profile_;
     }
     const auto& mode = pc_.boot_mode_progress();
     out << ",\"boot_progress\":{\"handed_off\":" << (pc_.cpu.instructions ? "true" : "false")
@@ -488,6 +498,27 @@ class AndroidBootSession final {
       throw std::runtime_error("El invitado de prueba no confirmó la capacidad ATA del QSSD.");
   }
 
+  void start_boot_profile() {
+    pc_.enable_boot_hotspots();
+    pc_.enable_boot_timing();
+    boot_profile_.emplace(BootProfile::kDefaultCheckpointSteps);
+    boot_profile_->begin(pc_, *board_);
+  }
+
+  std::string completed_boot_profile() const {
+    std::ostringstream out;
+    out << "{\"source\":\"" << source_name() << "\",\"phase\":" << restarts_
+        << ",\"session_start_steps\":" << previous_boot_steps_
+        << ",\"boot_profile\":";
+    boot_profile_->write_json(out, pc_, *board_);
+    out << ",\"boot_time_samples\":";
+    pc_.boot_timing()->write_json(out);
+    out << ",\"boot_code_regions\":";
+    pc_.boot_regions()->write_json(out);
+    out << '}';
+    return out.str();
+  }
+
   void restart_guest() {
     using Restart = cosmic_pc::PcMachine::GuestRestart;
     switch (pc_.guest_restart()) {
@@ -510,6 +541,7 @@ class AndroidBootSession final {
       else if (++rapid_restarts_>3)
         throw std::runtime_error("El medio solicitó reinicios repetidos al arrancar.");
 
+      auto completed = boot_profile_ ? std::optional<std::string>(completed_boot_profile()) : std::nullopt;
       if (next==BootSource::Disk) {
         pc_.mount([this](auto off, auto* into, auto count) {
           return disk_->read_bytes(off,into,count);
@@ -521,8 +553,12 @@ class AndroidBootSession final {
       }
       source_=next;
       ++restarts_;
+      key_routes_.fill(KeyRoute::None);
       text_visible_=false;
-      if (boot_profile_) boot_profile_->begin(pc_, *board_);
+      if (boot_profile_) {
+        previous_boot_profile_ = std::move(completed);
+        boot_profile_->begin(pc_, *board_);
+      }
     } catch (const std::exception& error) { pc_.host_error=error.what(); }
   }
   class OpticalReader {
@@ -588,8 +624,11 @@ class AndroidBootSession final {
     return "unknown";
   }
 
+  enum class KeyRoute : std::uint8_t { None, Bios, Ps2 };
   BootSource source_;
+  std::array<KeyRoute, 512> key_routes_{};
   std::optional<BootProfile> boot_profile_;
+  std::optional<std::string> previous_boot_profile_;
   cosmic_pc::PcMachine pc_;
   SpillInfo spill_;
   std::shared_ptr<OpticalReader> iso_;
