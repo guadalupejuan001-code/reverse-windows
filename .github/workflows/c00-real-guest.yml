@@ -290,6 +290,14 @@ jobs:
           assert 'REVERSE_WINDOWS_C09R_READINESS_PASS' in lines[-1]
           print('C09R_USER_TECH_REAL_HARDWARE_AUDIT_PASS windows_ran=false')
           PY
+      - name: Measure exact GPU Virtual calculation on the host CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O3 -Wall -Wextra -Wpedantic -Werror -pthread \
+            -I deps/GPU-VIRTUAL/include -isystem deps/mundo-X/native/include \
+            tests/gpu_calculo_benchmark.cpp -o build/gpu-calculo-benchmark
+          ./build/gpu-calculo-benchmark | tee build/gpu-calculo-benchmark.txt
       - name: Trace authentic CPU and BIOS execution from a SYNTHETIC El Torito ISO
         shell: bash
         run: |
@@ -437,6 +445,7 @@ jobs:
             build/c09-quota-diagnosis.json
             build/c09-hardware-trace.log
             build/c09r-hardware-audit.jsonl
+            build/gpu-calculo-benchmark.txt
             build/c02-cpu-conformance.log
             build/c03-boot-evidence.json
             build/c03-bios-disk.log
