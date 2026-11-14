@@ -79,7 +79,7 @@ final class NativeMachine {
     static native boolean maintainRamBudget(long handle);
     static native boolean key(long handle, int ascii, int scanCode, boolean pressed);
     static native void flush(long handle);
-    static native String diagnostic(long handle);
+    static native String diagnostic(long handle, boolean detailed);
     static native int[] captureVideo(long handle, byte[] text);
     static native void retryVideo(long handle);
 }

@@ -16,6 +16,7 @@ import android.graphics.drawable.RippleDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.text.TextUtils;
 import android.view.Gravity;
@@ -81,16 +82,18 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private Button hardwareCheck;
     private TextView hardwareResult;
     private LinearLayout controls;
+    private LinearLayout setupPanel;
     private boolean pending;
     private boolean session;
     private boolean running;
     private boolean fault;
     private boolean terminal;
     private boolean checkingHardware;
+    private boolean requestingDiagnostic;
     private boolean blankTextFrame;
     private String lastJson = "";
     private String diagnosticToExport = "";
-    private long previousElapsedMs = -1;
+    private long previousStepUs = -1;
     private long previousSteps;
     private long stepsPerSecond = -1;
 
@@ -136,15 +139,16 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         body.setPadding(dp(18), dp(14), dp(18), dp(20));
         scroll.addView(body);
 
-        TextView title = label("REVERSE Windows", 27, TEXT);
+        TextView title = label("REVERSE Windows Prime", 24, TEXT);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         body.addView(title);
-        source = label("BIOS · x86-64", 12, ACCENT);
+        source = label(BuildConfig.VERSION_NAME + " · Invitado x86-64", 12, ACCENT);
         source.setTypeface(Typeface.MONOSPACE);
         source.setLetterSpacing(0.07f);
         add(body, source, 4);
 
-        LinearLayout display = card(body, 14);
+        setupPanel = card(body, 14);
+        LinearLayout display = card(body, 12);
         status = label("Máquina apagada", 16, TEXT);
         status.setId(R.id.vm_status);
         status.setTypeface(Typeface.DEFAULT_BOLD);
@@ -197,8 +201,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         weighted(extraKeys, action("F8", false, () -> sendGuestKey(0, 0x42)), 6);
         weighted(extraKeys, action("F10", false, () -> sendGuestKey(0, 0x44)), 6);
 
-        LinearLayout setup = card(body, 12);
-        TextView bootTitle = label("Medios de arranque", 16, TEXT);
+        LinearLayout setup = setupPanel;
+        TextView bootTitle = label("Arranque", 16, TEXT);
         bootTitle.setTypeface(Typeface.DEFAULT_BOLD);
         setup.addView(bootTitle);
         media = label("", 13, MUTED);
@@ -214,9 +218,6 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
 
         storage = label("", 13, MUTED);
         add(setup, storage, 9);
-        createDisk = action("Crear QSSD de 64 GiB", false, this::prepareDisk);
-        createDisk.setId(R.id.vm_create_disk);
-        add(setup, createDisk, 5);
 
         bootIso = action("Arrancar desde ISO", true, () -> start(NativeMachine.BOOT_ISO, false));
         bootIso.setId(R.id.vm_boot_iso);
@@ -228,6 +229,10 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         biosTest = action("Probar BIOS", false, () -> start(NativeMachine.BOOT_SELF_TEST, false));
         biosTest.setId(R.id.vm_bios_test);
         pair(bootRow, bootDisk, biosTest);
+
+        createDisk = action("Crear QSSD de 64 GiB", false, this::prepareDisk);
+        createDisk.setId(R.id.vm_create_disk);
+        add(setup, createDisk, 6);
 
         hardwareCheck = action("Comprobar equipo virtual", false, this::checkHardware);
         hardwareCheck.setId(R.id.vm_hardware_check);
@@ -244,8 +249,14 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         picker.addCategory(Intent.CATEGORY_OPENABLE);
         picker.setType("*/*");
+        picker.putExtra(DocumentsContract.EXTRA_INITIAL_URI,
+                DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", "primary:Download"));
         picker.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-        startActivityForResult(picker, ISO_PICKER);
+        try {
+            startActivityForResult(picker, ISO_PICKER);
+        } catch (android.content.ActivityNotFoundException error) {
+            Toast.makeText(this, "Android no encontró un selector de archivos.", Toast.LENGTH_LONG).show();
+        }
     }
 
     @Override
@@ -327,7 +338,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         fault = false;
         terminal = false;
         blankTextFrame = false;
-        previousElapsedMs = -1;
+        previousStepUs = -1;
         stepsPerSecond = -1;
         monitor.reset();
         monitor.requestFocus();
@@ -336,7 +347,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             case NativeMachine.BOOT_QSSD -> "BIOS · QSSD";
             default -> "BIOS · PRUEBA";
         });
-        status.setText("Cargando medio de arranque…");
+        status.setText(bootSource == NativeMachine.BOOT_ISO
+                ? "Abriendo la ISO y preparando el QSSD…" : "Cargando medio de arranque…");
         status.setTextColor(TEXT);
         stats.setText("");
         updateControls();
@@ -435,17 +447,18 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     }
 
     @Override
-    public void onState(String json, boolean active, boolean hasSession, boolean stopped) {
+    public void onState(String json, boolean active, boolean hasSession, boolean stopped, boolean detailed) {
         boolean wasFault = fault;
+        boolean wasSession = session;
         pending = false;
         session = hasSession;
         running = active;
         terminal = stopped;
-        if (!json.isEmpty()) lastJson = json;
+        if (detailed && !json.isEmpty()) lastJson = json;
         if (!session) {
             status.setTextColor(TEXT);
             status.setText("Máquina apagada");
-            source.setText("BIOS · x86-64");
+            source.setText(BuildConfig.VERSION_NAME + " · Invitado x86-64");
             fault = false;
         }
         if (!json.isEmpty()) {
@@ -480,7 +493,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             stats.setText("");
         }
         updateControls();
-        if (fault && !wasFault) showBootStatus();
+        if ((session && !wasSession) || (fault && !wasFault)) showBootStatus();
     }
 
     private void updateBootProgress(JSONObject diagnostic, JSONObject boot) {
@@ -494,14 +507,15 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         JSONObject ram = diagnostic.optJSONObject("ram_profile");
         long steps = machine.optLong("instructions");
         long sessionSteps = boot == null ? steps : boot.optLong("session_steps", steps);
-        long elapsedMs = diagnostic.optLong("elapsed_ms", -1);
-        if (!running || previousElapsedMs < 0 || sessionSteps < previousSteps) {
+        JSONObject workerTiming = diagnostic.optJSONObject("worker_timing");
+        long stepUs = workerTiming == null ? -1 : workerTiming.optLong("step_us", -1);
+        if (!running || previousStepUs < 0 || sessionSteps < previousSteps) {
             stepsPerSecond = -1;
-        } else if (elapsedMs > previousElapsedMs) {
-            stepsPerSecond = Math.round((sessionSteps - previousSteps) * 1000.0 /
-                    (elapsedMs - previousElapsedMs));
+        } else if (stepUs > previousStepUs) {
+            stepsPerSecond = Math.round((sessionSteps - previousSteps) * 1_000_000.0 /
+                    (stepUs - previousStepUs));
         }
-        previousElapsedMs = running ? elapsedMs : -1;
+        previousStepUs = running ? stepUs : -1;
         previousSteps = sessionSteps;
         long reads = machine.optLong("disk_reads");
         long readSectors = ata == null ? 0 : ata.optLong("read_sectors");
@@ -516,7 +530,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         progress.append("\nModo ").append(modeName(machine.optString("cpu_mode")));
         progress.append(String.format(Locale.getDefault(), "\n%,d pasos x86 en esta sesión", sessionSteps));
         if (stepsPerSecond >= 0) {
-            progress.append(String.format(Locale.getDefault(), " · %,d pasos/s", stepsPerSecond));
+            progress.append(String.format(Locale.getDefault(), " · %,d pasos/s de ejecución", stepsPerSecond));
         }
         if (ram != null) {
             progress.append(String.format(Locale.getDefault(), "\nRAM residente: %,d / %,d MiB",
@@ -596,7 +610,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     }
 
     private void showBootStatus() {
-        scroll.post(() -> scroll.smoothScrollTo(0, 0));
+        status.post(() -> status.requestRectangleOnScreen(
+                new Rect(0, 0, status.getWidth(), status.getHeight())));
     }
 
     @Override
@@ -653,14 +668,15 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         else
             getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         boolean diskReady = disk.isFile();
-        media.setText(iso == null ? "CD/DVD · sin ISO" : "CD/DVD · " + isoName);
-        storage.setText(diskReady ? "QSSD · 64 GiB lógicos" : "QSSD · sin disco");
+        media.setText(iso == null ? "Selecciona tu ISO local de Windows" : "CD/DVD · " + isoName);
+        storage.setText(diskReady ? "QSSD · 64 GiB lógicos" : "QSSD · se crea al arrancar la ISO");
         boolean setup = !session && !pending;
+        setupPanel.setVisibility(session ? View.GONE : View.VISIBLE);
         selectIso.setEnabled(setup);
         ejectIso.setEnabled(setup && iso != null);
         createDisk.setVisibility(diskReady ? View.GONE : View.VISIBLE);
         createDisk.setEnabled(setup);
-        bootIso.setEnabled(setup && iso != null && diskReady);
+        bootIso.setEnabled(setup && iso != null);
         bootDisk.setEnabled(setup && diskReady);
         biosTest.setEnabled(setup);
         hardwareCheck.setEnabled(setup);
@@ -669,10 +685,25 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         pause.setEnabled(session && !pending && !fault && !terminal);
         stop.setEnabled(session && !pending);
         evidence.setVisibility(lastJson.isEmpty() ? View.GONE : View.VISIBLE);
+        evidence.setEnabled(!requestingDiagnostic);
     }
 
     private void showDiagnostic() {
-        String json = lastJson;
+        if (session && !requestingDiagnostic) {
+            requestingDiagnostic = true;
+            evidence.setEnabled(false);
+            worker.requestDiagnostic(json -> {
+                requestingDiagnostic = false;
+                evidence.setEnabled(true);
+                if (!json.isEmpty()) lastJson = json;
+                showDiagnosticDialog(lastJson);
+            });
+        } else if (!requestingDiagnostic) {
+            showDiagnosticDialog(lastJson);
+        }
+    }
+
+    private void showDiagnosticDialog(String json) {
         if (json.isEmpty()) return;
         new AlertDialog.Builder(this)
                 .setTitle("Último diagnóstico")

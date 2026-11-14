@@ -359,6 +359,18 @@ int main(int argc, char** argv) {
               "Writable ISO descriptor was accepted or mutated the disk");
     }
     {
+      const auto invalid = dir.path / "invalid.iso";
+      std::ofstream(invalid) << "No El Torito image";
+      bool rejected = false;
+      try {
+        FileDescriptor iso(invalid, O_RDONLY);
+        Session denied(disk, 64, Session::BootSource::Iso, iso.value);
+      } catch (const std::runtime_error&) {
+        rejected = true;
+      }
+      require(rejected && !std::filesystem::exists(disk), "Invalid ISO created a disk before validation");
+    }
+    {
       auto session = [&] {
         FileDescriptor iso(fixture, O_RDONLY);
         return Session(disk, 64, Session::BootSource::Iso, iso.value, original.size());
@@ -367,6 +379,11 @@ int main(int argc, char** argv) {
                 "El Torito guest did not detect QSSD and return to the real-mode BIOS prompt", 1);
       frame = capture_cells(session);
       progress = session.diagnostic();
+      const auto live = session.diagnostic(false);
+      require(live.size() < progress.size() && live.find("\"boot_profile\":") == std::string::npos &&
+                  live.find("\"status\":\"waiting_key\"") != std::string::npos &&
+                  counter(live, "session_steps") == counter(progress, "session_steps"),
+              "Live status must preserve guest progress without serializing detailed profiles");
       require(counter(progress, "session_steps") == counter(progress, "instructions") &&
                   counter(progress, "session_steps") > 0,
               "Before the first restart, session and CPU steps must match");

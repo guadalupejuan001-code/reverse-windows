@@ -25,53 +25,8 @@ permissions:
   contents: read
 
 jobs:
-  prime-android-compile:
-    # Compile Prime revisions against the pinned SDK before packaging.
-    if: ${{ startsWith(github.head_ref || github.ref_name, 'feature/windows-prime-') }}
-    name: Prime Android 35 Java and ARM64 JNI
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-      - uses: android-actions/setup-android@v3
-        with:
-          cmdline-tools-version: "11076708"
-          packages: "platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018 cmake;3.22.1"
-      - uses: gradle/actions/setup-gradle@v4
-      - name: Compile the app and ARM64 native library
-        run: |
-          set -eu
-          python3 scripts/verify_deps.py --manifest-only
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          import subprocess
-
-          for component in json.loads(Path("config/dependencies.lock.json").read_text())["components"]:
-              target = component["checkout"]
-              url = "https://github.com/" + component["repository"] + ".git"
-              subprocess.run(["git", "init", "--quiet", target], check=True)
-              subprocess.run(["git", "-C", target, "fetch", "--quiet", "--depth", "1", url,
-                              component["commit"]], check=True)
-              subprocess.run(["git", "-C", target, "checkout", "--quiet", "--detach", "FETCH_HEAD"], check=True)
-          PY
-          python3 scripts/verify_deps.py
-          cd android
-          ./gradlew --no-daemon -PandroidAbi=arm64-v8a -PetherPreview=true \
-            :app:compileDebugJavaWithJavac :app:externalNativeBuildDebug
-
   android:
-    # Prime's component cycles run the native suite. Android packaging
-    # resumes when a completed Prime revision is selected for release.
-    if: ${{ !startsWith(github.head_ref || github.ref_name, 'feature/windows-prime-') }}
-    name: Android ${{ matrix.abi }}
+    name: Prime Android ${{ matrix.abi }}
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     strategy:
@@ -80,9 +35,9 @@ jobs:
         abi: [arm64-v8a, x86_64]
     env:
       ANDROID_ABI: ${{ matrix.abi }}
-      ANDROID_APP_ID: com.reversewindows.android.ether.r026
-      ANDROID_VERSION: "0.1.16"
-      ANDROID_VERSION_CODE: "17"
+      ANDROID_APP_ID: com.reversewindows.android.prime.c08
+      ANDROID_VERSION: "0.2.0"
+      ANDROID_VERSION_CODE: "18"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -148,7 +103,7 @@ jobs:
           tools="$ANDROID_HOME/build-tools/35.0.0"
           out="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI"
           mkdir -p "$out"
-          apk_name="REVERSE-Windows-Ether-$ANDROID_VERSION-$ANDROID_ABI-debug.apk"
+          apk_name="REVERSE-Windows-Prime-$ANDROID_VERSION-$ANDROID_ABI.apk"
           cp "$apk" "$out/$apk_name"
           "$tools/apksigner" verify --verbose --print-certs "$apk" | tee "$out/signature.txt"
           grep -Fxq 'Number of signers: 1' "$out/signature.txt"
@@ -157,7 +112,7 @@ jobs:
           "$tools/zipalign" -c -P 16 -v 4 "$apk" > "$out/alignment.txt"
           "$tools/aapt" dump badging "$apk" > "$out/manifest.txt"
           grep -Fq "package: name='$ANDROID_APP_ID' versionCode='$ANDROID_VERSION_CODE' versionName='$ANDROID_VERSION'" "$out/manifest.txt"
-          grep -Fxq "application-label:'REVERSE Windows Ether $ANDROID_VERSION'" "$out/manifest.txt"
+          grep -Fxq "application-label:'REVERSE Windows Prime'" "$out/manifest.txt"
           "$tools/aapt" dump xmltree "$apk" AndroidManifest.xml > "$RUNNER_TEMP/reverse-windows-app-manifest.txt"
           "$tools/aapt" dump resources "$apk" > "$RUNNER_TEMP/reverse-windows-app-resources.txt"
           icon_id=$(sed -n 's/.*A: android:icon([^)]*)=@\(0x[[:xdigit:]]\{8\}\).*/\1/p' "$RUNNER_TEMP/reverse-windows-app-manifest.txt")
@@ -196,7 +151,7 @@ jobs:
         if: matrix.abi == 'arm64-v8a'
         uses: actions/upload-artifact@v4
         with:
-          name: REVERSE-Windows-Ether-${{ env.ANDROID_VERSION }}-arm64-v8a-debug
+          name: REVERSE-Windows-Prime-${{ env.ANDROID_VERSION }}-ARM64
           path: ${{ runner.temp }}/reverse-windows-arm64-v8a
           if-no-files-found: error
       - name: Enable KVM for Android runtime smoke test
@@ -303,17 +258,78 @@ jobs:
           assert snapshot["ether_next"]["boot_paged_rep_elements"] == 0
           PY
           adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity"
+          saved=false
           for attempt in {1..8}; do
             adb shell uiautomator dump /sdcard/reverse-windows-window.xml >/dev/null
             adb exec-out cat /sdcard/reverse-windows-window.xml > "$RUNNER_TEMP/reverse-windows-window.xml"
             if grep -Fq "resource-id=\"$ANDROID_APP_ID:id/vm_copy_diagnostic\"" "$RUNNER_TEMP/reverse-windows-window.xml"; then
-              exit 0
+              saved=true
+              break
             fi
           done
-          echo "Saved diagnostic was unavailable after relaunch" >&2
-          exit 1
+          if [[ "$saved" != true ]]; then
+            echo "Saved diagnostic was unavailable after relaunch" >&2
+            exit 1
+          fi
+
+          tap_visible() {
+            local field="$1" label="$2" point
+            for attempt in {1..12}; do
+              adb shell uiautomator dump /sdcard/reverse-windows-window.xml >/dev/null
+              adb exec-out cat /sdcard/reverse-windows-window.xml > "$RUNNER_TEMP/reverse-windows-window.xml"
+              point=$(python3 - "$RUNNER_TEMP/reverse-windows-window.xml" "$field" "$label" <<'PY'
+          import re
+          import sys
+          import xml.etree.ElementTree as xml
+          path, field, label = sys.argv[1:]
+          for node in xml.parse(path).iter("node"):
+              if node.get(field) == label and node.get("enabled") == "true":
+                  left, top, right, bottom = map(int, re.findall(r"\d+", node.get("bounds")))
+                  if right > left and bottom > top:
+                      print((left + right) // 2, (top + bottom) // 2)
+                      break
+          PY
+              )
+              if [[ "$point" =~ ^[0-9]+\ [0-9]+$ ]]; then
+                read -r x y <<< "$point"
+                adb shell input tap "$x" "$y"
+                return
+              fi
+              sleep 1
+            done
+            echo "Could not find enabled Android control $label" >&2
+            cat "$RUNNER_TEMP/reverse-windows-window.xml" >&2
+            return 1
+          }
+          iso=reverse-windows-test.iso
+          python3 tests/c10_android_boot_iso.py "$RUNNER_TEMP/$iso"
+          adb push "$RUNNER_TEMP/$iso" "/sdcard/Download/$iso"
+          tap_visible resource-id "$ANDROID_APP_ID:id/vm_select_iso"
+          tap_visible text "$iso"
+          tap_visible resource-id "$ANDROID_APP_ID:id/vm_boot_iso"
+
+          snapshot="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/iso-diagnostic.json"
+          for attempt in {1..30}; do
+            if adb exec-out run-as "$ANDROID_APP_ID" cat files/ultimo-diagnostico.json > "$snapshot" &&
+              grep -Fq '"source":"iso","status":"waiting_key"' "$snapshot"; then
+              break
+            fi
+            sleep 1
+          done
+          python3 - "$snapshot" "$RUNNER_TEMP/$iso" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          report = json.loads(Path(sys.argv[1]).read_text())
+          assert report["source"] == "iso" and report["status"] == "waiting_key", report
+          assert report["iso_bytes"] == Path(sys.argv[2]).stat().st_size
+          assert report["disk"]["logical_bytes"] == 64 * 1024**3 and report["disk"]["initial_commits"] == 0
+          assert report["ata"]["identify_data_transfers"] == 1
+          assert report["boot_progress"]["handed_off"] and report["boot_profile"]["checkpoint_interval_steps"] == 50_000_000
+          print("PRIME_ANDROID_ISO_PICKER_PASS boot=el-torito qssd_created=1")
+          PY
           BASH
-      - name: Run synthetic BIOS and keyboard on Android
+      - name: Run BIOS, keyboard and synthetic ISO from Downloads on Android
         if: matrix.abi == 'x86_64' && steps.kvm.outputs.available == 'true'
         uses: reactivecircus/android-emulator-runner@v2
         with:

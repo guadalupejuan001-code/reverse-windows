@@ -2,12 +2,14 @@ package com.reversewindows.android;
 
 import android.content.ContentResolver;
 import android.content.Context;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
+import android.provider.OpenableColumns;
 import android.util.AtomicFile;
 import android.util.Log;
 import android.view.Choreographer;
@@ -20,10 +22,11 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.function.Consumer;
 
 final class VmWorker {
     interface Listener {
-        void onState(String json, boolean running, boolean hasSession, boolean stopped);
+        void onState(String json, boolean running, boolean hasSession, boolean stopped, boolean detailed);
         void onFrame(Frame frame);
         void onError(String message, boolean hasSession);
         void onDiskCreated();
@@ -136,6 +139,23 @@ final class VmWorker {
         });
     }
 
+    void requestDiagnostic(Consumer<String> ready) {
+        worker.post(() -> {
+            String json = lastDiagnostic;
+            try {
+                if (handle != 0 && outcome != NativeMachine.FAULT) {
+                    json = currentDiagnostic(true);
+                    lastDiagnostic = json;
+                    saveDiagnostic(json);
+                }
+            } catch (RuntimeException | LinkageError error) {
+                Log.w(TAG, "No se pudo actualizar el diagnóstico", error);
+            }
+            final String result = json.isEmpty() ? persistedDiagnostic : json;
+            send(() -> ready.accept(result));
+        });
+    }
+
     void createDisk() {
         worker.post(() -> {
             try {
@@ -159,8 +179,8 @@ final class VmWorker {
                     ParcelFileDescriptor selected = null;
                     String issue = "Android no pudo abrir la ISO.";
                     try {
-                        selected = resolver.openFileDescriptor(iso, "r");
-                    } catch (IOException | SecurityException error) {
+                        selected = openIso(iso);
+                    } catch (IOException error) {
                         if (error.getMessage() != null) issue = error.getMessage();
                     }
                     if (selected == null) {
@@ -168,7 +188,7 @@ final class VmWorker {
                     } else {
                         try (ParcelFileDescriptor fd = selected) {
                             result = NativeMachine.checkHardware(context, diskPath, fd.getFd(),
-                                    Math.max(0, fd.getStatSize()), null);
+                                    isoSize(iso, fd), null);
                         }
                     }
                 }
@@ -178,6 +198,28 @@ final class VmWorker {
                 report(error);
             }
         });
+    }
+
+    private ParcelFileDescriptor openIso(Uri iso) throws IOException {
+        try {
+            ParcelFileDescriptor fd = resolver.openFileDescriptor(iso, "r");
+            if (fd == null) throw new IOException("El proveedor devolvió un descriptor vacío.");
+            return fd;
+        } catch (IOException | SecurityException error) {
+            throw new IOException("Android no pudo abrir la ISO. Vuelve a elegir el archivo local.", error);
+        }
+    }
+
+    private long isoSize(Uri uri, ParcelFileDescriptor fd) {
+        long size = fd.getStatSize();
+        if (size > 0) return size;
+        try (Cursor cursor = resolver.query(uri, new String[]{OpenableColumns.SIZE}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst() && !cursor.isNull(0))
+                return Math.max(0, cursor.getLong(0));
+        } catch (RuntimeException ignored) {
+            // The native reader also checks the descriptor's size and seekability.
+        }
+        return 0;
     }
 
     void start(int source, Uri iso, boolean debug) {
@@ -190,10 +232,10 @@ final class VmWorker {
                 String path = source == NativeMachine.BOOT_SELF_TEST ? "" : disk.getAbsolutePath();
                 if (source == NativeMachine.BOOT_ISO) {
                     if (iso == null) throw new IOException("Elige primero una imagen ISO.");
-                    try (ParcelFileDescriptor fd = resolver.openFileDescriptor(iso, "r")) {
-                        if (fd == null) throw new IOException("Android no pudo abrir la ISO.");
-                        handle = NativeMachine.open(context, path, 0, fd.getFd(),
-                                Math.max(0, fd.getStatSize()), source);
+                    try (ParcelFileDescriptor fd = openIso(iso)) {
+                        int createGiB = disk.exists() ? 0 : DISK_GIB;
+                        handle = NativeMachine.open(context, path, createGiB, fd.getFd(),
+                                isoSize(iso, fd), source);
                     }
                 } else {
                     handle = NativeMachine.open(context, path, 0, -1, 0, source);
@@ -286,10 +328,10 @@ final class VmWorker {
     void stop() {
         worker.post(() -> {
             try {
-                String diagnostic = handle == 0 ? "" : currentDiagnostic();
+                String diagnostic = handle == 0 ? "" : currentDiagnostic(true);
                 saveDiagnostic(diagnostic);
                 closeMachine();
-                send(() -> listener.onState(diagnostic, false, false, false));
+                send(() -> listener.onState(diagnostic, false, false, false, true));
             } catch (RuntimeException | LinkageError error) {
                 report(error);
             }
@@ -437,8 +479,8 @@ final class VmWorker {
         }
     }
 
-    private String currentDiagnostic() {
-        return withBuildMetadata(NativeMachine.diagnostic(handle),
+    private String currentDiagnostic(boolean detailed) {
+        return withBuildMetadata(NativeMachine.diagnostic(handle, detailed),
                 ",\"elapsed_ms\":" + (SystemClock.elapsedRealtime() - sessionStarted)
                 + ",\"worker_timing\":{\"step_us\":" + stepNanos / 1000
                 + ",\"frame_us\":" + frameNanos / 1000
@@ -448,8 +490,11 @@ final class VmWorker {
     private void publishState(boolean saveNow) {
         long started = SystemClock.elapsedRealtimeNanos();
         lastStatus = SystemClock.uptimeMillis();
-        String json = currentDiagnostic();
-        lastDiagnostic = json;
+        boolean detailed = debugSelfTest || saveNow || lastStatus - lastDiagnosticSave >= DIAGNOSTIC_INTERVAL_MS;
+        String json = currentDiagnostic(detailed);
+        if (detailed) {
+            lastDiagnostic = json;
+        }
         if (saveNow || lastStatus - lastDiagnosticSave >= DIAGNOSTIC_INTERVAL_MS)
             saveDiagnostic(json);
         statusNanos += SystemClock.elapsedRealtimeNanos() - started;
@@ -462,7 +507,7 @@ final class VmWorker {
                 lastLoggedStatus = state;
             }
         }
-        send(() -> listener.onState(json, active, true, stopped));
+        send(() -> listener.onState(json, active, true, stopped, detailed));
     }
 
     private static String withBuildMetadata(String json) {
@@ -521,7 +566,7 @@ final class VmWorker {
         if (hasSession) outcome = NativeMachine.FAULT;
         String snapshot = hasSession ? lastDiagnostic : "";
         try {
-            if (hasSession) snapshot = currentDiagnostic();
+            if (hasSession) snapshot = currentDiagnostic(true);
         } catch (RuntimeException | LinkageError ignored) {
             // Retain the most recent successful native snapshot.
         }

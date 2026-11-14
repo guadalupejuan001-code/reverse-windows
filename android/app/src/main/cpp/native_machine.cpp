@@ -199,10 +199,10 @@ JNIEXPORT void JNICALL Java_com_reversewindows_android_NativeMachine_flush(
 }
 
 JNIEXPORT jstring JNICALL Java_com_reversewindows_android_NativeMachine_diagnostic(
-        JNIEnv* env, jclass, jlong handle) {
+        JNIEnv* env, jclass, jlong handle, jboolean detailed) {
     return call<jstring>(env, nullptr, [&] {
-        return session(handle, [env](Session& machine) {
-            return env->NewStringUTF(machine.diagnostic().c_str());
+        return session(handle, [env, detailed](Session& machine) {
+            return env->NewStringUTF(machine.diagnostic(detailed == JNI_TRUE).c_str());
         });
     });
 }

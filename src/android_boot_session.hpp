@@ -377,7 +377,7 @@ class AndroidBootSession final {
     pc_.cpu.memory.invalidate_write_watch();
   }
 
-  std::string diagnostic() const {
+  std::string diagnostic(bool detailed = true) const {
     const auto platform = board_->evidence();
     const auto interrupts = board_->interrupt_state();
     const auto status = platform.powered_off ? "powered_off" : pc_.status();
@@ -428,25 +428,27 @@ class AndroidBootSession final {
     out << '}';
     out << ",\"ether_arm64\":";
     write_ether_arm64(out, pc_.cpu);
-    if (const auto& hotspots = pc_.boot_hotspots()) {
-      out << ",\"boot_hotspots\":";
-      hotspots->write_json(out);
-    }
-    if (const auto& hotspots = pc_.boot_scalar_hotspots()) {
-      out << ",\"boot_scalar_hotspots\":";
-      hotspots->write_json(out);
-    }
-    if (boot_profile_) {
-      out << ",\"boot_profile_phase\":" << restarts_
-          << ",\"boot_profile_session_start_steps\":" << previous_boot_steps_;
-      out << ",\"boot_profile\":";
-      boot_profile_->write_json(out, pc_, *board_);
-      out << ",\"boot_time_samples\":";
-      pc_.boot_timing()->write_json(out);
-      out << ",\"boot_code_regions\":";
-      pc_.boot_regions()->write_json(out);
-      if (previous_boot_profile_)
-        out << ",\"previous_boot_profile\":" << *previous_boot_profile_;
+    if (detailed) {
+      if (const auto& hotspots = pc_.boot_hotspots()) {
+        out << ",\"boot_hotspots\":";
+        hotspots->write_json(out);
+      }
+      if (const auto& hotspots = pc_.boot_scalar_hotspots()) {
+        out << ",\"boot_scalar_hotspots\":";
+        hotspots->write_json(out);
+      }
+      if (boot_profile_) {
+        out << ",\"boot_profile_phase\":" << restarts_
+            << ",\"boot_profile_session_start_steps\":" << previous_boot_steps_;
+        out << ",\"boot_profile\":";
+        boot_profile_->write_json(out, pc_, *board_);
+        out << ",\"boot_time_samples\":";
+        pc_.boot_timing()->write_json(out);
+        out << ",\"boot_code_regions\":";
+        pc_.boot_regions()->write_json(out);
+        if (previous_boot_profile_)
+          out << ",\"previous_boot_profile\":" << *previous_boot_profile_;
+      }
     }
     const auto& mode = pc_.boot_mode_progress();
     out << ",\"boot_progress\":{\"handed_off\":" << (pc_.cpu.instructions ? "true" : "false")
