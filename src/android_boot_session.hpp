@@ -100,6 +100,7 @@ class AndroidBootSession final {
     if (source != BootSource::SelfTest) pc_.enable_guest_restart();
     pc_.enable_boot_acceleration();
     pc_.cpu.enable_page_translation_cache();
+    pc_.cpu.enable_ether_arm64_blocks();
     if (source != BootSource::SelfTest) start_boot_profile();
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     pc_.cpu.enable_ether_next();
@@ -368,6 +369,8 @@ class AndroidBootSession final {
         << ",\"cache_fallbacks\":" << ether.cache.fallbacks;
 #endif
     out << '}';
+    out << ",\"ether_arm64\":";
+    write_ether_arm64(out, pc_.cpu);
     if (const auto& hotspots = pc_.boot_hotspots()) {
       out << ",\"boot_hotspots\":";
       hotspots->write_json(out);
@@ -515,6 +518,8 @@ class AndroidBootSession final {
     pc_.boot_timing()->write_json(out);
     out << ",\"boot_code_regions\":";
     pc_.boot_regions()->write_json(out);
+    out << ",\"ether_arm64\":";
+    write_ether_arm64(out, pc_.cpu);
     out << '}';
     return out.str();
   }

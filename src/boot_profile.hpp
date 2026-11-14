@@ -11,6 +11,16 @@
 
 namespace reverse_windows {
 
+inline void write_ether_arm64(std::ostream& out, const cosmic_pc::Cpu& cpu) {
+  const auto& stats = cpu.ether_arm64_stats();
+  out << "{\"host_supported\":" << (cpu.ether_arm64_host() ? "true" : "false")
+      << ",\"enabled\":" << (cpu.ether_arm64_blocks_enabled() ? "true" : "false")
+      << ",\"translated\":" << stats.translated << ",\"cache_hits\":" << stats.hits
+      << ",\"executed_blocks\":" << stats.blocks << ",\"guest_steps\":" << stats.steps
+      << ",\"invalidated\":" << stats.invalidated << ",\"data_fallbacks\":" << stats.data_fallbacks
+      << '}';
+}
+
 // Compare the same logical guest progress across runs. CPU and board
 // state at each boundary help detect execution paths that diverge.
 class BootProfile {
@@ -110,7 +120,8 @@ class BootProfile {
     out.resident_bytes = memory.allocated_bytes;
     out.spill_reads = memory.backing_reads;
     out.spill_writes = memory.backing_writes;
-    out.batched = work.rep_elements + work.shift_loop_steps + work.zero_loop_steps + work.scan_loop_steps;
+    out.batched = work.rep_elements + work.shift_loop_steps + work.zero_loop_steps +
+        work.scan_loop_steps + work.arm64_block_steps;
     out.mode_changes = pc.boot_mode_progress().changes;
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     out.neon_steps = cpu.ether_next_stats().native_instructions;
