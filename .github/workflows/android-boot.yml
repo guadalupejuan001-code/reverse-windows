@@ -35,9 +35,9 @@ jobs:
         abi: [arm64-v8a, x86_64]
     env:
       ANDROID_ABI: ${{ matrix.abi }}
-      ANDROID_APP_ID: com.reversewindows.android.ether.r024
-      ANDROID_VERSION: "0.1.14"
-      ANDROID_VERSION_CODE: "15"
+      ANDROID_APP_ID: com.reversewindows.android.ether.r025
+      ANDROID_VERSION: "0.1.15"
+      ANDROID_VERSION_CODE: "16"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -231,6 +231,9 @@ jobs:
           assert snapshot["boot_progress"]["session_steps"] == snapshot["machine"]["instructions"]
           assert snapshot["iso_read_us"] == 0
           assert snapshot["ram_profile"]["spill_read_us"] == snapshot["ram_profile"]["spill_write_us"] == 0
+          assert snapshot["worker_timing"]["step_us"] > 0
+          assert snapshot["machine"]["page_translation_hits"] == 0
+          assert snapshot["ether_next"]["boot_paged_rep_elements"] == 0
           PY
           adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity"
           for attempt in {1..8}; do

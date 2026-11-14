@@ -97,6 +97,7 @@ class AndroidBootSession final {
     board_->enable_ps2_keyboard();
     if (source != BootSource::SelfTest) pc_.enable_guest_restart();
     pc_.enable_boot_acceleration();
+    pc_.cpu.enable_page_translation_cache();
     if (source == BootSource::Iso) pc_.enable_boot_hotspots();
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     pc_.cpu.enable_ether_next();
@@ -337,10 +338,12 @@ class AndroidBootSession final {
         << ",\"boot_rep_batches\":" << boot_work.batches
         << ",\"boot_rep_elements\":" << boot_work.rep_elements
         << ",\"boot_rep_bytes\":" << boot_work.bytes
+        << ",\"boot_paged_rep_elements\":" << boot_work.paged_rep_elements
         << ",\"boot_shift_loop_batches\":" << boot_work.shift_loop_batches
         << ",\"boot_shift_loop_steps\":" << boot_work.shift_loop_steps
         << ",\"boot_zero_loop_batches\":" << boot_work.zero_loop_batches
-        << ",\"boot_zero_loop_steps\":" << boot_work.zero_loop_steps;
+        << ",\"boot_zero_loop_steps\":" << boot_work.zero_loop_steps
+        << ",\"boot_scan_loop_steps\":" << boot_work.scan_loop_steps;
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     const auto ether = pc_.cpu.ether_next_stats();
     out << ",\"neon_requested\":" << (pc_.cpu.ether_next_enabled() ? "true" : "false")
