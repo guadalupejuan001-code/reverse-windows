@@ -1,5 +1,7 @@
 #include "pc_machine.hpp"
+#include "android_ram_backing.hpp"
 #include "bios_hard_disk.hpp"
+#include "boot_profile.hpp"
 #include "qssd_disk.hpp"
 #include "c06_motherboard.hpp"
 #include "c09_guest_trace.hpp"
@@ -12,6 +14,7 @@
 #include <optional>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -25,10 +28,13 @@ struct Options {
     std::uint64_t create_disk_gib = 0;
     std::string evidence_path;
     std::string trace_path;
+    std::string ram_spill_directory;
     std::uint64_t trace_max_events=25000;
     std::uint64_t steps = 200000;
     std::uint64_t ram_mib = 2048;
     std::uint64_t resident_mib = 256;
+    std::uint64_t profile_every = 0, profile_from = 0, profile_until = 0;
+    bool profile_timing = true;
 };
 
 std::uint64_t positive(const std::string& raw, std::uint64_t upper, const char* name) {
@@ -42,6 +48,7 @@ std::uint64_t positive(const std::string& raw, std::uint64_t upper, const char* 
 
 Options parse(int argc, char** argv) {
     Options out;
+    bool unprofiled = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg(argv[i]);
         auto next = [&]() -> std::string {
@@ -62,16 +69,37 @@ Options parse(int argc, char** argv) {
         else if (arg == "--qssd-disk") out.qssd_path = next();
         else if (arg == "--create-qssd-gib") out.create_qssd_gib = positive(next(), 16384, "create-qssd-gib");
         else if (arg == "--create-disk-gib") out.create_disk_gib = positive(next(), 256, "create-disk-gib");
-        else if (arg == "--steps") out.steps = positive(next(), 100000000, "steps");
+        else if (arg == "--steps") out.steps = positive(next(), 20'000'000'000, "steps");
         else if (arg == "--ram-mib") out.ram_mib = positive(next(), cosmic_pc::PcMachine::max_ram_mib(), "ram-mib");
         else if (arg == "--resident-mib") out.resident_mib = positive(next(), cosmic_pc::PcMachine::max_ram_mib(), "resident-mib");
+        else if (arg == "--ram-spill-directory") out.ram_spill_directory = next();
         else if (arg == "--evidence") out.evidence_path = next();
+        else if (arg == "--profile-every") out.profile_every = positive(next(), 100000000, "profile-every");
+        else if (arg == "--profile-from") out.profile_from = positive(next(), 20'000'000'000, "profile-from");
+        else if (arg == "--profile-until") out.profile_until = positive(next(), 20'000'000'000, "profile-until");
+        else if (arg == "--profile-counts-only") unprofiled = true;
         else if (arg == "--trace") out.trace_path = next();
         else if (arg == "--trace-max-events")
             out.trace_max_events = positive(next(), 2000000, "trace-max-events");
         else throw std::invalid_argument("Unknown option: " + arg);
     }
     if (out.source == Options::Source::None) throw std::invalid_argument("Select a boot source or --qssd-checkpoint/--qssd-compact");
+    out.profile_timing = !unprofiled;
+    if ((unprofiled || out.profile_from || out.profile_until || !out.ram_spill_directory.empty()) && !out.profile_every)
+        throw std::invalid_argument("Profile options require --profile-every");
+    if (!out.profile_every && out.steps > 100000000)
+        throw std::invalid_argument("steps out of supported bounds without boot profiling");
+    if (out.profile_every) {
+        if (out.profile_every < reverse_windows::BootProfile::kMinCheckpointSteps)
+            throw std::invalid_argument("--profile-every requires at least 4096 steps");
+        if (!out.trace_path.empty() || out.source == Options::Source::QssdCheckpoint ||
+            out.source == Options::Source::QssdCompact)
+            throw std::invalid_argument("--profile-every requires a guest without instruction tracing");
+        if (out.profile_from >= out.steps)
+            throw std::invalid_argument("--profile-from must precede the run budget");
+        if (out.profile_until && (out.profile_until <= out.profile_from || out.profile_until > out.steps))
+            throw std::invalid_argument("--profile-until must follow the profile start and fit the run budget");
+    }
     if (out.source == Options::Source::QssdCheckpoint ||
         out.source == Options::Source::QssdCompact) {
         if (out.qssd_path.empty() || !out.disk_path.empty() ||
@@ -94,6 +122,16 @@ Options parse(int argc, char** argv) {
     if (out.create_qssd_gib && out.qssd_path.empty()) throw std::invalid_argument("--create-qssd-gib requires --qssd-disk PATH.rqvd");
     if (!out.disk_path.empty() && !out.qssd_path.empty()) throw std::invalid_argument("Select one writable disk backend");
     if (out.source == Options::Source::Disk && out.disk_path.empty() && out.qssd_path.empty()) throw std::invalid_argument("--boot-hdd requires --disk or --qssd-disk");
+    if (!out.evidence_path.empty()) {
+        const auto evidence = std::filesystem::weakly_canonical(out.evidence_path);
+        for (const auto* input : {&out.iso_path, &out.disk_path, &out.qssd_path, &out.trace_path}) {
+            if (input->empty()) continue;
+            if (evidence == std::filesystem::weakly_canonical(*input) ||
+                (std::filesystem::exists(evidence) && std::filesystem::exists(*input) &&
+                 std::filesystem::equivalent(evidence, *input)))
+                throw std::invalid_argument("Evidence path aliases a guest medium or trace");
+        }
+    }
     return out;
 }
 }  // namespace
@@ -121,9 +159,22 @@ int main(int argc, char** argv) {
                       <<(results.checkpoint_saved?"true":"false")<<"}\n";
             return 0;
         }
+        cosmic_pc::BootTiming::Duration iso_read_time{};
+        bool profile_active = false;
         cosmic_pc::PcMachine pc(
             static_cast<std::size_t>(opts.ram_mib * 1024ULL * 1024ULL),
             static_cast<std::size_t>(opts.resident_mib * 1024ULL * 1024ULL));
+        reverse_windows::AndroidRamBacking* ram_spill = nullptr;
+        if (!opts.ram_spill_directory.empty() && pc.cpu.memory.budget_bytes() < pc.cpu.memory.size()) {
+            const auto spill_budget = std::min(pc.cpu.memory.size(),
+                reverse_windows::AndroidRamBacking::spill_budget(opts.ram_spill_directory));
+            if (!spill_budget) throw std::runtime_error("No space for the requested RAM spill backing");
+            auto backing = std::make_unique<reverse_windows::AndroidRamBacking>(
+                opts.ram_spill_directory, pc.cpu.memory.size(), spill_budget);
+            ram_spill = backing.get();
+            pc.cpu.memory.attach_page_backing(std::move(backing));
+        }
+        std::optional<reverse_windows::BootProfile> profile;
         std::unique_ptr<reverse_windows::BlockDisk> disk;
         reverse_windows::QssdDisk* qdisk = nullptr;
         if (!opts.disk_path.empty()) {
@@ -158,10 +209,12 @@ int main(int argc, char** argv) {
             const auto end = medium->tellg();
             if (end <= 0) throw std::runtime_error("Invalid ISO size");
             optical_bytes=static_cast<std::uint64_t>(end);
-            read_iso=[medium](std::uint64_t offset, std::uint8_t* data, std::size_t size) {
+            read_iso=[medium,&iso_read_time,&profile_active](std::uint64_t offset, std::uint8_t* data, std::size_t size) {
+                const auto start = profile_active ? cosmic_pc::BootTiming::Clock::now() : cosmic_pc::BootTiming::Clock::time_point{};
                 medium->clear();
                 medium->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
                 medium->read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(size));
+                if (profile_active) iso_read_time += cosmic_pc::BootTiming::Clock::now() - start;
                 return static_cast<std::size_t>(medium->gcount()) == size;
             };
             // Independently audit El Torito metadata only when tracing.
@@ -176,6 +229,16 @@ int main(int argc, char** argv) {
         // One canonical guest CPU. The motherboard wraps its existing I/O hooks
         // after boot firmware and QSSD are mounted, and stays alive until exit.
         reverse_windows::PcMotherboardC06 motherboard(pc,disk.get(),read_iso,optical_bytes);
+        const auto initial_disk_commits=qdisk ? qdisk->stats().commits : 0;
+        if (opts.profile_every) {
+            motherboard.enable_ps2_keyboard();
+            pc.enable_boot_acceleration();
+            if (opts.source == Options::Source::Iso) pc.enable_boot_hotspots();
+            pc.cpu.enable_page_translation_cache();
+#if defined(MUNDO_X_PC_ETHER_NEXT)
+            pc.cpu.enable_ether_next();
+#endif
+        }
         std::unique_ptr<reverse_windows::C09GuestTrace> trace;
         if (!opts.trace_path.empty()) {
             trace=std::make_unique<reverse_windows::C09GuestTrace>(
@@ -194,7 +257,22 @@ int main(int argc, char** argv) {
         const bool demo = opts.source == Options::Source::DemoX86 ||
                           opts.source == Options::Source::DemoX64;
         auto platform = motherboard.evidence();
+        cosmic_pc::BootTiming::Clock::time_point profile_start;
+        std::uint64_t spill_read_start = 0, spill_write_start = 0;
+        const auto begin_profile = [&] {
+            if (opts.profile_timing) pc.enable_boot_timing();
+            profile.emplace(opts.profile_every);
+            profile->begin(pc,motherboard);
+            if (ram_spill) {
+                spill_read_start = ram_spill->read_us();
+                spill_write_start = ram_spill->write_us();
+            }
+            profile_active = true;
+            profile_start = cosmic_pc::BootTiming::Clock::now();
+        };
+        if (opts.profile_every && !opts.profile_from) begin_profile();
         while (platform.ticks < opts.steps && pc.status() != "fault" && !platform.powered_off) {
+            if (opts.profile_until && pc.cpu.instructions == opts.profile_until) break;
             if (pc.cpu.halted && (demo || !pc.cpu.flag(cosmic_pc::Cpu::IF))) break;
             if (pc.waiting_key) {
                 if (opts.source != Options::Source::DemoX86) break;
@@ -203,13 +281,57 @@ int main(int argc, char** argv) {
             const auto before = platform.ticks;
             const auto chunk = static_cast<unsigned>(
                 std::min<std::uint64_t>(5000, opts.steps - before));
-            pc.run(chunk);
+            auto slice = chunk;
+            if (profile) slice = profile->budget(chunk,pc);
+            else if (opts.profile_every)
+                slice = static_cast<unsigned>(std::min<std::uint64_t>(chunk,opts.profile_from-pc.cpu.instructions));
+            if (opts.profile_until)
+                slice = static_cast<unsigned>(std::min<std::uint64_t>(slice,opts.profile_until-pc.cpu.instructions));
+            pc.run(slice);
+            if (opts.profile_every && !profile && pc.cpu.instructions==opts.profile_from) begin_profile();
+            if (profile) profile->after_run(pc, motherboard);
             platform = motherboard.evidence();
+            // The profiling loop excludes host-side frame capture.
+            if (!opts.profile_every) {
+                vga_frame=vga_work.capture();
+                ++vga_captures;
+                vga_total_upload_bytes+=vga_frame.transferred_bytes;
+                vga_baseline_bytes+=4000;
+            }
+            if (platform.ticks == before && !pc.waiting_key) break;
+        }
+        std::ostringstream performance;
+        if (opts.profile_every && !profile)
+            throw std::runtime_error("Guest stopped before the requested profile start");
+        if (profile) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                cosmic_pc::BootTiming::Clock::now() - profile_start).count();
+            const auto optical_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(iso_read_time).count();
+            performance << ",\"boot_profile\":";
+            profile->write_json(performance, pc, motherboard);
+            performance << ",\"profile_wall_ns\":" << elapsed
+                        << ",\"profile_iso_read_ns\":" << optical_ns
+                        << ",\"profile_until_steps\":" << opts.profile_until
+                        << ",\"profile_until_reached\":"
+                        << (opts.profile_until && pc.cpu.instructions == opts.profile_until ? "true" : "false")
+                        << ",\"profile_source_bytes\":" << optical_bytes
+                        << ",\"profile_ram_mib\":" << opts.ram_mib
+                        << ",\"profile_resident_mib\":" << opts.resident_mib
+                        << ",\"profile_initial_qssd_commits\":" << initial_disk_commits;
+            if (ram_spill) {
+                performance << ",\"profile_spill_read_us\":" << ram_spill->read_us() - spill_read_start
+                            << ",\"profile_spill_write_us\":" << ram_spill->write_us() - spill_write_start;
+            }
+            if (opts.profile_timing) {
+                performance << ",\"boot_time_samples\":";
+                pc.boot_timing()->write_json(performance);
+                performance << ",\"boot_code_regions\":";
+                pc.boot_regions()->write_json(performance);
+            }
             vga_frame=vga_work.capture();
             ++vga_captures;
             vga_total_upload_bytes+=vga_frame.transferred_bytes;
             vga_baseline_bytes+=4000;
-            if (platform.ticks == before && !pc.waiting_key) break;
         }
         if (trace) trace->finish();
         const auto final_json = pc.json();
@@ -247,7 +369,7 @@ int main(int argc, char** argv) {
                std::to_string(platform.pit_irqs) + ",\"apic_irqs\":" +
                std::to_string(platform.apic_irqs) + ",\"ticks\":" +
                std::to_string(platform.ticks) + "}" +
-            ",\"machine\":" + final_json +
+            performance.str() + ",\"machine\":" + final_json +
             ",\"vga_text\":" + cosmic_pc::PcMachine::quote(pc.screen()) + "}\n";
         std::cout << evidence;
         if (!opts.evidence_path.empty()) {
@@ -257,6 +379,7 @@ int main(int argc, char** argv) {
             if (!file) throw std::runtime_error("Incomplete evidence write");
         }
         if (pc.status() == "fault") return 2;
+        if (opts.profile_until) return pc.cpu.instructions == opts.profile_until ? 0 : 3;
         if (opts.source == Options::Source::DemoX64)
             return pc.cpu.halted && std::string(pc.cpu.mode_name()) == "long64" ? 0 : 3;
         if (opts.source == Options::Source::DemoX86)

@@ -251,6 +251,12 @@ int main(int argc, char** argv) {
       require(counter(progress, "session_steps") == counter(progress, "instructions") &&
                   counter(progress, "session_steps") > 0,
               "Before the first restart, session and CPU steps must match");
+      require(progress.find("\"boot_profile\":{") != std::string::npos &&
+                  progress.find("\"boot_time_samples\":{") != std::string::npos &&
+                  progress.find("\"boot_code_regions\":{") != std::string::npos &&
+                  counter(progress, "sampled_windows") > 0 &&
+                  counter(progress, "initial_commits") == 0,
+              "ISO profiling must report activity and the initial disk state");
       require(progress.find("\"cpu_mode\":\"real16\"") != std::string::npos,
               "Guest BIOS prompt was reached outside real mode");
       require(progress.find("\"last_mode_from\":\"protected16\",\"last_mode_to\":\"real16\"") != std::string::npos,
@@ -319,6 +325,8 @@ int main(int argc, char** argv) {
               "QSSD did not boot the MBR installed by the ISO guest");
       require(reboot.diagnostic().find("\"source\":\"qssd\"") != std::string::npos,
               "Reboot diagnostic did not identify QSSD");
+      require(counter(reboot.diagnostic(), "initial_commits") == 1,
+              "Disk-only session must report the already committed sector as initial state");
     }
     {
       const auto wrong_disk = dir.path / "unexpected-capacity.rqvd";

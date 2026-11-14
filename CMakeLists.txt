@@ -32,7 +32,10 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(reverse_windows_component_headers INTERFACE -frounding-math)
 endif()
 
-add_executable(reverse_windows_boot_probe src/reverse_windows_boot_probe.cpp)
+add_executable(reverse_windows_boot_probe src/reverse_windows_boot_probe.cpp
+  "${REVERSE_MUNDO_X_ROOT}/native/src/ether_transform.cpp"
+  "${REVERSE_MUNDO_X_ROOT}/native/src/ether_neon.cpp")
+target_compile_definitions(reverse_windows_boot_probe PRIVATE MUNDO_X_PC_ETHER_NEXT=1)
 target_link_libraries(reverse_windows_boot_probe PRIVATE reverse_windows_component_headers)
 
 # ISO-free hardware readiness audit: one canonical PcMachine, Ether/XI,
@@ -60,6 +63,11 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_BINARY_DIR}/c03-boot-evidence.json")
   set_tests_properties(reverse_windows_android_bios_iso_qssd PROPERTIES
     FIXTURES_REQUIRED android_boot_iso TIMEOUT 60)
+  add_test(NAME reverse_windows_prime_boot_profile
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/prime_boot_profile.py"
+      "$<TARGET_FILE:reverse_windows_boot_probe>"
+      --evidence "${CMAKE_CURRENT_BINARY_DIR}/prime-c02-boot-profile.json")
+  set_tests_properties(reverse_windows_prime_boot_profile PROPERTIES TIMEOUT 90)
   add_executable(reverse_windows_atapi_cdrom_guest_test tests/atapi_cdrom_guest_test.cpp)
   target_link_libraries(reverse_windows_atapi_cdrom_guest_test PRIVATE reverse_windows_component_headers)
   add_test(NAME reverse_windows_android_atapi_guest COMMAND reverse_windows_atapi_cdrom_guest_test)
