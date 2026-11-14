@@ -33,7 +33,7 @@ enum RwGpuRegister {
   RWGPU_REG_VRAM_BATCH_BYTES = 0x48,
   RWGPU_REG_AUX_LO = 0x4c, RWGPU_REG_AUX_HI = 0x50,
   RWGPU_REG_LENGTH_HI = 0x54, RWGPU_REG_RESULT_LO = 0x58, RWGPU_REG_RESULT_HI = 0x5c,
-  RWGPU_REG_DIRECT_MAX = 0x60
+  RWGPU_REG_DIRECT_MAX = 0x60, RWGPU_REG_BUS_MASTER = 0x64
 };
 // UPLOAD, DOWNLOAD and COPY use OFFSET as source and AUX as destination.
 // RAM addresses are physical and require PCI bus mastering. VRAM addresses
@@ -41,16 +41,17 @@ enum RwGpuRegister {
 enum RwGpuCommand {
   RWGPU_WRITE = 1, RWGPU_READ = 2, RWGPU_DRAW = 3, RWGPU_READ_COLOR = 4,
   RWGPU_UPLOAD = 5, RWGPU_DOWNLOAD = 6, RWGPU_COPY = 7, RWGPU_SUM_INDICES = 8,
-  RWGPU_DRAW_VRAM = 9
+  RWGPU_DRAW_VRAM = 9, RWGPU_READ_COLOR_RAM = 10
 };
 enum RwGpuStatus { RWGPU_IDLE = 0, RWGPU_OK = 1, RWGPU_BAD_COMMAND = 2,
                   RWGPU_INVALID = 3, RWGPU_UNAVAILABLE = 4, RWGPU_FAILED = 5 };
 enum RwGpuCaps {
   RWGPU_CAP_VRAM = 1, RWGPU_CAP_TRIANGLES = 2, RWGPU_CAP_DIRECT_VRAM = 4,
-  RWGPU_CAP_SUM_INDICES = 8, RWGPU_CAP_DRAW_VRAM = 16
+  RWGPU_CAP_SUM_INDICES = 8, RWGPU_CAP_DRAW_VRAM = 16, RWGPU_CAP_COLOR_DMA = 32
 };
 // DRAW uses OFFSET as flags. DRAW_VRAM uses OFFSET as the VRAM source and AUX
-// as flags. READ_COLOR addresses the last tightly packed, top-down BGRX8888 draw.
+// as flags. READ_COLOR and READ_COLOR_RAM address the last tightly packed,
+// top-down BGRX8888 draw. READ_COLOR_RAM uses AUX for the physical RAM target.
 #define RWGPU_DRAW_PRESENT_VBE UINT64_C(1)
 
 // Colors are RGBA8 from the least to the most significant byte.

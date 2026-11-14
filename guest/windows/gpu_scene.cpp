@@ -135,26 +135,38 @@ std::array<std::uint32_t, checks.size()> render_d3d11(IDXGIAdapter1* adapter = n
     return pixels;
 }
 
-void verify_guest(const std::array<std::uint32_t, checks.size()>& expected) {
-    const auto device = CreateFileW(RWGPU_DEVICE_PATH, GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (device == INVALID_HANDLE_VALUE) {
+class GuestGpu {
+public:
+    GuestGpu() {
+        device_ = CreateFileW(RWGPU_DEVICE_PATH, GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (device_ != INVALID_HANDLE_VALUE) return;
         std::fprintf(stderr, "REVERSE Prime PCI transport failed to open (Win32 %lu)\n", GetLastError());
         throw std::runtime_error("PCI transport unavailable");
     }
-    struct Close { HANDLE value; ~Close() { CloseHandle(value); } } close{device};
-    struct Packet {
-        RwGpuDrawRequest request;
-        std::array<RwGpuVertex, scene.size()> vertices;
-    } packet{{RWGPU_ABI, width, height, clear, static_cast<std::uint32_t>(scene.size())}, scene};
-    static_assert(sizeof(Packet) == sizeof(RwGpuDrawRequest) + sizeof(scene));
-    std::vector<std::uint8_t> result(width * height * 4);
-    DWORD written = 0;
-    auto start = std::chrono::steady_clock::now();
-    if (!DeviceIoControl(device, RWGPU_IOCTL_DRAW, &packet, sizeof(packet), result.data(),
-                         static_cast<DWORD>(result.size()), &written, nullptr) || written != result.size()) {
-        std::fprintf(stderr, "REVERSE Prime PCI draw failed (Win32 %lu)\n", GetLastError());
-        throw std::runtime_error("PCI draw failed");
+    ~GuestGpu() { CloseHandle(device_); }
+    GuestGpu(const GuestGpu&) = delete;
+    GuestGpu& operator=(const GuestGpu&) = delete;
+
+    void cmd(DWORD op, void* input, DWORD input_bytes, void* data, DWORD bytes, DWORD expected) {
+        DWORD written = 0;
+        if (DeviceIoControl(device_, op, input, input_bytes, data, bytes, &written, nullptr) &&
+            written == expected) return;
+        std::fprintf(stderr, "REVERSE Prime command 0x%lx failed (Win32 %lu, %lu bytes)\n",
+                     op, GetLastError(), written);
+        throw std::runtime_error("PCI command failed");
     }
+
+    void transfer(DWORD op, std::uint64_t offset, std::uint8_t* bytes, DWORD size) {
+        RwGpuVramTransfer transfer{offset, RWGPU_ABI, size};
+        cmd(op, &transfer, sizeof(transfer), bytes, size, op == RWGPU_IOCTL_UPLOAD ? 0 : size);
+    }
+
+private:
+    HANDLE device_;
+};
+
+void verify_pixels(const std::vector<std::uint8_t>& result,
+                   const std::array<std::uint32_t, checks.size()>& expected) {
     for (std::size_t i = 0; i < checks.size(); ++i) {
         const auto* p = result.data() + (checks[i][1] * width + checks[i][0]) * 4;
         const auto color = 0xff000000U | (std::uint32_t(p[0]) << 16) | (std::uint32_t(p[1]) << 8) | p[2];
@@ -164,10 +176,65 @@ void verify_guest(const std::array<std::uint32_t, checks.size()>& expected) {
             throw std::runtime_error("REgraphics differs from Direct3D oracle");
         }
     }
+}
+
+void verify_guest(const std::array<std::uint32_t, checks.size()>& expected) {
+    GuestGpu device;
+    struct Packet {
+        RwGpuDrawRequest request;
+        std::array<RwGpuVertex, scene.size()> vertices;
+    } packet{{RWGPU_ABI, width, height, clear, static_cast<std::uint32_t>(scene.size())}, scene};
+    static_assert(sizeof(Packet) == sizeof(RwGpuDrawRequest) + sizeof(scene));
+    std::vector<std::uint8_t> result(width * height * 4);
+    const auto bytes = static_cast<DWORD>(result.size());
+    auto start = std::chrono::steady_clock::now();
+    device.cmd(RWGPU_IOCTL_DRAW, &packet, sizeof(packet), result.data(), bytes, bytes);
+    verify_pixels(result, expected);
     const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - start).count();
     std::printf("PRIME_C08_WINDOWS_PCI_SCENE_PASS oracle=D3D11-WARP compared_pixels=%zu roundtrip_us=%lld\n",
                 checks.size(), static_cast<long long>(elapsed));
+}
+
+void verify_primevgc(const std::array<std::uint32_t, checks.size()>& expected) {
+    GuestGpu device;
+    RwGpuDmaInfo info{};
+    device.cmd(RWGPU_IOCTL_GET_DMA, nullptr, 0, &info, sizeof(info), sizeof(info));
+    constexpr std::uint64_t offset = 108ULL << 30;
+    constexpr unsigned caps = RWGPU_CAP_DIRECT_VRAM | RWGPU_CAP_DRAW_VRAM | RWGPU_CAP_COLOR_DMA;
+    if (info.logical_bytes != RWGPU_LOGICAL_BYTES || (info.capabilities & caps) != caps ||
+        info.transfer_bytes < sizeof(scene) || info.transfer_bytes > RWGPU_DIRECT_TRANSFER_BYTES)
+        throw std::runtime_error("PrimeVGC DMA capabilities do not match this fixture");
+    const auto size = info.transfer_bytes;
+    std::vector<std::uint8_t> original(size), payload(size), returned(size), color(width * height * 4);
+    device.transfer(RWGPU_IOCTL_DOWNLOAD, offset, original.data(), size);
+    std::uint32_t random = 0xd32f405a;
+    for (auto& byte : payload) {
+        random ^= random << 13; random ^= random >> 17; random ^= random << 5;
+        byte = static_cast<std::uint8_t>(random);
+    }
+    std::memcpy(payload.data(), scene.data(), sizeof(scene));
+    const auto run = [&] {
+        device.transfer(RWGPU_IOCTL_UPLOAD, offset, payload.data(), size);
+        device.transfer(RWGPU_IOCTL_DOWNLOAD, offset, returned.data(), size);
+        if (returned != payload) throw std::runtime_error("PrimeVGC PCI DMA payload changed");
+        RwGpuDrawVramRequest request{offset, {RWGPU_ABI, width, height, clear,
+                                            static_cast<std::uint32_t>(scene.size())}, 0};
+        const auto bytes = static_cast<DWORD>(color.size());
+        device.cmd(RWGPU_IOCTL_DRAW_VRAM, &request, sizeof(request), color.data(), bytes, bytes);
+        verify_pixels(color, expected);
+    };
+    const auto start = std::chrono::steady_clock::now();
+    try { run(); }
+    catch (...) {
+        device.transfer(RWGPU_IOCTL_UPLOAD, offset, original.data(), size);
+        throw;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    device.transfer(RWGPU_IOCTL_UPLOAD, offset, original.data(), size);
+    std::printf("PRIME_C08_WINDOWS_PRIMEVGC_PASS bytes=%lu pixels=%zu roundtrip_and_draw_us=%lld\n",
+                static_cast<unsigned long>(size), checks.size(), static_cast<long long>(elapsed));
 }
 
 ComPtr<IDXGIAdapter1> find_prime_adapter() {
@@ -209,8 +276,10 @@ int main(int argc, char** argv) {
         }
         std::printf("PRIME_C08_DIRECT3D_REFERENCE_PASS pixels=%zu device=WARP\n", checks.size());
         if (argc == 2 && std::string_view(argv[1]) == "--reference") return 0;
-        if (argc != 1) throw std::runtime_error("Usage: prime_gpu_scene [--reference | --wddm]");
-        verify_guest(samples);
+        if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--primevgc"))
+            verify_primevgc(samples);
+        else if (argc == 2 && std::string_view(argv[1]) == "--staged") verify_guest(samples);
+        else throw std::runtime_error("Usage: prime_gpu_scene [--reference | --primevgc | --staged | --wddm]");
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());

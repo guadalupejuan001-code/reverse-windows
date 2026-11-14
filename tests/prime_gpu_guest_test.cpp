@@ -243,6 +243,21 @@ void verify(const std::filesystem::path& volume) {
     require(rgb(pc, 320, 240) == red && rgb(pc, 320, 63) == green &&
             rgb(pc, 34, 81) == blue && rgb(pc, 639, 479) == clear,
             "Guest GPU did not preserve clip position, depth, color or clear");
+    Guest32 retrieve;
+    constexpr auto color_target = 0x200000U;
+    constexpr auto color_bytes = width * height * 4;
+    retrieve.direct_command(RWGPU_READ_COLOR_RAM, 11, 0, color_target, color_bytes);
+    retrieve.read(moved_bar + RWGPU_REG_STATUS, 0xe054);
+    retrieve.read(moved_bar + RWGPU_REG_RESULT_LO, 0xe05c);
+    retrieve.direct_command(RWGPU_READ_COLOR_RAM, 12, color_bytes - 3, color_target, 4);
+    retrieve.read(moved_bar + RWGPU_REG_STATUS, 0xe058);
+    retrieve.run(pc);
+    std::vector<std::uint8_t> via_dma(color_bytes), via_vbe(color_bytes);
+    pc.cpu.memory.read_block(color_target, via_dma.data(), via_dma.size());
+    pc.cpu.memory.read_block(pc.video_info().physical_address, via_vbe.data(), via_vbe.size());
+    require(pc.cpu.read32(0xe054) == RWGPU_OK && pc.cpu.read32(0xe058) == RWGPU_INVALID &&
+            pc.cpu.read32(0xe05c) == color_bytes && via_dma == via_vbe,
+            "PCI color DMA did not deliver the exact BGRX frame directly to guest RAM");
     const auto& packet = mirror.capture(width, height);
     require(!packet.empty(), "C07 did not receive the 3D framebuffer stores");
     const auto first = gpu_stats(*board.attached_gpu());
@@ -251,7 +266,7 @@ void verify(const std::filesystem::path& volume) {
             "GPU Virtual did not select and version the exact 3D work");
     Guest32 repeat;
     repeat.copy(moved_bar + RWGPU_STAGE_OFFSET, source, sizeof(vertices));
-    repeat.command(RWGPU_DRAW, 11, RWGPU_DRAW_PRESENT_VBE, sizeof(vertices));
+    repeat.command(RWGPU_DRAW, 13, RWGPU_DRAW_PRESENT_VBE, sizeof(vertices));
     repeat.read(moved_bar + RWGPU_REG_STATUS, 0xe02c);
     repeat.run(pc);
     require(pc.cpu.read32(0xe02c) == RWGPU_OK && mirror.capture(width, height).empty(),
@@ -260,9 +275,9 @@ void verify(const std::filesystem::path& volume) {
     Guest32 offscreen;
     offscreen.write(moved_bar + RWGPU_REG_WIDTH, 32);
     offscreen.write(moved_bar + RWGPU_REG_HEIGHT, 32);
-    offscreen.command(RWGPU_DRAW, 12, 0, 0);
+    offscreen.command(RWGPU_DRAW, 14, 0, 0);
     offscreen.read(moved_bar + RWGPU_REG_STATUS, 0xe030);
-    offscreen.command(RWGPU_READ_COLOR, 13, (32 * 32 - 1) * 4, 4);
+    offscreen.command(RWGPU_READ_COLOR, 15, (32 * 32 - 1) * 4, 4);
     offscreen.read(moved_bar + RWGPU_REG_STATUS, 0xe034);
     offscreen.read(moved_bar + RWGPU_STAGE_OFFSET, 0xe038);
     offscreen.run(pc);
