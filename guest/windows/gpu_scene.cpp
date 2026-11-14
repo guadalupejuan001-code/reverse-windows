@@ -7,6 +7,7 @@
 #include <wrl/client.h>
 #include "gpu_transport.h"
 #include "gpu_scene_shaders.h"
+#include "prime_wddm_adapter.h"
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -238,18 +239,13 @@ void verify_primevgc(const std::array<std::uint32_t, checks.size()>& expected) {
                 static_cast<unsigned long>(size), checks.size(), static_cast<long long>(elapsed));
 }
 
-ComPtr<IDXGIAdapter1> find_prime_adapter() {
-    ComPtr<IDXGIFactory1> factory;
-    check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "DXGI factory");
-    for (UINT index = 0;; ++index) {
-        ComPtr<IDXGIAdapter1> adapter;
-        const auto result = factory->EnumAdapters1(index, &adapter);
-        if (result == DXGI_ERROR_NOT_FOUND) return {};
-        check(result, "Enumerate DXGI adapter");
-        DXGI_ADAPTER_DESC1 info{};
-        check(adapter->GetDesc1(&info), "Read DXGI adapter identity");
-        if (info.VendorId == RWGPU_VENDOR_ID && info.DeviceId == RWGPU_DEVICE_ID &&
-            !(info.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) return adapter;
+void verify_reference(const std::array<std::uint32_t, checks.size()>& samples) {
+    for (std::size_t i = 0; i < checks.size(); ++i) {
+        if (samples[i] != checks[i][2]) {
+            std::fprintf(stderr, "D3D11 color (%u,%u) %08x expected %08x\n",
+                         checks[i][0], checks[i][1], samples[i], checks[i][2]);
+            throw std::runtime_error("Direct3D fixture differs from pixel oracle");
+        }
     }
 }
 } // namespace
@@ -257,24 +253,27 @@ ComPtr<IDXGIAdapter1> find_prime_adapter() {
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--wddm") {
-            const auto adapter = find_prime_adapter();
+            const auto adapter = prime_wddm::find_adapter();
             if (!adapter) {
                 std::fprintf(stderr, "PRIME_C08_WDDM_ADAPTER_ABSENT pci=1b36:c083\n");
                 return 3;
             }
-            if (render_d3d11(adapter.Get()) != render_d3d11())
+            const prime_wddm::Adapter transport(*adapter.Get());
+            const auto before = transport.query();
+            const auto actual = render_d3d11(adapter.Get());
+            const auto after = transport.query();
+            if (!after.last_draw_ticket || before.last_draw_ticket == after.last_draw_ticket)
+                throw std::runtime_error("Direct3D did not produce a PrimeVGC PCI completion");
+            const auto reference = render_d3d11();
+            verify_reference(reference);
+            if (actual != reference)
                 throw std::runtime_error("WDDM rendering differs from the Direct3D oracle");
-            std::printf("PRIME_C08_WDDM_SCENE_PASS pci=1b36:c083 pixels=%zu\n", checks.size());
+            std::printf("PRIME_C08_WDDM_SCENE_PASS pci=1b36:c083 ticket=%u samples=%zu\n",
+                        after.last_draw_ticket, checks.size());
             return 0;
         }
         const auto samples = render_d3d11();
-        for (std::size_t i = 0; i < checks.size(); ++i) {
-            if (samples[i] != checks[i][2]) {
-                std::fprintf(stderr, "D3D11 color (%u,%u) %08x expected %08x\n",
-                             checks[i][0], checks[i][1], samples[i], checks[i][2]);
-                throw std::runtime_error("Direct3D fixture differs from pixel oracle");
-            }
-        }
+        verify_reference(samples);
         std::printf("PRIME_C08_DIRECT3D_REFERENCE_PASS pixels=%zu device=WARP\n", checks.size());
         if (argc == 2 && std::string_view(argv[1]) == "--reference") return 0;
         if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--primevgc"))

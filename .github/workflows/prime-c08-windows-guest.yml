@@ -55,4 +55,5 @@ jobs:
           path: |
             ${{ runner.temp }}/prime-c08-windows/wddm-package/*
             ${{ runner.temp }}/prime-c08-windows/prime_wddm_probe.exe
+            ${{ runner.temp }}/prime-c08-windows/prime_gpu_scene.exe
           if-no-files-found: error

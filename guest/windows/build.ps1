@@ -58,9 +58,9 @@ Invoke-Checked $linker @('/nologo','/driver','/subsystem:native','/machine:x64',
     '/nodefaultlib','/incremental:no','/dynamicbase','/nxcompat','/integritycheck',
     "/out:$driver", "/libpath:$($lib.Directory.FullName)", $obj,
     'ntoskrnl.lib','hal.lib','wdmsec.lib','BufferOverflowFastFailK.lib')
-Invoke-Checked $compiler @('/nologo','/std:c++17','/EHsc','/W4','/O2','/MT',
+Invoke-Checked $compiler (@('/nologo','/std:c++17','/EHsc','/W4','/O2','/MT',
     "/Fo$(Join-Path $out 'gpu_scene.obj')","/Fe$(Join-Path $out 'prime_gpu_scene.exe')",
-    $scene,'dxgi.lib','d3d11.lib','d3dcompiler.lib')
+    $scene,'dxgi.lib','d3d11.lib','d3dcompiler.lib','gdi32.lib') + $graphicsInclude)
 Invoke-Checked (Join-Path $out 'prime_gpu_scene.exe') @('--reference')
 
 # The display package is separate from the working command transport.

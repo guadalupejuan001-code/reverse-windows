@@ -14,6 +14,7 @@ typedef struct PrimeAdapter {
     PUCHAR dma;
     PHYSICAL_ADDRESS bus;
     ULONG dmaBytes;
+    ULONG drawTicket;
     BOOLEAN powered;
 } PrimeAdapter;
 
@@ -59,6 +60,7 @@ static VOID prime_release(PrimeAdapter* gpu) {
         gpu->bar = NULL;
     }
     gpu->powered = FALSE;
+    gpu->drawTicket = 0;
 }
 
 static NTSTATUS prime_map(PrimeAdapter* gpu, PCM_RESOURCE_LIST resources) {
@@ -230,7 +232,7 @@ static NTSTATUS APIENTRY prime_node(HANDLE adapter, UINT ordinal, DXGKARG_GETNOD
 static VOID prime_adapter_info(PrimeAdapter* gpu, RwGpuWddmAdapter* out) {
     const RwGpuWddmAdapter info = {{RWGPU_WDDM_MAGIC, RWGPU_WDDM_ABI, RWGPU_WDDM_QUERY, sizeof(info)},
         rwgpu_read_wide(gpu->bar, RWGPU_REG_LOGICAL_LO), (RWGPU_DEVICE_ID << 16) | RWGPU_VENDOR_ID,
-        rwgpu_read(gpu->bar, RWGPU_REG_CAPS), RWGPU_MAX_WIDTH, RWGPU_MAX_HEIGHT};
+        rwgpu_read(gpu->bar, RWGPU_REG_CAPS), RWGPU_MAX_WIDTH, RWGPU_MAX_HEIGHT, gpu->drawTicket, 0};
     *out = info;
 }
 
@@ -283,6 +285,7 @@ static NTSTATUS prime_draw(PrimeAdapter* gpu, RwGpuWddmFrame* frame, PUCHAR data
         offset += chunk;
     }
     frame->draw_ticket = ticket;
+    gpu->drawTicket = ticket;
     return STATUS_SUCCESS;
 }
 

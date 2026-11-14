@@ -5,7 +5,7 @@
 // address. Draw output is BGRA and follows the vertices in the same packet.
 // The same request returns its PCI command ticket to the caller.
 #define RWGPU_WDDM_MAGIC UINT32_C(0x31445752)
-#define RWGPU_WDDM_ABI 2u
+#define RWGPU_WDDM_ABI 3u
 enum RwGpuWddmCommand { RWGPU_WDDM_QUERY = 1, RWGPU_WDDM_DRAW = 2 };
 
 typedef struct RwGpuWddmHeader {
@@ -16,6 +16,7 @@ typedef struct RwGpuWddmAdapter {
   RwGpuWddmHeader header;
   uint64_t logical_vram_bytes;
   uint32_t pci_id, capabilities, max_width, max_height;
+  uint32_t last_draw_ticket, reserved;
 } RwGpuWddmAdapter;
 
 typedef struct RwGpuWddmFrame {

@@ -35,7 +35,7 @@ HRESULT APIENTRY query(HANDLE, const D3DDDICB_QUERYADAPTERINFO* info) {
     if (info->PrivateDriverDataSize != sizeof(RwGpuWddmAdapter)) return E_INVALIDARG;
     const RwGpuWddmAdapter out{{RWGPU_WDDM_MAGIC, RWGPU_WDDM_ABI, RWGPU_WDDM_QUERY, sizeof(out)},
         RWGPU_LOGICAL_BYTES, (RWGPU_DEVICE_ID << 16) | RWGPU_VENDOR_ID,
-        RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_DMA | RWGPU_CAP_COLOR_ALPHA, RWGPU_MAX_WIDTH, RWGPU_MAX_HEIGHT};
+        RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_DMA | RWGPU_CAP_COLOR_ALPHA, RWGPU_MAX_WIDTH, RWGPU_MAX_HEIGHT, 0, 0};
     std::memcpy(info->pPrivateDriverData, &out, sizeof(out));
     return S_OK;
 }
