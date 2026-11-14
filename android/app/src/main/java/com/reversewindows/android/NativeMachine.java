@@ -53,10 +53,10 @@ final class NativeMachine {
     }
 
     static boolean refreshRamPressure(Context context, long handle, boolean reclaimMemory) {
+        if (reclaimMemory) return sampleRamPressure(handle, 0, 0, true);
         ActivityManager.MemoryInfo memory = memoryInfo(context);
-        if (memory == null && !reclaimMemory) return false;
-        return sampleRamPressure(handle, memory == null ? 0 : memory.availMem,
-                memory == null ? 0 : memory.threshold, reclaimMemory || memory.lowMemory);
+        return memory != null && sampleRamPressure(handle, memory.availMem,
+                memory.threshold, memory.lowMemory);
     }
 
     static native void createDisk(String qssdPath, int capacityGiB);

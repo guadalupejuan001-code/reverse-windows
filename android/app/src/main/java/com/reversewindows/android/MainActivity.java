@@ -781,10 +781,15 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     }
 
     @Override
+    @SuppressWarnings("deprecation")
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
-        if (worker != null && level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND)
-            worker.trimRam();
+        if (worker == null) return;
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND)
+            worker.trimRam(true);
+        else if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW &&
+                 level < ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN)
+            worker.trimRam(false);
     }
 
     @Override

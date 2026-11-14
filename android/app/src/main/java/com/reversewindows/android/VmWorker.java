@@ -61,7 +61,8 @@ final class VmWorker {
     private static final long FRAME_INTERVAL_MS = 100;
     private static final long STATUS_INTERVAL_MS = 350;
     private static final long DIAGNOSTIC_INTERVAL_MS = 5_000;
-    private static final long RAM_SAMPLE_INTERVAL_MS = 2_000;
+    // Newer Android versions no longer send the running-low trim levels.
+    private static final long RAM_SAMPLE_INTERVAL_MS = 10_000;
     private static final long RAM_RECLAIM_INTERVAL_MS = 16;
     private static final String DIAGNOSTIC_FILE = "ultimo-diagnostico.json";
     private static final int MAX_FRAME_WIDTH = 960;
@@ -219,7 +220,7 @@ final class VmWorker {
                 publishState(true);
                 reclaimRam = false;
                 nextRamSample = 0;
-                scheduleRam(RAM_SAMPLE_INTERVAL_MS);
+                if (foreground) scheduleRam(RAM_SAMPLE_INTERVAL_MS);
                 schedule(0);
             } catch (IOException | RuntimeException | LinkageError error) {
                 report(error);
@@ -230,7 +231,10 @@ final class VmWorker {
     void setForeground(boolean visible) {
         worker.post(() -> {
             foreground = visible;
-            if (!visible) worker.removeCallbacks(slice);
+            if (!visible) {
+                worker.removeCallbacks(slice);
+                worker.removeCallbacks(ramMaintenance);
+            }
             if (running && handle != 0 && !isTerminal()) {
                 try {
                     publishState(!visible);
@@ -247,10 +251,10 @@ final class VmWorker {
         });
     }
 
-    void trimRam() {
+    void trimRam(boolean background) {
         worker.post(() -> {
-            if (foreground || released || handle == 0 || isTerminal()) return;
-            reclaimRam = true;
+            if ((background && foreground) || released || handle == 0 || isTerminal()) return;
+            reclaimRam = background;
             nextRamSample = 0;
             scheduleRam(0);
         });
@@ -338,11 +342,11 @@ final class VmWorker {
             } else {
                 more = NativeMachine.maintainRamBudget(handle);
             }
-            scheduleRam(more ? RAM_RECLAIM_INTERVAL_MS :
-                    Math.max(0, nextRamSample - SystemClock.uptimeMillis()));
+            if (more) scheduleRam(RAM_RECLAIM_INTERVAL_MS);
+            else if (foreground) scheduleRam(Math.max(0, nextRamSample - SystemClock.uptimeMillis()));
         } catch (RuntimeException | LinkageError error) {
             Log.w(TAG, "No se pudo ajustar el respaldo de RAM", error);
-            scheduleRam(RAM_SAMPLE_INTERVAL_MS);
+            if (foreground) scheduleRam(RAM_SAMPLE_INTERVAL_MS);
         }
     }
 
