@@ -404,7 +404,7 @@ final class VmWorker {
             long now = SystemClock.uptimeMillis();
             requestFrame();
             if (now - lastStatus >= STATUS_INTERVAL_MS || outcome != previous)
-                publishState(isTerminal());
+                publishState(isTerminal() || outcome == NativeMachine.WAITING_KEY);
             if (isTerminal()) running = false;
             schedule(outcome == NativeMachine.HALTED ? HALTED_POLL_DELAY_MS : 0);
         } catch (RuntimeException | LinkageError error) {
