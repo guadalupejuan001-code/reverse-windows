@@ -25,11 +25,13 @@ jobs:
           if (!$vs) { throw 'Visual Studio x64 toolchain unavailable' }
           & "$vs\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
           & .\guest\windows\build.ps1 -OutDir "$env:RUNNER_TEMP\prime-c08-windows"
-          $PSNativeCommandUseErrorActionPreference = $false
-          $output = & "$env:RUNNER_TEMP\prime-c08-windows\prime_gpu_scene.exe" --wddm 2>&1
-          $result = $LASTEXITCODE
+          $dir = "$env:RUNNER_TEMP\prime-c08-windows"
+          $log = "$dir\wddm-check.txt"
+          $process = Start-Process -FilePath "$dir\prime_gpu_scene.exe" -ArgumentList '--wddm' `
+            -RedirectStandardError $log -NoNewWindow -Wait -PassThru
+          $output = Get-Content $log -Raw
           $output
-          if ($result -ne 3 -or "$output" -notmatch 'PRIME_C08_WDDM_ADAPTER_ABSENT') {
+          if ($process.ExitCode -ne 3 -or $output -notmatch 'PRIME_C08_WDDM_ADAPTER_ABSENT') {
             throw 'WDDM acceptance must reject every host adapter on this runner'
           }
       - uses: actions/upload-artifact@v4
