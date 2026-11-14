@@ -126,6 +126,73 @@ void rep_boot_with_pit_guest(bool local_apic){
   };
   need(check(false)==check(true),"batched timer delivery crossed a guest interrupt deadline");
 }
+void paged_boot_batches_with_timer(){
+  const auto check=[](bool accelerate,bool scan){
+    PcMachine pc(16*1024*1024);
+    pc.boot_long_mode_demo();run(pc,12000);
+    auto& cpu=pc.cpu;
+    need(cpu.halted&&cpu.is_long_mode(),"paged timer fixture did not boot");
+    PcMotherboardC06 board(pc);
+    pc.enable_boot_acceleration(accelerate);
+    cpu.enable_page_translation_cache(accelerate);
+    pc.enable_boot_hotspots();
+    constexpr auto apic=Cpu::kLocalApicAddress;
+    // Map the APIC for the guest handler. The address remains MMIO.
+    cpu.write64(0x2000+3*8,0x4003);
+    cpu.write64(0x4000+503*8,apic|0x83);
+    constexpr unsigned entry=0xa000, into=0x24000, total=8192, idt=0x18000, handler=0x19000;
+    constexpr unsigned log=0xb000;
+    cpu.idtr={0x7ff,idt};
+    cpu.write64(idt+0x42*16,std::uint64_t(handler&0xffff)|0x8e0000180000ULL|
+                (std::uint64_t(handler>>16)<<48));
+    cpu.write64(idt+0x42*16+8,0);
+    code(cpu,handler,{
+        0x50,0x89,0x0c,0x25,0x00,0xb0,0,0,
+        0x48,0x8b,0x44,0x24,0x08,
+        0x48,0x89,0x04,0x25,0x08,0xb0,0,0,
+        0x48,0xb8,0xb0,0,0xe0,0xfe,0,0,0,0,
+        0xc7,0x00,0,0,0,0,0x58,0x48,0xcf});
+    cpu.write32(apic+0xf0,0x1ff);
+    cpu.write32(apic+0x320,0x42);
+    cpu.write32(apic+0x380,307);
+    cpu.eip=entry;cpu.halted=false;
+    cpu.regs[Cpu::ESP]=0x7000;
+    cpu.eflags=2|Cpu::IF;
+    if(scan) {
+      code(cpu,entry,{0x44,0x8d,0x40,0x01,0x48,0xff,0xc2,0x41,0x8b,0xc0,
+                      0x41,0x89,0x81,0xd8,0x2e,0,0,0x80,0x3a,0xe8,0x75,0xea,0xfa,0xf4});
+      cpu.memory.fill(into,0x8c,total);
+      cpu.write8(into+total-1,0xe8);
+      cpu.regs[Cpu::R9]=0xc000-0x2ed8;
+      cpu.regs[Cpu::EDX]=into-1;
+      cpu.regs[Cpu::EAX]=0;
+    }else{
+      code(cpu,entry,{0xf3,0xaa,0xfa,0xf4});
+      cpu.regs[Cpu::EDI]=into;
+      cpu.regs[Cpu::EAX]=0x5a;
+      cpu.regs[Cpu::ECX]=total;
+    }
+    for(unsigned slice=0;slice<40&&!cpu.halted;++slice)run(pc,4091);
+    const auto interrupted=cpu.read64(log+8);
+    need(cpu.halted&&cpu.regs[Cpu::ESP]==0x7000&&board.evidence().irq_delivered==1&&
+        interrupted>=entry&&interrupted<=entry+(scan?20:0),"paged guest lost the live timer boundary");
+    if(scan) {
+      need(cpu.regs[Cpu::EDX]==into+total-1&&cpu.read32(0xc000)==total&&
+          (!accelerate||pc.boot_acceleration().scan_loop_steps>47000),"x64 scan did not finish or batch");
+    }else{
+      need(cpu.regs[Cpu::ECX]==0&&cpu.read8(into+total-1)==0x5a&&
+          (!accelerate||pc.boot_acceleration().paged_rep_elements>8100),"paged REP did not finish or batch");
+    }
+    return std::array<std::uint64_t,5>{interrupted,cpu.read32(log),cpu.instructions,
+        cpu.eflags,board.evidence().ticks};
+  };
+  for(bool scan:{false,true}){
+    const auto scalar=check(false,scan);
+    const auto accelerated=check(true,scan);
+    need(scalar==accelerated,"paged acceleration changed the timer boundary or guest result");
+  }
+  std::cout<<"ETHER_PAGED_BATCH_IRQ_PASS rep=1 byte_scan=1\n";
+}
 void shift_boot_with_pit_guest(){
   const auto check=[](bool accelerate,std::uint8_t period_low){
     PcMachine pc(16*1024*1024);
@@ -829,6 +896,7 @@ int main(){
     pic_pit_guest();
     rep_boot_with_pit_guest(false);
     rep_boot_with_pit_guest(true);
+    paged_boot_batches_with_timer();
     shift_boot_with_pit_guest();
     std::cout<<"ETHER_BOOT_IRQ_TIMING_PASS pit=1 lapic=1 shift_loop=1\n";
     zero_boot_with_lapic_guest();

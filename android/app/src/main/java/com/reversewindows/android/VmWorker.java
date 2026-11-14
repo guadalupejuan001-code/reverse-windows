@@ -87,6 +87,9 @@ final class VmWorker {
     private long lastStatus;
     private long lastDiagnosticSave;
     private long sessionStarted;
+    private long stepNanos;
+    private long frameNanos;
+    private long statusNanos;
     private int[] graphics;
     private int graphicsWidth;
     private int graphicsHeight;
@@ -204,6 +207,7 @@ final class VmWorker {
                 lastStatus = 0;
                 lastDiagnosticSave = 0;
                 sessionStarted = SystemClock.elapsedRealtime();
+                stepNanos = frameNanos = statusNanos = 0;
                 lastFrame = 0;
                 forceFrame = true;
                 running = true;
@@ -301,8 +305,9 @@ final class VmWorker {
             int previous = outcome;
             long started = SystemClock.elapsedRealtimeNanos();
             outcome = NativeMachine.step(handle, sliceSteps);
+            long elapsed = Math.max(1, SystemClock.elapsedRealtimeNanos() - started);
+            stepNanos += elapsed;
             if (outcome == NativeMachine.RUNNING) {
-                long elapsed = Math.max(1, SystemClock.elapsedRealtimeNanos() - started);
                 long estimate = sliceSteps * TARGET_SLICE_NS / elapsed;
                 sliceSteps = (int) Math.max(MIN_SLICE_STEPS,
                         Math.min(MAX_SLICE_STEPS, (sliceSteps + estimate) / 2));
@@ -328,6 +333,7 @@ final class VmWorker {
         }
         retryFrame = false;
         boolean posted = false;
+        long started = SystemClock.elapsedRealtimeNanos();
         try {
             int[] info = NativeMachine.videoInfo(handle);
             if (info == null || info.length != 3 || info[0] <= 0 || info[1] <= 0) return;
@@ -362,21 +368,27 @@ final class VmWorker {
                 }
             });
         } finally {
+            frameNanos += SystemClock.elapsedRealtimeNanos() - started;
             if (!posted) framePending.set(false);
         }
     }
 
     private String currentDiagnostic() {
         return withBuildMetadata(NativeMachine.diagnostic(handle),
-                SystemClock.elapsedRealtime() - sessionStarted);
+                ",\"elapsed_ms\":" + (SystemClock.elapsedRealtime() - sessionStarted)
+                + ",\"worker_timing\":{\"step_us\":" + stepNanos / 1000
+                + ",\"frame_us\":" + frameNanos / 1000
+                + ",\"diagnostic_us\":" + statusNanos / 1000 + "}");
     }
 
     private void publishState(boolean saveNow) {
+        long started = SystemClock.elapsedRealtimeNanos();
         lastStatus = SystemClock.uptimeMillis();
         String json = currentDiagnostic();
         lastDiagnostic = json;
         if (saveNow || lastStatus - lastDiagnosticSave >= DIAGNOSTIC_INTERVAL_MS)
             saveDiagnostic(json);
+        statusNanos += SystemClock.elapsedRealtimeNanos() - started;
         boolean stopped = outcome == NativeMachine.STOPPED;
         boolean active = running && foreground && !isTerminal();
         if (debugSelfTest) {
@@ -390,16 +402,15 @@ final class VmWorker {
     }
 
     private static String withBuildMetadata(String json) {
-        return withBuildMetadata(json, -1);
+        return withBuildMetadata(json, "");
     }
 
-    private static String withBuildMetadata(String json, long elapsedMs) {
+    private static String withBuildMetadata(String json, String extraFields) {
         if (json == null || !json.startsWith("{\"")) {
             throw new IllegalStateException("El diagnóstico de la máquina virtual no es válido.");
         }
         // Preserve the native JSON's full 64-bit register values.
-        String tail = elapsedMs >= 0 ? ",\"elapsed_ms\":" + elapsedMs + "}" : "}";
-        return "{" + BUILD_METADATA + "," + json.substring(1, json.length() - 1) + tail;
+        return "{" + BUILD_METADATA + "," + json.substring(1, json.length() - 1) + extraFields + "}";
     }
 
     private void saveDiagnostic(String json) {
