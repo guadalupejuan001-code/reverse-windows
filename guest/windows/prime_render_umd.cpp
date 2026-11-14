@@ -124,7 +124,8 @@ Shader decode_shader(const UINT* code, bool vertex) {
 struct Resource {
     DXGI_FORMAT format{};
     UINT width = 0, height = 0, usage = 0, bind = 0;
-    bool buffer = false, mapped = false, initialized = false;
+    bool buffer = false, mapped = false, initialized = false, dirty = false;
+    Resource* partner = nullptr;
     std::vector<std::uint8_t> data;
     std::vector<RwGpuVertex> triangles;
     std::uint32_t clear = 0;
@@ -151,6 +152,7 @@ struct Device {
     D3D10_DDI_PRIMITIVE_TOPOLOGY topology{};
     D3D10_DDI_VIEWPORT viewport{};
     bool viewport_set = false, raster = false, depth_test = true, blend = true;
+    std::vector<std::uint8_t> packet;
     void error(HRESULT hr) const { user->pfnSetErrorCb(core, hr); }
 };
 
@@ -159,10 +161,12 @@ Resource* resource(D3D10DDI_HRESOURCE handle) { return static_cast<Resource*>(ha
 Resource* view_resource(void* handle) { return handle ? static_cast<View*>(handle)->resource : nullptr; }
 
 HRESULT submit(Device& dev, Resource& target) {
+    if (!target.dirty) return S_OK;
     const auto vertex_bytes = target.triangles.size() * sizeof(RwGpuVertex);
     const auto required = sizeof(RwGpuWddmFrame) + vertex_bytes + target.data.size();
     try {
-        std::vector<std::uint8_t> message(required);
+        auto& message = dev.packet;
+        message.resize(required);
         RwGpuWddmFrame frame{{RWGPU_WDDM_MAGIC, RWGPU_WDDM_ABI, RWGPU_WDDM_DRAW, static_cast<UINT>(required)},
             target.width, target.height, target.clear, static_cast<UINT>(target.triangles.size()), 0};
         std::memcpy(message.data(), &frame, sizeof(frame));
@@ -184,6 +188,7 @@ HRESULT submit(Device& dev, Resource& target) {
             target.data[i + 2] = bgra[i];
             target.data[i + 3] = bgra[i + 3];
         }
+        target.dirty = false;
         return S_OK;
     } catch (const std::bad_alloc&) {
         return E_OUTOFMEMORY;
@@ -250,6 +255,7 @@ void APIENTRY destroy_resource(D3D10DDI_HDEVICE handle, D3D10DDI_HRESOURCE value
     if (dev.vertex_buffer == current) dev.vertex_buffer = nullptr;
     if (dev.target == current) dev.target = nullptr;
     if (dev.depth == current) dev.depth = nullptr;
+    if (current->partner) current->partner->partner = nullptr;
     current->~Resource();
 }
 
@@ -375,6 +381,7 @@ void APIENTRY clear_color(D3D10DDI_HDEVICE h, D3D10DDI_HRENDERTARGETVIEW v, FLOA
     target->clear = rgba;
     target->triangles.clear();
     target->initialized = true;
+    target->dirty = false;
     for (std::size_t i = 0; i < target->data.size(); i += 4)
         std::memcpy(target->data.data() + i, &rgba, sizeof(rgba));
 }
@@ -383,9 +390,13 @@ void APIENTRY clear_depth(D3D10DDI_HDEVICE h, D3D10DDI_HDEPTHSTENCILVIEW v, UINT
     auto& dev = device(h);
     auto* depth = view_resource(v.pDrvPrivate);
     if (!depth || flags != D3D10_DDI_CLEAR_DEPTH || z != 1.f ||
-        (dev.target && !dev.target->triangles.empty())) {
+        (depth->partner && !depth->partner->triangles.empty())) {
         dev.error(DXGI_ERROR_UNSUPPORTED);
         return;
+    }
+    if (depth->partner) {
+        depth->partner->partner = nullptr;
+        depth->partner = nullptr;
     }
     depth->initialized = true;
 }
@@ -397,7 +408,9 @@ void APIENTRY draw(D3D10DDI_HDEVICE handle, UINT count, UINT first) {
     auto* vb = dev.vertex_buffer;
     const auto& viewport = dev.viewport;
     if (!rt || !rt->initialized || !vb || !vb->buffer || !vb->initialized ||
-        !dev.depth || !dev.depth->initialized || dev.depth->width != rt->width ||
+        !dev.depth || !dev.depth->initialized || (dev.depth->partner && dev.depth->partner != rt) ||
+        (rt->triangles.empty() ? rt->partner != nullptr : rt->partner != dev.depth) ||
+        dev.depth->width != rt->width ||
         dev.depth->height != rt->height || !dev.depth_test || !dev.blend || !dev.raster ||
         !dev.viewport_set || viewport.TopLeftX != 0.f || viewport.TopLeftY != 0.f ||
         viewport.MinDepth != 0.f || viewport.MaxDepth != 1.f ||
@@ -437,11 +450,9 @@ void APIENTRY draw(D3D10DDI_HDEVICE handle, UINT count, UINT first) {
         std::memcpy(&vertex.x, data + position->AlignedByteOffset, 16);
         std::memcpy(&vertex.rgba, data + color->AlignedByteOffset, 4);
     }
-    const HRESULT result = submit(dev, *rt);
-    if (FAILED(result)) {
-        rt->triangles.resize(old_count);
-        dev.error(result);
-    }
+    rt->partner = dev.depth;
+    dev.depth->partner = rt;
+    rt->dirty = true;
 }
 
 void APIENTRY copy_resource(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE out, D3D10DDI_HRESOURCE in) {
@@ -453,6 +464,9 @@ void APIENTRY copy_resource(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE out, D3D10DDI
         device(h).error(DXGI_ERROR_UNSUPPORTED);
         return;
     }
+    auto& dev = device(h);
+    const HRESULT result = submit(dev, *src);
+    if (FAILED(result)) { dev.error(result); return; }
     std::copy(src->data.begin(), src->data.end(), dst->data.begin());
     dst->initialized = true;
 }
@@ -526,7 +540,13 @@ void APIENTRY sample_quality(D3D10DDI_HDEVICE, DXGI_FORMAT f, UINT samples, UINT
 }
 
 void APIENTRY counter_info(D3D10DDI_HDEVICE, D3D10DDI_COUNTER_INFO* out) { *out = {}; }
-BOOL APIENTRY flush(D3D10DDI_HDEVICE, UINT) { return TRUE; }
+BOOL APIENTRY flush(D3D10DDI_HDEVICE h, UINT) {
+    auto& dev = device(h);
+    if (!dev.target) return FALSE;
+    const HRESULT result = submit(dev, *dev.target);
+    if (FAILED(result)) dev.error(result);
+    return SUCCEEDED(result);
+}
 BOOL APIENTRY is_busy(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE) { return FALSE; }
 void APIENTRY relocate(D3D10DDI_HDEVICE, D3DWDDM1_3DDI_DEVICEFUNCS*) {}
 void APIENTRY hazard(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE) {}
@@ -686,7 +706,9 @@ extern "C" __declspec(dllexport) HRESULT APIENTRY OpenAdapter10_2(D3D10DDIARG_OP
     if (adapter.header.magic != RWGPU_WDDM_MAGIC || adapter.header.version != RWGPU_WDDM_ABI ||
         adapter.header.command != RWGPU_WDDM_QUERY || adapter.header.bytes != sizeof(adapter) ||
         adapter.pci_id != ((RWGPU_DEVICE_ID << 16) | RWGPU_VENDOR_ID) ||
-        adapter.logical_vram_bytes != RWGPU_LOGICAL_BYTES) return DXGI_ERROR_UNSUPPORTED;
+        adapter.logical_vram_bytes != RWGPU_LOGICAL_BYTES ||
+        (adapter.capabilities & (RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_DMA | RWGPU_CAP_COLOR_ALPHA)) !=
+            (RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_DMA | RWGPU_CAP_COLOR_ALPHA)) return DXGI_ERROR_UNSUPPORTED;
 
     const D3D10_2DDI_ADAPTERFUNCS callbacks{device_size, create_device, close_adapter, versions, caps};
     *args->pAdapterFuncs_2 = callbacks;

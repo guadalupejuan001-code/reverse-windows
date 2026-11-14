@@ -62,9 +62,15 @@ Invoke-Checked $linker @('/nologo','/driver','/subsystem:native','/machine:x64',
     'ntoskrnl.lib','hal.lib','displib.lib','BufferOverflowFastFailK.lib')
 
 $umd = Join-Path $PSScriptRoot 'prime_render_umd.cpp'
+$umdDll = Join-Path $out 'ReversePrimeRenderUmd.dll'
 Invoke-Checked $compiler (@('/nologo','/std:c++17','/EHsc','/W4','/O2','/MT','/LD',
-    "/Fo$(Join-Path $out 'prime_render_umd.obj')","/Fe$(Join-Path $out 'ReversePrimeRenderUmd.dll')",
+    "/Fo$(Join-Path $out 'prime_render_umd.obj')","/Fe$umdDll",
     "/Fd$(Join-Path $out 'prime_render_umd.pdb')") + $graphicsInclude + @($umd))
+$umdTest = Join-Path $PSScriptRoot 'prime_render_umd_test.cpp'
+$umdTestExe = Join-Path $out 'prime_render_umd_test.exe'
+Invoke-Checked $compiler (@('/nologo','/std:c++17','/EHsc','/W4','/O2','/MT',
+    "/Fo$(Join-Path $out 'prime_render_umd_test.obj')","/Fe$umdTestExe", $umdTest, 'd3dcompiler.lib') + $graphicsInclude)
+Invoke-Checked $umdTestExe @($umdDll)
 $probe = Join-Path $PSScriptRoot 'prime_wddm_probe.cpp'
 Invoke-Checked $compiler (@('/nologo','/std:c++17','/EHsc','/W4','/O2','/MT',
     "/Fo$(Join-Path $out 'prime_wddm_probe.obj')","/Fe$(Join-Path $out 'prime_wddm_probe.exe')",
