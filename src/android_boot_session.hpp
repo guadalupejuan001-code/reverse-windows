@@ -357,6 +357,10 @@ class AndroidBootSession final {
       out << ",\"boot_hotspots\":";
       hotspots->write_json(out);
     }
+    if (const auto& hotspots = pc_.boot_scalar_hotspots()) {
+      out << ",\"boot_scalar_hotspots\":";
+      hotspots->write_json(out);
+    }
     const auto& mode = pc_.boot_mode_progress();
     out << ",\"boot_progress\":{\"handed_off\":" << (pc_.cpu.instructions ? "true" : "false")
         << ",\"session_steps\":" << previous_boot_steps_ + pc_.cpu.instructions

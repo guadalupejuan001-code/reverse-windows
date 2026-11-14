@@ -64,6 +64,7 @@ class PcMotherboardC06 {
     std::uint8_t status() const {return read_isr?isr:irr;}
     std::uint8_t pending() const {
       const auto candidates=unsigned(irr&~mask);
+      if(!candidates)return 0;
       for(unsigned n=0;n<8;++n)if(candidates&(1u<<n)){
         // A currently serviced IRQ blocks requests at equal/lower priority.
         if(isr) {
