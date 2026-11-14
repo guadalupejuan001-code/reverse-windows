@@ -299,8 +299,10 @@ jobs:
             -I src -I deps/mundo-X/pc-android/native -I deps/mundo-X/native/include \
             -I deps/GPU-VIRTUAL/include -I deps/Virtual-qSSD-/include \
             tests/gpu_vram_transfer_test.cpp -o build/gpu-vram-transfer-release
-          ./build/gpu-vram-transfer-release | tee build/prime-gpu-vram-transfer.log
+          ./build/gpu-vram-transfer-release --bulk | tee build/prime-gpu-vram-transfer.log
           grep -q 'PRIME_GPU_C02_VRAM_PASS logical_bytes=120000000000 last_byte=119999999999' build/prime-gpu-vram-transfer.log
+          grep -q 'exact_bytes=268435456' build/prime-gpu-vram-transfer.log
+          grep -q 'command_bytes=8388608' build/prime-gpu-vram-transfer.log
       - name: Measure exact GPU Virtual calculation on the host CPU
         shell: bash
         run: |
@@ -439,6 +441,7 @@ jobs:
             build/prime-c03-ether-arm64.json
             build/prime-c04-ram.log
             build/prime-c06-qssd.log
+            build/prime-gpu-vram-transfer.log
             build/reverse-windows-c07-ata.log
             build/reverse-windows-c08-maintenance.log
             build/reverse-windows-c08-benchmark.jsonl

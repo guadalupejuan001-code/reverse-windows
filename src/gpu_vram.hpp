@@ -22,7 +22,7 @@ class GpuVram {
  public:
   static constexpr std::uint64_t kBytes = 120'000'000'000ULL;
   static constexpr std::size_t kPageBytes = QssdDisk::kBlockSize;
-  static constexpr std::size_t kTransferBytes = QssdDisk::kMaxTransactionBytes;
+  static constexpr std::size_t kTransferBytes = QssdDisk::kMaxBulkTransactionBytes;
   static constexpr std::size_t kResidentBytes = 8U * 1024U * 1024U;
   static_assert(kBytes % kPageBytes == 0 && kResidentBytes % kPageBytes == 0);
 
