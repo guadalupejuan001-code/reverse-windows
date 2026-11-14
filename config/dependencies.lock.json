@@ -6,7 +6,7 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "0f893791458e51f46f7829572b6c19f2f488fed1",
+      "commit": "67ed98fd340082ca2aa8670fa2f1cc541695a79e",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
       "status": "candidate-paged-boot-acceleration",
