@@ -5,6 +5,7 @@
 #include "c06_acpi.hpp"
 #include "c07_ata.hpp"
 #include "atapi_cdrom.hpp"
+#include "gpu_pci_c01.hpp"
 #include "pc_machine.hpp"
 #include "ps2_keyboard.hpp"
 #include <algorithm>
@@ -142,6 +143,7 @@ class PcMotherboardC06 {
   unsigned pit_phase_=0;
   std::uint8_t speaker_control_=0;
   std::uint32_t pci_selector_=0;
+  GpuPciC01 gpu_{};
   std::uint8_t cmos_index_=0,rtc_b_=2;
   std::array<std::uint8_t,256> host_cfg_{},isa_cfg_{};
   std::uint16_t pm_control_=0x0001; // SCI_EN: firmware starts in ACPI mode.
@@ -204,6 +206,7 @@ class PcMotherboardC06 {
     io_redir_low_.fill(0x10000U);io_redir_high_.fill(0);
     io_remote_vector_.fill(0);
     mmio_pending_={};
+    gpu_=GpuPciC01{};
     build_config(host_cfg_,0x0001,0x00);
     build_config(isa_cfg_,0x0002,0x01);
     if(ide_present()){
@@ -218,7 +221,7 @@ class PcMotherboardC06 {
     }
     // After a real PcMachine::reset, firmware RAM is new; republish the
     // same discovered tables and keep their E820-reserved addresses.
-    AcpiC06::install(pc_.cpu,ide_present());
+    AcpiC06::install(pc_.cpu,ide_present(),GpuPciC01::kWindowBase,GpuPciC01::kWindowBytes);
   }
   bool ide_present()const noexcept{return bool(ata_)||bool(optical_);}
   static bool ide_port(std::uint16_t port) noexcept {
@@ -241,12 +244,17 @@ class PcMotherboardC06 {
     if(dev==2&&ide_present())return &ata_cfg_;
     return nullptr;
   }
+  bool gpu_selected() const noexcept {
+    // Enable plus exactly bus 0, the assigned slot and function 0.
+    return (pci_selector_&0x80ffff00U)==(0x80000000U|(GpuPciC01::kSlot<<11));
+  }
   std::optional<std::uint32_t> pci_read(std::uint16_t p,unsigned width){
     if(p==0xcf8&&width==4)return pci_selector_;
     if(p>=0xcfc&&p+width<=0xd00&&(width==1||width==2||width==4)){
-      const auto config=selected_pci();
       const unsigned offset=(pci_selector_&0xfcU)+(p-0xcfc);
       if(offset+width>256)return part_mask(width);
+      if(gpu_selected())return gpu_.config_read(offset,width);
+      const auto config=selected_pci();
       std::uint32_t value=0;
       for(unsigned i=0;i<width;++i)
         value|=std::uint32_t(config?(*config)[offset+i]:0xff)<<(i*8);
@@ -257,10 +265,14 @@ class PcMotherboardC06 {
   bool pci_write(std::uint16_t p,unsigned width,std::uint32_t value){
     if(p==0xcf8&&width==4){pci_selector_=value;return true;}
     if(p>=0xcfc&&p+width<=0xd00&&(width==1||width==2||width==4)){
-      const auto config=selected_pci();
-      if(!config)return true; // non-existent devices ignore writes
       const unsigned offset=(pci_selector_&0xfcU)+(p-0xcfc);
       if(offset+width>256)return true;
+      if(gpu_selected()){
+        gpu_.config_write(offset,width,value);
+        return true;
+      }
+      const auto config=selected_pci();
+      if(!config)return true; // non-existent devices ignore writes
       // Fixed-function bridges implement only the low decode bits. IDE
       // has compatibility I/O ports and no memory BARs or bus mastering.
       for(unsigned i=0;i<width;++i){
@@ -404,13 +416,14 @@ class PcMotherboardC06 {
   }
   bool mmio_claim(std::uint64_t a) const{
     return (a>=kLocalApic&&a<kLocalApic+4096)||
-           (a>=kIoApic&&a<kIoApic+4096);
+           (a>=kIoApic&&a<kIoApic+4096)||GpuPciC01::in_window(a);
   }
   bool mmio_range_claim(std::uint64_t start,std::size_t length) const {
-    const auto overlaps=[&](std::uint64_t base){
-      return start<base+4096U && (start>=base || length>base-start);
+    const auto overlaps=[&](std::uint64_t base,std::size_t bytes){
+      return start<base+bytes && (start>=base || length>base-start);
     };
-    return length && (overlaps(kLocalApic) || overlaps(kIoApic) ||
+    return length && (overlaps(kLocalApic,4096) || overlaps(kIoApic,4096) ||
+        overlaps(GpuPciC01::kWindowBase,GpuPciC01::kWindowBytes) ||
         (prior_mmio_claim_ && (!prior_mmio_range_claim_ || prior_mmio_range_claim_(start,length))));
   }
   static unsigned highest_vector(const std::bitset<256>& vectors) {
@@ -789,10 +802,15 @@ class PcMotherboardC06 {
       return mmio_range_claim(start,length);
     };
     pc_.cpu.mmio_read_hook=[this](std::uint64_t a){
+      if(GpuPciC01::in_window(a))return std::optional<std::uint8_t>(gpu_.mmio_read(a));
       if(mmio_claim(a))return mmio_byte(a);
       return prior_mmio_read_?prior_mmio_read_(a):std::nullopt;
     };
     pc_.cpu.mmio_write_hook=[this](std::uint64_t a,std::uint8_t v){
+      if(GpuPciC01::in_window(a)){
+        gpu_.mmio_write(a,v);
+        return true;
+      }
       if(mmio_claim(a))return mmio_write(a,v);
       return prior_mmio_write_&&prior_mmio_write_(a,v);
     };

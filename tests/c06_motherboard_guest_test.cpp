@@ -15,6 +15,7 @@ using cosmic_pc::Cpu;
 using cosmic_pc::PcMachine;
 using reverse_windows::PcMotherboardC06;
 using reverse_windows::AcpiC06;
+using reverse_windows::GpuPciC01;
 std::uint64_t checks=0;
 void need(bool ok,const std::string& reason){
   ++checks;if(!ok)throw std::runtime_error(reason);
@@ -509,12 +510,13 @@ void pci_acpi_cmos_guest(){
        "DSDT does not describe the PCI0 root in the system bus scope");
   const auto crs=root+30;
   const auto resources=crs+10;
+  constexpr unsigned resource_bytes=108;
   const std::array<std::pair<std::uint16_t,std::uint16_t>,5> ranges{{
     {0,1},{0x170,8},{0x1f0,8},{0x376,1},{0x3f6,1}
   }};
   need(pc.cpu.read32(crs+1)==0x5352435fU && pc.cpu.read8(crs+5)==0x11 &&
-       pc.cpu.read8(crs+9)==82 && package_end(crs+6)==resources+82 &&
-       pc.cpu.read16(resources+80)==0x0079,
+       pc.cpu.read8(crs+9)==resource_bytes && package_end(crs+6)==resources+resource_bytes &&
+       pc.cpu.read16(resources+resource_bytes-2)==0x0079,
        "PCI0 resource template has invalid AML boundaries");
   for(unsigned i=0;i<ranges.size();++i){
     const auto entry=resources+16*i;
@@ -524,7 +526,14 @@ void pci_acpi_cmos_guest(){
          pc.cpu.read16(entry+14)==count,
          "PCI0 resource template does not match the fixed bus and IDE ports");
   }
-  const auto prt=resources+82;
+  const auto window=resources+16*ranges.size();
+  need(pc.cpu.read32(window)==0x001787U && pc.cpu.read16(window+4)==0x010c &&
+       pc.cpu.read32(window+6)==0 && pc.cpu.read32(window+18)==0 &&
+       pc.cpu.read32(window+10)==GpuPciC01::kWindowBase &&
+       pc.cpu.read32(window+14)==GpuPciC01::kWindowBase+GpuPciC01::kWindowBytes-1 &&
+       pc.cpu.read32(window+22)==GpuPciC01::kWindowBytes,
+       "ACPI PCI window does not match the board's GPU window");
+  const auto prt=resources+resource_bytes;
   const auto reserved=prt+8;
   need(pc.cpu.read32(prt+1)==0x5452505fU && pc.cpu.read8(prt+7)==0 &&
        pc.cpu.read16(reserved)==0x825b && pc.cpu.read32(reserved+3)==0x30534552U &&
@@ -645,7 +654,9 @@ void prime_pci_inventory() {
     need(cpu.halted&&cpu.read32(result)==0x00011b36&&cpu.read32(result+4)==0x00021b36&&
          cpu.read32(result+8)==(media?0xc0711b36U:UINT32_MAX),
          "PCI IDs must match the mounted storage profile");
-    for(unsigned slot=3;slot<32;++slot)
+    need(cpu.read32(result+12)==GpuPciC01::kPciId,
+         "GPU PCI discovery must not depend on the selected storage devices");
+    for(unsigned slot=4;slot<32;++slot)
       need(cpu.read32(result+4*slot)==UINT32_MAX,"PCI enumeration exposed a phantom device");
     const auto control=result+32*4;
     need(cpu.read32(control)==(media?0x01010001U:UINT32_MAX)&&
@@ -658,10 +669,162 @@ void prime_pci_inventory() {
          "PCI decode disable leaked a guest command");
     const auto aml=AcpiC06::dsdt_address+36;
     const auto resource_length=aml+13+8+30+9;
-    need(cpu.read8(resource_length)==(media?82:18),
+    need(cpu.read8(resource_length)==(media?108:44),
          "The firmware PCI root must offer IDE I/O resources only with the controller present");
   }
   std::cout<<"PRIME_C05_PCI_ENUMERATION_PASS profiles=4 slots=32 open_bus=1 decode_gate=1\n";
+}
+
+void gpu_pci_guest(bool long_mode){
+  PcMachine pc(16U<<20);
+  auto& cpu=pc.cpu;
+  constexpr unsigned entry=0xa000, output=0x9500;
+  constexpr std::uint32_t cfg=0x80001800U, base=GpuPciC01::kWindowBase;
+  constexpr std::uint32_t relocated=base+2*GpuPciC01::kBarBytes;
+  using Gpu=GpuPciC01;
+  const auto boot=[&](){
+    if(!long_mode){boot32(pc);return;}
+    pc.boot_long_mode_demo();
+    run(pc,12000);
+    need(cpu.halted&&cpu.is_long_mode(),"could not start a 64-bit guest");
+    constexpr auto page=base&~((1U<<21)-1);
+    // Identity-map the PCI window through a 2 MiB page in the high PDPT slot.
+    cpu.write64(0x2000+3*8,0x4003);
+    cpu.write64(0x4000+((page>>21)&0x1ff)*8,page|0x83U);
+    cpu.halted=false;
+  };
+  boot();
+  PcMotherboardC06 board(pc);
+  std::vector<std::uint8_t> guest{0xfa};
+  const auto imm=[&](std::uint32_t value){
+    for(unsigned i=0;i<4;++i)guest.push_back(std::uint8_t(value>>(8*i)));
+  };
+  const auto select=[&](unsigned offset){
+    emit(guest,{0x66,0xba,0xf8,0x0c,0xb8});imm(cfg+offset);
+    emit(guest,{0xef,0x66,0xba,0xfc,0x0c});
+  };
+  const auto store=[&](unsigned index){
+    emit(guest,{0xbb});imm(output+4*index);
+    emit(guest,{0x89,0x03}); // MOV [EBX/RBX],EAX
+  };
+  const auto config_read=[&](unsigned offset,unsigned index){
+    select(offset);emit(guest,{0xed});store(index);
+  };
+  const auto config_write=[&](unsigned offset,std::uint32_t value){
+    select(offset);emit(guest,{0xb8});imm(value);emit(guest,{0xef});
+  };
+  const auto snapshot=[&](std::uint32_t address,unsigned index){
+    emit(guest,{0xbb});imm(address);
+    emit(guest,{0x8b,0x03});store(index);
+  };
+  const auto write=[&](std::uint32_t address,std::uint32_t value){
+    emit(guest,{0xbb});imm(address);
+    emit(guest,{0xc7,0x03});imm(value);
+  };
+  config_read(0x00,0);
+  config_read(0x08,1);
+  config_read(0x100,2); // Function 1 must read as absent.
+  config_read(0x04,3);
+  config_read(0x10,4);
+  config_write(0x10,UINT32_MAX);
+  config_read(0x10,5);
+  config_write(0x14,UINT32_MAX);
+  config_read(0x14,6);
+  config_write(0x10,relocated|0xfU);
+  config_read(0x10,7);
+  snapshot(relocated+Gpu::kAbi,8); // BAR programmed, PCI decode still off.
+  // A word write to the command register may enable memory decode only.
+  select(0x04);
+  emit(guest,{0x66,0xb8,7,0,0x66,0xef});
+  config_read(0x04,9);
+  snapshot(base+Gpu::kAbi,10);
+  snapshot(relocated+Gpu::kAbi,11);
+  snapshot(relocated+Gpu::kCapabilities,12);
+  snapshot(relocated+Gpu::kStatus,13);
+  write(relocated+Gpu::kData,0x11223344U);
+  write(relocated+Gpu::kData+4,0xa1b2c3d4U);
+  write(relocated+Gpu::kSource,1);
+  write(relocated+Gpu::kDestination,9);
+  write(relocated+Gpu::kCountLow,6);
+  write(relocated+Gpu::kDoorbell,Gpu::Copy);
+  snapshot(relocated+Gpu::kStatus,14);
+  snapshot(relocated+Gpu::kResultLow,15);
+  snapshot(relocated+Gpu::kData+8,16);
+  snapshot(relocated+Gpu::kData+12,17);
+  write(relocated+Gpu::kSource,9);
+  write(relocated+Gpu::kDestination,10);
+  write(relocated+Gpu::kCountLow,5);
+  write(relocated+Gpu::kDoorbell,Gpu::Copy);
+  snapshot(relocated+Gpu::kData+8,18);
+  snapshot(relocated+Gpu::kData+12,19);
+  write(relocated+Gpu::kSource,Gpu::kDataBytes-1);
+  write(relocated+Gpu::kDoorbell,Gpu::Copy);
+  snapshot(relocated+Gpu::kStatus,20);
+  snapshot(relocated+Gpu::kResultLow,21);
+  snapshot(relocated+Gpu::kData+8,22);
+  snapshot(relocated+Gpu::kData+12,23);
+  write(relocated+Gpu::kCountLow,0);
+  write(relocated+Gpu::kCountHigh,1);
+  write(relocated+Gpu::kDoorbell,Gpu::SumIndices);
+  snapshot(relocated+Gpu::kStatus,24);
+  snapshot(relocated+Gpu::kResultLow,25);
+  snapshot(relocated+Gpu::kResultHigh,26);
+  write(relocated+Gpu::kCountLow,1);
+  write(relocated+Gpu::kDoorbell,Gpu::SumIndices);
+  snapshot(relocated+Gpu::kStatus,27);
+  snapshot(relocated+Gpu::kResultLow,28);
+  snapshot(relocated+Gpu::kResultHigh,29);
+  write(relocated+Gpu::kDoorbell,0xffU);
+  snapshot(relocated+Gpu::kStatus,30);
+  config_write(0x04,0);
+  write(relocated+Gpu::kData,0);
+  snapshot(relocated+Gpu::kAbi,31);
+  config_write(0x04,2);
+  snapshot(relocated+Gpu::kData,32);
+  config_write(0x10,0x110000U); // Cannot shadow ordinary guest RAM.
+  write(0x110000U,0x89abcdefU);
+  snapshot(0x110000U,33);
+  snapshot(relocated+Gpu::kAbi,34);
+  emit(guest,{0xf4});
+  code(cpu,entry,guest);
+  cpu.eip=entry;
+  run(pc,400);
+  const auto value=[&](unsigned index){return cpu.read32(output+4*index);};
+  need(cpu.halted && value(0)==0xc101fffeU && value(1)==0x03800001U &&
+       value(2)==UINT32_MAX && value(3)==0,"guest did not discover the expected PCI display function");
+  need(value(4)==base && value(5)==0xfffff000U && value(6)==0 && value(7)==relocated &&
+       value(8)==UINT32_MAX && value(9)==2 && value(10)==UINT32_MAX &&
+       value(11)==1 && value(12)==3 && value(13)==Gpu::Idle,
+       "PCI BAR probing, relocation or memory decode failed");
+  need(value(14)==Gpu::Done && value(15)==6 && value(16)==0x11223300U &&
+       value(17)==0x00b2c3d4U && value(18)==0x22333300U && value(19)==0x00c3d411U,
+       "guest byte copy or overlapping copy lost data");
+  need(value(20)==Gpu::InvalidRange && value(21)==0 && value(22)==value(18) &&
+       value(23)==value(19),"invalid copy modified the data aperture or retained a stale result");
+  const auto sum=(std::uint64_t{value(26)}<<32)|value(25);
+  need(value(24)==Gpu::Done && sum==9'223'372'034'707'292'160ULL &&
+       value(27)==Gpu::InvalidRange && value(28)==0 && value(29)==0 &&
+       value(30)==Gpu::UnknownCommand,"guest GPU Virtual reduction or command errors are wrong");
+  need(value(31)==UINT32_MAX && value(32)==0x11223344U &&
+       value(33)==0x89abcdefU && value(34)==UINT32_MAX,
+       "disabled or out-of-window decode changed device or RAM");
+
+  boot(); // Reboot the same machine with this board still attached.
+  guest={0xfa};
+  config_read(0x10,0);
+  config_read(0x04,1);
+  config_write(0x04,2);
+  snapshot(base+Gpu::kData,2);
+  snapshot(base+Gpu::kStatus,3);
+  snapshot(base+Gpu::kResultLow,4);
+  emit(guest,{0xf4});
+  code(cpu,entry,guest);
+  cpu.eip=entry;
+  run(pc,100);
+  need(cpu.halted && value(0)==base && value(1)==0 && value(2)==0 &&
+       value(3)==Gpu::Idle && value(4)==0,"GPU reboot retained old address, data or command state");
+  std::cout<<"PRIME_GPU_C01_PCI_GUEST_PASS copy=1 indexed_values=4294967296 sum="
+           <<sum<<" relocate=1 reset=1 mode="<<(long_mode?"x64":"x86")<<"\n";
 }
 
 void ioapic_lapic_guest(){
@@ -1197,6 +1360,8 @@ int main(){
     pic_legacy_x87_guest();
     pci_acpi_cmos_guest();
     prime_pci_inventory();
+    gpu_pci_guest(false);
+    gpu_pci_guest(true);
     ioapic_lapic_guest();
     nested_apic_guest();
     apic_timer_divisor_and_global_enable();
