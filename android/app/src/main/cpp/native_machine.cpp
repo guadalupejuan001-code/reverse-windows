@@ -152,12 +152,12 @@ JNIEXPORT jint JNICALL Java_com_reversewindows_android_NativeMachine_step(
     });
 }
 
-JNIEXPORT void JNICALL Java_com_reversewindows_android_NativeMachine_key(
+JNIEXPORT jboolean JNICALL Java_com_reversewindows_android_NativeMachine_key(
         JNIEnv* env, jclass, jlong handle, jint ascii, jint scancode, jboolean pressed) {
-    call(env, false, [&] {
-        return session(handle, [=](Session& machine) {
-            machine.key(static_cast<unsigned>(ascii), static_cast<unsigned>(scancode), pressed != JNI_FALSE);
-            return true;
+    return call<jboolean>(env, JNI_FALSE, [&] {
+        return session(handle, [=](Session& machine) -> jboolean {
+            return machine.key(static_cast<unsigned>(ascii), static_cast<unsigned>(scancode),
+                               pressed != JNI_FALSE) ? JNI_TRUE : JNI_FALSE;
         });
     });
 }
