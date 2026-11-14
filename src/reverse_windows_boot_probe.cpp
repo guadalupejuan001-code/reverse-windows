@@ -35,6 +35,7 @@ struct Options {
     std::uint64_t resident_mib = 256;
     std::uint64_t profile_every = 0, profile_from = 0, profile_until = 0;
     bool profile_timing = true;
+    bool ether_arm64 = false;
 };
 
 std::uint64_t positive(const std::string& raw, std::uint64_t upper, const char* name) {
@@ -78,12 +79,15 @@ Options parse(int argc, char** argv) {
         else if (arg == "--profile-from") out.profile_from = positive(next(), 20'000'000'000, "profile-from");
         else if (arg == "--profile-until") out.profile_until = positive(next(), 20'000'000'000, "profile-until");
         else if (arg == "--profile-counts-only") unprofiled = true;
+        else if (arg == "--ether-arm64") out.ether_arm64 = true;
         else if (arg == "--trace") out.trace_path = next();
         else if (arg == "--trace-max-events")
             out.trace_max_events = positive(next(), 2000000, "trace-max-events");
         else throw std::invalid_argument("Unknown option: " + arg);
     }
     if (out.source == Options::Source::None) throw std::invalid_argument("Select a boot source or --qssd-checkpoint/--qssd-compact");
+    if (out.ether_arm64 && !out.profile_every)
+        throw std::invalid_argument("--ether-arm64 requires --profile-every");
     out.profile_timing = !unprofiled;
     if ((unprofiled || out.profile_from || out.profile_until || !out.ram_spill_directory.empty()) && !out.profile_every)
         throw std::invalid_argument("Profile options require --profile-every");
@@ -235,6 +239,7 @@ int main(int argc, char** argv) {
             pc.enable_boot_acceleration();
             if (opts.source == Options::Source::Iso) pc.enable_boot_hotspots(true, false);
             pc.cpu.enable_page_translation_cache();
+            pc.cpu.enable_ether_arm64_blocks(opts.ether_arm64);
 #if defined(MUNDO_X_PC_ETHER_NEXT)
             pc.cpu.enable_ether_next();
 #endif
@@ -301,6 +306,8 @@ int main(int argc, char** argv) {
             if (platform.ticks == before && !pc.waiting_key) break;
         }
         std::ostringstream performance;
+        performance << ",\"ether_arm64\":";
+        reverse_windows::write_ether_arm64(performance, pc.cpu);
         if (opts.profile_every && !profile)
             throw std::runtime_error("Guest stopped before the requested profile start");
         if (profile) {
