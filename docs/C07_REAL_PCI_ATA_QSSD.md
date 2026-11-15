@@ -61,7 +61,7 @@ Archivo CI: `.github/workflows/c00-real-guest.yml`, con log y artefactos de ATA 
 - No hay DMA, bus mastering IDE, UDMA, AHCI/SATA, canal secundario operativo, ATAPI, IDENTIFY PACKET, MSI/MSI-X, APIC completo o timing físico del 8259/PIT.
 - PIO de un sector por fase; las transferencias largas se realizan secuencialmente, QSSD hace sincronización frecuente y el rendimiento no está medido. No se atribuye aceleración cuántica física.
 - Las operaciones complejas de PCI BAR sizing, ACPI/AML completo, drivers Windows, IRQ cascadas especiales y modos mixtos requieren más compatibilidad.
-- La promesa lógica de 16 TiB para QSSD exige particionado GPT/UEFI para usar todo el volumen en Windows; el primer Windows BIOS/MBR debe utilizar un volumen de tamaño razonable, por ejemplo 64 GiB.
+- El disco de datos QSSD de 8 PiB usa el segundo dispositivo del canal IDE primario. GPT permite usar esa capacidad como volumen de datos en Windows 10 1709 o posterior. El disco de arranque usa BIOS y MBR.
 - No se subió una ISO privada, disco físico, datos de usuario o APK no verificada.
 
 **Sin merge automático.** La PR C07 se encadena sobre la PR #10 C06, y la evolución de CPU en Mundo X se encadena sobre PR #88.

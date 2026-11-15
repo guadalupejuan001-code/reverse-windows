@@ -367,6 +367,9 @@ int main(int argc, char** argv) {
     verify_real_mode_ps2(dir.path / "keyboard-poll.rqvd", false);
     verify_arm64_session(dir.path / "ether-arm64.rqvd");
     const auto disk = dir.path / "android-test.rqvd";
+    const auto data_disk = dir.path / "android-data.rqvd";
+    const auto vram = dir.path / "android-test-vram.rqvd";
+    const auto prime = Session::ram_profile(768ULL << 20, 256ULL << 20, false, true);
     const auto fixture = dir.path / "boot.iso";
     std::filesystem::copy_file(argv[1], fixture);
     const auto original = bytes(fixture);
@@ -403,9 +406,12 @@ int main(int argc, char** argv) {
       require(rejected && !std::filesystem::exists(disk), "Invalid ISO created a disk before validation");
     }
     {
+      using reverse_windows::QssdDisk;
+      Session::create_disk(data_disk, QssdDisk::kMaxLogicalBytes / QssdDisk::kGiB);
       auto session = [&] {
         FileDescriptor iso(fixture, O_RDONLY);
-        return Session(disk, 64, Session::BootSource::Iso, iso.value, original.size());
+        return Session(disk, 64, Session::BootSource::Iso, iso.value, original.size(),
+                       prime, dir.path, vram, data_disk);
       }();
       run_until(session, Session::Step::WaitingKey,
                 "El Torito guest did not detect QSSD and return to the real-mode BIOS prompt", 1);
@@ -440,6 +446,13 @@ int main(int argc, char** argv) {
                                  "\"lapic_pending_vector\":0", "\"lapic_timer_count\":0"})
         require(progress.find(marker) != std::string::npos, marker);
       const auto text = screen(frame);
+      require(progress.find("\"data_disk\":{\"logical_bytes\":9007199254740992,\"physical_bytes\":64,") !=
+                  std::string::npos, "Session did not report the attached sparse 8 PiB data disk");
+      require(counter(progress, "usable_bytes") == Session::kPrimeRamBytes &&
+                  counter(progress, "logical_vram_bytes") == 120000000000ULL &&
+                  counter(progress, "resident_bytes") <= prime.backing_bytes &&
+                  progress.find("\"spill_backend\":\"qssd-transient\"") != std::string::npos,
+              "Prime ISO must boot with 64 GiB, bounded RAM backing and the PrimeVGC attached");
       require(text.compare(0, 14, "EL TORITO BIOS") == 0 &&
                   text.compare(80, 20, "QSSD 64 GiB DETECTED") == 0 &&
                   text.compare(3 * 80, 32, "ENTER: WRITE TEST MBR AND REBOOT") == 0,
@@ -494,13 +507,22 @@ int main(int argc, char** argv) {
     }
     require(bytes(disk)==with_tail, "Preflight modified the QSSD or recovered its tail in place");
     {
-      Session reboot(disk, 0, Session::BootSource::Disk);
+      Session reboot(disk, 0, Session::BootSource::Disk, -1, 0, prime, dir.path, vram, data_disk);
       run_until(reboot, Session::Step::Halted, "QSSD guest did not complete its boot");
       require(screen(capture_cells(reboot)).find("QSSD REBOOT OK") != std::string::npos,
               "QSSD did not boot the MBR installed by the ISO guest");
       require(reboot.diagnostic().find("\"source\":\"qssd\"") != std::string::npos,
               "Reboot diagnostic did not identify QSSD");
       const auto disk_boot = reboot.diagnostic();
+      require(disk_boot.find("\"data_disk\":{\"logical_bytes\":9007199254740992,\"physical_bytes\":64,") !=
+                  std::string::npos, "Direct boot did not reopen the data disk");
+      require(counter(disk_boot, "usable_bytes") == Session::kPrimeRamBytes &&
+                  counter(disk_boot, "logical_vram_bytes") == 120000000000ULL,
+              "Direct QSSD boot must keep the RAM and graphics profile used by ISO boot");
+      std::cout << "PRIME_UNIFIED_SESSION_PASS ram=" << counter(disk_boot, "usable_bytes")
+                << " vram=" << counter(disk_boot, "logical_vram_bytes")
+                << " ram_metadata=" << counter(progress, "resident_metadata_bytes")
+                << " ram_resident=" << counter(progress, "resident_bytes") << '\n';
       require(counter(disk_boot, "initial_commits") == 1,
               "Disk-only session must report the already committed sector as initial state");
       require(counter(disk_boot, "boot_profile_phase") == 0 &&

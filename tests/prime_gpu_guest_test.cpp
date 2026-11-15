@@ -109,6 +109,7 @@ void check_firmware(PcMachine& pc) {
   cpu.memory.write_block(0x1000, bios, sizeof(bios));
   unsigned token = 0;
   bool saw_window = false;
+  std::uint64_t usable = 0;
   do {
     cpu.eip = 0x1000; cpu.halted = false;
     cpu.regs[Cpu::EAX] = 0xe820;
@@ -120,15 +121,16 @@ void check_firmware(PcMachine& pc) {
     require(!cpu.fault && !cpu.flag(Cpu::CF), "E820 would not deliver PCI mode memory map");
     const auto base = cpu.read64(0x7000), size = cpu.read64(0x7008);
     const auto type = cpu.read32(0x7010);
+    if (type == 1) usable += size;
     if (base < GuestGpuC08::pci_window_end && base + size > GuestGpuC08::pci_window_start) {
       require(base == RWGPU_BAR_DEFAULT && size == GuestGpuC08::pci_window_bytes && type == 2,
               "E820 exposed PCI space as usable RAM");
       saw_window = true;
     }
     token = cpu.regs[Cpu::EBX];
-    require(token < 8, "E820 did not finish");
+    require(token < 9, "E820 did not finish");
   } while (token);
-  require(saw_window, "PCI MMIO E820 reservation absent");
+  require(saw_window && usable == (64ULL << 30), "E820 did not separate PCI from 64 GiB of RAM");
   const auto dsdt = reverse_windows::AcpiC06::dsdt_address;
   std::vector<std::uint8_t> aml(cpu.read32(dsdt + 4));
   cpu.memory.read_block(dsdt, aml.data(), aml.size());
@@ -148,7 +150,9 @@ void verify_scheduled_dma(PcMachine& pc, PcMotherboardC06& board,
                           const RwGpuVertex* vertices, unsigned count,
                           const std::array<std::uint8_t, 4096>& reference) {
   constexpr std::uint32_t idt = 0x480000, handler = 0xf000, receipt = 0xe200;
-  constexpr std::uint32_t command_ram = 0x500000, read_first = 0x510000, read_second = 0x530000;
+  constexpr std::uint32_t read_first = 0x510000;
+  constexpr std::uint64_t command_ram = 0x1'0050'0000ULL;
+  constexpr std::uint64_t read_second = command_ram + 0x30000;
   constexpr std::uint32_t lapic = PcMachine::kLocalApicAddress;
   constexpr unsigned vector = 0x5a;
   constexpr std::uint64_t target = 0x1900010000ULL, scratch = target + RWGPU_PAGE_BYTES;
@@ -170,7 +174,7 @@ void verify_scheduled_dma(PcMachine& pc, PcMotherboardC06& board,
   irq.write(lapic + 0xb0, 0);
   irq.emit({0x58,0xcf}); // POP EAX; IRETD.
   cpu.memory.write_block(handler, irq.bytes.data(), irq.bytes.size());
-  const auto store = [&](std::uint32_t address, const auto& value) {
+  const auto store = [&](std::uint64_t address, const auto& value) {
     cpu.memory.write_block(address, reinterpret_cast<const std::uint8_t*>(&value), sizeof(value));
   };
   const auto queue = [&](std::uint32_t offset, const void* data, unsigned size) {
@@ -243,7 +247,7 @@ void verify_scheduled_dma(PcMachine& pc, PcMotherboardC06& board,
           pixels == reference && !pc.cpu.memory.write_watch()->pending(),
           "VidMm DMA data, MSI fences, fault, or preemption diverged");
   std::cout << "PRIME_C08_SCHEDULED_DMA_PASS msi=6 fence=104 fault=105 preempt=205 pixels=4096"
-               " pin=system-ram vbe_stores=0\n";
+               " pin=system-ram vbe_stores=0 high_dma=1\n";
 }
 #endif
 
@@ -251,7 +255,7 @@ void verify(const std::filesystem::path& volume) {
   std::array<std::uint8_t, RWGPU_PAGE_BYTES> payload{}, actual{};
   for (unsigned i = 0; i < payload.size(); ++i) payload[i] = (i * 17) ^ (i >> 8);
   {
-    PcMachine pc(4096ULL * MiB, 64 * MiB);
+    PcMachine pc(PcMachine::high_ram_address_space(64ULL << 30, true), 64 * MiB);
     pc.boot_graphics_demo(width, height);
     pc.enable_boot_acceleration();
     PcMotherboardC06 board(pc, nullptr, {}, 0, volume);

@@ -37,9 +37,9 @@ jobs:
         abi: [arm64-v8a, x86_64]
     env:
       ANDROID_ABI: ${{ matrix.abi }}
-      ANDROID_APP_ID: com.reversewindows.android.prime.c08.r03
-      ANDROID_VERSION: "0.2.2"
-      ANDROID_VERSION_CODE: "20"
+      ANDROID_APP_ID: com.reversewindows.android.prime.c08.r04
+      ANDROID_VERSION: "0.2.3"
+      ANDROID_VERSION_CODE: "21"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -100,7 +100,7 @@ jobs:
           "$tools/zipalign" -c -P 16 -v 4 "$apk" > "$out/alignment.txt"
           "$tools/aapt" dump badging "$apk" > "$out/manifest.txt"
           grep -Fq "package: name='$ANDROID_APP_ID' versionCode='$ANDROID_VERSION_CODE' versionName='$ANDROID_VERSION'" "$out/manifest.txt"
-          grep -Fxq "application-label:'REVERSE Windows Prime'" "$out/manifest.txt"
+          grep -Fxq "application-label:'REVERSE Windows Prime $ANDROID_VERSION'" "$out/manifest.txt"
           "$tools/aapt" dump xmltree "$apk" AndroidManifest.xml > "$RUNNER_TEMP/reverse-windows-app-manifest.txt"
           "$tools/aapt" dump resources "$apk" > "$RUNNER_TEMP/reverse-windows-app-resources.txt"
           icon_id=$(sed -n 's/.*A: android:icon([^)]*)=@\(0x[[:xdigit:]]\{8\}\).*/\1/p' "$RUNNER_TEMP/reverse-windows-app-manifest.txt")
@@ -262,27 +262,43 @@ jobs:
           fi
 
           tap_visible() {
-            local field="$1" label="$2" point
+            local field="$1" label="$2" scroll="${3:-}" point
             for attempt in {1..12}; do
               adb shell uiautomator dump /sdcard/reverse-windows-window.xml >/dev/null
               adb exec-out cat /sdcard/reverse-windows-window.xml > "$RUNNER_TEMP/reverse-windows-window.xml"
-              point=$(python3 - "$RUNNER_TEMP/reverse-windows-window.xml" "$field" "$label" <<'PY'
+              point=$(python3 - "$RUNNER_TEMP/reverse-windows-window.xml" "$field" "$label" "$scroll" <<'PY'
           import re
           import sys
           import xml.etree.ElementTree as xml
-          path, field, label = sys.argv[1:]
-          for node in xml.parse(path).iter("node"):
+          path, field, label, scroll = sys.argv[1:]
+          nodes = list(xml.parse(path).iter("node"))
+          for node in nodes:
               if node.get(field) == label and node.get("enabled") == "true":
                   left, top, right, bottom = map(int, re.findall(r"\d+", node.get("bounds")))
                   if right > left and bottom > top:
                       print((left + right) // 2, (top + bottom) // 2)
                       break
+          else:
+              if scroll:
+                  for node in nodes:
+                      if node.get("class") == "android.widget.ScrollView" and node.get("scrollable") == "true":
+                          left, top, right, bottom = map(int, re.findall(r"\d+", node.get("bounds")))
+                          x = (left + right) // 2
+                          top_y = top + (bottom - top) // 5
+                          bottom_y = bottom - (bottom - top) // 5
+                          start_y, end_y = (bottom_y, top_y) if scroll == "down" else (top_y, bottom_y)
+                          print(x, start_y, x, end_y)
+                          break
           PY
               )
               if [[ "$point" =~ ^[0-9]+\ [0-9]+$ ]]; then
                 read -r x y <<< "$point"
                 adb shell input tap "$x" "$y"
                 return
+              fi
+              if [[ "$point" =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+$ ]]; then
+                read -r x1 y1 x2 y2 <<< "$point"
+                adb shell input swipe "$x1" "$y1" "$x2" "$y2" 240
               fi
               sleep 1
             done
@@ -295,7 +311,18 @@ jobs:
           adb push "$RUNNER_TEMP/$iso" "/sdcard/Download/$iso"
           tap_visible resource-id "$ANDROID_APP_ID:id/vm_select_iso"
           tap_visible text "$iso"
-          tap_visible resource-id "$ANDROID_APP_ID:id/vm_boot_iso"
+
+          # Mount the optional data drive through its normal Android control.
+          tap_visible resource-id "$ANDROID_APP_ID:id/vm_create_data_disk" down
+          tap_visible resource-id android:id/button1
+          for attempt in {1..20}; do
+            if adb shell run-as "$ANDROID_APP_ID" test -f files/windows-data.rqvd; then
+              break
+            fi
+            sleep 1
+          done
+          adb shell run-as "$ANDROID_APP_ID" test -f files/windows-data.rqvd
+          tap_visible resource-id "$ANDROID_APP_ID:id/vm_boot_iso" up
 
           snapshot="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/iso-diagnostic.json"
           for attempt in {1..30}; do
@@ -314,13 +341,15 @@ jobs:
           assert report["source"] == "iso" and report["status"] == "waiting_key", report
           assert report["iso_bytes"] == Path(sys.argv[2]).stat().st_size
           assert report["disk"]["logical_bytes"] == 64 * 1024**3 and report["disk"]["initial_commits"] == 0
+          assert report["data_disk"]["logical_bytes"] == 8 << 50 and report["data_disk"]["physical_bytes"] == 64
+          assert report["guest_gpu"]["logical_vram_bytes"] == 120_000_000_000
           assert report["ata"]["identify_data_transfers"] == 1
           assert report["boot_progress"]["handed_off"] and report["boot_profile"]["checkpoint_interval_steps"] == 50_000_000
           assert report["ram_profile"]["usable_bytes"] == 64 << 30, report["ram_profile"]
           ether = report["ether_arm64"]
           assert ether["mundo_x_source_sha"] == os.environ["MUNDO_X_SHA"]
           assert ether["code_version_hits"] == ether["code_byte_checks"] == ether["code_bytes_read"] == 0
-          print("PRIME_ANDROID_ISO_PICKER_PASS boot=el-torito qssd_created=1")
+          print("PRIME_ANDROID_ISO_PICKER_PASS boot=el-torito ram_gib=64 qssd_boot_gib=64 qssd_data_pib=8")
           PY
           BASH
       - name: Run BIOS, keyboard and synthetic ISO from Downloads on Android

@@ -18,6 +18,7 @@ final class VmTelemetry extends LinearLayout {
     private static final long KIB = 1024;
     private static final long MIB = 1024 * KIB;
     private static final long GIB = 1024 * MIB;
+    private static final long PIB = (1L << 20) * GIB;
     private static final String UNKNOWN = "—";
 
     private enum Category {
@@ -167,8 +168,7 @@ final class VmTelemetry extends LinearLayout {
         long limit = number(ram, "backing_budget_bytes", number(machine, "ram_budget_bytes"));
         boolean knownOccupancy = used >= 0 && limit > 0;
         double ratio = knownOccupancy ? (double) used / limit : 0;
-        heading("RAM invitada", units(logical, GIB, "GiB", 2),
-                usable >= 0 ? units(usable, GIB, "GiB", 2) + " útiles" : "");
+        heading("RAM utilizable por el invitado", units(usable >= 0 ? usable : logical, GIB, "GiB", 2), "");
         put(resident, formatted(used, MIB, 1) + " / " + formatted(limit, MIB, 1) + " MiB");
         put(occupancy, knownOccupancy ? String.format(Locale.getDefault(), "%.1f %%", ratio * 100) : "");
         meter.setVisibility(knownOccupancy ? View.VISIBLE : View.GONE);
@@ -176,7 +176,8 @@ final class VmTelemetry extends LinearLayout {
         long pssKiB = number(snapshot, "android_pss_kib");
         metric(0, "Páginas en archivo", units(number(ram, "spilled_bytes"), MIB, "MiB", 1));
         metric(1, "Proceso Android (PSS)", pssKiB > 0 ? units(pssKiB, KIB, "MiB", 1) : UNKNOWN);
-        showRows(2);
+        metric(2, "Metadatos de RAM", storage(number(ram, "resident_metadata_bytes")));
+        showRows(3);
     }
 
     private void renderCpu() {
@@ -206,8 +207,14 @@ final class VmTelemetry extends LinearLayout {
                 iso ? units(capacity, GIB, "GiB", 1) : count(number(machine, "disk_reads")));
         metric(1, "Archivo QSSD en el teléfono", storage(number(disk, "physical_bytes")));
         metric(2, "Operaciones guardadas", count(number(disk, "commits")));
-        if (iso) metric(3, "Tamaño del ISO", units(number(snapshot, "iso_bytes"), GIB, "GiB", 2));
-        showRows(iso ? 4 : 3);
+        JSONObject dataDisk = snapshot.optJSONObject("data_disk");
+        if (dataDisk != null) {
+            metric(3, "QSSD de datos", storage(number(dataDisk, "logical_bytes")) + " · "
+                    + storage(number(dataDisk, "physical_bytes")) + " en Android");
+        } else if (iso) {
+            metric(3, "Tamaño de la ISO", units(number(snapshot, "iso_bytes"), GIB, "GiB", 2));
+        }
+        showRows(iso || dataDisk != null ? 4 : 3);
     }
 
     private void renderVideo() {
@@ -266,6 +273,7 @@ final class VmTelemetry extends LinearLayout {
     }
 
     private static String storage(long bytes) {
+        if (bytes >= PIB) return units(bytes, PIB, "PiB", 1);
         if (bytes >= GIB) return units(bytes, GIB, "GiB", 1);
         if (bytes >= MIB) return units(bytes, MIB, "MiB", 1);
         if (bytes >= KIB) return units(bytes, KIB, "KiB", 1);

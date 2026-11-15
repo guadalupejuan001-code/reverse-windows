@@ -361,14 +361,17 @@ class GuestGpuC08 {
 
   bool ordinary_ram(std::uint64_t address, std::size_t size) const {
     const auto& cpu = pc_.cpu;
-    const auto top = std::min(cpu.memory.size(), cosmic_pc::PcMachine::kIoApicAddress);
+    using Pc = cosmic_pc::PcMachine;
+    const auto top = cpu.memory.size();
     if (address > top || size > top - address) return false;
     if (!size) return true;
     const auto overlaps = [&](std::uint64_t base, std::uint64_t length) {
       return address < base + length && base < address + size;
     };
     using Video = cosmic_pc::PcVideo;
-    return !overlaps(0xa0000, 0x60000) && !overlaps(pci_window_start, pci_window_bytes) &&
+    return !overlaps(Pc::kConventionalRamEnd, Pc::kExtendedRamStart - Pc::kConventionalRamEnd) &&
+           !overlaps(Pc::kIoApicAddress, Pc::kLegacyPhysicalLimit - Pc::kIoApicAddress) &&
+           !overlaps(pci_window_start, pci_window_bytes) &&
            (!Video::available(cpu.memory) || !overlaps(Video::kFramebufferAddress, Video::kApertureBytes)) &&
            (!cpu.memory.has_window() || !overlaps(cpu.memory.window_base(), cpu.memory.window_bytes())) &&
            (!cpu.mmio_range_claim_hook || !cpu.mmio_range_claim_hook(address, size));

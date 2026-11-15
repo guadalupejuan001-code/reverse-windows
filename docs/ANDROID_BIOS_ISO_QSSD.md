@@ -10,7 +10,13 @@ La app conecta el selector de archivos de Android, el arranque BIOS de Mundo X y
 4. Si Windows Setup llega a mostrar el disco, elige ese QSSD para crear las particiones. Después de que Setup termine de copiar y prepare el reinicio, arranca desde **QSSD** si el sistema vuelve al CD.
 5. Si la máquina se detiene, usa **Copiar diagnóstico**. El informe incluye el modo de CPU, el punto de ejecución, el motivo del fallo y el estado del disco.
 
-Desinstalar la app borra su disco privado. Para conservar la instalación, actualiza con un APK firmado con la misma clave.
+Desinstalar la app borra sus discos privados. Para conservar la instalación, el APK de actualización debe usar el mismo identificador de aplicación y la misma clave de firma.
+
+## Disco de datos de máxima capacidad
+
+Con la máquina apagada, pulsa **Añadir QSSD de datos de 8 PiB**. La app monta el archivo por separado y usa el disco de arranque existente para iniciar Windows. El archivo de datos empieza con una cabecera de 64 bytes. El almacenamiento real del teléfono determina cuánto cabe al escribir.
+
+En Windows 10 1709 o posterior, inicializa el disco nuevo como GPT y crea un volumen con formato rápido NTFS y unidades de asignación de 2 MiB para usar la capacidad disponible. El diagnóstico incluye `data_disk` con capacidad lógica, bytes físicos y actividad ATA. La prueba de invitado x86 verifica que se puede leer y escribir el último sector de los 8 PiB y recuperar los datos al reabrir el archivo. Queda pendiente verificar el montaje del volumen en Windows 10.
 
 ## Prueba de arranque con Ether
 
