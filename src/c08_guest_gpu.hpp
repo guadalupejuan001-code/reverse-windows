@@ -33,6 +33,7 @@ class GuestGpuC08 {
   static_assert(pci_window_start == cosmic_pc::PcMachine::kPciMmioBase &&
                 pci_window_bytes == cosmic_pc::PcMachine::kPciMmioBytes &&
                 pci_window_end <= cosmic_pc::PcMachine::kIoApicAddress);
+  static_assert(RWGPU_STAGE_OFFSET % 4 == 0 && RWGPU_STAGE_BYTES % 4 == 0);
 
   using Msi = std::function<bool(std::uint32_t, std::uint16_t)>;
   GuestGpuC08(cosmic_pc::PcMachine& machine, const std::filesystem::path& vram, Msi msi = {})
@@ -114,6 +115,31 @@ class GuestGpuC08 {
       return stage_[offset - RWGPU_STAGE_OFFSET];
     return std::uint8_t(word(offset & ~3u) >> ((offset & 3) * 8));
   }
+  // The board routes only aligned dwords within the decoded BAR here.
+  std::uint32_t read32(std::uint64_t address) const noexcept {
+    const auto offset = unsigned(address - bar_);
+    if (offset >= RWGPU_STAGE_OFFSET && offset - RWGPU_STAGE_OFFSET < stage_.size()) {
+      const auto index = offset - RWGPU_STAGE_OFFSET;
+      std::uint32_t value = 0;
+      for (unsigned i = 0; i < 4; ++i) value |= std::uint32_t(stage_[index + i]) << (i * 8);
+      return value;
+    }
+    return word(offset);
+  }
+  bool write32(std::uint64_t address, std::uint32_t value) {
+    const auto offset = unsigned(address - bar_);
+    if (offset >= RWGPU_STAGE_OFFSET && offset - RWGPU_STAGE_OFFSET < RWGPU_STAGE_BYTES) {
+      // The byte path owns first allocation and reports allocation failures.
+      if (stage_.empty()) return false;
+      const auto index = offset - RWGPU_STAGE_OFFSET;
+      for (unsigned i = 0; i < 4; ++i) stage_[index + i] = std::uint8_t(value >> (i * 8));
+      pending_ = {};
+      return true;
+    }
+    pending_ = {};
+    commit_register(offset, value);
+    return true;
+  }
   bool write(std::uint64_t address, std::uint8_t data) {
     const auto offset = unsigned(address - bar_);
     if (offset >= RWGPU_STAGE_OFFSET && offset - RWGPU_STAGE_OFFSET < RWGPU_STAGE_BYTES) {
@@ -140,11 +166,7 @@ class GuestGpuC08 {
     if (pending_.written == 4) {
       const auto value = pending_.value;
       pending_ = {};
-      if (reg == RWGPU_REG_DOORBELL) dispatch(value);
-      else if (reg == RWGPU_REG_IRQ_ACK) irq_status_ &= ~value;
-      else if (reg == RWGPU_REG_ENGINE_RESET) { if (value == 1) reset_engine(); }
-      else if (command_register(reg)) params_[(reg - RWGPU_REG_OFFSET_LO) / 4] = value;
-      else direct_params_[(reg - RWGPU_REG_AUX_LO) / 4] = value;
+      commit_register(reg, value);
     }
     return true;
   }
@@ -236,6 +258,13 @@ class GuestGpuC08 {
   }
   static bool direct_register(unsigned reg) noexcept {
     return reg >= RWGPU_REG_AUX_LO && reg <= RWGPU_REG_LENGTH_HI;
+  }
+  void commit_register(unsigned reg, std::uint32_t value) {
+    if (reg == RWGPU_REG_DOORBELL) dispatch(value);
+    else if (reg == RWGPU_REG_IRQ_ACK) irq_status_ &= ~value;
+    else if (reg == RWGPU_REG_ENGINE_RESET) { if (value == 1) reset_engine(); }
+    else if (command_register(reg)) params_[(reg - RWGPU_REG_OFFSET_LO) / 4] = value;
+    else if (direct_register(reg)) direct_params_[(reg - RWGPU_REG_AUX_LO) / 4] = value;
   }
   static std::uint64_t wide(std::uint32_t lo, std::uint32_t hi) noexcept {
     return (std::uint64_t(hi) << 32) | lo;

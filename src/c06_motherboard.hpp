@@ -131,6 +131,8 @@ class PcMotherboardC06 {
   std::function<bool(std::uint64_t,std::size_t)> prior_mmio_range_claim_;
   std::function<std::optional<std::uint8_t>(std::uint64_t)> prior_mmio_read_;
   std::function<bool(std::uint64_t,std::uint8_t)> prior_mmio_write_;
+  decltype(cosmic_pc::Cpu::mmio_read32_hook) prior_mmio_read32_;
+  decltype(cosmic_pc::Cpu::mmio_write32_hook) prior_mmio_write32_;
   std::function<void()> prior_tick_;
   std::function<unsigned(unsigned)> prior_batch_limit_;
   std::function<void(unsigned)> prior_batch_advance_;
@@ -915,6 +917,23 @@ class PcMotherboardC06 {
       if (gpu_ && gpu_->claims(address)) return gpu_->write(address, value);
       return prior_mmio_write_ && prior_mmio_write_(address, value);
     };
+    cpu.mmio_read32_hook = [this, &apic](std::uint64_t address) {
+      if (mmio_claim(address)) return mmio_register(apic, address);
+      if (gpu_ && gpu_->claims(address)) return std::optional<std::uint32_t>(gpu_->read32(address));
+      return prior_mmio_read32_ ? prior_mmio_read32_(address) : std::nullopt;
+    };
+    cpu.mmio_write32_hook = [this, &apic](std::uint64_t address, std::uint32_t value)
+        -> std::optional<bool> {
+      if (mmio_claim(address)) {
+        apic.mmio_pending = {};
+        return mmio_commit(apic, address, value);
+      }
+      if (gpu_ && gpu_->claims(address)) {
+        if (gpu_->write32(address, value)) return true;
+        return std::nullopt;
+      }
+      return prior_mmio_write32_ ? prior_mmio_write32_(address, value) : std::nullopt;
+    };
   }
 
   static bool needs_service(const LocalApic& apic) noexcept {
@@ -1015,6 +1034,8 @@ class PcMotherboardC06 {
     prior_mmio_range_claim_=pc_.cpu.mmio_range_claim_hook;
     prior_mmio_read_=pc_.cpu.mmio_read_hook;
     prior_mmio_write_=pc_.cpu.mmio_write_hook;
+    prior_mmio_read32_=pc_.cpu.mmio_read32_hook;
+    prior_mmio_write32_=pc_.cpu.mmio_write32_hook;
     prior_tick_=pc_.device_step_hook;
     prior_batch_limit_=pc_.device_batch_limit_hook;
     prior_batch_advance_=pc_.device_batch_advance_hook;
@@ -1084,6 +1105,8 @@ class PcMotherboardC06 {
     pc_.cpu.mmio_range_claim_hook=std::move(prior_mmio_range_claim_);
     pc_.cpu.mmio_read_hook=std::move(prior_mmio_read_);
     pc_.cpu.mmio_write_hook=std::move(prior_mmio_write_);
+    pc_.cpu.mmio_read32_hook=std::move(prior_mmio_read32_);
+    pc_.cpu.mmio_write32_hook=std::move(prior_mmio_write32_);
     pc_.device_step_hook=std::move(prior_tick_);
     pc_.device_batch_limit_hook=std::move(prior_batch_limit_);
     pc_.device_batch_advance_hook=std::move(prior_batch_advance_);

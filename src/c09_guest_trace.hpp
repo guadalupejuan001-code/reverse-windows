@@ -35,6 +35,8 @@ class C09GuestTrace final {
   std::function<bool(std::uint16_t,unsigned,std::uint32_t)> previous_out_;
   std::function<std::optional<std::uint8_t>(std::uint64_t)> previous_mmio_read_;
   std::function<bool(std::uint64_t,std::uint8_t)> previous_mmio_write_;
+  decltype(Cpu::mmio_read32_hook) previous_mmio_read32_;
+  decltype(Cpu::mmio_write32_hook) previous_mmio_write32_;
   std::function<bool(Cpu&,std::uint8_t)> previous_bios_;
 
   static std::string quote(const std::string& s){return cosmic_pc::PcMachine::quote(s);}
@@ -63,6 +65,12 @@ class C09GuestTrace final {
         if(essential && !final_or_fault) ++critical_emitted_;
       }
     }catch(...) {failed_=true;last_error_="Trace output exception";}
+  }
+  void record_mmio(const char* type,std::uint64_t physical,unsigned width,
+                   std::uint32_t value,bool handled) {
+    record("{\"type\":"+quote(type)+",\"address\":"+quote(address(physical))+
+           ",\"width\":"+std::to_string(width)+",\"value\":"+std::to_string(value)+
+           ",\"handled\":"+(handled?"true":"false")+"}");
   }
   void step(const Cpu::StepTrace& t) {
     ++steps_;
@@ -157,6 +165,8 @@ class C09GuestTrace final {
     previous_out_=pc_.cpu.out_hook;
     previous_mmio_read_=pc_.cpu.mmio_read_hook;
     previous_mmio_write_=pc_.cpu.mmio_write_hook;
+    previous_mmio_read32_=pc_.cpu.mmio_read32_hook;
+    previous_mmio_write32_=pc_.cpu.mmio_write32_hook;
     previous_bios_=pc_.cpu.interrupt_hook;
     pc_.cpu.step_trace_hook=[this](const Cpu::StepTrace& t){
       if(previous_step_)try{previous_step_(t);}catch(...){}
@@ -192,19 +202,33 @@ class C09GuestTrace final {
       auto value=previous_mmio_read_?previous_mmio_read_(address):
                                    std::optional<std::uint8_t>{};
       ++mmio_reads_;
-      record("{\"type\":\"mmio-read\",\"address\":"+quote(C09GuestTrace::address(address))+
-             ",\"handled\":"+std::string(value?"true":"false")+
-             ",\"value\":"+std::to_string(value.value_or(0))+"}");
+      record_mmio("mmio-read",address,1,value.value_or(0),value.has_value());
       return value;
     };
     pc_.cpu.mmio_write_hook=[this](std::uint64_t address,std::uint8_t value){
       const auto accepted=previous_mmio_write_&&previous_mmio_write_(address,value);
       ++mmio_writes_;
-      record("{\"type\":\"mmio-write\",\"address\":"+quote(C09GuestTrace::address(address))+
-             ",\"value\":"+std::to_string(value)+
-             ",\"handled\":"+std::string(accepted?"true":"false")+"}");
+      record_mmio("mmio-write",address,1,value,accepted);
       return accepted;
     };
+    if(previous_mmio_read32_)
+      pc_.cpu.mmio_read32_hook=[this](std::uint64_t address){
+        const auto value=previous_mmio_read32_(address);
+        if(value){
+          ++mmio_reads_;
+          record_mmio("mmio-read",address,4,*value,true);
+        }
+        return value;
+      };
+    if(previous_mmio_write32_)
+      pc_.cpu.mmio_write32_hook=[this](std::uint64_t address,std::uint32_t value){
+        const auto accepted=previous_mmio_write32_(address,value);
+        if(accepted){
+          ++mmio_writes_;
+          record_mmio("mmio-write",address,4,value,*accepted);
+        }
+        return accepted;
+      };
     pc_.cpu.interrupt_hook=[this](Cpu& cpu,std::uint8_t vector){
       const auto ah=cpu.reg8(4);
       const auto drive=cpu.reg8(Cpu::EDX); // DL, not DH (legacy reg8 index 6)
@@ -234,6 +258,8 @@ class C09GuestTrace final {
     pc_.cpu.out_hook=std::move(previous_out_);
     pc_.cpu.mmio_read_hook=std::move(previous_mmio_read_);
     pc_.cpu.mmio_write_hook=std::move(previous_mmio_write_);
+    pc_.cpu.mmio_read32_hook=std::move(previous_mmio_read32_);
+    pc_.cpu.mmio_write32_hook=std::move(previous_mmio_write32_);
     pc_.cpu.interrupt_hook=std::move(previous_bios_);
   }
   void note_boot_plan(const cosmic_pc::BootPlan& plan,std::uint64_t medium_bytes) {

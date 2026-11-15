@@ -666,7 +666,25 @@ void prime_pci_inventory() {
 
 void ioapic_lapic_guest(){
   PcMachine pc(16*1024*1024);boot32(pc);
+  unsigned word_reads=0,word_writes=0,byte_reads=0,byte_writes=0;
   PcMotherboardC06 board(pc);
+  auto& cpu=pc.cpu;
+  cpu.mmio_read32_hook=[read=cpu.mmio_read32_hook,&word_reads](std::uint64_t address){
+    ++word_reads;
+    return read(address);
+  };
+  cpu.mmio_write32_hook=[write=cpu.mmio_write32_hook,&word_writes](std::uint64_t address,std::uint32_t value){
+    ++word_writes;
+    return write(address,value);
+  };
+  cpu.mmio_read_hook=[read=cpu.mmio_read_hook,&byte_reads](std::uint64_t address){
+    ++byte_reads;
+    return read(address);
+  };
+  cpu.mmio_write_hook=[write=cpu.mmio_write_hook,&byte_writes](std::uint64_t address,std::uint8_t value){
+    ++byte_writes;
+    return write(address,value);
+  };
   pc.cpu.idtr={0x1000,0x15000};pc.cpu.regs[Cpu::ESP]=0x190000;
   gate(pc.cpu,0x31,0x13300);
   code(pc.cpu,0x13300,{
@@ -698,6 +716,10 @@ void ioapic_lapic_guest(){
           0xfb,0xf4,0xeb,0xfe});
   code(pc.cpu,0xa000,p);pc.cpu.eip=0xa000;pc.cpu.halted=false;
   run(pc,220);
+  need(word_reads==1&&word_writes==6&&byte_reads==0&&byte_writes==0,
+       "each aligned APIC access must use a single dword transaction");
+  need(cpu.read16(0xfee00031)==0x0500&&word_reads==1&&byte_reads==2,
+       "a partial APIC register read must retain byte semantics");
   need(pc.cpu.read32(0x9104)==0x00050014,
        "guest did not read actual LAPIC MMIO version");
   need((pc.cpu.read32(0x9108)&((1U<<28)|(1U<<9)))==(1U<<9) &&
@@ -715,6 +737,10 @@ void ioapic_lapic_guest(){
   bool unsupported=false;
   try{(void)pc.cpu.read32(0xfee00290);}catch(const std::exception&){unsupported=true;}
   need(unsupported,"unsupported local APIC register must not fake value");
+  unsupported=false;
+  try{cpu.write32(0xfee00290,0);}catch(const std::exception&){unsupported=true;}
+  need(unsupported&&word_writes==7&&byte_writes==0,
+       "a rejected dword write must fault without retrying bytes");
   std::cout<<"C06_IOAPIC_LAPIC_MMIO_IRQ_PASS delivered="<<board.evidence().apic_irqs<<"\n";
 }
 void nested_apic_guest(){

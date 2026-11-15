@@ -68,6 +68,7 @@ void run(const std::string& path,const std::string& journal){
     // These instructions result in real physical APIC MMIO events.
     append(p,{0xa1,0x30,0x00,0xe0,0xfe,
               0xa3,0x04,0x91,0,0,
+              0x66,0xa1,0x31,0x00,0xe0,0xfe, // Partial LAPIC version read.
               0xc7,0x05,0xf0,0x00,0xe0,0xfe,0xff,0x01,0,0,
               0xc7,0x05,0x50,0x03,0xe0,0xfe,0x00,0x07,0,0}); // LINT0 ExtINT.
     // Explicit PIC remap: master 0x20, slave 0x28, cascade IRQ2,
@@ -115,19 +116,21 @@ void run(const std::string& path,const std::string& journal){
   std::ifstream file(journal);
   need(bool(file),"C09 device trace file missing");
   std::string line;
-  bool irq=false,mmio_read=false,mmio_write=false,ata_port=false,finish=false;
+  bool irq=false,mmio_read=false,mmio_write=false,mmio_byte=false,ata_port=false,finish=false;
   for(;std::getline(file,line);){
     if(line.find("\"type\":\"hardware-irq\",\"vector\":46")!=std::string::npos)irq=true;
-    if(line.find("\"type\":\"mmio-read\",\"address\":\"0x00000000fee00030\"")!=std::string::npos)
+    if(line.find("\"type\":\"mmio-read\",\"address\":\"0x00000000fee00030\",\"width\":4,\"value\":327700")!=std::string::npos)
       mmio_read=true;
-    if(line.find("\"type\":\"mmio-write\",\"address\":\"0x00000000fee000f0\"")!=std::string::npos)
+    if(line.find("\"type\":\"mmio-write\",\"address\":\"0x00000000fee000f0\",\"width\":4,\"value\":511")!=std::string::npos)
       mmio_write=true;
+    if(line.find("\"type\":\"mmio-read\",\"address\":\"0x00000000fee00032\",\"width\":1,\"value\":5")!=std::string::npos)
+      mmio_byte=true;
     if(line.find("\"type\":\"io-out\",\"port\":496")!=std::string::npos)ata_port=true;
     if(line.find("\"type\":\"finish\"")!=std::string::npos &&
        line.find("\"qssd_commits\":1")!=std::string::npos &&
        line.find("\"hardware_irqs\":1")!=std::string::npos)finish=true;
   }
-  need(irq&&mmio_read&&mmio_write&&ata_port&&finish,
+  need(irq&&mmio_read&&mmio_write&&mmio_byte&&ata_port&&finish,
        "C09 trace omitted authenticated hardware IRQ/MMIO/ATA/QSSD evidence");
   std::cout<<"C09_HARDWARE_IRQ14_MMIO_QSSD_TRACE_PASS vector=46 "
               "mmio_read_write=true ata_pio=true qssd_commits=1\n";
