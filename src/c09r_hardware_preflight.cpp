@@ -2,6 +2,9 @@
 #include "c06_motherboard.hpp"
 #include "qssd_disk.hpp"
 #include "c09r_guest_vga_fabric.hpp"
+#include "ejecucion_gpu.hpp"
+#include "transformacion_reversible.hpp"
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -9,6 +12,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using cosmic_pc::Cpu;
 using cosmic_pc::PcMachine;
@@ -20,6 +24,36 @@ using reverse_windows::GuestVgaFabricC09R;
 static void require(bool ok,const char* reason){
   if(!ok)throw std::runtime_error(reason);
 }
+
+static xgpu::ValueReader::UnsignedSum check_gpu_computation(){
+  using Op=xgpu::StateOp;
+  xgpu::Execution state(1,{},xgpu::ExecutionProfile::C12);
+  const auto id=state.enqueue({{{Op::Index,0},{Op::Output,0},{Op::Halt}}},xgpu::domain_limit);
+  require(state.run(),"GPU Virtual index dispatch did not finish");
+  const auto& result=state.dispatch(id);
+  require(result.output_valid.full(),"GPU Virtual did not produce a complete dispatch");
+  auto sum=xgpu::ValueReader(result.output).sum_unsigned(0,result.count);
+  require(sum.value==9223372034707292160ULL&&sum.evaluated_words==0,
+          "GPU Virtual wide affine sum differs from the uint64 reference");
+  return sum;
+}
+
+static std::size_t check_gpu_xi(){
+  using Transform=xgpu::ReversibleBitTransform;
+  constexpr std::size_t bits=1024;
+  constexpr std::uint64_t pattern=0xa379d40fee16080bULL;
+  std::vector<Transform::Gate> gates;
+  gates.reserve(bits/2);
+  for(std::size_t i=0;i<bits/2;++i)
+    gates.push_back({Transform::Operation::Cnot,bits/2+i,i});
+  const Transform circuit(bits,gates);
+  Transform::Bits input(bits/64,pattern);
+  auto expected=input;
+  std::fill(expected.begin()+bits/128,expected.end(),0);
+  require(circuit.apply(input)==expected,"GPU Virtual wide XI transform lost bits");
+  return bits;
+}
+
 static std::array<std::uint32_t,4> cpuid(Cpu& cpu,std::uint32_t leaf){
   cpu.reset(0,0x1000);
   cpu.a20_enabled=true;
@@ -42,6 +76,8 @@ int main(int argc,char** argv){
      std::chrono::steady_clock::now().time_since_epoch().count()))).string()+".rqvd";
   try{
     // A single canonical PcMachine. No ISO is mounted or executed.
+    const auto compute=check_gpu_computation();
+    const auto xi_bits=check_gpu_xi();
     PcMachine pc(2048ULL*1024*1024,128ULL*1024*1024);
     const auto basic=cpuid(pc.cpu,1);
     const auto extended=cpuid(pc.cpu,0x80000001U);
@@ -145,6 +181,10 @@ int main(int argc,char** argv){
       <<",\"pci_ata_guest_detected\":"<<yes(pci)
       <<",\"ether_xi_memory_aperture\":"<<yes(ether)
       <<",\"gpu_virtual_vga_delta\":"<<yes(graphics)
+      <<",\"gpu_virtual_compute_words\":"<<xgpu::domain_limit
+      <<",\"gpu_virtual_compute_sum_u64\":\""<<compute.value<<'"'
+      <<",\"gpu_virtual_compute_evaluated_words\":"<<compute.evaluated_words
+      <<",\"gpu_virtual_xi_bits\":"<<xi_bits
       <<",\"gpu_vga_delta_upload_bytes\":"<<frame_bytes
       <<",\"gpu_full_frame_bytes\":4000,"
       <<"\"qssd_graphics_serial\":"<<graphic_serial

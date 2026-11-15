@@ -98,7 +98,7 @@ JNIEXPORT jstring JNICALL Java_com_reversewindows_android_NativeMachine_checkHar
 
 JNIEXPORT jlong JNICALL Java_com_reversewindows_android_NativeMachine_openWithRam(
         JNIEnv* env, jclass, jstring disk, jint capacity, jint iso_fd, jlong iso_bytes, jint source,
-        jlong available, jlong threshold, jboolean low_memory, jstring ram_cache) {
+        jlong available, jlong threshold, jboolean low_memory, jstring ram_cache, jstring graphics_vram) {
     return call<jlong>(env, 0, [&] {
         if (capacity < 0 || iso_bytes < 0)
             throw std::invalid_argument("Tamaño de medio inválido.");
@@ -106,7 +106,7 @@ JNIEXPORT jlong JNICALL Java_com_reversewindows_android_NativeMachine_openWithRa
             string_from(env, disk), static_cast<unsigned>(capacity),
             static_cast<Session::BootSource>(source), iso_fd,
             static_cast<std::uint64_t>(iso_bytes), ram_profile(available, threshold, low_memory),
-            string_from(env, ram_cache));
+            string_from(env, ram_cache), string_from(env, graphics_vram));
         auto instance = std::make_shared<Instance>(std::move(machine));
         std::lock_guard<std::mutex> lock(registry_mutex);
         if (next_handle == std::numeric_limits<jlong>::max())
@@ -199,10 +199,10 @@ JNIEXPORT void JNICALL Java_com_reversewindows_android_NativeMachine_flush(
 }
 
 JNIEXPORT jstring JNICALL Java_com_reversewindows_android_NativeMachine_diagnostic(
-        JNIEnv* env, jclass, jlong handle) {
+        JNIEnv* env, jclass, jlong handle, jboolean detailed) {
     return call<jstring>(env, nullptr, [&] {
-        return session(handle, [env](Session& machine) {
-            return env->NewStringUTF(machine.diagnostic().c_str());
+        return session(handle, [env, detailed](Session& machine) {
+            return env->NewStringUTF(machine.diagnostic(detailed == JNI_TRUE).c_str());
         });
     });
 }

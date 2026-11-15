@@ -6,10 +6,10 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "cdfa3b01bb2ee9b0aa7feb17d3eeaa0b77813bb0",
+      "commit": "88a51096f2d5c3f5428d1e3040a1207e355df5b5",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
-      "status": "candidate-prime-c07-visible-video-writes",
+      "status": "candidate-prime-c08-pci-memory-map",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/pc_video.hpp",
@@ -85,14 +85,17 @@
     {
       "key": "gpu_virtual",
       "repository": "guadalupejuan001-code/GPU-VIRTUAL",
-      "commit": "44ce659a17985862e1fedb79cf2db69e25bf0296",
+      "commit": "933bbd7ea7679f661de7188fd4235691ab885567",
       "checkout": "deps/GPU-VIRTUAL",
-      "role": "C12.1-physical-and-framebuffer-work-authority",
-      "status": "candidate-prime-c07-gpu-virtual",
+      "role": "C12.3-physical-framebuffer-guest-triangles-and-PrimeVGC-compute",
+      "status": "candidate-prime-c08-primevgc",
       "required_paths": [
         "include/ejecucion_gpu.hpp",
         "VERSION",
         "include/trabajo_fisico.hpp",
+        "include/guest_triangle_work.hpp",
+        "include/relaciones_gpu.hpp",
+        "include/transformacion_reversible.hpp",
         "tests/physical_work_authority.cpp"
       ]
     },
@@ -112,12 +115,13 @@
     {
       "key": "reverse_pc",
       "repository": "guadalupejuan001-code/REVERSE-PC",
-      "commit": "6727d8a34fa722ee2a0662e98b8917ac4d53d4f5",
+      "commit": "5f4f9f6d80004cf9c21df740eff83f0742a53490",
       "checkout": "deps/REVERSE-PC",
-      "role": "C03-integrated-host-and-renderer",
-      "status": "candidate-unmerged-PR239",
+      "role": "REgraphics-guest-triangle-renderer-and-C03-integrated-host",
+      "status": "candidate-prime-c08-regraphics",
       "required_paths": [
         "src/fabric/reverse_fabric.hpp",
+        "src/regraphics/guest_renderer.hpp",
         "reverse-os-android/app/src/main/assets/workbench/reverse-gpu-physical.js",
         "docs/reverse-pc-gpu-physical-c03.md"
       ]

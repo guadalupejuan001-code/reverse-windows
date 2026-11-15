@@ -30,6 +30,7 @@ struct Options {
     std::string evidence_path;
     std::string trace_path;
     std::string ram_spill_directory;
+    std::string vram_path;
     std::uint64_t trace_max_events=25000;
     std::uint64_t steps = 200000;
     std::uint64_t ram_mib = 2048;
@@ -75,6 +76,7 @@ Options parse(int argc, char** argv) {
         else if (arg == "--ram-mib") out.ram_mib = positive(next(), cosmic_pc::PcMachine::max_ram_mib(), "ram-mib");
         else if (arg == "--resident-mib") out.resident_mib = positive(next(), cosmic_pc::PcMachine::max_ram_mib(), "resident-mib");
         else if (arg == "--ram-spill-directory") out.ram_spill_directory = next();
+        else if (arg == "--gpu-vram") out.vram_path = next();
         else if (arg == "--evidence") out.evidence_path = next();
         else if (arg == "--profile-every") out.profile_every = positive(next(), 100000000, "profile-every");
         else if (arg == "--profile-from") out.profile_from = positive(next(), 20'000'000'000, "profile-from");
@@ -127,6 +129,17 @@ Options parse(int argc, char** argv) {
     if (out.create_qssd_gib && out.qssd_path.empty()) throw std::invalid_argument("--create-qssd-gib requires --qssd-disk PATH.rqvd");
     if (!out.disk_path.empty() && !out.qssd_path.empty()) throw std::invalid_argument("Select one writable disk backend");
     if (out.source == Options::Source::Disk && out.disk_path.empty() && out.qssd_path.empty()) throw std::invalid_argument("--boot-hdd requires --disk or --qssd-disk");
+    if (!out.vram_path.empty()) {
+        const auto vram = std::filesystem::weakly_canonical(out.vram_path);
+        for (const auto* path : {&out.iso_path, &out.disk_path, &out.qssd_path,
+                                 &out.trace_path, &out.evidence_path}) {
+            if (path->empty()) continue;
+            if (vram == std::filesystem::weakly_canonical(*path) ||
+                (std::filesystem::exists(vram) && std::filesystem::exists(*path) &&
+                 std::filesystem::equivalent(vram, *path)))
+                throw std::invalid_argument("GPU memory backing aliases another guest file");
+        }
+    }
     if (!out.evidence_path.empty()) {
         const auto evidence = std::filesystem::weakly_canonical(out.evidence_path);
         for (const auto* input : {&out.iso_path, &out.disk_path, &out.qssd_path, &out.trace_path}) {
@@ -233,7 +246,7 @@ int main(int argc, char** argv) {
         if (disk) hdd = std::make_unique<reverse_windows::BiosHardDisk>(pc, *disk);
         // One canonical guest CPU. The motherboard wraps its existing I/O hooks
         // after boot firmware and QSSD are mounted, and stays alive until exit.
-        reverse_windows::PcMotherboardC06 motherboard(pc,disk.get(),read_iso,optical_bytes);
+        reverse_windows::PcMotherboardC06 motherboard(pc,disk.get(),read_iso,optical_bytes,opts.vram_path);
         const auto initial_disk_commits=qdisk ? qdisk->stats().commits : 0;
         if (opts.profile_every) {
             motherboard.enable_ps2_keyboard();
@@ -347,10 +360,15 @@ int main(int argc, char** argv) {
         const auto final_json = pc.json();
         const auto* ata = motherboard.attached_ata();
         const auto ata_stats = ata ? ata->counters() : reverse_windows::AtaC07::Counters{};
+        std::ostringstream graphics;
+        if (const auto* gpu = motherboard.attached_gpu()) {
+            graphics << ",\"guest_gpu\":";
+            gpu->write_json(graphics);
+        }
         const std::string evidence = std::string("{\"schema\":\"reverse-windows-boot-evidence-v1\",") +
             "\"guest_kind\":" + cosmic_pc::PcMachine::quote(kind) +
             ",\"source\":\"original-Mundo-X-PcMachine\"" +
-            ",\"windows10_boot_verified\":false" +
+            ",\"windows10_boot_verified\":false" + graphics.str() +
             ",\"c09r_gpu_vga_work\":{\"owner\":\"GPU-VIRTUAL-plus-qSSD-StateBus\",\"source\":\"real-guest-VGA\",\"frames\":" +
                std::to_string(vga_captures) + ",\"full_frame_bytes_baseline\":" +
                std::to_string(vga_baseline_bytes) + ",\"planned_host_update_bytes\":" +

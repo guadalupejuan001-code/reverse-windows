@@ -1,0 +1,59 @@
+name: Prime C08 Windows guest graphics transport and Direct3D reference
+
+on:
+  pull_request:
+    paths: ["guest/windows/**", "src/c08_gpu_protocol.h", "src/c08_wddm_protocol.h", ".github/workflows/prime-c08-windows-guest.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  c08-windows-reference:
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Build x64 guest drivers, validate catalogs and test Direct3D callbacks
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'Visual Studio x64 toolchain unavailable' }
+          & "$vs\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          & .\guest\windows\build.ps1 -OutDir "$env:RUNNER_TEMP\prime-c08-windows"
+          $dir = "$env:RUNNER_TEMP\prime-c08-windows"
+          $log = "$dir\wddm-check.txt"
+          $process = Start-Process -FilePath "$dir\prime_gpu_scene.exe" -ArgumentList '--wddm' `
+            -RedirectStandardError $log -NoNewWindow -Wait -PassThru
+          $output = Get-Content $log -Raw
+          $output
+          if ($process.ExitCode -ne 3 -or $output -notmatch 'PRIME_C08_WDDM_ADAPTER_ABSENT') {
+            throw 'WDDM acceptance must reject every host adapter on this runner'
+          }
+          $log = "$dir\wddm-bridge-check.txt"
+          $process = Start-Process -FilePath "$dir\prime_wddm_probe.exe" `
+            -RedirectStandardError $log -NoNewWindow -Wait -PassThru
+          $output = Get-Content $log -Raw
+          $output
+          if ($process.ExitCode -ne 3 -or $output -notmatch 'PRIME_C08_WDDM_BRIDGE_ADAPTER_ABSENT') {
+            throw 'The PrimeVGC miniport probe must reject every host adapter on this runner'
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prime-c08-windows-unsigned-guest
+          path: |
+            ${{ runner.temp }}/prime-c08-windows/wdm-package/*
+            ${{ runner.temp }}/prime-c08-windows/prime_gpu_scene.exe
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prime-c08-wddm-development-unsigned
+          path: |
+            ${{ runner.temp }}/prime-c08-windows/wddm-package/*
+            ${{ runner.temp }}/prime-c08-windows/prime_wddm_probe.exe
+            ${{ runner.temp }}/prime-c08-windows/prime_gpu_scene.exe
+          if-no-files-found: error

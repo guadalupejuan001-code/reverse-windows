@@ -36,6 +36,10 @@ class QssdDisk final : public BlockDisk {
   enum class Access { ReadWrite, ReadOnly };
   static constexpr std::uint64_t kSectorSize = 512, kBlockSize = 4096;
   static constexpr std::uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
+  static constexpr std::size_t kMaxTransactionBlocks = 128;
+  static constexpr std::size_t kMaxTransactionBytes = kMaxTransactionBlocks * kBlockSize;
+  static constexpr std::size_t kMaxBulkTransactionBlocks = 2048;
+  static constexpr std::size_t kMaxBulkTransactionBytes = kMaxBulkTransactionBlocks * kBlockSize;
   struct Stats {
     std::uint64_t logical_bytes, physical_bytes, commits, raw_blocks;
     std::uint64_t zero_blocks, pattern_blocks, deduplicated_blocks, qssd_serial;
@@ -66,7 +70,11 @@ class QssdDisk final : public BlockDisk {
  private:
   // Immutable 16-way radix nodes allow COW block-index updates in O(log16 blocks).
   // Old qSSD epoch views retain the exact old block map without copying a disk.
-  struct Ref { std::uint64_t offset=0,word_xor=0; };
+  enum Kind : std::uint32_t { Raw=1, Zero=2, Pattern=3, Reference=4, Commit=5 };
+  struct Ref {
+    std::uint64_t offset=0,word_xor=0;
+    Kind kind=Zero;
+  };
   struct Node {
     std::array<std::shared_ptr<const Node>, 16> children{};
     Ref ref{};
@@ -77,17 +85,18 @@ class QssdDisk final : public BlockDisk {
     NodePtr root;
     std::uint64_t commits=0, raw=0, zeros=0, patterns=0, refs=0, end=kHeader;
   };
-  enum Kind : std::uint32_t { Raw=1, Zero=2, Pattern=3, Reference=4, Commit=5 };
   struct Record {
     Kind kind;
     std::uint64_t block, digest, reference, offset, next;
     std::vector<std::uint8_t> payload;
   };
-  struct Change { std::uint64_t block, offset; Kind kind; std::uint64_t digest; };
 
   static constexpr std::size_t kHeader=64, kRecHeader=40, kRecFooter=16;
+  static constexpr std::size_t kRawRecordBytes=kRecHeader+kBlockSize+kRecFooter;
   static constexpr std::size_t kIndexHeader=112, kIndexEntry=16;
   static constexpr std::uint64_t kFNVStart=14695981039346656037ULL;
+  static constexpr std::uint64_t kFNVPrime=1099511628211ULL;
+  static constexpr std::size_t kDigestLanes=4;
 
   static constexpr std::size_t kDedupWindow=4096;
   static constexpr std::size_t kReadCacheBlocks=128; // 512 KiB bounded data
@@ -137,11 +146,24 @@ class QssdDisk final : public BlockDisk {
     for(unsigned i=0;i<8;++i)p[i]=std::uint8_t(v>>(i*8));
   }
   static std::uint64_t digest_update(std::uint64_t h,const std::uint8_t* p,std::size_t n) {
-    for(std::size_t i=0;i<n;++i){h^=p[i];h*=1099511628211ULL;}
+    for(std::size_t i=0;i<n;++i){h^=p[i];h*=kFNVPrime;}
     return h;
   }
   static std::uint64_t digest(const std::uint8_t* p,std::size_t n) {
     return digest_update(kFNVStart,p,n);
+  }
+  static std::array<std::uint64_t,kDigestLanes> digest_four(
+      const std::array<const std::uint8_t*,kDigestLanes>& data,std::size_t size) noexcept {
+    // Four independent streams hide the multiplication latency while keeping
+    // the identical on-disk FNV-1a digest of each record.
+    auto a=kFNVStart,b=kFNVStart,c=kFNVStart,d=kFNVStart;
+    for(std::size_t i=0;i<size;++i){
+      a=(a^data[0][i])*kFNVPrime;
+      b=(b^data[1][i])*kFNVPrime;
+      c=(c^data[2][i])*kFNVPrime;
+      d=(d^data[3][i])*kFNVPrime;
+    }
+    return {a,b,c,d};
   }
   static std::uint64_t fd_digest(int fd,std::uint64_t end,IoCounters* measurement=nullptr) {
     std::array<std::uint8_t,65536> page{};
@@ -213,10 +235,12 @@ class QssdDisk final : public BlockDisk {
     if(::fstat(fd_,&info)!=0||info.st_size<0)throw std::runtime_error("QSSD stat failed");
     return static_cast<std::uint64_t>(info.st_size);
   }
-  static Ref locate(NodePtr node,std::uint64_t block) {
+  static Ref locate(const NodePtr& root,std::uint64_t block) {
+    // The epoch retains the entire immutable tree for the duration of a lookup.
+    const auto* node=root.get();
     for(int level=7;level>=0;--level){
       if(!node)return {};
-      node=node->children[(block>>(level*4))&15];
+      node=node->children[(block>>(level*4))&15].get();
     }
     return node?node->ref:Ref{};
   }
@@ -234,37 +258,46 @@ class QssdDisk final : public BlockDisk {
                   prefix|(std::uint64_t(index)<<shift),visit);
     }
   }
-  static NodePtr replace(NodePtr node,std::uint64_t block,int level,Ref ref,bool nonzero) {
+  static NodePtr replace_contiguous(const NodePtr& node,std::uint64_t block,unsigned level,
+                                    const Ref* refs,std::size_t count) {
     auto next=std::make_shared<Node>(node?*node:Node{});
-    if(level==0){
-      next->ref=ref;
-      next->word_xor=ref.word_xor;
-      next->nonzero_blocks=nonzero?1:0;
+    if(!level){
+      next->ref=*refs;
+      next->word_xor=refs->word_xor;
+      next->nonzero_blocks=refs->kind!=Zero;
+      return next;
     }
-    else {
-      const auto slot=unsigned((block>>((level-1)*4))&15);
-      const auto& old=next->children[slot];
-      if(old){
-        next->word_xor^=old->word_xor;
-        next->nonzero_blocks-=old->nonzero_blocks;
+    const auto shift=(level-1)*4;
+    const auto stride=std::uint64_t{1}<<shift;
+    while(count){
+      const auto slot=(block>>shift)&15U;
+      const auto run=std::min<std::uint64_t>(count,stride-(block&(stride-1)));
+      auto& child=next->children[slot];
+      if(child){
+        next->word_xor^=child->word_xor;
+        next->nonzero_blocks-=child->nonzero_blocks;
       }
-      next->children[slot]=replace(next->children[slot],block,level-1,ref,nonzero);
-      next->word_xor^=next->children[slot]->word_xor;
-      next->nonzero_blocks+=next->children[slot]->nonzero_blocks;
+      child=replace_contiguous(child,block,level-1,refs,std::size_t(run));
+      next->word_xor^=child->word_xor;
+      next->nonzero_blocks+=child->nonzero_blocks;
+      block+=run;refs+=run;count-=std::size_t(run);
     }
     return next;
   }
-  static std::uint64_t xor_words(const BlockData& data) noexcept {
+  static NodePtr replace(const NodePtr& node,std::uint64_t block,unsigned level,Ref ref) {
+    return replace_contiguous(node,block,level,&ref,1);
+  }
+  static std::uint64_t xor_words(const std::uint8_t* data) noexcept {
     std::uint64_t aggregate=0;
-    for(std::size_t offset=0;offset<data.size();offset+=8){
+    for(std::size_t offset=0;offset<kBlockSize;offset+=8){
       std::uint64_t word;
-      std::memcpy(&word,data.data()+offset,sizeof(word));
+      std::memcpy(&word,data+offset,sizeof(word));
       aggregate^=word;
     }
     return u64(reinterpret_cast<const std::uint8_t*>(&aggregate));
   }
   static std::uint64_t xor_rule(const BlockData& data,std::size_t period) noexcept {
-    if(!period)return xor_words(data);
+    if(!period)return xor_words(data.data());
     // Each XOR lane repeats after period bytes even with a non-aligned motif.
     // Pairs of complete repetitions cancel. Only odd repetitions and the tail contribute.
     std::uint8_t lanes[8]{};
@@ -275,53 +308,63 @@ class QssdDisk final : public BlockDisk {
     return u64(lanes);
   }
 
-  // nullptr means incomplete tail, never "valid but corrupt".
-  std::unique_ptr<Record> record_at(std::uint64_t offset,std::uint64_t limit) const {
-    if(offset>limit||limit-offset<kRecHeader)return {};
-    std::array<std::uint8_t,kRecHeader> h{};
-    read_all(fd_,offset,h.data(),h.size(),&physical_reads_);
-    if(std::memcmp(h.data(),"QBLK",4)!=0)throw std::runtime_error("QSSD record magic corruption");
-    const auto kind=u32(h.data()+4), len=u32(h.data()+16);
+  static std::size_t record_payload_size(const std::uint8_t* header) {
+    if(std::memcmp(header,"QBLK",4)!=0)throw std::runtime_error("QSSD record magic corruption");
+    const auto kind=u32(header+4), len=u32(header+16);
     if(kind<Raw||kind>Commit||len>kBlockSize)
       throw std::runtime_error("QSSD unknown record type or oversize payload");
     if((kind==Raw&&len!=kBlockSize)||(kind==Zero&&len!=0)||
        (kind==Pattern&&(len<1||len>32))||
        ((kind==Reference||kind==Commit)&&len!=0))
       throw std::runtime_error("QSSD invalid record length");
-    const auto total=kRecHeader+std::uint64_t(len)+kRecFooter;
-    if(total>limit-offset)return {};
-    std::vector<std::uint8_t> all(static_cast<std::size_t>(total));
-    std::copy(h.begin(),h.end(),all.begin());
-    read_all(fd_,offset+kRecHeader,all.data()+kRecHeader,all.size()-kRecHeader,&physical_reads_);
-    const auto* footer=all.data()+kRecHeader+len;
-    if(std::memcmp(footer,"QEND",4)!=0||u32(footer+4)!=total||
-       u64(footer+8)!=digest(all.data(),kRecHeader+len))
+    return len;
+  }
+  static void verify_record_footer(const std::uint8_t* record,std::size_t len) {
+    const auto* footer=record+kRecHeader+len;
+    if(std::memcmp(footer,"QEND",4)!=0||u32(footer+4)!=kRecHeader+len+kRecFooter||
+       u64(footer+8)!=digest(record,kRecHeader+len))
       throw std::runtime_error("QSSD journal checksum corruption");
-    auto out=std::make_unique<Record>();
-    out->kind=static_cast<Kind>(kind);
-    out->block=u64(h.data()+8);
-    out->digest=u64(h.data()+24);
-    out->reference=u64(h.data()+32);
-    out->offset=offset;out->next=offset+total;
-    out->payload.assign(all.begin()+kRecHeader,all.begin()+kRecHeader+len);
-    return out;
+  }
+  // A missing record means incomplete tail. Malformed complete records throw.
+  static std::optional<Record> parse_record_at(const std::uint8_t* bytes,
+                                               std::uint64_t offset,std::size_t available) {
+    if(available<kRecHeader)return std::nullopt;
+    const auto len=record_payload_size(bytes);
+    const auto total=kRecHeader+len+kRecFooter;
+    if(available<total)return std::nullopt;
+    verify_record_footer(bytes,len);
+    return Record{Kind(u32(bytes+4)),u64(bytes+8),u64(bytes+24),u64(bytes+32),offset,offset+total,
+                  {bytes+kRecHeader,bytes+kRecHeader+len}};
+  }
+  std::optional<Record> record_at(std::uint64_t offset,std::uint64_t limit) const {
+    if(offset>limit||limit-offset<kRecHeader)return {};
+    std::array<std::uint8_t,kRecHeader> h{};
+    read_all(fd_,offset,h.data(),h.size(),&physical_reads_);
+    const auto total=kRecHeader+record_payload_size(h.data())+kRecFooter;
+    if(total>limit-offset)return {};
+    std::array<std::uint8_t,kRawRecordBytes> all;
+    std::copy(h.begin(),h.end(),all.data());
+    read_all(fd_,offset+kRecHeader,all.data()+kRecHeader,total-kRecHeader,&physical_reads_);
+    return parse_record_at(all.data(),offset,total);
   }
   std::array<std::uint8_t,kBlockSize> decode(std::uint64_t offset,std::uint64_t limit) const {
     const auto record=record_at(offset,limit);
     if(!record)throw std::runtime_error("QSSD missing stored data block");
     return decode(*record,limit);
   }
+  static void expand_payload(BlockData& data,const std::uint8_t* payload,std::size_t size) {
+    std::memcpy(data.data(),payload,size);
+    for(auto filled=size;filled<data.size();){
+      const auto count=std::min(filled,data.size()-filled);
+      std::memcpy(data.data()+filled,data.data(),count);
+      filled+=count;
+    }
+  }
   std::array<std::uint8_t,kBlockSize> decode(const Record& record,std::uint64_t limit) const {
     if(record.kind==Commit)throw std::runtime_error("QSSD missing stored data block");
     std::array<std::uint8_t,kBlockSize> data{};
-    if(record.kind==Raw) std::copy(record.payload.begin(),record.payload.end(),data.begin());
-    else if(record.kind==Pattern) {
-      std::copy(record.payload.begin(),record.payload.end(),data.begin());
-      for(auto filled=record.payload.size();filled<data.size();){
-        const auto count=std::min(filled,data.size()-filled);
-        std::memcpy(data.data()+filled,data.data(),count);
-        filled+=count;
-      }
+    if(record.kind==Raw||record.kind==Pattern) {
+      expand_payload(data,record.payload.data(),record.payload.size());
     } else if(record.kind==Reference) {
       if(record.reference<kHeader||record.reference>=record.offset)
         throw std::runtime_error("QSSD forward/dangling content reference");
@@ -333,9 +376,9 @@ class QssdDisk final : public BlockDisk {
       throw std::runtime_error("QSSD decoded block digest differs");
     return data;
   }
-  static void encode_record(std::vector<std::uint8_t>& bytes,Kind kind,std::uint64_t block,
-                            std::uint64_t hash,std::uint64_t reference,
-                            const std::uint8_t* payload,std::size_t size) {
+  static std::size_t append_record(std::vector<std::uint8_t>& bytes,Kind kind,std::uint64_t block,
+                                   std::uint64_t hash,std::uint64_t reference,
+                                   const std::uint8_t* payload,std::size_t size) {
     const auto position=bytes.size();
     const auto length=kRecHeader+size+kRecFooter;
     bytes.resize(position+length);
@@ -350,7 +393,32 @@ class QssdDisk final : public BlockDisk {
     auto* end=record+kRecHeader+size;
     std::memcpy(end,"QEND",4);
     put32(end+4,static_cast<std::uint32_t>(length));
-    put64(end+8,digest(record,kRecHeader+size));
+    return position;
+  }
+  static void encode_record(std::vector<std::uint8_t>& bytes,Kind kind,std::uint64_t block,
+                            std::uint64_t hash,std::uint64_t reference,
+                            const std::uint8_t* payload,std::size_t size) {
+    const auto position=append_record(bytes,kind,block,hash,reference,payload,size);
+    const auto length=kRecHeader+size;
+    auto* record=bytes.data()+position;
+    put64(record+length+8,digest(record,length));
+  }
+  static void finish_raw_records(std::vector<std::uint8_t>& journal,
+                                 const std::vector<std::size_t>& positions) noexcept {
+    constexpr auto digested=kRecHeader+kBlockSize;
+    std::size_t i=0;
+    for(;positions.size()-i>=kDigestLanes;i+=kDigestLanes){
+      std::array<const std::uint8_t*,kDigestLanes> records{};
+      for(std::size_t lane=0;lane<kDigestLanes;++lane)
+        records[lane]=journal.data()+positions[i+lane];
+      const auto sums=digest_four(records,digested);
+      for(std::size_t lane=0;lane<kDigestLanes;++lane)
+        put64(journal.data()+positions[i+lane]+digested+8,sums[lane]);
+    }
+    for(;i<positions.size();++i){
+      auto* record=journal.data()+positions[i];
+      put64(record+digested+8,digest(record,digested));
+    }
   }
   static std::uint64_t append_to(int fd,std::uint64_t at,Kind kind,std::uint64_t block,
                                  std::uint64_t hash,std::uint64_t reference,
@@ -366,8 +434,7 @@ class QssdDisk final : public BlockDisk {
       if(std::memcmp(start,start+period,data.size()-period)==0)return period;
     return 0;
   }
-  void cache_insert(std::uint64_t off,std::shared_ptr<const BlockData> data) const {
-    std::lock_guard<std::mutex> guard(cache_mutex_);
+  void cache_insert_locked(std::uint64_t off,std::shared_ptr<const BlockData> data) const {
     if(read_cache_.find(off)!=read_cache_.end())return;
     if(read_fifo_.size()>=kReadCacheBlocks) {
       const auto old=read_fifo_.front();read_fifo_.pop_front();
@@ -377,6 +444,77 @@ class QssdDisk final : public BlockDisk {
     try{read_cache_.emplace(off,std::move(data));}
     catch(...){read_fifo_.pop_back();throw;}
   }
+  void cache_insert(std::uint64_t off,std::shared_ptr<const BlockData> data) const {
+    std::lock_guard<std::mutex> guard(cache_mutex_);
+    cache_insert_locked(off,std::move(data));
+  }
+  bool read_cached_raw_run(std::uint64_t offset,std::size_t count,std::uint8_t* target) const {
+    std::lock_guard<std::mutex> guard(cache_mutex_);
+    std::array<const BlockData*,kMaxTransactionBlocks> pages;
+    for(std::size_t i=0;i<count;++i){
+      const auto found=read_cache_.find(offset+i*kRawRecordBytes);
+      if(found==read_cache_.end())return false;
+      pages[i]=found->second.get();
+    }
+    for(std::size_t i=0;i<count;++i)
+      std::memcpy(target+i*kBlockSize,pages[i]->data(),kBlockSize);
+    cache_hits_.fetch_add(count,std::memory_order_relaxed);
+    return true;
+  }
+  static void verify_raw_batch(const std::array<const std::uint8_t*,kDigestLanes>& records,
+                               std::size_t count) {
+    constexpr auto digested=kRecHeader+kBlockSize;
+    std::array<const std::uint8_t*,kDigestLanes> payloads{};
+    for(std::size_t lane=0;lane<count;++lane){
+      const auto* record=records[lane];
+      const auto* tail=record+digested;
+      if(std::memcmp(record,"QBLK",4)!=0||u32(record+4)!=Raw||u32(record+16)!=kBlockSize||
+         std::memcmp(tail,"QEND",4)!=0||u32(tail+4)!=kRawRecordBytes)
+        throw std::runtime_error("QSSD invalid RAW record");
+      payloads[lane]=record+kRecHeader;
+    }
+    std::array<std::uint64_t,kDigestLanes> encoded{},data{};
+    if(count==kDigestLanes){
+      encoded=digest_four(records,digested);
+      data=digest_four(payloads,kBlockSize);
+    }else{
+      for(std::size_t lane=0;lane<count;++lane){
+        encoded[lane]=digest(records[lane],digested);
+        data[lane]=digest(payloads[lane],kBlockSize);
+      }
+    }
+    for(std::size_t lane=0;lane<count;++lane)
+      if(encoded[lane]!=u64(records[lane]+digested+8)||data[lane]!=u64(records[lane]+24))
+        throw std::runtime_error("QSSD RAW record checksum corruption");
+  }
+  void read_raw_run(std::uint64_t offset,std::uint64_t block,std::size_t count,
+                    std::uint64_t limit,std::vector<std::uint8_t>& buffer,
+                    std::uint8_t* target) const {
+    const auto size=count*kRawRecordBytes;
+    if(offset>limit||size>limit-offset)
+      throw std::runtime_error("QSSD truncated contiguous RAW records");
+    if(read_cached_raw_run(offset,count,target))return;
+    buffer.resize(size);
+    read_all(fd_,offset,buffer.data(),size,&physical_reads_);
+
+    for(std::size_t i=0;i<count;){
+      std::array<const std::uint8_t*,kDigestLanes> records{};
+      const auto batch=std::min(kDigestLanes,count-i);
+      for(std::size_t lane=0;lane<batch;++lane){
+        const auto* record=buffer.data()+(i+lane)*kRawRecordBytes;
+        if(u64(record+8)!=block+i+lane)
+          throw std::runtime_error("QSSD RAW record block address differs");
+        records[lane]=record;
+      }
+      verify_raw_batch(records,batch);
+      i+=batch;
+    }
+    // Copy only after the raw run has passed both checksum checks.
+    for(std::size_t i=0;i<count;++i)
+      std::memcpy(target+i*kBlockSize,buffer.data()+i*kRawRecordBytes+kRecHeader,kBlockSize);
+    cache_misses_.fetch_add(count,std::memory_order_relaxed);
+  }
+
   std::shared_ptr<const BlockData> cached_decode(std::uint64_t off,
                                                   std::uint64_t limit) const {
     {
@@ -472,7 +610,7 @@ class QssdDisk final : public BlockDisk {
           throw std::runtime_error("QSSD checkpoint references non-block record");
         const auto data=decode(*rec,cutoff);
         const auto word=rec->kind==Zero?0:xor_rule(data,rec->kind==Pattern?rec->payload.size():0);
-        state.root=replace(state.root,block,8,Ref{off,word},rec->kind!=Zero);
+        state.root=replace(state.root,block,8,Ref{off,word,rec->kind});
         if(rec->kind==Raw)remember(rec->digest,off);
         previous=block;
       }
@@ -565,21 +703,65 @@ class QssdDisk final : public BlockDisk {
     const auto checkpoint=read_checkpoint(sz);
     auto state=checkpoint?*checkpoint:Epoch{};
     std::uint64_t pos=state.end, last_commit=state.end;
-    struct ReplayChange { Change record; std::uint64_t word_xor; };
+    struct ReplayChange { std::uint64_t block,digest; Ref ref; };
     std::vector<ReplayChange> pending;
+    pending.reserve(kMaxTransactionBlocks);
+    std::vector<Ref> refs;
+    refs.reserve(kMaxTransactionBlocks);
+    constexpr std::size_t chunk_bytes=1024U*1024U;
+    std::vector<std::uint8_t> buffer;
+    std::uint64_t buffer_from=pos, buffer_end=pos;
     while(pos<sz){
-      auto record=record_at(pos,sz);
+      if(buffer_end<sz&&buffer_end-pos<kDigestLanes*kRawRecordBytes){
+        const auto bytes=std::size_t(std::min<std::uint64_t>(sz-pos,chunk_bytes));
+        buffer.resize(bytes);
+        read_all(fd_,pos,buffer.data(),bytes,&physical_reads_);
+        buffer_from=pos;buffer_end=pos+bytes;
+      }
+      if(pending.size()+kDigestLanes<=kMaxBulkTransactionBlocks&&
+         kDigestLanes*kRawRecordBytes<=buffer_end-pos){
+        std::array<const std::uint8_t*,kDigestLanes> headers{};
+        const auto* base=buffer.data()+std::size_t(pos-buffer_from);
+        bool raw=true;
+        for(std::size_t lane=0;lane<kDigestLanes;++lane){
+          const auto* header=base+lane*kRawRecordBytes;
+          if(u32(header+4)!=Raw||u32(header+16)!=kBlockSize||
+             u64(header+8)>=capacity_/kBlockSize){
+            raw=false;
+            break;
+          }
+          headers[lane]=header;
+        }
+        if(raw){
+          verify_raw_batch(headers,kDigestLanes);
+          for(const auto* header:headers){
+            pending.push_back({u64(header+8),u64(header+24),
+                               {pos,xor_words(header+kRecHeader),Raw}});
+            pos+=kRawRecordBytes;
+          }
+          recovery_.replayed_records+=kDigestLanes;
+          continue;
+        }
+      }
+      auto record=parse_record_at(buffer.data()+std::size_t(pos-buffer_from),pos,
+                                  std::size_t(buffer_end-pos));
       if(!record)break; // interrupted tail is never a published transaction
       ++recovery_.replayed_records;
       if(record->kind==Commit) {
         if(pending.empty()||record->block!=state.commits+1||
            record->reference!=pending.size())
           throw std::runtime_error("QSSD transaction commit mismatch");
+        for(std::size_t i=0;i<pending.size();){
+          refs.clear();
+          const auto first=pending[i].block;
+          do {
+            refs.push_back(pending[i++].ref);
+          } while(i<pending.size()&&pending[i].block==first+refs.size());
+          state.root=replace_contiguous(state.root,first,8,refs.data(),refs.size());
+        }
         for(const auto& change:pending) {
-          const auto& p=change.record;
-          state.root=replace(state.root,p.block,8,Ref{p.offset,change.word_xor},p.kind!=Zero);
-          switch(p.kind){
-            case Raw: ++state.raw;remember(p.digest,p.offset);break;
+          switch(change.ref.kind){
+            case Raw: ++state.raw;remember(change.digest,change.ref.offset);break;
             case Zero: ++state.zeros;break;
             case Pattern: ++state.patterns;break;
             case Reference: ++state.refs;break;
@@ -590,11 +772,11 @@ class QssdDisk final : public BlockDisk {
         pending.clear();
         last_commit=record->next;
       } else {
-        if(record->block>=capacity_/kBlockSize||pending.size()>=128)
+        if(record->block>=capacity_/kBlockSize||pending.size()>=kMaxBulkTransactionBlocks)
           throw std::runtime_error("QSSD journal record address/count invalid");
         const auto data=decode(*record,sz);
         const auto word=record->kind==Zero?0:xor_rule(data,record->kind==Pattern?record->payload.size():0);
-        pending.push_back({{record->block,pos,record->kind,record->digest},word});
+        pending.push_back({record->block,record->digest,{pos,word,record->kind}});
       }
       pos=record->next;
     }
@@ -656,7 +838,7 @@ class QssdDisk final : public BlockDisk {
                 data.begin()+(period?period:data.size()));
             position=append_to(out,position,kind,block,digest(data.data(),data.size()),0,payload);
             ++result.live_blocks;
-            if(++staged==128)finish_batch(); // replay bound: <=128 per commit
+            if(++staged==kMaxTransactionBlocks)finish_batch();
           };
           each_live(root,8,0,transfer);
           finish_batch();
@@ -712,8 +894,13 @@ class QssdDisk final : public BlockDisk {
   }
 
   static void create(const std::filesystem::path& path,std::uint64_t gib) {
-    check_path(path);
     if(gib<1||gib>16384)throw std::invalid_argument("QSSD supported logical capacity is 1 GiB .. 16 TiB");
+    create_bytes(path,gib*kGiB);
+  }
+  static void create_bytes(const std::filesystem::path& path,std::uint64_t bytes) {
+    check_path(path);
+    if(bytes<kGiB||bytes>16384*kGiB||bytes%kBlockSize)
+      throw std::invalid_argument("QSSD capacity must be block aligned and within 1 GiB .. 16 TiB");
     const auto name=path.string();
     int fd=::open(name.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
     if(fd<0)throw std::system_error(errno,std::generic_category(),"QSSD create without overwrite");
@@ -722,11 +909,12 @@ class QssdDisk final : public BlockDisk {
       std::array<std::uint8_t,kHeader> head{};
       std::memcpy(head.data(),"RQVD0001",8);
       put64(head.data()+8,1);
-      put64(head.data()+16,gib*kGiB);
+      put64(head.data()+16,bytes);
       put64(head.data()+24,kBlockSize);
       put64(head.data()+32,digest(head.data(),32));
       write_all(fd,0,head.data(),head.size());
       if(::fsync(fd)!=0)throw std::system_error(errno,std::generic_category(),"QSSD create sync");
+      fsync_parent(path);
       complete=true;
     }catch(...){::close(fd);::unlink(name.c_str());throw;}
     ::close(fd);
@@ -795,12 +983,26 @@ class QssdDisk final : public BlockDisk {
     if((!target&&size)||offset>capacity_||size>capacity_-offset)return false;
     try{
       const auto view=states_.snapshot(); // one coherent qSSD version for this request
+      std::vector<std::uint8_t> raw_buffer;
       std::size_t done=0;
       while(done<size){
         const auto block=(offset+done)/kBlockSize;
         const auto start=static_cast<std::size_t>((offset+done)%kBlockSize);
         const auto n=std::min<std::size_t>(size-done,kBlockSize-start);
         const auto ref=locate(view->value->root,block);
+        if(start==0&&ref.kind==Raw&&(size-done)/kBlockSize>=kDigestLanes){
+          const auto max_count=std::min(kMaxTransactionBlocks,(size-done)/kBlockSize);
+          std::size_t count=1;
+          for(;count<max_count;++count){
+            const auto next=locate(view->value->root,block+count);
+            if(next.kind!=Raw||next.offset!=ref.offset+count*kRawRecordBytes)break;
+          }
+          if(count>=kDigestLanes){
+            read_raw_run(ref.offset,block,count,view->value->end,raw_buffer,target+done);
+            done+=count*kBlockSize;
+            continue;
+          }
+        }
         if(!ref.offset)std::memset(target+done,0,n);
         else {
           const auto data=cached_decode(ref.offset,view->value->end);
@@ -822,33 +1024,59 @@ class QssdDisk final : public BlockDisk {
   }
 
   bool write(std::uint64_t lba,std::uint16_t count,const std::uint8_t* source) override {
-    if(access_==Access::ReadOnly||!source||!count||count>127||lba>sectors()||count>sectors()-lba)return false;
+    if(!count||count>127||lba>sectors()||count>sectors()-lba)return false;
+    return write_bytes(lba*kSectorSize,std::size_t(count)*kSectorSize,source);
+  }
+
+  bool write_bytes(std::uint64_t first,std::size_t total,const std::uint8_t* source) {
+    if(access_==Access::ReadOnly||first>capacity_||total>capacity_-first||
+       total>kMaxBulkTransactionBytes-first%kBlockSize||(!source&&total))return false;
+    if(!total)return true;
     std::lock_guard<std::mutex> hold(writer_);
     bool appending=false;
     try{
       const auto old=states_.snapshot();
       Epoch next=*old->value;
       const auto original_end=committed_end_;
-      struct RawCandidate {std::uint64_t hash,offset,word_xor;std::shared_ptr<const BlockData> data;};
+      struct RawCandidate {std::uint64_t hash,offset,word_xor;};
       std::vector<RawCandidate> new_raw;
-      std::vector<std::pair<std::uint64_t,std::shared_ptr<const BlockData>>> prepared_cache;
-      const std::uint64_t first=lba*kSectorSize, total=std::uint64_t(count)*kSectorSize;
+      std::unordered_multimap<std::uint64_t,std::size_t> staged_hashes;
+      std::vector<std::size_t> cache_positions;
       const auto block_count=(first%kBlockSize+total+kBlockSize-1)/kBlockSize;
+      new_raw.reserve(block_count);
+      staged_hashes.reserve(block_count);
+      cache_positions.reserve(block_count);
+      std::vector<Ref> replacements;
+      replacements.reserve(block_count);
+      std::vector<std::size_t> raw_positions;
+      raw_positions.reserve(block_count);
       std::vector<std::uint8_t> journal;
       journal.reserve(block_count*(kRecHeader+kBlockSize+kRecFooter)+kRecHeader+kRecFooter);
-      std::uint64_t done=0;
+      std::size_t done=0,digested_lane=kDigestLanes;
+      std::array<std::uint64_t,kDigestLanes> content_digests{};
       while(done<total){
         const auto block=(first+done)/kBlockSize;
         const auto start=static_cast<std::size_t>((first+done)%kBlockSize);
-        const auto n=std::min<std::uint64_t>(total-done,kBlockSize-start);
+        const auto n=std::min<std::size_t>(total-done,kBlockSize-start);
         BlockData data;
-        if(n!=kBlockSize){
+        auto hash=std::uint64_t{0};
+        if(n==kBlockSize){
+          std::memcpy(data.data(),source+done,n);
+          if(digested_lane==kDigestLanes&&total-done>=kDigestLanes*kBlockSize){
+            std::array<const std::uint8_t*,kDigestLanes> blocks{};
+            for(std::size_t lane=0;lane<kDigestLanes;++lane)
+              blocks[lane]=source+done+lane*kBlockSize;
+            content_digests=digest_four(blocks,kBlockSize);
+            digested_lane=0;
+          }
+          hash=digested_lane<kDigestLanes?content_digests[digested_lane++]:digest(data.data(),n);
+        }else{
           const auto ref=locate(old->value->root,block);
           if(ref.offset)data=*cached_decode(ref.offset,original_end);
           else data.fill(0);
+          std::memcpy(data.data()+start,source+done,n);
+          hash=digest(data.data(),data.size());
         }
-        std::memcpy(data.data()+start,source+done,std::size_t(n));
-        const auto hash=digest(data.data(),data.size());
         const auto period=rule_period(data);
         Kind kind=Raw;
         std::uint64_t backref=0;
@@ -859,14 +1087,17 @@ class QssdDisk final : public BlockDisk {
           payload=kind==Zero?0:period;
           word_xor=xor_rule(data,period);
         }else{
-          const auto staged=std::find_if(new_raw.begin(),new_raw.end(),[&](const auto& item){
-            return item.hash==hash&&*item.data==data;
-          });
-          if(staged!=new_raw.end()){
-            backref=staged->offset;
-            word_xor=staged->word_xor;
-          }else{
-            word_xor=xor_words(data);
+          const auto matching=staged_hashes.equal_range(hash);
+          for(auto entry=matching.first;entry!=matching.second;++entry){
+            const auto& staged=new_raw[entry->second];
+            const auto* bytes=journal.data()+std::size_t(staged.offset-original_end)+kRecHeader;
+            if(std::memcmp(bytes,data.data(),data.size())!=0||(backref&&staged.offset>=backref))
+              continue;
+            backref=staged.offset;
+            word_xor=staged.word_xor;
+          }
+          if(!backref){
+            word_xor=xor_words(data.data());
             const auto it=dedup_.find(hash);
             if(it!=dedup_.end())for(const auto candidate:it->second){
               if(*cached_decode(candidate,original_end)==data){backref=candidate;break;}
@@ -874,22 +1105,25 @@ class QssdDisk final : public BlockDisk {
           }
           if(backref){kind=Reference;payload=0;}
         }
-        const auto record_offset=original_end+journal.size();
-        encode_record(journal,kind,block,hash,backref,data.data(),payload);
-        std::shared_ptr<const BlockData> cached;
+        const auto position=journal.size();
+        const auto record_offset=original_end+position;
+        if(kind==Raw)
+          raw_positions.push_back(append_record(journal,kind,block,hash,backref,data.data(),payload));
+        else
+          encode_record(journal,kind,block,hash,backref,data.data(),payload);
         if(kind==Raw){
-          cached=std::make_shared<const BlockData>(data);
-          new_raw.push_back({hash,record_offset,word_xor,cached});
+          staged_hashes.emplace(hash,new_raw.size());
+          new_raw.push_back({hash,record_offset,word_xor});
           ++next.raw;
         }else if(kind==Zero)++next.zeros;
-        else if(kind==Pattern){
-          cached=std::make_shared<const BlockData>(data);
-          ++next.patterns;
-        }else ++next.refs;
-        if(cached)prepared_cache.emplace_back(record_offset,std::move(cached));
-        next.root=replace(next.root,block,8,Ref{record_offset,word_xor},kind!=Zero);
+        else if(kind==Pattern)++next.patterns;
+        else ++next.refs;
+        if(kind==Raw||kind==Pattern)cache_positions.push_back(position);
+        replacements.push_back({record_offset,word_xor,kind});
         done+=n;
       }
+      finish_raw_records(journal,raw_positions);
+      next.root=replace_contiguous(next.root,first/kBlockSize,8,replacements.data(),replacements.size());
       ++next.commits;
       encode_record(journal,Commit,next.commits,0,block_count,nullptr,0);
       const auto end=original_end+journal.size();
@@ -905,7 +1139,17 @@ class QssdDisk final : public BlockDisk {
       catch(const std::exception&) {dedup_.clear();dedup_fifo_.clear();}
       // Discardable cache mutations cannot invalidate an already fsynced
       // and published guest transaction.
-      try {for(const auto& entry:prepared_cache)cache_insert(entry.first,entry.second);}
+      try {
+        std::lock_guard<std::mutex> guard(cache_mutex_);
+        const auto keep=std::min(cache_positions.size(),kReadCacheBlocks);
+        for(auto i=cache_positions.size()-keep;i<cache_positions.size();++i){
+          const auto position=cache_positions[i];
+          const auto* record=journal.data()+position;
+          auto block=std::make_shared<BlockData>();
+          expand_payload(*block,record+kRecHeader,u32(record+16));
+          cache_insert_locked(original_end+position,std::move(block));
+        }
+      }
       catch(const std::exception&){}
       return true;
     }catch(const std::exception&){

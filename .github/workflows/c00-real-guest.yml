@@ -30,14 +30,14 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/mundo-X
-          ref: cdfa3b01bb2ee9b0aa7feb17d3eeaa0b77813bb0
+          ref: 88a51096f2d5c3f5428d1e3040a1207e355df5b5
           path: deps/mundo-X
           persist-credentials: false
-      - name: Checkout GPU-VIRTUAL C12.1 with framebuffer work authority
+      - name: Checkout GPU-VIRTUAL C12.3 with guest triangle and PrimeVGC compute
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/GPU-VIRTUAL
-          ref: 44ce659a17985862e1fedb79cf2db69e25bf0296
+          ref: 933bbd7ea7679f661de7188fd4235691ab885567
           path: deps/GPU-VIRTUAL
           persist-credentials: false
       - name: Checkout QSSD current StateBus plus graphics revisions
@@ -47,11 +47,11 @@ jobs:
           ref: 5555f1cfc95e50d60df5d7481317380a6c5891d8
           path: deps/Virtual-qSSD-
           persist-credentials: false
-      - name: Checkout REVERSE-PC C03 integrated host candidate
+      - name: Checkout REgraphics guest triangle renderer
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/REVERSE-PC
-          ref: 6727d8a34fa722ee2a0662e98b8917ac4d53d4f5
+          ref: 5f4f9f6d80004cf9c21df740eff83f0742a53490
           path: deps/REVERSE-PC
           persist-credentials: false
       - name: Enforce exact component SHAs and real source files
@@ -61,10 +61,46 @@ jobs:
           python3 scripts/verify_deps.py
       - name: Compile native boot probe against actual x86/x64 CPU
         run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri
           cmake -S . -B build -DREVERSE_MUNDO_X_ROOT="$PWD/deps/mundo-X" -DREVERSE_QSSD_ROOT="$PWD/deps/Virtual-qSSD-" -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+      - name: Verify PrimeVGC guest transfers and measure bulk QSSD bandwidth
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build --parallel 2 --target reverse_windows_primevgc_transfer_test reverse_windows_primevgc_compute_test
+          for sample in 1 2 3; do
+            ./build/reverse_windows_primevgc_transfer_test
+          done | tee build/primevgc-transfer.log
+          grep -q '^PRIME_C08_PRIMEVGC_VRAM_PASS logical_bytes=120000000000 last_byte=119999999999' build/primevgc-transfer.log
+          for sample in 1 2 3; do
+            ./build/reverse_windows_primevgc_transfer_test --bulk-512k
+            ./build/reverse_windows_primevgc_transfer_test --bulk
+          done | tee build/primevgc-bulk.log
+          grep -q 'exact_bytes=268435456 .*command_bytes=524288 upload_commits=512' build/primevgc-bulk.log
+          grep -q 'exact_bytes=268435456 .*command_bytes=8388608 upload_commits=32' build/primevgc-bulk.log
+          ./build/reverse_windows_primevgc_compute_test | tee build/primevgc-compute.log
+      - name: Build the remaining native regressions
+        run: |
           cmake --build build --parallel 2
       - name: Execute real x86 and long-mode x64 guest demos
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
         run: ctest --test-dir build --output-on-failure
+      - name: Verify Prime C08 PCI, QSSD VRAM, and REgraphics rasterization
+        env:
+          EGL_PLATFORM: surfaceless
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sample in 1 2 3 4; do
+            ./build/reverse_windows_prime_gpu_guest_test
+          done | tee build/prime-c08-gpu.log
+          grep -q '^PRIME_C08_REGRAPHICS_PASS .*"vram_draw_requests":1.*"ram_draw_requests":3.*"color_dma_reads":2.*"submitted_triangles":3' build/prime-c08-gpu.log
+          grep -q '^PRIME_C08_BGRA_DMA_PASS alpha_ticket=18 vbe_stores=0 .*"alpha_draw_ticket":18' build/prime-c08-gpu.log
+          grep -q '^PRIME_C08_PCI_VRAM_PASS logical_bytes=120000000000 last_byte=119999999999 .* exact=1' build/prime-c08-gpu.log
+          grep -q '^PRIME_C08_VRAM_BATCH_PASS bytes=7864320 .* commits=128 .* exact=1' build/prime-c08-gpu.log
       - name: Record Prime BIOS keyboard and PS/2 regressions
         shell: bash
         run: |
@@ -293,6 +329,10 @@ jobs:
           assert report['pci_ata_guest_detected']
           assert report['ether_xi_memory_aperture']
           assert report['gpu_virtual_vga_delta']
+          assert report['gpu_virtual_compute_words']==2**32
+          assert int(report['gpu_virtual_compute_sum_u64'])==(2**32-1)*2**31
+          assert report['gpu_virtual_compute_evaluated_words']==0
+          assert report['gpu_virtual_xi_bits']==1024
           assert report['gpu_vga_delta_upload_bytes']==4
           assert report['gpu_full_frame_bytes']==4000
           assert report['qssd_graphics_serial']==3
@@ -419,7 +459,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: reverse-windows-c07-${{ matrix.architecture }}-evidence
+          name: reverse-windows-c08-${{ matrix.architecture }}-evidence
           path: |
             build/reverse-windows-x64.json
             build/reverse-windows-c06-motherboard.log
@@ -431,6 +471,10 @@ jobs:
             build/prime-c06-qssd.log
             build/prime-c07-vram.log
             build/prime-c07-vbe.log
+            build/prime-c08-gpu.log
+            build/primevgc-transfer.log
+            build/primevgc-bulk.log
+            build/primevgc-compute.log
             build/reverse-windows-c07-ata.log
             build/reverse-windows-c08-maintenance.log
             build/reverse-windows-c08-benchmark.jsonl
