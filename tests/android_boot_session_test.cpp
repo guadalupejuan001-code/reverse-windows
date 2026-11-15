@@ -69,6 +69,13 @@ void verify_ram_profile() {
                 report.find("\"backing_budget_bytes\":1073741824") != std::string::npos,
             "Hardware preflight must report its selected RAM profile and backing budget");
   }
+  const auto prime = Session::ram_profile(4096 * mib, 256 * mib, false, true);
+  const auto report = Session::check_hardware({}, -1, 0, {}, prime);
+  require(counter(report, "usable_bytes") == Session::kPrimeRamBytes &&
+              counter(report, "address_space_bytes") == prime.physical_bytes &&
+              counter(report, "backing_budget_bytes") == 1920 * mib &&
+              counter(report, "resident_bytes") < mib,
+          "Prime must expose all 64 GiB while allocating pages on demand");
   try {
     (void)Session::ram_profile(300 * mib, 256 * mib, true);
   } catch (const std::runtime_error&) { return; }
@@ -155,9 +162,11 @@ void verify_ram_spill(const std::filesystem::path& directory) {
     require(std::filesystem::is_empty(cache), "Session history must not retain temporary RAM files");
   }
   {
-    constexpr std::uint64_t address = 0x100000;
     constexpr std::size_t resident = 8 * page;
-    cosmic_pc::PcMachine pc(2 * mib, resident);
+    using Pc = cosmic_pc::PcMachine;
+    Pc pc(Pc::high_ram_address_space(Session::kPrimeRamBytes, true), resident);
+    pc.cpu.a20_enabled = true;
+    const auto address = pc.cpu.memory.size() - 20 * page;
     auto file = std::make_unique<Backing>(cache, pc.cpu.memory.size(), 32 * page);
     auto* file_stats = file.get();
     pc.cpu.memory.attach_page_backing(std::move(file));
@@ -181,6 +190,7 @@ void verify_ram_spill(const std::filesystem::path& directory) {
               "Guest bytes must survive real-file eviction and reload");
     }
     require(pc.cpu.memory.metrics().backing_reads >= 12, "Guest reads must reach the real spill file");
+    require(pc.cpu.read32(address & UINT32_MAX) == 0, "A high RAM spill must never alias a low page");
     pc.cpu.memory.reset_zero();
     require(pc.cpu.memory.metrics().spilled_pages == 0 && file_stats->file_payload_bytes() == 0 &&
                 pc.cpu.read32(address) == 0,
@@ -276,29 +286,33 @@ void verify_arm64_session(const std::filesystem::path& path) {
   std::copy(std::begin(handoff), std::end(handoff), start);
   const std::uint8_t guest[]{
       0x0f,0x09,                              // WBINVD at CPL0, then continue.
-      0xbe,0xa0,0x7d,0,0,                    // ESI = first chain node.
-      0x41,0xbe,0xe0,0x7d,0,0,               // R14D = end of chain.
+      0x48,0xb8,0x83,0,0,0,0x10,0,0,0,      // 2 MiB page starting at physical 64 GiB.
+      0x48,0x89,0x04,0x25,0x08,0x30,0,0,    // Install it as PDE[1].
+      0xbf,0,0,0x20,0, 0xb9,8,0,0,0,         // Linear 2 MiB, eight links.
+      0x48,0x8d,0x47,8, 0x48,0xab,0xe2,0xf8, // LEA next address; STOSQ; LOOP.
+      0xbe,0,0,0x20,0,                       // ESI = first chain node.
+      0x41,0xbe,0x40,0,0x20,0,               // R14D = end of chain.
       0x48,0x8b,0x36,0x49,0x3b,0xf6,0x75,0xf8,
       0xfa,0xf4};
   std::copy(std::begin(guest), std::end(guest), boot.begin() + loop_offset);
-  for (unsigned offset = 0x1a0; offset < 0x1e0; offset += 8) {
-    boot[offset] = std::uint8_t(0x7c00 + offset + 8);
-    boot[offset + 1] = std::uint8_t((0x7c00 + offset + 8) >> 8);
-  }
   Session::create_disk(path, 1);
   {
     reverse_windows::QssdDisk disk(path);
     require(disk.write(0, 1, boot.data()) && disk.flush(), "Could not persist long-mode test sector");
   }
-  Session session(path, 0, Session::BootSource::Disk);
+  const auto prime = Session::ram_profile(768ULL << 20, 256ULL << 20, false, true);
+  Session session(path, 0, Session::BootSource::Disk, -1, 0, prime, path.parent_path());
   for (unsigned steps = 0; steps < 6000 && !session.is_stopped(); steps += 256) {
     if (session.step(256) == Session::Step::Fault)
       throw std::runtime_error(session.diagnostic());
   }
-  const auto info = session.diagnostic();
+  const auto info = session.diagnostic(false);
   require(session.is_stopped() && info.find("\"cpu_mode\":\"long64\"") != std::string::npos,
           "The Android native session did not execute the long-mode QSSD guest");
   require(counter(info, "wbinvd_retired") == 1, "The Android session did not continue after WBINVD");
+  require(counter(info, "usable_bytes") == Session::kPrimeRamBytes &&
+              counter(info, "page_translation_hits") > 0,
+          "The Android guest must use cached translations into its 64 GiB profile");
   std::cout << "PRIME_C10_WBINVD_SESSION_PASS count=1 resume=1\n";
   const auto arm64 = info.find("\"ether_arm64\":{");
   require(arm64 != std::string::npos, "C03 counts are missing from the Android diagnostic");
