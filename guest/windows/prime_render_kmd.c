@@ -97,21 +97,24 @@ static NTSTATUS prime_allocate_dma(PrimeAdapter* gpu) {
     const ULONG minimum = (geometry + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1UL);
     const ULONG preferred = rwgpu_read(gpu->bar, RWGPU_REG_CAPS) & RWGPU_CAP_DRAW_READBACK
         ? RWGPU_DIRECT_TRANSFER_BYTES : minimum;
-    description.MaximumLength = preferred;
-    ULONG registers = 0;
-    gpu->adapter = IoGetDmaAdapter(gpu->physical, &description, &registers);
-    if (!gpu->adapter) return STATUS_INSUFFICIENT_RESOURCES;
-    gpu->dma = gpu->adapter->DmaOperations->AllocateCommonBuffer(
-        gpu->adapter, preferred, &gpu->bus, FALSE);
-    if (gpu->dma) {
-        gpu->dmaBytes = preferred;
-    } else if (preferred != minimum) {
-        gpu->dma = gpu->adapter->DmaOperations->AllocateCommonBuffer(
-            gpu->adapter, minimum, &gpu->bus, FALSE);
-        if (gpu->dma) gpu->dmaBytes = minimum;
+    ULONG bytes = preferred;
+    for (;;) {
+        ULONG registers = 0;
+        description.MaximumLength = bytes;
+        gpu->adapter = IoGetDmaAdapter(gpu->physical, &description, &registers);
+        if (gpu->adapter) {
+            gpu->dma = gpu->adapter->DmaOperations->AllocateCommonBuffer(
+                gpu->adapter, bytes, &gpu->bus, FALSE);
+            if (gpu->dma) {
+                gpu->dmaBytes = bytes;
+                return STATUS_SUCCESS;
+            }
+            gpu->adapter->DmaOperations->PutDmaAdapter(gpu->adapter);
+            gpu->adapter = NULL;
+        }
+        if (bytes == minimum) return STATUS_INSUFFICIENT_RESOURCES;
+        bytes = minimum;
     }
-    if (!gpu->dma) return STATUS_INSUFFICIENT_RESOURCES;
-    return STATUS_SUCCESS;
 }
 
 static NTSTATUS prime_start(PVOID context, PDXGK_START_INFO start_info, PDXGKRNL_INTERFACE dxgk,

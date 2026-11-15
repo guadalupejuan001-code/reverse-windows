@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/mundo-X
-          ref: 6654cbd637dce28af3d0a07989c67e9bd30bb08f
+          ref: b9eee187b96ab905821ee1ebc98c6e6173e1a34f
           path: deps/mundo-X
           persist-credentials: false
       - name: Checkout GPU-VIRTUAL C12.3 with guest triangle and PrimeVGC compute

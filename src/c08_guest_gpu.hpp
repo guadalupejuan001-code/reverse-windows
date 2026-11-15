@@ -409,11 +409,14 @@ class GuestGpuC08 {
     if (dma_out) pc_.cpu.memory.prepare_write(*dma_out, pixels);
     const auto plan = std::make_shared<const xgpu::GuestTrianglePlan>(planner_.plan(vertices_));
     auto receipt = renderer_.render(*plan, width, height, clear, bgrx_, alpha);
+    if (dma_out && bgrx_.size() != pixels) return RWGPU_FAILED;
     // Return the actual readback to the canonical guest display. C07 observes
     // this physical write the same way as BIOS or ordinary guest pixel stores.
     if (present) pc_.cpu.memory.write_block(display.physical_address, bgrx_.data(), bgrx_.size());
-    if (dma_out) pc_.cpu.memory.write_block(*dma_out, bgrx_.data(), bgrx_.size());
     work_.publish(plan, plan->revision, plan->revision);
+    // The DMA destination is resident and pinned, so this copy cannot need
+    // backing I/O or grow SparseRam after publishing the completed work.
+    if (dma_out) pc_.cpu.memory.write_block(*dma_out, bgrx_.data(), pixels);
     bgrx_.swap(color_);
     ++draws_;
     if (dma_out) {
