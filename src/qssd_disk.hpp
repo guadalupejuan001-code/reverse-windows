@@ -36,6 +36,7 @@ class QssdDisk final : public BlockDisk {
   enum class Access { ReadWrite, ReadOnly };
   static constexpr std::uint64_t kSectorSize = 512, kBlockSize = 4096;
   static constexpr std::uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
+  static constexpr std::uint64_t kMaxLogicalBytes = 8ULL << 50;
   static constexpr std::size_t kMaxTransactionBlocks = 128;
   static constexpr std::size_t kMaxTransactionBytes = kMaxTransactionBlocks * kBlockSize;
   static constexpr std::size_t kMaxBulkTransactionBlocks = 2048;
@@ -104,6 +105,7 @@ class QssdDisk final : public BlockDisk {
   const Access access_;
   std::filesystem::path path_;
   std::uint64_t capacity_=0, committed_end_=kHeader, generation_=0;
+  unsigned index_levels_=8;
   RecoveryStats recovery_{};
   std::mutex writer_;
   // Readers can observe immutable qSSD epochs while the journal appends.
@@ -235,12 +237,12 @@ class QssdDisk final : public BlockDisk {
     if(::fstat(fd_,&info)!=0||info.st_size<0)throw std::runtime_error("QSSD stat failed");
     return static_cast<std::uint64_t>(info.st_size);
   }
-  static Ref locate(const NodePtr& root,std::uint64_t block) {
+  Ref locate(const NodePtr& root,std::uint64_t block) const {
     // The epoch retains the entire immutable tree for the duration of a lookup.
     const auto* node=root.get();
-    for(int level=7;level>=0;--level){
+    for(unsigned level=index_levels_;level>0;--level){
       if(!node)return {};
-      node=node->children[(block>>(level*4))&15].get();
+      node=node->children[(block>>((level-1)*4))&15].get();
     }
     return node?node->ref:Ref{};
   }
@@ -610,7 +612,7 @@ class QssdDisk final : public BlockDisk {
           throw std::runtime_error("QSSD checkpoint references non-block record");
         const auto data=decode(*rec,cutoff);
         const auto word=rec->kind==Zero?0:xor_rule(data,rec->kind==Pattern?rec->payload.size():0);
-        state.root=replace(state.root,block,8,Ref{off,word,rec->kind});
+        state.root=replace(state.root,block,index_levels_,Ref{off,word,rec->kind});
         if(rec->kind==Raw)remember(rec->digest,off);
         previous=block;
       }
@@ -661,7 +663,7 @@ class QssdDisk final : public BlockDisk {
         write_all(out,kIndexHeader+count*kIndexEntry,entry.data(),entry.size());
         ++count;
       };
-      each_live(state.root,8,0,append_entry);
+      each_live(state.root,index_levels_,0,append_entry);
       put64(header.data()+80,count);
       // checksum over header with index_hash=0 and all ordered entries
       write_all(out,0,header.data(),header.size());
@@ -696,8 +698,12 @@ class QssdDisk final : public BlockDisk {
     generation_=u64(head.data()+40); // old C03 images have zero generation
     if(generation_ && u64(head.data()+48)!=digest(head.data(),48))
       throw std::runtime_error("QSSD compacted generation/header checksum mismatch");
-    if(capacity_<kGiB||capacity_>16384*kGiB||capacity_%kBlockSize)
+    if(capacity_<kGiB||capacity_>kMaxLogicalBytes||capacity_%kBlockSize)
       throw std::runtime_error("QSSD volume logical size invalid");
+    // Journal and checkpoint entries already store 64-bit block numbers.
+    // Keep the established depth for disks up to 16 TiB and add levels as needed.
+    const auto last_block=capacity_/kBlockSize-1;
+    for(auto extra=last_block>>(index_levels_*4);extra;extra>>=4)++index_levels_;
     recovery_={};
     dedup_fifo_.clear();dedup_.clear();
     const auto checkpoint=read_checkpoint(sz);
@@ -757,7 +763,7 @@ class QssdDisk final : public BlockDisk {
           do {
             refs.push_back(pending[i++].ref);
           } while(i<pending.size()&&pending[i].block==first+refs.size());
-          state.root=replace_contiguous(state.root,first,8,refs.data(),refs.size());
+          state.root=replace_contiguous(state.root,first,index_levels_,refs.data(),refs.size());
         }
         for(const auto& change:pending) {
           switch(change.ref.kind){
@@ -840,7 +846,7 @@ class QssdDisk final : public BlockDisk {
             ++result.live_blocks;
             if(++staged==kMaxTransactionBlocks)finish_batch();
           };
-          each_live(root,8,0,transfer);
+          each_live(root,original.index_levels_,0,transfer);
           finish_batch();
           result.compact_commits=committed;
           result.after_bytes=position;
@@ -866,7 +872,7 @@ class QssdDisk final : public BlockDisk {
                actual!=expected)
               throw std::runtime_error("QSSD compact candidate differs from guest block state");
           };
-          each_live(root,8,0,verify);
+          each_live(root,original.index_levels_,0,verify);
         }
         if(inject_abort_before_rename)
           throw std::runtime_error("C08 injected crash point: before atomic compact rename");
@@ -894,13 +900,14 @@ class QssdDisk final : public BlockDisk {
   }
 
   static void create(const std::filesystem::path& path,std::uint64_t gib) {
-    if(gib<1||gib>16384)throw std::invalid_argument("QSSD supported logical capacity is 1 GiB .. 16 TiB");
+    if(gib<1||gib>kMaxLogicalBytes/kGiB)
+      throw std::invalid_argument("QSSD supported logical capacity is 1 GiB .. 8 PiB");
     create_bytes(path,gib*kGiB);
   }
   static void create_bytes(const std::filesystem::path& path,std::uint64_t bytes) {
     check_path(path);
-    if(bytes<kGiB||bytes>16384*kGiB||bytes%kBlockSize)
-      throw std::invalid_argument("QSSD capacity must be block aligned and within 1 GiB .. 16 TiB");
+    if(bytes<kGiB||bytes>kMaxLogicalBytes||bytes%kBlockSize)
+      throw std::invalid_argument("QSSD capacity must be block aligned and within 1 GiB .. 8 PiB");
     const auto name=path.string();
     int fd=::open(name.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
     if(fd<0)throw std::system_error(errno,std::generic_category(),"QSSD create without overwrite");
@@ -1123,7 +1130,8 @@ class QssdDisk final : public BlockDisk {
         done+=n;
       }
       finish_raw_records(journal,raw_positions);
-      next.root=replace_contiguous(next.root,first/kBlockSize,8,replacements.data(),replacements.size());
+      next.root=replace_contiguous(next.root,first/kBlockSize,index_levels_,
+                                   replacements.data(),replacements.size());
       ++next.commits;
       encode_record(journal,Commit,next.commits,0,block_count,nullptr,0);
       const auto end=original_end+journal.size();

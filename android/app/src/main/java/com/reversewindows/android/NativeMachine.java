@@ -46,7 +46,7 @@ final class NativeMachine {
     }
 
     static long open(Context context, String qssdPath, int capacityGiB, int isoFd, long isoBytes,
-                     int bootSource, boolean primeRam) {
+                     int bootSource, boolean primeRam, String dataDiskPath) {
         ActivityManager.MemoryInfo memory = memoryInfo(context);
         File graphicsVram = new File(context.getFilesDir(), "gpu-vram.rqvd");
         if (!graphicsVram.exists() && qssdPath != null && !qssdPath.isEmpty()) {
@@ -55,7 +55,8 @@ final class NativeMachine {
         }
         return openWithRam(qssdPath, capacityGiB, isoFd, isoBytes, bootSource,
                 memory == null ? -1 : memory.availMem, memory == null ? 0 : memory.threshold,
-                memory != null && memory.lowMemory, primeRam, ramCache(context), graphicsVram.getAbsolutePath());
+                memory != null && memory.lowMemory, primeRam, ramCache(context), graphicsVram.getAbsolutePath(),
+                dataDiskPath);
     }
 
     static boolean refreshRamPressure(Context context, long handle, boolean reclaimMemory) {
@@ -73,7 +74,7 @@ final class NativeMachine {
     private static native long openWithRam(String qssdPath, int capacityGiB, int isoFd, long isoBytes,
                                            int bootSource, long available, long threshold,
                                            boolean lowMemory, boolean primeRam,
-                                           String ramCacheDirectory, String graphicsVram);
+                                           String ramCacheDirectory, String graphicsVram, String dataDiskPath);
     static native void close(long handle);
     static native int step(long handle, int instructions);
     private static native boolean sampleRamPressure(long handle, long available, long threshold,

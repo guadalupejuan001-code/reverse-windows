@@ -151,7 +151,7 @@ std::uint64_t ns(Clock::duration elapsed) {
 }
 void xor_large_revision(const std::filesystem::path& path) {
   constexpr auto bytes=QssdDisk::kBlockSize;
-  constexpr auto extent=16384*QssdDisk::kGiB; // Full supported 16 TiB logical address range.
+  constexpr auto extent=16384*QssdDisk::kGiB;
   constexpr unsigned blocks=512;
   QssdDisk::create(path,16384);
   using Block=std::array<std::uint8_t,bytes>;

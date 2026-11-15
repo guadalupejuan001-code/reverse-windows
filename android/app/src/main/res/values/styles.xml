@@ -17,6 +17,7 @@
     <item name="vm_hardware_result" type="id" />
     <item name="vm_select_iso" type="id" />
     <item name="vm_create_disk" type="id" />
+    <item name="vm_create_data_disk" type="id" />
     <item name="vm_boot_iso" type="id" />
     <item name="vm_boot_disk" type="id" />
     <item name="vm_bios_test" type="id" />
