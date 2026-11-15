@@ -33,20 +33,20 @@ final class NativeMachine {
     private static String ramCache(Context context) {
         File cache = context.getCacheDir();
         if (cache == null) return "";
-        // Scope the anonymous spill file to ordinary application-private storage.
+        // The temporary QSSD pages live in application-private storage.
         return cache.getAbsolutePath();
     }
 
     static String checkHardware(Context context, String qssdPath, int isoFd, long isoBytes,
-                                String isoError) {
+                                String isoError, boolean primeRam) {
         ActivityManager.MemoryInfo memory = memoryInfo(context);
         return checkHardwareWithRam(qssdPath, isoFd, isoBytes, isoError,
                 memory == null ? -1 : memory.availMem, memory == null ? 0 : memory.threshold,
-                memory != null && memory.lowMemory, ramCache(context));
+                memory != null && memory.lowMemory, primeRam, ramCache(context));
     }
 
     static long open(Context context, String qssdPath, int capacityGiB, int isoFd, long isoBytes,
-                     int bootSource) {
+                     int bootSource, boolean primeRam) {
         ActivityManager.MemoryInfo memory = memoryInfo(context);
         File graphicsVram = new File(context.getFilesDir(), "gpu-vram.rqvd");
         if (!graphicsVram.exists() && qssdPath != null && !qssdPath.isEmpty()) {
@@ -55,7 +55,7 @@ final class NativeMachine {
         }
         return openWithRam(qssdPath, capacityGiB, isoFd, isoBytes, bootSource,
                 memory == null ? -1 : memory.availMem, memory == null ? 0 : memory.threshold,
-                memory != null && memory.lowMemory, ramCache(context), graphicsVram.getAbsolutePath());
+                memory != null && memory.lowMemory, primeRam, ramCache(context), graphicsVram.getAbsolutePath());
     }
 
     static boolean refreshRamPressure(Context context, long handle, boolean reclaimMemory) {
@@ -68,10 +68,12 @@ final class NativeMachine {
     static native void createDisk(String qssdPath, int capacityGiB);
     private static native String checkHardwareWithRam(String qssdPath, int isoFd, long isoBytes,
                                                       String isoError, long available, long threshold,
-                                                      boolean lowMemory, String ramCacheDirectory);
+                                                      boolean lowMemory, boolean primeRam,
+                                                      String ramCacheDirectory);
     private static native long openWithRam(String qssdPath, int capacityGiB, int isoFd, long isoBytes,
                                            int bootSource, long available, long threshold,
-                                           boolean lowMemory, String ramCacheDirectory, String graphicsVram);
+                                           boolean lowMemory, boolean primeRam,
+                                           String ramCacheDirectory, String graphicsVram);
     static native void close(long handle);
     static native int step(long handle, int instructions);
     private static native boolean sampleRamPressure(long handle, long available, long threshold,

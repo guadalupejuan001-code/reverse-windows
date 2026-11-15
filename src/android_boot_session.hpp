@@ -40,23 +40,27 @@ class AndroidBootSession final {
   };
   static constexpr unsigned kMaxVideoWidth = 960, kMaxVideoHeight = 720;
   static constexpr RamProfile kDefaultRamProfile{2048ULL * 1024 * 1024, 256ULL * 1024 * 1024};
+  static constexpr std::uint64_t kPrimeRamBytes = 64ULL << 30;
   static constexpr std::uint64_t kMaxResidentBytes = 1024ULL * 1024 * 1024;
   static constexpr std::uint64_t kMinResidentBytes = 16ULL * 1024 * 1024;
 
   static RamProfile ram_profile(std::uint64_t available_bytes, std::uint64_t low_threshold,
-                                bool low_memory) {
+                                bool low_memory, bool prime_ram = false) {
     constexpr std::uint64_t MiB = 1024 * 1024;
     const auto headroom = available_bytes > low_threshold ? available_bytes - low_threshold : 0;
     const auto backing = (headroom / 2) / cosmic_pc::MemoryFabric::kPageSize *
                          cosmic_pc::MemoryFabric::kPageSize;
     if (low_memory || backing < kMinResidentBytes)
       throw std::runtime_error("Android tiene poca RAM disponible para iniciar el equipo virtual.");
-    // Keep room above Android's low-memory threshold for the handset. The
-    // 4 GiB address space is selected only when more backing is available.
-    const auto physical = backing >= 768 * MiB && cosmic_pc::PcMachine::max_ram_mib() >= 4096
-        ? cosmic_pc::PcMachine::kMaxPhysicalBytes : kDefaultRamProfile.physical_bytes;
+    using Pc = cosmic_pc::PcMachine;
+    auto physical = prime_ram ? Pc::high_ram_address_space(kPrimeRamBytes, true)
+                              : std::uint64_t(kDefaultRamProfile.physical_bytes);
+    if (!prime_ram && backing >= 768 * MiB && Pc::max_ram_mib() >= 4096)
+      physical = Pc::kLegacyPhysicalLimit;
+    if (physical > std::numeric_limits<std::size_t>::max())
+      throw std::runtime_error("El perfil de 64 GiB requiere un anfitrión de 64 bits.");
     return {static_cast<std::size_t>(physical),
-            static_cast<std::size_t>(std::min({backing, physical, kMaxResidentBytes}))};
+            static_cast<std::size_t>(std::min(backing, resident_limit(physical)))};
   }
 
   void sample_ram_pressure(std::uint64_t available, std::uint64_t threshold, bool low_memory) {
@@ -65,8 +69,8 @@ class AndroidBootSession final {
     const auto headroom = available > threshold ? available - threshold : 0;
     // Android's available RAM already reflects the VM's resident payload.
     // Add that payload back before dividing the combined headroom.
-    const auto half = std::min(headroom, 2 * kMaxResidentBytes) / 2 + memory.allocated_bytes() / 2;
-    const auto limit = std::min(memory.size(), kMaxResidentBytes);
+    const auto limit = resident_limit(memory.size());
+    const auto half = std::min(headroom, 2 * limit) / 2 + memory.allocated_bytes() / 2;
     const auto floor = std::min(limit, kMinResidentBytes);
     const auto target = low_memory ? floor : std::clamp<std::uint64_t>(half / page * page, floor, limit);
     board_->set_gpu_cache_enabled(!low_memory && target > floor);
@@ -102,6 +106,8 @@ class AndroidBootSession final {
       : source_(source), pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_), vbe_(pc_) {
     if (disk.empty() && (create_gib || source != BootSource::SelfTest))
       throw std::invalid_argument("Selecciona o crea un disco QSSD para iniciar.");
+    if (profile.physical_bytes > cosmic_pc::PcMachine::kLegacyPhysicalLimit)
+      pc_.reserve_pci_mmio(true); // Match the installed RAM profile even without a graphics device.
     spill_ = configure_spill(pc_, ram_cache);
     switch (source) {
       case BootSource::Iso:
@@ -162,6 +168,7 @@ class AndroidBootSession final {
                                     RamProfile profile=kDefaultRamProfile,
                                     const std::filesystem::path& ram_cache={}) {
     cosmic_pc::PcMachine pc(profile.physical_bytes, profile.backing_bytes);
+    if (profile.physical_bytes > cosmic_pc::PcMachine::kLegacyPhysicalLimit) pc.reserve_pci_mmio(true);
     const auto spill = configure_spill(pc, ram_cache);
     pc.boot_demo();
     auto& cpu = pc.cpu;
@@ -495,6 +502,11 @@ class AndroidBootSession final {
   }
 
  private:
+  static std::uint64_t resident_limit(std::uint64_t physical) noexcept {
+    return physical > cosmic_pc::PcMachine::kLegacyPhysicalLimit
+        ? physical : std::min(physical, kMaxResidentBytes);
+  }
+
   struct RamPressure {
     std::uint64_t target = 0;
     bool low_memory = false;
@@ -558,6 +570,7 @@ class AndroidBootSession final {
     }
     out
         << ",\"spill_mode\":" << cosmic_pc::PcMachine::quote(spill.state)
+        << ",\"spill_backend\":" << (spill.file ? "\"qssd-transient\"" : "null")
         << ",\"spill_error\":" << cosmic_pc::PcMachine::quote(spill.detail)
         << ",\"spill_limit_bytes\":" << spill.limit
         << ",\"spilled_bytes\":" << metrics.backing_bytes

@@ -171,14 +171,14 @@ final class VmWorker {
         });
     }
 
-    void checkHardware(Uri iso) {
+    void checkHardware(Uri iso, boolean primeRam) {
         worker.post(() -> {
             if (released || handle != 0) return;
             try {
                 String diskPath = disk.exists() ? disk.getAbsolutePath() : "";
                 String result;
                 if (iso == null) {
-                    result = NativeMachine.checkHardware(context, diskPath, -1, 0, null);
+                    result = NativeMachine.checkHardware(context, diskPath, -1, 0, null, primeRam);
                 } else {
                     ParcelFileDescriptor selected = null;
                     String issue = "Android no pudo abrir la ISO.";
@@ -188,11 +188,11 @@ final class VmWorker {
                         if (error.getMessage() != null) issue = error.getMessage();
                     }
                     if (selected == null) {
-                        result = NativeMachine.checkHardware(context, diskPath, -1, 0, issue);
+                        result = NativeMachine.checkHardware(context, diskPath, -1, 0, issue, primeRam);
                     } else {
                         try (ParcelFileDescriptor fd = selected) {
                             result = NativeMachine.checkHardware(context, diskPath, fd.getFd(),
-                                    isoSize(iso, fd), null);
+                                    isoSize(iso, fd), null, primeRam);
                         }
                     }
                 }
@@ -226,7 +226,7 @@ final class VmWorker {
         return 0;
     }
 
-    void start(int source, Uri iso, boolean debug) {
+    void start(int source, Uri iso, boolean debug, boolean primeRam) {
         worker.post(() -> {
             if (handle != 0) return;
             try {
@@ -239,10 +239,10 @@ final class VmWorker {
                     try (ParcelFileDescriptor fd = openIso(iso)) {
                         int createGiB = disk.exists() ? 0 : DISK_GIB;
                         handle = NativeMachine.open(context, path, createGiB, fd.getFd(),
-                                isoSize(iso, fd), source);
+                                isoSize(iso, fd), source, primeRam);
                     }
                 } else {
-                    handle = NativeMachine.open(context, path, 0, -1, 0, source);
+                    handle = NativeMachine.open(context, path, 0, -1, 0, source, primeRam);
                 }
                 if (handle == 0) throw new IllegalStateException("La máquina no se pudo iniciar.");
                 outcome = NativeMachine.RUNNING;

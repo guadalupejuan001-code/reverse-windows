@@ -211,10 +211,12 @@ jobs:
 
           report = json.loads(pathlib.Path(sys.argv[1]).read_text())
           ram = report["ram_profile"]
+          assert ram["usable_bytes"] == 64 << 30, ram
           assert ram["resident_bytes"] <= ram["backing_budget_bytes"], ram
           assert ram["spilled_bytes"] == 0 and ram["spill_writes"] == 0, ram
           assert ram["spill_mode"] in {"file", "disabled", "unavailable"}, ram
           if ram["spill_mode"] == "file":
+              assert ram["spill_backend"] == "qssd-transient", ram
               assert ram["spill_limit_bytes"] > 0 and not ram["spill_error"], ram
           elif ram["spill_mode"] == "unavailable":
               assert ram["spill_limit_bytes"] == 0 and ram["spill_error"], ram
@@ -314,6 +316,7 @@ jobs:
           assert report["disk"]["logical_bytes"] == 64 * 1024**3 and report["disk"]["initial_commits"] == 0
           assert report["ata"]["identify_data_transfers"] == 1
           assert report["boot_progress"]["handed_off"] and report["boot_profile"]["checkpoint_interval_steps"] == 50_000_000
+          assert report["ram_profile"]["usable_bytes"] == 64 << 30, report["ram_profile"]
           ether = report["ether_arm64"]
           assert ether["mundo_x_source_sha"] == os.environ["MUNDO_X_SHA"]
           assert ether["code_version_hits"] == ether["code_byte_checks"] == ether["code_bytes_read"] == 0

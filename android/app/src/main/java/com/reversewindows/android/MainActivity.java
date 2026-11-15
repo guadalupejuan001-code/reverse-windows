@@ -91,6 +91,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private Button stop;
     private Button evidence;
     private Button hardwareCheck;
+    private Button ramProfile;
     private TextView hardwareResult;
     private LinearLayout controls;
     private LinearLayout primaryActions;
@@ -104,6 +105,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private boolean checkingHardware;
     private boolean requestingDiagnostic;
     private boolean blankTextFrame;
+    private boolean primeRam;
     private String lastJson = "";
     private String diagnosticToExport = "";
     private long previousStepUs = -1;
@@ -117,6 +119,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         getWindow().setNavigationBarColor(BG);
         disk = new File(getFilesDir(), "windows.rqvd");
         prefs = getSharedPreferences("vm", MODE_PRIVATE);
+        primeRam = prefs.getBoolean("prime_ram_64_gib", true);
         String savedIso = prefs.getString("iso", "");
         if (!savedIso.isEmpty()) {
             iso = Uri.parse(savedIso);
@@ -261,6 +264,13 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
 
         storage = label("", 13, MUTED);
         add(setup, storage, 9);
+        ramProfile = action("", false, () -> {
+            primeRam = !primeRam;
+            prefs.edit().putBoolean("prime_ram_64_gib", primeRam).apply();
+            clearHardwareResult();
+            updateControls();
+        });
+        add(setup, ramProfile, 6);
 
         bootIso = action("Arrancar desde ISO", true, () -> start(NativeMachine.BOOT_ISO, false));
         bootIso.setId(R.id.vm_boot_iso);
@@ -451,7 +461,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         status.setTextColor(TEXT);
         stats.setText("");
         updateControls();
-        worker.start(bootSource, iso, debug);
+        worker.start(bootSource, iso, debug, primeRam);
         showBootStatus();
     }
 
@@ -461,7 +471,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         checkingHardware = true;
         setHardwareResult("Comprobando equipo virtual y medios seleccionados…", MUTED);
         updateControls();
-        worker.checkHardware(iso);
+        worker.checkHardware(iso, primeRam);
     }
 
     private void clearHardwareResult() {
@@ -496,7 +506,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
                         .append(ram.getLong("backing_budget_bytes") / MIB).append(" MiB");
                 String spill = ram.optString("spill_mode");
                 if ("file".equals(spill)) {
-                    result.append("\nRespaldo temporal de RAM: hasta ")
+                    result.append("\nQSSD temporal para RAM · hasta ")
                             .append(ram.optLong("spill_limit_bytes") / MIB).append(" MiB");
                 } else if ("unavailable".equals(spill)) {
                     result.append("\nRespaldo temporal de RAM no disponible.");
@@ -642,6 +652,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             progress.append(String.format(Locale.getDefault(), " · %,d pasos/s de ejecución", stepsPerSecond));
         }
         if (ram != null) {
+            progress.append(String.format(Locale.getDefault(), "\nRAM del invitado · %,d MiB",
+                    ram.optLong("usable_bytes") / MIB));
             progress.append(String.format(Locale.getDefault(), "\nRAM residente: %,d / %,d MiB",
                     ram.optLong("resident_bytes") / MIB, ram.optLong("backing_budget_bytes") / MIB));
             if ("file".equals(ram.optString("spill_mode"))) {
@@ -786,6 +798,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         storage.setText(diskReady ? "QSSD · 64 GiB lógicos" : "QSSD · se crea al arrancar la ISO");
         boolean setup = !session && !pending;
         setupPanel.setVisibility(session ? View.GONE : View.VISIBLE);
+        ramProfile.setText(primeRam ? "RAM del invitado · 64 GiB" : "RAM del invitado · Automática");
+        ramProfile.setEnabled(setup);
         selectIso.setEnabled(setup);
         ejectIso.setEnabled(setup && iso != null);
         createDisk.setVisibility(diskReady ? View.GONE : View.VISIBLE);
