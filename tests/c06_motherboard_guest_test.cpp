@@ -128,7 +128,7 @@ void rep_boot_with_pit_guest(bool local_apic){
   need(check(false)==check(true),"batched timer delivery crossed a guest interrupt deadline");
 }
 void paged_boot_batches_with_timer(){
-  enum class Fixture { Rep, Scan, Arm64 };
+  enum class Fixture { Rep, Scan, Arm64, Counter };
   const auto check=[](bool accelerate,Fixture fixture,unsigned deadline){
     PcMachine pc(16*1024*1024);
     pc.boot_long_mode_demo();run(pc,12000);
@@ -176,6 +176,10 @@ void paged_boot_batches_with_timer(){
       cpu.regs[Cpu::R9]=0xc000-0x2ed8;
       cpu.regs[Cpu::EDX]=into-1;
       cpu.regs[Cpu::EAX]=0;
+    } else if (fixture == Fixture::Counter) {
+      code(cpu,entry,{0x48,0xff,0xc9,0x75,0xfb,0xfa,0xf4}); // DEC RCX; JNZ; CLI; HLT.
+      cpu.regs[Cpu::ECX]=total;
+      cpu.eflags|=Cpu::CF;
     }else{
       code(cpu,entry,{0xf3,0xaa,0xfa,0xf4});
       cpu.regs[Cpu::EDI]=into;
@@ -185,7 +189,8 @@ void paged_boot_batches_with_timer(){
     const auto initial_steps = cpu.instructions;
     for(unsigned slice=0;slice<40&&!cpu.halted;++slice)run(pc,4091);
     const auto interrupted=cpu.read64(log+8);
-    const auto last_ip = fixture == Fixture::Scan ? 20 : fixture == Fixture::Arm64 ? 6 : 0;
+    const auto last_ip = fixture == Fixture::Scan ? 20 : fixture == Fixture::Arm64 ? 6 :
+        fixture == Fixture::Counter ? 3 : 0;
     need(cpu.halted&&cpu.regs[Cpu::ESP]==0x7000&&board.evidence().irq_delivered==1&&
         interrupted>=entry&&interrupted<=entry+last_ip,"paged guest lost the live timer boundary");
     if (fixture == Fixture::Arm64) {
@@ -196,12 +201,18 @@ void paged_boot_batches_with_timer(){
     } else if(fixture == Fixture::Scan) {
       need(cpu.regs[Cpu::EDX]==into+total-1&&cpu.read32(0xc000)==total&&
           (!accelerate||pc.boot_acceleration().scan_loop_steps>47000),"x64 scan did not finish or batch");
+    } else if (fixture == Fixture::Counter) {
+      need(cpu.regs[Cpu::ECX]==0 && cpu.eflags==(2|Cpu::CF|Cpu::PF|Cpu::ZF) &&
+           cpu.read32(log)>0 && cpu.read32(log)<total &&
+           (interrupted==entry || interrupted==entry+3) &&
+           (!accelerate || pc.boot_acceleration().counter_loop_steps>16000),
+           "counter loop must retire exactly and allow the LAPIC to see the original boundary");
     }else{
       need(cpu.regs[Cpu::ECX]==0&&cpu.read8(into+total-1)==0x5a&&
           (!accelerate||pc.boot_acceleration().paged_rep_elements>8100),"paged REP did not finish or batch");
     }
     const auto batched = pc.boot_acceleration().rep_elements + pc.boot_acceleration().scan_loop_steps +
-        pc.boot_acceleration().arm64_block_steps;
+        pc.boot_acceleration().arm64_block_steps + pc.boot_acceleration().counter_loop_steps;
     const auto count_steps = [&](const cosmic_pc::BootHotspots& profile) {
       std::ostringstream result;
       profile.write_json(result);
@@ -219,17 +230,17 @@ void paged_boot_batches_with_timer(){
     need(scalar_profile.find("\"sampled_step_ns\":") != std::string::npos &&
              (accelerate || scalar_profile.find("\"estimated_sample_ns\":") != std::string::npos),
          "Scalar hotspots must report sampled execution duration");
-    return std::array<std::uint64_t,5>{interrupted,cpu.read32(log),cpu.instructions,
-        cpu.eflags,board.evidence().ticks};
+    return std::array<std::uint64_t,6>{interrupted,cpu.read32(log),cpu.instructions,
+        cpu.eflags,board.evidence().ticks,cpu.clock_cycles()};
   };
-  for(const auto fixture:{Fixture::Rep,Fixture::Scan,Fixture::Arm64}){
+  for(const auto fixture:{Fixture::Rep,Fixture::Scan,Fixture::Arm64,Fixture::Counter}){
     for (const auto deadline : {307U, 308U}) {
       const auto scalar=check(false,fixture,deadline);
       const auto accelerated=check(true,fixture,deadline);
       need(scalar==accelerated,"paged acceleration changed the timer boundary or guest result");
     }
   }
-  std::cout<<"ETHER_PAGED_BATCH_IRQ_PASS rep=1 byte_scan=1 arm64="<<Cpu::ether_arm64_host()<<'\n';
+  std::cout<<"ETHER_PAGED_BATCH_IRQ_PASS rep=1 byte_scan=1 counter=1 arm64="<<Cpu::ether_arm64_host()<<'\n';
 }
 void shift_boot_with_pit_guest(){
   const auto check=[](bool accelerate,std::uint8_t period_low){
