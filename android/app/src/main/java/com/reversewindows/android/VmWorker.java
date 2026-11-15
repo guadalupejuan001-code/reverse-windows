@@ -316,7 +316,7 @@ final class VmWorker {
 
     void key(int ascii, int scan, boolean pressed) {
         worker.post(() -> {
-            if (handle == 0 || !running || isTerminal()) return;
+            if (handle == 0 || !running || !foreground || isTerminal()) return;
             try {
                 boolean wokeBios = NativeMachine.key(handle, ascii, scan, pressed);
                 requestFrame();
