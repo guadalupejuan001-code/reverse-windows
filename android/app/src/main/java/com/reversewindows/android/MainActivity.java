@@ -672,6 +672,17 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         if (stepsPerSecond >= 0) {
             progress.append(String.format(Locale.getDefault(), " · %,d pasos/s de ejecución", stepsPerSecond));
         }
+        if (workerTiming != null && workerTiming.optInt("max_steps_per_slice") > 0) {
+            progress.append(String.format(Locale.getDefault(),
+                    "\nTanda de hasta %,d pasos · Guardado cada %d s",
+                    workerTiming.optInt("max_steps_per_slice"),
+                    workerTiming.optLong("diagnostic_save_interval_ms") / 1000));
+        }
+        if (boot != null && boot.optLong("checkpoint_interval_steps") > 0) {
+            progress.append(String.format(Locale.getDefault(),
+                    "\nPunto de control cada %,d pasos del núcleo de arranque",
+                    boot.optLong("checkpoint_interval_steps")));
+        }
         JSONObject topology = diagnostic.optJSONObject("cpu_topology");
         if (topology != null) {
             progress.append(String.format(Locale.getDefault(),
@@ -870,9 +881,10 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         if (json.isEmpty()) return;
         new AlertDialog.Builder(this)
                 .setTitle("Último diagnóstico")
-                .setItems(new String[]{"Copiar texto", "Guardar archivo JSON"}, (dialog, choice) -> {
+                .setItems(new String[]{"Copiar texto", "Guardar archivo JSON", "Guardar archivo TXT"},
+                        (dialog, choice) -> {
                     if (choice == 0) copyEvidence(json);
-                    else saveEvidence(json);
+                    else saveEvidence(json, choice == 2);
                 })
                 .setNegativeButton("Cerrar", null)
                 .show();
@@ -889,12 +901,13 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         }
     }
 
-    private void saveEvidence(String json) {
+    private void saveEvidence(String json, boolean plainText) {
         diagnosticToExport = json;
         Intent picker = new Intent(Intent.ACTION_CREATE_DOCUMENT);
         picker.addCategory(Intent.CATEGORY_OPENABLE);
-        picker.setType("application/json");
-        picker.putExtra(Intent.EXTRA_TITLE, "reverse-windows-diagnostico.json");
+        picker.setType(plainText ? "text/plain" : "application/json");
+        picker.putExtra(Intent.EXTRA_TITLE, plainText ? "reverse-windows-diagnostico.txt"
+                : "reverse-windows-diagnostico.json");
         try {
             startActivityForResult(picker, DIAGNOSTIC_PICKER);
         } catch (android.content.ActivityNotFoundException error) {
