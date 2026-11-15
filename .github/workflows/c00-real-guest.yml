@@ -109,6 +109,8 @@ jobs:
           ./build/reverse_windows_prime_ether_arm64_test | tee build/prime-c03-ether-arm64.log
           if [ "$(uname -m)" = "aarch64" ]; then
             grep -q '^PRIME_C03_ARM64_PASS ' build/prime-c03-ether-arm64.log
+            grep -q '^PRIME_ARM64_PROTECTED32_PASS ' build/prime-c03-ether-arm64.log
+            grep -q '^PRIME_ARM64_BYTE_COPY_PASS ' build/prime-c03-ether-arm64.log
             sed -n 's/^PRIME_C03_ARM64_BENCH //p' build/prime-c03-ether-arm64.log > build/prime-c03-ether-arm64.json
             python3 -m json.tool build/prime-c03-ether-arm64.json >/dev/null
           else

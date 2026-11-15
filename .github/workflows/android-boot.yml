@@ -37,9 +37,9 @@ jobs:
         abi: [arm64-v8a, x86_64]
     env:
       ANDROID_ABI: ${{ matrix.abi }}
-      ANDROID_APP_ID: com.reversewindows.android.prime.smp.r029
-      ANDROID_VERSION: "0.2.9"
-      ANDROID_VERSION_CODE: "27"
+      ANDROID_APP_ID: com.reversewindows.android.prime.smp.r030
+      ANDROID_VERSION: "0.3.0"
+      ANDROID_VERSION_CODE: "28"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -358,6 +358,7 @@ jobs:
           assert report["ram_profile"]["usable_bytes"] == 64 << 30, report["ram_profile"]
           ether = report["ether_arm64"]
           assert ether["mundo_x_source_sha"] == os.environ["MUNDO_X_SHA"]
+          assert ether["protected32_guest_steps"] == 0
           assert ether["code_version_hits"] == ether["code_byte_checks"] == ether["code_bytes_read"] == 0
           print("PRIME_ANDROID_ISO_PICKER_PASS boot=el-torito ram_gib=64 qssd_boot_gib=64 qssd_data_pib=8")
           PY
