@@ -111,6 +111,9 @@ jobs:
             grep -q '^PRIME_C03_ARM64_PASS ' build/prime-c03-ether-arm64.log
             grep -q '^PRIME_ARM64_PROTECTED32_PASS ' build/prime-c03-ether-arm64.log
             grep -q '^PRIME_ARM64_BYTE_COPY_PASS ' build/prime-c03-ether-arm64.log
+            grep -q '^PRIME_ETHER_INTEGER_PASS mode=protected32 ' build/prime-c03-ether-arm64.log
+            grep -q '^PRIME_ETHER_INTEGER_PASS mode=long64 ' build/prime-c03-ether-arm64.log
+            grep -q '^PRIME_ETHER_RIP_RELATIVE_PASS$' build/prime-c03-ether-arm64.log
             sed -n 's/^PRIME_C03_ARM64_BENCH //p' build/prime-c03-ether-arm64.log > build/prime-c03-ether-arm64.json
             python3 -m json.tool build/prime-c03-ether-arm64.json >/dev/null
           else
