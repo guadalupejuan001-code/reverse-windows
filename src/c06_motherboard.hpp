@@ -165,6 +165,34 @@ class PcMotherboardC06 {
     std::uint32_t value = 0;
     std::uint8_t bytes = 0;
   };
+  // IRR and ISR are read on every eligible CPU tick. Recompute the priority
+  // only when an interrupt is queued or the current highest vector is removed.
+  class ApicPriorityVectors {
+   public:
+    void set(unsigned vector) {
+      bits_.set(vector);
+      highest_ = std::max(highest_, vector);
+    }
+    void reset(unsigned vector) {
+      bits_.reset(vector);
+      if (vector != highest_) return;
+      highest_ = 0;
+      if (bits_.none()) return;
+      while (vector > 16) {
+        --vector;
+        if (bits_[vector]) {
+          highest_ = vector;
+          return;
+        }
+      }
+    }
+    unsigned highest() const noexcept { return highest_; }
+    const std::bitset<256>& bits() const noexcept { return bits_; }
+
+   private:
+    std::bitset<256> bits_;
+    unsigned highest_ = 0;
+  };
   struct LocalApic {
     explicit LocalApic(cosmic_pc::Cpu* processor = nullptr) : cpu(processor) {
       lvt.fill(kLvtMasked);
@@ -177,7 +205,8 @@ class PcMotherboardC06 {
     std::array<std::uint32_t,6> lvt{};
     std::uint32_t timer_reload = 0, divider = 0;
     std::uint64_t timer_cycles = 0, last_tick = 0;
-    std::bitset<256> pending, in_service, pending_level, in_service_level, pending_ata, pending_sci;
+    ApicPriorityVectors pending, in_service;
+    std::bitset<256> pending_level, in_service_level, pending_ata, pending_sci;
     PendingWrite mmio_pending;
   };
   static constexpr auto kMaxProcessors = cosmic_pc::CpuTopology::kMaxLogical;
@@ -472,12 +501,6 @@ class PcMotherboardC06 {
         (gpu_ && gpu_->claims(start,length)) ||
         (prior_mmio_claim_ && (!prior_mmio_range_claim_ || prior_mmio_range_claim_(start,length))));
   }
-  static unsigned highest_vector(const std::bitset<256>& vectors) {
-    if(vectors.none())return 0;
-    for(unsigned vector=255;vector>=16;--vector)
-      if(vectors[vector])return vector;
-    return 0;
-  }
   static std::uint32_t vector_register(const std::bitset<256>& vectors,unsigned offset) {
     const unsigned first=(offset&0x70U)*2;
     std::uint32_t result=0;
@@ -487,7 +510,7 @@ class PcMotherboardC06 {
   }
   static unsigned processor_priority(const LocalApic& apic) {
     const auto tpr=apic.cpu->apic_task_priority();
-    const auto service=highest_vector(apic.in_service)&0xf0U;
+    const auto service=apic.in_service.highest()&0xf0U;
     return (tpr&0xf0U)>=service?tpr:service;
   }
   static unsigned timer_divisor(const LocalApic& apic) {
@@ -507,10 +530,10 @@ class PcMotherboardC06 {
     if(base>=kLocalApic&&base<kLocalApic+4096) {
       if(!apic.cpu->apic_global_enabled())return std::nullopt;
       const auto r=unsigned(base-kLocalApic);
-      if(r>=0x100&&r<=0x170&&(r&15U)==0)return vector_register(apic.in_service,r);
+      if(r>=0x100&&r<=0x170&&(r&15U)==0)return vector_register(apic.in_service.bits(),r);
       if(r>=0x180&&r<=0x1f0&&(r&15U)==0)
         return vector_register(apic.pending_level|apic.in_service_level,r);
-      if(r>=0x200&&r<=0x270&&(r&15U)==0)return vector_register(apic.pending,r);
+      if(r>=0x200&&r<=0x270&&(r&15U)==0)return vector_register(apic.pending.bits(),r);
       if(const auto lvt=lvt_index(r))return apic.lvt[*lvt];
       switch(r) {
         case 0x20:return apic.cpu->apic_id() << 24;
@@ -620,7 +643,8 @@ class PcMotherboardC06 {
   }
   static unsigned deliverable_lapic_vector(const LocalApic& apic) {
     if(!lapic_on(apic))return 0;
-    const auto vector=highest_vector(apic.pending);
+    const auto vector=apic.pending.highest();
+    if(!vector)return 0;
     return (vector&0xf0U)>(processor_priority(apic)&0xf0U)?vector:0;
   }
   bool interrupt_pending()const {
@@ -705,7 +729,7 @@ class PcMotherboardC06 {
     if(lapic_on(apic)&&!(lvt&kLvtMasked)&&(lvt&255U)>=16)apic.pending.set(lvt&255U);
   }
   void complete_lapic_irq(LocalApic& apic) {
-    const auto vector=highest_vector(apic.in_service);
+    const auto vector=apic.in_service.highest();
     if(!vector)return;
     apic.in_service.reset(vector);
     if(!apic.in_service_level.test(vector))return;
@@ -1072,8 +1096,8 @@ class PcMotherboardC06 {
     return {ticks_,irq_delivered_,pit_irqs_,apic_irqs_,true,true,powered_off_,ata_irq_delivered_,sci_irqs_};
   }
   InterruptState interrupt_state()const{
-    return {pc_.cpu.apic_global_enabled(),lapic_on(bsp()),highest_vector(bsp().pending),
-            highest_vector(bsp().in_service),processor_priority(bsp()),timer_count(bsp())};
+    return {pc_.cpu.apic_global_enabled(),lapic_on(bsp()),bsp().pending.highest(),
+            bsp().in_service.highest(),processor_priority(bsp()),timer_count(bsp())};
   }
   bool secondary_can_run() const noexcept {
     for (unsigned id = 1; id < processor_count_; ++id)

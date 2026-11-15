@@ -1080,6 +1080,8 @@ void queued_lapic_requests_guest(){
   need(board.inject_ps2_key(0x1e,true),"test keyboard did not queue a scan code");
   run(pc,25);
   need(board.evidence().irq_delivered==0,"IRQ was delivered while guest IF was clear");
+  need(board.interrupt_state().pending==0x42,
+       "a later lower-priority IRQ must leave the timer vector highest in IRR");
   code(pc.cpu,0xa100,{0xfb,0xf4,0xeb,0xfd});
   pc.cpu.eip=0xa100;
   run(pc,100);
@@ -1087,6 +1089,13 @@ void queued_lapic_requests_guest(){
        pc.cpu.regs[Cpu::EDI]==0x9402 && board.evidence().apic_irqs==2,
        "LAPIC lost a pending request or delivered vectors out of priority order");
   need(pc.cpu.regs[Cpu::ESP]==0x190000,"queued LAPIC interrupts did not restore the guest stack");
+  need(board.interrupt_state().pending==0&&board.interrupt_state().in_service==0,
+       "delivery and EOI must clear the pending and in-service priorities");
+  pc.cpu.write32(PcMotherboardC06::kLocalApic+0x300,0x400f1); // Self IPI before reset.
+  need(board.interrupt_state().pending==0xf1,"self IPI must queue before reset");
+  pc.boot_long_mode_demo();
+  need(board.interrupt_state().pending==0&&board.interrupt_state().in_service==0,
+       "reset must clear the LAPIC priority state even with a queued vector");
   std::cout<<"C06_LAPIC_QUEUED_IRQ_PASS timer=0x42 keyboard=0x31\n";
 }
 void cr8_lapic_priority_guest(){
