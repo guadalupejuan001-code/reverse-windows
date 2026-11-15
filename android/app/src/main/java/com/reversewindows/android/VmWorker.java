@@ -509,7 +509,10 @@ final class VmWorker {
                 + ",\"android_pss_kib\":" + androidPssKiB
                 + ",\"worker_timing\":{\"step_us\":" + stepNanos / 1000
                 + ",\"frame_us\":" + frameNanos / 1000
-                + ",\"diagnostic_us\":" + statusNanos / 1000 + "}");
+                + ",\"diagnostic_us\":" + statusNanos / 1000
+                + ",\"max_steps_per_slice\":" + MAX_SLICE_STEPS
+                + ",\"target_slice_us\":" + TARGET_SLICE_NS / 1000
+                + ",\"diagnostic_save_interval_ms\":" + DIAGNOSTIC_INTERVAL_MS + "}");
     }
 
     private void publishState(boolean saveNow) {

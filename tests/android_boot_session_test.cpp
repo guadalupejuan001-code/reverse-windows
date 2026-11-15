@@ -275,15 +275,24 @@ void verify_real_mode_ps2(const std::filesystem::path& path, bool via_irq) {
   require(screen(capture_cells(session)).front() == 'K', "Keyboard input reached the wrong guest interface");
 }
 
-void verify_arm64_session(const std::filesystem::path& path) {
+constexpr unsigned kLongModeTestOffset = 0x160;
+
+template <std::size_t N>
+auto long_mode_test_sector(const std::uint8_t (&guest)[N]) {
   auto boot = cosmic_pc::long_mode_boot_disk();
   const std::array<std::uint8_t, 6> signature{0x48,0xb8,0x01,0,0,0};
   const auto start = std::search(boot.begin(), boot.end(), signature.begin(), signature.end());
   require(start != boot.end(), "Long-mode boot sector entry changed");
   // Redirect the canonical boot sector after it enables long mode.
-  constexpr unsigned loop_offset = 0x160, destination = 0x7c00 + loop_offset;
+  constexpr unsigned destination = 0x7c00 + kLongModeTestOffset;
   const std::uint8_t handoff[] = {0xbb,std::uint8_t(destination),std::uint8_t(destination >> 8),0,0,0xff,0xe3};
   std::copy(std::begin(handoff), std::end(handoff), start);
+  static_assert(kLongModeTestOffset + N <= 510, "Guest must fit before the boot signature");
+  std::copy(std::begin(guest), std::end(guest), boot.begin() + kLongModeTestOffset);
+  return boot;
+}
+
+void verify_arm64_session(const std::filesystem::path& path) {
   const std::uint8_t guest[]{
       0x0f,0x09,                              // WBINVD at CPL0, then continue.
       0x48,0xb8,0x83,0,0,0,0x10,0,0,0,      // 2 MiB page starting at physical 64 GiB.
@@ -294,7 +303,7 @@ void verify_arm64_session(const std::filesystem::path& path) {
       0x41,0xbe,0x40,0,0x20,0,               // R14D = end of chain.
       0x48,0x8b,0x36,0x49,0x3b,0xf6,0x75,0xf8,
       0xfa,0xf4};
-  std::copy(std::begin(guest), std::end(guest), boot.begin() + loop_offset);
+  const auto boot = long_mode_test_sector(guest);
   Session::create_disk(path, 1);
   {
     reverse_windows::QssdDisk disk(path);
@@ -337,6 +346,35 @@ void verify_arm64_session(const std::filesystem::path& path) {
   std::cout << "PRIME_C03_NATIVE_SESSION_PASS translated_steps=" << native_steps << '\n';
 }
 
+void verify_idt_diagnostic(const std::filesystem::path& path) {
+  const std::uint8_t guest[] = {0x0f,0x01,0x1c,0x25,0xd0,0x7d,0,0, 0xcc}; // LIDT [0x7dd0]; INT3.
+  auto boot = long_mode_test_sector(guest);
+  const std::uint8_t idtr[] = {0xff,0x0f,0x00,0x50,0x01,0,0,0,0,0}; // 256 entries at 0x15000.
+  std::copy(std::begin(idtr), std::end(idtr), boot.begin() + 0x1d0);
+  Session::create_disk(path, 1);
+  {
+    reverse_windows::QssdDisk disk(path);
+    require(disk.write(0, 1, boot.data()) && disk.flush(), "Could not persist IDT test sector");
+  }
+  Session session(path, 0, Session::BootSource::Disk, -1, 0, Session::kDefaultRamProfile,
+                  {}, {}, {}, Session::kPrimeCpuTopology);
+  require(session.step(6000) == Session::Step::Fault,
+          "INT3 failed to reach the terminal IDT diagnostic after entering long mode");
+  const auto live = session.diagnostic(false);
+  require(live.find("\"cpu_fault\":{\"apic_id\":0,") != std::string::npos &&
+              live.find("opcode=cc") != std::string::npos &&
+              live.find("\"idt_attempts\":[{\"source\":\"software\",\"vector\":3,") != std::string::npos &&
+              live.find("\"entry_address_hex\":\"0000000000015030\",\"entry_size\":16,"
+                        "\"bytes_read\":16,\"gate_bytes_hex\":\"00000000000000000000000000000000\"") !=
+                  std::string::npos,
+          "Immediate Android fault must include the CPU, vector and raw 64-bit gate");
+  require(live.find("\"source\":\"exception\",\"vector\":13,") != std::string::npos &&
+              live.find("\"source\":\"exception\",\"vector\":8,") != std::string::npos &&
+              counter(live, "checkpoint_interval_steps") == 50'000'000,
+          "Android fault must carry nested IDT failures and the profile interval");
+  std::cout << "PRIME_ANDROID_IDT_DIAGNOSTIC_PASS vector=3 gate_bytes=16 nested_vectors=13,8\n";
+}
+
 void write_evidence(const std::filesystem::path& path, const VgaCells& cells,
                     const std::string& before, const std::string& after) {
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -366,6 +404,7 @@ int main(int argc, char** argv) {
     verify_real_mode_ps2(dir.path / "keyboard-irq.rqvd", true);
     verify_real_mode_ps2(dir.path / "keyboard-poll.rqvd", false);
     verify_arm64_session(dir.path / "ether-arm64.rqvd");
+    verify_idt_diagnostic(dir.path / "idt-diagnostic.rqvd");
     const auto disk = dir.path / "android-test.rqvd";
     const auto data_disk = dir.path / "android-data.rqvd";
     const auto vram = dir.path / "android-test-vram.rqvd";

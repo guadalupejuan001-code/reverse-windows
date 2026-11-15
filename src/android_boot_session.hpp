@@ -447,7 +447,12 @@ class AndroidBootSession final {
     const auto* faulted_cpu = secondary_fault ? secondary_fault : &pc_.cpu;
     if (faulted_cpu->fault) {
       out << ",\"cpu_fault\":{\"apic_id\":" << faulted_cpu->apic_id() << ",\"message\":"
-          << cosmic_pc::PcMachine::quote(faulted_cpu->fault->describe()) << '}';
+          << cosmic_pc::PcMachine::quote(faulted_cpu->fault->describe());
+      if (faulted_cpu->fault->idt_attempt_count) {
+        out << ",\"idt_attempts\":";
+        cosmic_pc::PcMachine::write_idt_attempts(out, *faulted_cpu->fault);
+      }
+      out << '}';
     }
     out << ",\"ram_profile\":";
     write_ram_profile(out, pc_, spill_, &pressure_);
@@ -502,6 +507,7 @@ class AndroidBootSession final {
     const auto& mode = pc_.boot_mode_progress();
     out << ",\"boot_progress\":{\"handed_off\":" << (pc_.cpu.instructions ? "true" : "false")
         << ",\"session_steps\":" << previous_boot_steps_ + board_->total_processor_steps()
+        << ",\"checkpoint_interval_steps\":" << (boot_profile_ ? BootProfile::kDefaultCheckpointSteps : 0)
         << ",\"mode_changes\":" << mode.changes << ",\"last_mode_from\":\"" << mode.from
         << "\",\"last_mode_to\":\"" << mode.to << "\",\"last_mode_step\":" << mode.step
         << ",\"restarts\":" << restarts_ << ",\"last_restart\":\"" << last_restart_ << "\"}";

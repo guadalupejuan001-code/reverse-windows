@@ -37,9 +37,9 @@ jobs:
         abi: [arm64-v8a, x86_64]
     env:
       ANDROID_ABI: ${{ matrix.abi }}
-      ANDROID_APP_ID: com.reversewindows.android.prime.smp
-      ANDROID_VERSION: "0.2.6"
-      ANDROID_VERSION_CODE: "24"
+      ANDROID_APP_ID: com.reversewindows.android.prime.smp.r027
+      ANDROID_VERSION: "0.2.7"
+      ANDROID_VERSION_CODE: "25"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,7 +53,7 @@ jobs:
         run: |
           python3 scripts/verify_deps.py --checkout
           printf 'MUNDO_X_SHA=%s\n' "$(git -C deps/mundo-X rev-parse HEAD)" >> "$GITHUB_ENV"
-      - name: Verify synthetic ISO boot, CPU mode transitions, keyboard and QSSD reboot
+      - name: Verify synthetic ISO boot, CPU exceptions, keyboard and QSSD reboot
         if: matrix.abi == 'arm64-v8a'
         run: |
           cmake -S . -B build \
@@ -64,7 +64,7 @@ jobs:
           cmake --build build --target reverse_windows_android_boot_session_test \
             reverse_windows_ether_core_rules_test \
             reverse_windows_atapi_cdrom_guest_test reverse_windows_c06_motherboard_guest_test \
-            reverse_windows_smp_guest_test \
+            reverse_windows_smp_guest_test reverse_windows_c04_guest_idt \
             reverse_windows_protected_entry_test reverse_windows_protected_real_transition_test \
             reverse_windows_cpu_profile_test reverse_windows_lock_rmw_test \
             reverse_windows_x86_long_mode_test reverse_windows_x86_long_null_ss_test reverse_windows_pc_video_test \
@@ -75,7 +75,7 @@ jobs:
             reverse_windows_x86_mmx_test reverse_windows_x86_x87_arithmetic_oracle_test \
             reverse_windows_x86_x87_state_test reverse_windows_c09r1_fxstate_test --parallel 2
           ctest --test-dir build --output-on-failure \
-            -R '^(reverse_windows_android_|reverse_windows_ether_core_rules$|reverse_windows_pc_video$|reverse_windows_c06_real_motherboard$|reverse_windows_smp_guest$|reverse_windows_protected_entry_stack$|reverse_windows_protected_real_transition$|reverse_windows_cpu_profile$|reverse_windows_lock_rmw$|reverse_windows_x64_optical_qssd$|reverse_windows_x86_(far_transfer64|system64|long_mode|long_null_ss|sse|mmx|x87)|reverse_windows_x86_c09r1_stage5_cvt_fxsr$|reverse_windows_c09r1_x87_fxsave_context$)'
+            -R '^(reverse_windows_android_|reverse_windows_ether_core_rules$|reverse_windows_pc_video$|reverse_windows_c04_real_guest_idt$|reverse_windows_c06_real_motherboard$|reverse_windows_smp_guest$|reverse_windows_protected_entry_stack$|reverse_windows_protected_real_transition$|reverse_windows_cpu_profile$|reverse_windows_lock_rmw$|reverse_windows_x64_optical_qssd$|reverse_windows_x86_(far_transfer64|system64|long_mode|long_null_ss|sse|mmx|x87)|reverse_windows_x86_c09r1_stage5_cvt_fxsr$|reverse_windows_x86_c09r1_x87_fxsave_context$)'
       - name: Install Android command-line tools and pinned packages
         uses: android-actions/setup-android@v3
         with:
@@ -346,6 +346,12 @@ jobs:
           assert report["guest_gpu"]["logical_vram_bytes"] == 120_000_000_000
           assert report["ata"]["identify_data_transfers"] == 1
           assert report["boot_progress"]["handed_off"] and report["boot_profile"]["checkpoint_interval_steps"] == 50_000_000
+          assert report["boot_progress"]["checkpoint_interval_steps"] == 50_000_000
+          timing = report["worker_timing"]
+          assert timing["max_steps_per_slice"] == 50_000 and timing["target_slice_us"] == 8_000
+          assert timing["diagnostic_save_interval_ms"] == 5_000
+          topology = report["cpu_topology"]
+          assert (topology["cores"], topology["threads_per_core"], topology["logical_processors"]) == (8, 2, 16)
           assert report["ram_profile"]["usable_bytes"] == 64 << 30, report["ram_profile"]
           ether = report["ether_arm64"]
           assert ether["mundo_x_source_sha"] == os.environ["MUNDO_X_SHA"]
