@@ -1,15 +1,15 @@
 {
   "schema": "reverse-windows-dependency-lock-v1",
-  "recorded_at": "2026-11-14",
+  "recorded_at": "2026-11-15",
   "policy": "exact-commit-only-no-silent-fallback-no-automatic-merge",
   "components": [
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "88a51096f2d5c3f5428d1e3040a1207e355df5b5",
+      "commit": "b9eee187b96ab905821ee1ebc98c6e6173e1a34f",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
-      "status": "candidate-prime-c08-pci-memory-map",
+      "status": "candidate-prime-ether-arm64-infinitecore",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/pc_video.hpp",
@@ -24,6 +24,7 @@
         "pc-android/native/tests/pc_memory_test.cpp",
         "pc-android/native/tests/pc_memory_fabric_test.cpp",
         "pc-android/native/memory_fabric.hpp",
+        "native/include/mundo_x/infinite_session.hpp",
         "pc-android/native/x86_wide_integer.hpp",
         "pc-android/native/x86_ether_arm64.hpp",
         "pc-android/native/x86_ether_arm64.inc",
