@@ -137,7 +137,8 @@ void paged_boot_batches_with_timer(){
     PcMotherboardC06 board(pc);
     pc.enable_boot_acceleration(accelerate);
     cpu.enable_page_translation_cache(accelerate);
-    cpu.enable_ether_arm64_blocks(accelerate && fixture == Fixture::Arm64);
+    cpu.enable_ether_arm64_blocks(accelerate &&
+        (fixture == Fixture::Arm64 || fixture == Fixture::Counter));
     pc.enable_boot_hotspots();
     constexpr auto apic=Cpu::kLocalApicAddress;
     // Map the APIC for the guest handler. The address remains MMIO.
@@ -240,7 +241,7 @@ void paged_boot_batches_with_timer(){
       need(scalar==accelerated,"paged acceleration changed the timer boundary or guest result");
     }
   }
-  std::cout<<"ETHER_PAGED_BATCH_IRQ_PASS rep=1 byte_scan=1 counter=1 arm64="<<Cpu::ether_arm64_host()<<'\n';
+  std::cout<<"ETHER_PAGED_BATCH_IRQ_PASS rep=1 byte_scan=1 arm64="<<Cpu::ether_arm64_host()<<" counter=1\n";
 }
 void shift_boot_with_pit_guest(){
   const auto check=[](bool accelerate,std::uint8_t period_low){
