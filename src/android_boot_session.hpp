@@ -607,7 +607,9 @@ class AndroidBootSession final {
         << ",\"resident_bytes\":" << metrics.allocated_bytes
         << ",\"resident_metadata_bytes\":" << metrics.metadata_bytes
         << ",\"pattern_pages\":" << metrics.pattern_pages
-        << ",\"sparse_word_pages\":" << metrics.sparse_word_pages;
+        << ",\"sparse_word_pages\":" << metrics.sparse_word_pages
+        << ",\"pattern_delta_pages\":" << metrics.pattern_delta_pages
+        << ",\"pattern_delta_bytes\":" << metrics.pattern_delta_bytes;
     if (pressure && pressure->target) {
       const auto status = pressure->status == Adjustment::Applied ? "applied" :
                           pressure->status == Adjustment::Reclaiming ? "reclaiming" : "blocked";
