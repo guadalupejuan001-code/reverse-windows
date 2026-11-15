@@ -43,7 +43,7 @@ La ejecución normal de `prime_gpu_scene.exe` comprueba y usa DMA en el transpor
 
 ### Direct3D, DMA programado y VidMm
 
-`ReversePrimeRender.inf` instala el miniport de desarrollo para el mismo dispositivo PCI que el transporte WDM. Son controladores alternativos. La compilación genera los catálogos y empaqueta cada controlador por separado. Los paquetes de CI están sin firmar.
+`ReversePrimeRender.inf` instala el miniport de desarrollo para el mismo dispositivo PCI que el transporte WDM. Son controladores alternativos. CI empaqueta WDDM con firma de prueba, certificado público y ejecutables de diagnóstico. El paquete WDDM requiere un Windows invitado habilitado para firmas de prueba.
 
 El módulo de usuario crea un contexto, valida las instrucciones DXBC de la escena y agrupa los dibujos hasta `CopyResource` o `Flush`. Reserva el destino de color con VidMm y entrega la geometría a `pfnRenderCb`. El miniport valida una copia del comando, recibe de Windows la ubicación de la asignación en el segmento de 120 GB y programa el DMA físico desde `DxgkDdiSubmitCommand`. PrimeVGC dibuja en esa ubicación con REgraphics. La paginación transfiere el contenido entre VRAM y las páginas físicas de la RAM invitada. `CopyResource` espera el resultado mediante el bloqueo de la asignación y convierte BGRA a RGBA.
 
