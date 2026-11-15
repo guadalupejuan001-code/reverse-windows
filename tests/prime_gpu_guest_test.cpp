@@ -295,6 +295,12 @@ void verify(const std::filesystem::path& volume) {
     driver.read(moved_bar + RWGPU_REG_STATUS, 0xe044);
     driver.copy(output + size, moved_bar + RWGPU_STAGE_OFFSET, size);
     driver.run(pc);
+    const auto stage = moved_bar + RWGPU_STAGE_OFFSET;
+    const auto first_word = std::uint32_t(payload[0]) | (std::uint32_t(payload[1]) << 8) |
+        (std::uint32_t(payload[2]) << 16) | (std::uint32_t(payload[3]) << 24);
+    require(pc.cpu.mmio_read32_hook(stage) == first_word &&
+            pc.cpu.mmio_write32_hook(stage, first_word).value_or(false),
+            "The GPU staging buffer must retain little-endian dword transfers");
     require(pc.cpu.read32(0xe000) == GuestGpuC08::pci_id && pc.cpu.read32(0xe004) == 0x03020001 &&
              pc.cpu.read32(0xe008) == ~(RWGPU_BAR_BYTES - 1) &&
              pc.cpu.read32(0xe00c) == RWGPU_MAGIC && pc.cpu.read64(0xe010) == RWGPU_LOGICAL_BYTES,
