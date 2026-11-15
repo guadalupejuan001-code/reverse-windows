@@ -116,9 +116,11 @@ $certificateParams = @{
 }
 $cert = New-SelfSignedCertificate @certificateParams
 $thumb = $cert.Thumbprint
-$root = "Cert:\CurrentUser\Root\$thumb"
+$rootStore = 'Cert:\LocalMachine\Root'
+$root = Join-Path $rootStore $thumb
 try {
     $sign = @('sign', '/fd', 'SHA256', '/s', 'My', '/sha1', $thumb)
+    Write-Output 'Signing the PrimeVGC binaries for development'
     Invoke-Checked $signTool ($sign + @($miniportSys, $umdDll))
     # Generate the catalog after embedding signatures so it describes the
     # exact signed binaries that are actually shipped.
@@ -128,7 +130,9 @@ try {
     Invoke-Checked $signTool ($sign + @($catalog))
     $certPath = Join-Path $folder 'PrimeVGC-Development-Test.cer'
     Export-Certificate -Cert $cert -FilePath $certPath | Out-Null
-    Import-Certificate -FilePath $certPath -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
+    # The per-user root store can display a Windows trust dialog on a headless runner.
+    Write-Output 'Verifying the signed PrimeVGC package'
+    Import-Certificate -FilePath $certPath -CertStoreLocation $rootStore -Confirm:$false | Out-Null
     Invoke-Checked $signTool @('verify', '/pa', $miniportSys)
     Invoke-Checked $signTool @('verify', '/pa', $catalog)
     foreach ($name in @('ReversePrimeRender.sys', 'ReversePrimeRenderUmd.dll', 'ReversePrimeRender.inf')) {
