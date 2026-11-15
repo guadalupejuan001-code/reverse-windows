@@ -170,8 +170,9 @@ void verify_ram_spill(const std::filesystem::path& directory) {
     auto file = std::make_unique<Backing>(cache, pc.cpu.memory.size(), 32 * page);
     auto* file_stats = file.get();
     pc.cpu.memory.attach_page_backing(std::move(file));
-    // Non-repeating writes to 20 distinct guest pages cross the real limit.
+    // Give each page too many changed words to keep it in compact RAM.
     for (unsigned index = 0; index < 20; ++index) {
+      pc.cpu.memory.fill(address + index * page + 256, 0x58, 512);
       pc.cpu.write32(address + index * page, 0x50580000U + index);
       pc.cpu.write32(address + index * page + page - 4, 0xdeadc0deU - index);
     }
@@ -195,6 +196,40 @@ void verify_ram_spill(const std::filesystem::path& directory) {
     require(pc.cpu.memory.metrics().spilled_pages == 0 && file_stats->file_payload_bytes() == 0 &&
                 pc.cpu.read32(address) == 0,
             "Guest RAM reset must discard the old file-backed image");
+
+    // The same high guest addresses with few changes now fit in compact RAM.
+    constexpr unsigned guest_pages = 20;
+    constexpr auto compact_bytes = guest_pages * (sizeof(std::uint64_t) +
+        2 * (sizeof(std::uint16_t) + sizeof(std::uint64_t)));
+    for (unsigned index = 0; index < guest_pages; ++index) {
+      pc.cpu.write32(address + index * page, 0x12120000U + index);
+      pc.cpu.write32(address + index * page + page - 4, 0xaabbcc00U + index);
+    }
+    require(pc.cpu.memory.adjust_payload_budget(compact_bytes, guest_pages) == Adjustment::Applied,
+            "Guest pressure must be able to reclaim the dense pages as exact pattern deltas");
+    const auto compact = pc.cpu.memory.metrics();
+    require(compact.pattern_delta_pages == guest_pages && compact.allocated_bytes == compact_bytes &&
+                compact.pattern_delta_bytes == compact_bytes && compact.backing_writes == 0 &&
+                file_stats->file_payload_bytes() == 0,
+            "Sparse guest writes should fit the compact budget without touching QSSD");
+    for (unsigned index = 0; index < guest_pages; ++index) {
+      require(pc.cpu.read32(address + index * page) == 0x12120000U + index &&
+                  pc.cpu.read32(address + index * page + page - 4) == 0xaabbcc00U + index,
+              "Compact guest reads lost a change above 4 GiB");
+    }
+    require(pc.cpu.memory.adjust_payload_budget(0, guest_pages) == Adjustment::Applied &&
+                pc.cpu.memory.metrics().pattern_delta_pages == 0 &&
+                file_stats->file_payload_bytes() == guest_pages * page,
+            "The QSSD fallback must materialize complete compact pages when needed");
+    for (unsigned index = 0; index < guest_pages; ++index) {
+      require(pc.cpu.read32(address + index * page) == 0x12120000U + index &&
+                  pc.cpu.read32(address + index * page + 8) == 0 &&
+                  pc.cpu.read32(address + index * page + page - 4) == 0xaabbcc00U + index,
+              "Compact pages changed after transfer to QSSD");
+    }
+    std::cout << "PRIME_RAM_PATTERN_DELTA_GUEST_PASS high_address=" << address
+              << " dense_payload_bytes=" << guest_pages * page
+              << " compact_payload_bytes=" << compact_bytes << " initial_qssd_writes=0\n";
   }
   std::cout << "REVERSE_WINDOWS_ANDROID_RAM_SPILL_PASS anonymous_file=true resident_cap=true"
                " limit_failure_preserves_data=true reset_releases_slots=true\n";
