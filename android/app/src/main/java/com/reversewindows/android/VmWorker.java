@@ -29,7 +29,7 @@ final class VmWorker {
         void onState(String json, boolean running, boolean hasSession, boolean stopped, boolean detailed);
         void onFrame(Frame frame);
         void onError(String message, boolean hasSession);
-        void onDiskCreated();
+        void onDiskCreated(boolean data);
         void onHardwareChecked(String json);
         void onSavedDiagnostic(String json);
         void onDiagnosticExported(boolean saved);
@@ -56,6 +56,7 @@ final class VmWorker {
             ",\"application_id\":" + JSONObject.quote(BuildConfig.APPLICATION_ID) +
             ",\"mundo_x_sha\":" + JSONObject.quote(BuildConfig.MUNDO_X_SHA);
     private static final int DISK_GIB = 64;
+    private static final int DATA_DISK_GIB = 8 * 1024 * 1024;
     private static final int INITIAL_SLICE_STEPS = 4096;
     private static final int MIN_SLICE_STEPS = 64;
     private static final int MAX_SLICE_STEPS = 16384;
@@ -71,6 +72,7 @@ final class VmWorker {
     private final Context context;
     private final ContentResolver resolver;
     private final File disk;
+    private final File dataDisk;
     private final AtomicFile diagnosticFile;
     private final Listener listener;
     private final HandlerThread thread = new HandlerThread("reverse-windows-vm");
@@ -101,10 +103,11 @@ final class VmWorker {
     private boolean reclaimRam;
     private long nextRamSample;
 
-    VmWorker(Context context, File disk, Listener listener) {
+    VmWorker(Context context, File disk, File dataDisk, Listener listener) {
         this.context = context.getApplicationContext();
         this.resolver = this.context.getContentResolver();
         this.disk = disk;
+        this.dataDisk = dataDisk;
         this.diagnosticFile = new AtomicFile(new File(this.context.getFilesDir(), DIAGNOSTIC_FILE));
         this.listener = listener;
         thread.start();
@@ -156,11 +159,13 @@ final class VmWorker {
         });
     }
 
-    void createDisk() {
+    void createDisk(boolean data) {
         worker.post(() -> {
+            if (released || handle != 0) return;
             try {
-                NativeMachine.createDisk(disk.getAbsolutePath(), DISK_GIB);
-                send(listener::onDiskCreated);
+                File image = data ? dataDisk : disk;
+                NativeMachine.createDisk(image.getAbsolutePath(), data ? DATA_DISK_GIB : DISK_GIB);
+                send(() -> listener.onDiskCreated(data));
             } catch (RuntimeException | LinkageError error) {
                 report(error);
             }
@@ -229,16 +234,18 @@ final class VmWorker {
                 debugSelfTest = debug;
                 lastLoggedStatus = "";
                 lastDiagnostic = "";
-                String path = source == NativeMachine.BOOT_SELF_TEST ? "" : disk.getAbsolutePath();
+                boolean selfTest = source == NativeMachine.BOOT_SELF_TEST;
+                String path = selfTest ? "" : disk.getAbsolutePath();
+                String dataPath = !selfTest && dataDisk.isFile() ? dataDisk.getAbsolutePath() : "";
                 if (source == NativeMachine.BOOT_ISO) {
                     if (iso == null) throw new IOException("Elige primero una imagen ISO.");
                     try (ParcelFileDescriptor fd = openIso(iso)) {
                         int createGiB = disk.exists() ? 0 : DISK_GIB;
                         handle = NativeMachine.open(context, path, createGiB, fd.getFd(),
-                                isoSize(iso, fd), source);
+                                isoSize(iso, fd), source, dataPath);
                     }
                 } else {
-                    handle = NativeMachine.open(context, path, 0, -1, 0, source);
+                    handle = NativeMachine.open(context, path, 0, -1, 0, source, dataPath);
                 }
                 if (handle == 0) throw new IllegalStateException("La máquina no se pudo iniciar.");
                 outcome = NativeMachine.RUNNING;

@@ -30,7 +30,7 @@ int main() {
       ("reverse-qssd-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   const auto path=root.string()+".rqvd";
   const auto corrupt=root.string()+"-corrupt.rqvd";
-  const auto enormous=root.string()+"-16tib.rqvd";
+  const auto enormous=root.string()+"-8pib.rqvd";
   try {
     reverse_windows::QssdDisk::create(path,64);
     need(std::filesystem::file_size(path)==64,"sparse disk allocated physical capacity at creation");
@@ -161,18 +161,40 @@ int main() {
       need(written&&!failed,"QSSD concurrent reader saw a torn transaction");
       std::cout<<"REVERSE_QSSD_CONCURRENT_SNAPSHOT_PASS commits="<<volume.stats().commits<<"\n";
     }
-    // Logical capacity is backed by a sparse journal, NOT by 16TiB of flash.
-    reverse_windows::QssdDisk::create(enormous,16384);
+    using reverse_windows::QssdDisk;
+    constexpr auto max_bytes=QssdDisk::kMaxLogicalBytes;
+    constexpr auto last_sector=(max_bytes-QssdDisk::kBlockSize)/QssdDisk::kSectorSize;
+    // The two block indices differ only in bits above the old 32-bit index.
+    constexpr auto lower_sector=((1ULL<<32)-1)*QssdDisk::kBlockSize/QssdDisk::kSectorSize;
+    std::array<std::uint8_t,QssdDisk::kBlockSize> upper{},lower{},actual{};
+    upper.fill(0x5a);
+    lower.fill(0xa5);
+    QssdDisk::create_bytes(enormous,max_bytes);
     {
-      reverse_windows::QssdDisk huge(enormous);
-      std::array<std::uint8_t,4096> data{},check{};
-      data.fill(0x5a);
-      need(huge.bytes()==16384*reverse_windows::QssdDisk::kGiB,"16TiB logical address invalid");
-      need(huge.write(huge.sectors()-8,8,data.data()),"16TiB last block write failed");
-      need(huge.read(huge.sectors()-8,8,check.data())&&check==data,"16TiB tail data incorrect");
-      need(huge.stats().physical_bytes<4096,"sparse logical disk inflated backing file");
+      QssdDisk huge(enormous);
+      need(huge.bytes()==max_bytes,"8 PiB logical capacity differs from the header");
+      need(huge.write(lower_sector,8,lower.data())&&huge.write(last_sector,8,upper.data()),
+           "8 PiB disk write failed");
+      need(huge.read(lower_sector,8,actual.data())&&actual==lower,
+           "8 PiB tail write aliased the low 32-bit block");
+      need(huge.read(last_sector,8,actual.data())&&actual==upper,
+           "8 PiB tail data incorrect");
+      need(huge.stats().physical_bytes<4096&&huge.checkpoint(),
+           "Sparse disk used excessive storage or failed to checkpoint");
+    }
+    need(QssdDisk::compact(enormous).checkpoint_saved,"8 PiB compaction lost its checkpoint");
+    {
+      QssdDisk huge(enormous,QssdDisk::Access::ReadOnly);
+      need(huge.recovery_stats().used_checkpoint&&huge.bytes()==max_bytes,
+           "8 PiB index was not recovered from the compacted checkpoint");
+      need(huge.read(lower_sector,8,actual.data())&&actual==lower&&
+           huge.read(last_sector,8,actual.data())&&actual==upper,
+           "Compaction or checkpoint recovery changed a high-address block");
     }
     std::filesystem::remove(enormous);
+    std::filesystem::remove(enormous+".rqix");
+    rejects([&]{QssdDisk::create_bytes(enormous,max_bytes+QssdDisk::kBlockSize);},
+            "QSSD accepted capacity above its supported range");
     // Full journal corruption MUST be rejected, not silently reinterpreted.
     reverse_windows::QssdDisk::create(corrupt,1);
     {
@@ -200,6 +222,7 @@ int main() {
     std::filesystem::remove(path,ignored);
     std::filesystem::remove(corrupt,ignored);
     std::filesystem::remove(enormous,ignored);
+    std::filesystem::remove(enormous+".rqix",ignored);
     std::cerr<<"REVERSE_QSSD_TEST_FAIL: "<<error.what()<<"\n";
     return 1;
   }

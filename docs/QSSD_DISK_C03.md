@@ -5,7 +5,7 @@ Status: CI-validated development branch, not Windows 10 installation. Based on C
 ## Implemented
 
 - A native BlockDisk contract shared by the RAW .rvdisk backend and new .rqvd backend. BIOS INT 13h uses the selected backend, with authentic x86 guest instructions.
-- .rqvd supports a 1 GiB to 16 TiB logical sparse disk (the format supports 2^32 chunks of 4 KiB). Creation writes a 64-byte header without reserving the full guest capacity. Actual written bytes consume real flash storage.
+- .rqvd supports sparse disks from 1 GiB to 8 PiB with 4 KiB blocks. The journal keeps its 64-bit block numbers, and the in-memory index grows in depth for disks above 16 TiB. Creation writes a 64-byte header. Actual written bytes consume real flash storage.
 - 4 KiB blocks, 512-byte sectors, partial-block read/modify/write and strict bounds.
 - Append-only RAW, ZERO, repeating PATTERN (1–32 bytes), and REF records. Dedup candidates are compared byte for byte; hashes alone never prove equality. The recent-content index is bounded; some duplicate content can remain.
 - Immutable copy-on-write radix index and actual qssd::StateBus authoritative committed epochs. Multi-block writes publish one root; concurrent readers see one committed version.
@@ -38,7 +38,7 @@ The local ISO is read-only and must not be uploaded to CI. The separate REVERSE 
 4. Real x86 BIOS EDD AH=43 and AH=42 sector write/read through the QSSD backend.
 5. Authentic x86 MBR boot code from persistent QSSD.
 6. Concurrent reads through qSSD epochs while two-block writes commit atomically.
-7. 16 TiB logical high-address write without 16 TiB host allocation.
+7. 8 PiB sparse addressing across the 32-bit block boundary, followed by compaction and checkpoint recovery.
 8. Original x86/x64 demos, legacy RAW HDD, and synthetic El Torito checks remain in the workflow.
 
 No real Windows ISO is supplied to GitHub Actions. Passing these tests does not demonstrate a Windows installation, a usable Windows storage driver, or faster performance than physical flash.

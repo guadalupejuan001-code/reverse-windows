@@ -77,8 +77,8 @@ void lba28(std::vector<std::uint8_t>& p,std::uint32_t sector){
   out8(p,0x1f4,std::uint8_t(sector>>8));
   out8(p,0x1f5,std::uint8_t(sector>>16));
 }
-void lba48(std::vector<std::uint8_t>& p,std::uint64_t sector){
-  out8(p,0x1f6,0xe0);
+void lba48(std::vector<std::uint8_t>& p,std::uint64_t sector,std::uint8_t drive=0xe0){
+  out8(p,0x1f6,drive);
   out8(p,0x1f2,0);
   out8(p,0x1f3,std::uint8_t(sector>>24));
   out8(p,0x1f4,std::uint8_t(sector>>32));
@@ -393,15 +393,73 @@ void test_corrupt_and_torn(const std::string& path){
   }
   std::cout<<"C07_QSSD_CORRUPT_REJECT_TORN_RECOVER_PASS\n";
 }
+
+void test_max_data_disk(const std::string& boot_path,const std::string& data_path){
+  constexpr auto capacity=QssdDisk::kMaxLogicalBytes;
+  constexpr auto last_sector=capacity/QssdDisk::kSectorSize-1;
+  constexpr auto slave=std::uint8_t{0xf0};
+  std::array<std::uint8_t,512> payload{},read{};
+  for(std::size_t i=0;i<payload.size();++i)payload[i]=std::uint8_t(i*29+i/5);
+  QssdDisk::create(data_path,capacity/QssdDisk::kGiB);
+  need(std::filesystem::file_size(data_path)==64,"Empty data disk preallocated guest capacity");
+  {
+    QssdDisk boot(boot_path),data(data_path);
+    const auto boot_commits=boot.stats().commits;
+    PcMachine pc(16*1024*1024);boot32(pc);
+    reverse_windows::BiosHardDisk bios(pc,boot);
+    PcMotherboardC06 board(pc,&boot,{},0,{},&data);
+    pc.enable_boot_acceleration();
+    pc.cpu.memory.write_block(0xb000,payload.data(),payload.size());
+
+    std::vector<std::uint8_t> code;
+    out8(code,0x3f6,2); // Poll task-file status for both drives.
+    out8(code,0x1f6,slave);out8(code,0x1f7,0xec);rep_words(code,true,0xa000);
+    in8_store(code,0x1f7,0x9600);
+    lba48(code,last_sector,slave);out8(code,0x1f7,0x34);rep_words(code,false,0xb000);
+    out8(code,0x1f7,0xea);in8_store(code,0x1f7,0x9601);
+    lba48(code,last_sector,slave);out8(code,0x1f7,0x24);rep_words(code,true,0xb400);
+    in8_store(code,0x1f7,0x9602);
+    lba48(code,last_sector+1,slave);out8(code,0x1f7,0x24);in8_store(code,0x1f1,0x9603);
+    out8(code,0x1f6,0xe0);out8(code,0x1f7,0xec);rep_words(code,true,0xa400);
+    in8_store(code,0x1f7,0x9604);ins(code,{0xf4});
+    program(pc,code);
+
+    need(pc.cpu.read64(0xa000+100*2)==last_sector+1,
+         "Guest IDENTIFY truncated the 8 PiB sector count");
+    need(pc.cpu.read64(0xa400+100*2)==boot.sectors(),
+         "Guest device selection reported the data capacity on the boot drive");
+    need(pc.cpu.read16(0xa000+19*2)!=pc.cpu.read16(0xa400+19*2),
+         "Boot and data disks must have distinct ATA serial numbers");
+    need(pc.cpu.memory[0x9600]==0x50&&pc.cpu.memory[0x9601]==0x50&&
+         pc.cpu.memory[0x9602]==0x50&&pc.cpu.memory[0x9603]==0x10&&pc.cpu.memory[0x9604]==0x50,
+         "Data disk I/O status or end-of-device error is incorrect");
+    pc.cpu.memory.read_block(0xb400,read.data(),read.size());
+    need(read==payload,"Guest read the wrong bytes from the last data-disk sector");
+    need(data.stats().commits==1&&boot.stats().commits==boot_commits,
+         "A data-disk write reached the boot journal or failed to commit");
+    need(board.attached_data_ata()->counters().write_sectors==1&&
+         board.attached_ata()->counters().write_sectors==0,
+         "ATA wrote through the wrong device");
+  }
+  QssdDisk reopened(data_path,QssdDisk::Access::ReadOnly);
+  need(reopened.read(last_sector,1,read.data())&&read==payload,
+       "Full address did not survive data-journal replay");
+  need(reopened.stats().physical_bytes<8192,"Data disk expanded to its logical capacity");
+  std::cout<<"QSSD_DATA_GUEST_PASS bytes="<<capacity<<" last_lba="<<last_sector
+           <<" physical_bytes="<<reopened.stats().physical_bytes<<" replay=true\n";
+}
 }
 int main(){
   const auto root=std::filesystem::temp_directory_path()/
      ("reverse-ata-c07-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   const auto path=root.string()+".rqvd";
+  const auto data_path=root.string()+".data.rqvd";
   try{
     QssdDisk::create(path,256);
     run_device(path);
     test_corrupt_and_torn(path);
+    test_max_data_disk(path,data_path);
+    std::filesystem::remove(data_path);
     std::filesystem::remove(path);
     std::cout<<"REVERSE_WINDOWS_C07_REAL_ATA_PASS checks="<<checks
              <<" pci_class=0101 pio=true irq14=true qssd=true windows_booted=false\n";
@@ -409,6 +467,7 @@ int main(){
   }catch(const std::exception& e){
     std::cerr<<"REVERSE_WINDOWS_C07_REAL_ATA_FAIL "<<e.what()<<"\n";
     std::error_code ignored;std::filesystem::remove(path,ignored);
+    std::filesystem::remove(data_path,ignored);
     return 1;
   }
 }
