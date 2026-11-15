@@ -605,6 +605,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         }
         updateControls();
         if (fault && !wasFault) showTrace(true);
+        if (session && !wasSession) restoreGuestFocus();
         if ((session && !wasSession) || (fault && !wasFault)) showBootStatus();
     }
 
@@ -887,8 +888,14 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         state.putString("diagnosticToExport", diagnosticToExport);
     }
 
+    private boolean canQueueGuestInput() {
+        // The worker, which also handles foreground changes, owns the
+        // running flag. The status broadcast can arrive after the first key.
+        return session && !pending && !fault && !terminal;
+    }
+
     private void sendGuestKey(int ascii, int scan) {
-        if (session && running && !pending && !fault) {
+        if (canQueueGuestInput()) {
             worker.key(ascii, scan, true);
             worker.key(ascii, scan, false);
         }
@@ -896,7 +903,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
 
     @Override
     public boolean onKey(KeyEvent event) {
-        if (!session || !running || pending || fault) return false;
+        if (!canQueueGuestInput()) return false;
         int ascii = GuestKeys.ascii(event);
         int scan = GuestKeys.scan(event.getKeyCode(), ascii);
         if (ascii == 0 && scan == 0) return false;
@@ -909,10 +916,11 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
 
     @Override
     public void onText(CharSequence text) {
+        if (!canQueueGuestInput()) return;
         for (int index = 0; index < Math.min(text.length(), 256); index++) {
             char key = text.charAt(index);
             int scan = GuestKeys.scanAscii(key);
-            if (scan == 0 || !session || !running || pending || fault) continue;
+            if (scan == 0) continue;
             boolean shift = GuestKeys.needsShift(key);
             if (shift) worker.key(0, 0x2a, true);
             sendGuestKey(key == '\n' ? 13 : key, scan);
@@ -924,6 +932,16 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     public boolean dispatchKeyEvent(KeyEvent event) {
         if (monitor != null && monitor.hasFocus() && onKey(event)) return true;
         return super.dispatchKeyEvent(event);
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) restoreGuestFocus();
+    }
+
+    private void restoreGuestFocus() {
+        if (monitor != null && monitor.isShown() && canQueueGuestInput()) monitor.requestFocus();
     }
 
     @Override
