@@ -59,6 +59,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     };
 
     private File disk;
+    private File dataDisk;
     private SharedPreferences prefs;
     private Uri iso;
     private String isoName;
@@ -73,6 +74,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private Button selectIso;
     private Button ejectIso;
     private Button createDisk;
+    private Button createDataDisk;
     private Button bootIso;
     private Button bootDisk;
     private Button biosTest;
@@ -103,6 +105,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
         disk = new File(getFilesDir(), "windows.rqvd");
+        dataDisk = new File(getFilesDir(), "windows-data.rqvd");
         prefs = getSharedPreferences("vm", MODE_PRIVATE);
         String savedIso = prefs.getString("iso", "");
         if (!savedIso.isEmpty()) {
@@ -111,7 +114,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         }
         if (savedState != null)
             diagnosticToExport = savedState.getString("diagnosticToExport", "");
-        worker = new VmWorker(this, disk, this);
+        worker = new VmWorker(this, disk, dataDisk, this);
         buildScreen();
         updateControls();
         worker.loadDiagnostic();
@@ -230,9 +233,12 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         biosTest.setId(R.id.vm_bios_test);
         pair(bootRow, bootDisk, biosTest);
 
-        createDisk = action("Crear QSSD de 64 GiB", false, this::prepareDisk);
+        createDisk = action("Crear QSSD de 64 GiB", false, () -> prepareDisk(false));
         createDisk.setId(R.id.vm_create_disk);
         add(setup, createDisk, 6);
+        createDataDisk = action("Añadir QSSD de datos de 8 PiB", false, () -> prepareDisk(true));
+        createDataDisk.setId(R.id.vm_create_data_disk);
+        add(setup, createDataDisk, 6);
 
         hardwareCheck = action("Comprobar equipo virtual", false, this::checkHardware);
         hardwareCheck.setId(R.id.vm_hardware_check);
@@ -317,17 +323,21 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         updateControls();
     }
 
-    private void prepareDisk() {
+    private void prepareDisk(boolean data) {
         new AlertDialog.Builder(this)
-                .setTitle("Crear disco virtual")
-                .setMessage("El QSSD mostrará 64 GiB al invitado. El archivo del teléfono crece conforme Windows guarda datos.")
+                .setTitle(data ? "Crear QSSD de datos" : "Crear disco virtual")
+                .setMessage(data
+                        ? "Añade 8 PiB lógicos. El archivo crece con lo que guardes. En Windows 10 "
+                            + "1709 o posterior, inicializa el disco como GPT y usa formato rápido "
+                            + "NTFS con unidades de asignación de 2 MiB."
+                        : "El QSSD mostrará 64 GiB al invitado. El archivo del teléfono crece conforme Windows guarda datos.")
                 .setNegativeButton("Cancelar", null)
                 .setPositiveButton("Crear", (dialog, which) -> {
                     pending = true;
                     status.setText("Creando QSSD…");
                     status.setTextColor(TEXT);
                     updateControls();
-                    worker.createDisk();
+                    worker.createDisk(data);
                 })
                 .show();
     }
@@ -653,11 +663,12 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     }
 
     @Override
-    public void onDiskCreated() {
+    public void onDiskCreated(boolean data) {
         pending = false;
-        status.setText("QSSD listo");
+        status.setText(data ? "QSSD de datos listo" : "QSSD listo");
         status.setTextColor(TEXT);
-        stats.setText("El disco virtual está vacío.");
+        stats.setText(data ? "Inicializa el disco de datos como GPT en Windows."
+                : "El disco virtual está vacío.");
         clearHardwareResult();
         updateControls();
     }
@@ -668,14 +679,19 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         else
             getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         boolean diskReady = disk.isFile();
+        boolean dataDiskReady = dataDisk.isFile();
         media.setText(iso == null ? "Selecciona tu ISO local de Windows" : "CD/DVD · " + isoName);
-        storage.setText(diskReady ? "QSSD · 64 GiB lógicos" : "QSSD · se crea al arrancar la ISO");
+        String bootStorage = diskReady ? "QSSD de arranque · 64 GiB lógicos"
+                : "QSSD · se crea al arrancar la ISO";
+        storage.setText(dataDiskReady ? bootStorage + "\nQSSD de datos · 8 PiB lógicos" : bootStorage);
         boolean setup = !session && !pending;
         setupPanel.setVisibility(session ? View.GONE : View.VISIBLE);
         selectIso.setEnabled(setup);
         ejectIso.setEnabled(setup && iso != null);
         createDisk.setVisibility(diskReady ? View.GONE : View.VISIBLE);
         createDisk.setEnabled(setup);
+        createDataDisk.setVisibility(dataDiskReady ? View.GONE : View.VISIBLE);
+        createDataDisk.setEnabled(setup);
         bootIso.setEnabled(setup && iso != null);
         bootDisk.setEnabled(setup && diskReady);
         biosTest.setEnabled(setup);

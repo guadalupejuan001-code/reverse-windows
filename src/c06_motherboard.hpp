@@ -136,6 +136,7 @@ class PcMotherboardC06 {
   std::function<void()> prior_reset_;
   Pic master_{},slave_{};
   std::unique_ptr<AtaC07> ata_;
+  std::unique_ptr<AtaC07> data_ata_;
   std::unique_ptr<AtapiCdrom> optical_;
   std::unique_ptr<GuestGpuC08> gpu_;
   bool prior_pci_reservation_=false;
@@ -194,6 +195,7 @@ class PcMotherboardC06 {
     ferr_was_asserted_=false;pc_.cpu.set_x87_ignne(false);
     ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=sci_irqs_=0;
     if(ata_)ata_->reset();
+    if(data_ata_)data_ata_->reset();
     if(optical_)optical_->reset();
     if(gpu_)gpu_->reset();
     pc_.cpu.set_apic_task_priority(0);
@@ -225,6 +227,9 @@ class PcMotherboardC06 {
     AcpiC06::install(pc_.cpu,ide_present(),bool(gpu_));
   }
   bool ide_present()const noexcept{return bool(ata_)||bool(optical_);}
+  AtaC07* selected_ata() const noexcept {
+    return data_ata_&&data_ata_->selected()?data_ata_.get():ata_.get();
+  }
   static bool ide_port(std::uint16_t port) noexcept {
     return (port>=AcpiC06::primary_ide_ports&&port<AcpiC06::primary_ide_ports+8)||
            port==AcpiC06::primary_ide_control||AtapiCdrom::handles(port);
@@ -322,7 +327,7 @@ class PcMotherboardC06 {
     }
     if(ide_port(p)){
       if(ata_cfg_[4]&1U){
-        if(ata_&&ata_->handles(p))return ata_->input(p,width);
+        if(ata_&&ata_->handles(p))return selected_ata()->input(p,width);
         if(optical_&&optical_->handles(p))return optical_->input(p,width);
       }
       return UINT32_MAX; // Inactive or empty channel: open bus.
@@ -363,7 +368,14 @@ class PcMotherboardC06 {
     }
     if(ide_port(p)){
       if(ata_cfg_[4]&1U){
-        if(ata_&&ata_->handles(p))return ata_->output(p,width,value);
+        if(ata_&&ata_->handles(p)){
+          if(data_ata_&&width==1&&(p==AtaC07::kDrive||p==AtaC07::kControl)){
+            // IDE device selection and software reset are shared by both units.
+            data_ata_->output(p,width,value);
+            return ata_->output(p,width,value);
+          }
+          return selected_ata()->output(p,width,value);
+        }
         if(optical_&&optical_->handles(p))return optical_->output(p,width,value);
       }
       return width==1||width==2||width==4; // No device receives the command.
@@ -771,8 +783,12 @@ class PcMotherboardC06 {
  public:
   explicit PcMotherboardC06(cosmic_pc::PcMachine& machine, BlockDisk* disk=nullptr,
                             AtapiCdrom::Reader optical={}, std::uint64_t optical_bytes=0,
-                            const std::filesystem::path& graphics_vram={}):pc_(machine){
+                            const std::filesystem::path& graphics_vram={},
+                            BlockDisk* data_disk=nullptr):pc_(machine){
+    if(data_disk&&!disk)throw std::invalid_argument("ATA data disk requires a primary disk");
     if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_isa_irq(14);});
+    if(data_disk)data_ata_=std::make_unique<AtaC07>(
+        *data_disk,[this](){signal_isa_irq(14);},AtaC07::Unit::Slave);
     if(optical)optical_=std::make_unique<AtapiCdrom>(
         std::move(optical),optical_bytes,[this](){signal_isa_irq(15);});
     if(!graphics_vram.empty())gpu_=std::make_unique<GuestGpuC08>(
@@ -806,12 +822,14 @@ class PcMotherboardC06 {
     };
     if(ata_){
       pc_.cpu.pio_batch_limit_hook=[this](std::uint16_t p,unsigned width,bool input,unsigned count){
-        if(p==AtaC07::kData&&(ata_cfg_[4]&1U))return ata_->pio_batch_limit(width,input,count);
+        if(p==AtaC07::kData&&(ata_cfg_[4]&1U))
+          return selected_ata()->pio_batch_limit(width,input,count);
         return 0U;
       };
       pc_.cpu.pio_batch_transfer_hook=[this](std::uint16_t p,unsigned width,bool input,
                                              std::uint8_t* data,unsigned count){
-        return p==AtaC07::kData&&(ata_cfg_[4]&1U)&&ata_->pio_batch_transfer(width,input,data,count);
+        return p==AtaC07::kData&&(ata_cfg_[4]&1U)&&
+               selected_ata()->pio_batch_transfer(width,input,data,count);
       };
     }
     pc_.cpu.mmio_claim_hook=[this](std::uint64_t a){
@@ -888,6 +906,7 @@ class PcMotherboardC06 {
     if (gpu_) gpu_->set_vram_cache_enabled(enabled);
   }
   const AtaC07* attached_ata()const{return ata_.get();}
+  const AtaC07* attached_data_ata()const{return data_ata_.get();}
   const AtapiCdrom* attached_atapi()const{return optical_.get();}
   bool optical_attached()const{return bool(optical_);}
 };

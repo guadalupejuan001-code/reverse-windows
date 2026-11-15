@@ -18,8 +18,10 @@ class AtaC07 {
  public:
   static constexpr std::uint16_t kData=0x1f0;
   static constexpr std::uint16_t kLast=0x1f7;
+  static constexpr std::uint16_t kDrive=0x1f6;
   static constexpr std::uint16_t kControl=0x3f6;
   static constexpr unsigned kMaxMultipleSectors=16;
+  enum class Unit { Master, Slave };
   struct Counters {
     std::uint64_t commands=0,read_sectors=0,write_sectors=0,identifies=0;
     std::uint64_t flushes=0,aborts=0,irqs_signaled=0;
@@ -34,6 +36,7 @@ class AtaC07 {
 
  private:
   BlockDisk& disk_;
+  const Unit unit_;
   std::function<void()> irq14_;
   std::array<std::uint8_t,kMaxMultipleSectors*512> buffer_{};
   enum class Transfer {Idle,Identify,Read,Write} transfer_=Transfer::Idle;
@@ -50,7 +53,6 @@ class AtaC07 {
   Backend backend_{};
 
   static constexpr std::uint8_t kErr=0x01,kDrq=0x08,kReady=0x40,kDsc=0x10;
-  bool selected_master() const {return (drive_&0x10U)==0;}
   bool lba_mode() const {return (drive_&0x40U)!=0;}
   bool irq_enabled() const {return (control_&2U)==0;}
   void signal_irq() {
@@ -79,9 +81,11 @@ class AtaC07 {
   void identify() {
     std::array<std::uint8_t,512> identify_data{};
     word(identify_data,0,0x0040); // Fixed disk.
-    ata_text(identify_data,10,10,"REVERSE-C07-00000001");
+    const bool data_disk=unit_==Unit::Slave;
+    ata_text(identify_data,10,10,data_disk?"REVERSE-C07-00000002":"REVERSE-C07-00000001");
     ata_text(identify_data,23,4,"C06P");
-    ata_text(identify_data,27,20,"REVERSE QSSD VIRTUAL ATA DISK");
+    ata_text(identify_data,27,20,
+             data_disk?"REVERSE QSSD DATA ATA DISK":"REVERSE QSSD VIRTUAL ATA DISK");
     word(identify_data,47,0x8000|kMaxMultipleSectors);
     word(identify_data,49,1u<<9); // LBA, using the PIO data port.
     word(identify_data,50,0x4000); // Valid capabilities; no extra capabilities.
@@ -249,8 +253,8 @@ class AtaC07 {
   }
 
  public:
-  explicit AtaC07(BlockDisk& disk,std::function<void()> signal_irq14)
-    :disk_(disk),irq14_(std::move(signal_irq14)) {
+  explicit AtaC07(BlockDisk& disk,std::function<void()> signal_irq14,Unit unit=Unit::Master)
+    :disk_(disk),unit_(unit),irq14_(std::move(signal_irq14)) {
     if(disk_.sectors()==0||disk_.bytes()!=disk_.sectors()*512ULL ||
        disk_.sectors() >= (1ULL<<48))
       throw std::invalid_argument("C07 ATA requires 512-byte sector BlockDisk within LBA48");
@@ -266,10 +270,11 @@ class AtaC07 {
     if(!device_only)backend_={};
   }
   bool handles(std::uint16_t port) const {
-    return (port>=0x1f0&&port<=0x1f7)||port==0x3f6;
+    return (port>=kData&&port<=kLast)||port==kControl;
   }
+  bool selected() const noexcept {return bool(drive_&0x10U)==(unit_==Unit::Slave);}
   unsigned pio_batch_limit(unsigned width,bool input,unsigned elements) const noexcept {
-    if((width!=2&&width!=4)||!selected_master()||!(status_&kDrq)||
+    if((width!=2&&width!=4)||!selected()||!(status_&kDrq)||
        transfer_!=(input?Transfer::Read:Transfer::Write))return 0;
     const auto available=(active_sectors_*512-pos_)/width;
     return available>1?std::min(elements,unsigned(available-1)):0;
@@ -285,7 +290,7 @@ class AtaC07 {
   }
   std::optional<std::uint32_t> input(std::uint16_t p,unsigned width) {
     if(!handles(p))return std::nullopt;
-    if(!selected_master())return 0; // The empty slave has no task-file registers.
+    if(!selected())return 0; // No device on the selected unit.
     if(p==kData)return read_data(width);
     if(width!=1)return std::nullopt;
     switch(p) {
@@ -294,7 +299,7 @@ class AtaC07 {
       case 0x1f3:return sector_number_;
       case 0x1f4:return cylinder_low_;
       case 0x1f5:return cylinder_high_;
-      case 0x1f6:return drive_;
+      case kDrive:return drive_;
       case 0x1f7:interrupt_pending_=false;return status_;
       case 0x3f6:return status_; // alternate status never acknowledges IRQ
       default:return std::nullopt;
@@ -302,11 +307,11 @@ class AtaC07 {
   }
   bool output(std::uint16_t p,unsigned width,std::uint32_t value) {
     if(!handles(p))return false;
-    if(p==kData)return selected_master() ? write_data(width,value) : (width==2||width==4);
+    if(p==kData)return selected() ? write_data(width,value) : (width==2||width==4);
     if(width!=1)return false;
     const auto v=std::uint8_t(value);
-    if(p==0x1f6){drive_=v;return true;}
-    if(p!=kControl&&(!selected_master()||(control_&4U)))return true;
+    if(p==kDrive){drive_=v;return true;}
+    if(p!=kControl&&(!selected()||(control_&4U)))return true;
     switch(p) {
       case 0x1f1:features_=v;return true;
       case 0x1f2:prev_count_=sector_count_;sector_count_=v;return true;
@@ -328,8 +333,8 @@ class AtaC07 {
   }
   Counters counters()const{return stats_;}
   bool irq_pending()const{return interrupt_pending_;}
-  bool ready()const{return selected_master() && (status_&kReady)!=0;}
-  std::uint8_t status()const{return selected_master()?status_:0;}
-  std::uint8_t error()const{return selected_master()?error_:0;}
+  bool ready()const{return selected() && (status_&kReady)!=0;}
+  std::uint8_t status()const{return selected()?status_:0;}
+  std::uint8_t error()const{return selected()?error_:0;}
 };
 } // namespace reverse_windows

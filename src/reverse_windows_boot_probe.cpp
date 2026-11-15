@@ -70,7 +70,11 @@ Options parse(int argc, char** argv) {
                                                         Options::Source::QssdCompact;
         } else if (arg == "--disk") out.disk_path = next();
         else if (arg == "--qssd-disk") out.qssd_path = next();
-        else if (arg == "--create-qssd-gib") out.create_qssd_gib = positive(next(), 16384, "create-qssd-gib");
+        else if (arg == "--create-qssd-gib") {
+            using reverse_windows::QssdDisk;
+            out.create_qssd_gib = positive(next(), QssdDisk::kMaxLogicalBytes / QssdDisk::kGiB,
+                                          "create-qssd-gib");
+        }
         else if (arg == "--create-disk-gib") out.create_disk_gib = positive(next(), 256, "create-disk-gib");
         else if (arg == "--steps") out.steps = positive(next(), 20'000'000'000, "steps");
         else if (arg == "--ram-mib") out.ram_mib = positive(next(), cosmic_pc::PcMachine::max_ram_mib(), "ram-mib");

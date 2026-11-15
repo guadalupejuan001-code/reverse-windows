@@ -98,7 +98,8 @@ class AndroidBootSession final {
                      BootSource source, int iso_fd=-1, std::uint64_t iso_bytes=0,
                      RamProfile profile=kDefaultRamProfile,
                      const std::filesystem::path& ram_cache={},
-                     const std::filesystem::path& graphics_vram={})
+                     const std::filesystem::path& graphics_vram={},
+                     const std::filesystem::path& data_disk={})
       : source_(source), pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_), vbe_(pc_) {
     if (disk.empty() && (create_gib || source != BootSource::SelfTest))
       throw std::invalid_argument("Selecciona o crea un disco QSSD para iniciar.");
@@ -124,6 +125,7 @@ class AndroidBootSession final {
       if (create_gib) create_disk(disk, create_gib);
       disk_ = std::make_unique<QssdDisk>(disk);
     }
+    if (!data_disk.empty()) data_disk_ = std::make_unique<QssdDisk>(data_disk);
     if (source == BootSource::Disk) {
       pc_.mount([this](auto offset, auto* target, auto count) {
         return disk_->read_bytes(offset, target, count);
@@ -137,10 +139,10 @@ class AndroidBootSession final {
       board_ = std::make_unique<PcMotherboardC06>(pc_, disk_.get(),
           [reader = iso_](auto offset, auto* target, auto count) {
             return reader->read(offset, target, count);
-          }, iso_->size(), graphics_vram);
+          }, iso_->size(), graphics_vram, data_disk_.get());
     } else {
       board_ = std::make_unique<PcMotherboardC06>(
-          pc_, disk_.get(), AtapiCdrom::Reader{}, 0, graphics_vram);
+          pc_, disk_.get(), AtapiCdrom::Reader{}, 0, graphics_vram, data_disk_.get());
     }
     board_->enable_ps2_keyboard();
     if (source != BootSource::SelfTest) pc_.enable_guest_restart();
@@ -318,7 +320,10 @@ class AndroidBootSession final {
   }
 
   void flush() {
-    if (disk_ && !disk_->flush()) throw std::runtime_error("No se pudo sincronizar QSSD.");
+    const bool boot_synced = !disk_ || disk_->flush();
+    const bool data_synced = !data_disk_ || data_disk_->flush();
+    if (!boot_synced) throw std::runtime_error("No se pudo sincronizar el QSSD de arranque.");
+    if (!data_synced) throw std::runtime_error("No se pudo sincronizar el QSSD de datos.");
   }
 
   cosmic_pc::PcVideoInfo video_info() const noexcept { return pc_.video_info(); }
@@ -397,6 +402,15 @@ class AndroidBootSession final {
           << ",\"generation\":" << disk_->generation() << '}';
     } else {
       out << "null";
+    }
+    if (data_disk_) {
+      const auto stats = data_disk_->stats();
+      const auto activity = board_->attached_data_ata()->counters();
+      out << ",\"data_disk\":{\"logical_bytes\":" << stats.logical_bytes
+          << ",\"physical_bytes\":" << stats.physical_bytes << ",\"commits\":" << stats.commits
+          << ",\"ata_identify_data_transfers\":" << activity.identify_data_transfers
+          << ",\"ata_read_sectors\":" << activity.read_sectors
+          << ",\"ata_write_sectors\":" << activity.write_sectors << '}';
     }
     out << ",\"storage_io\":";
     write_storage_profile(out, pc_, bios_disk_.get(), ata, disk_.get());
@@ -729,6 +743,7 @@ class AndroidBootSession final {
   RamPressure pressure_;
   std::shared_ptr<OpticalReader> iso_;
   std::unique_ptr<QssdDisk> disk_;
+  std::unique_ptr<QssdDisk> data_disk_;
   std::unique_ptr<BiosHardDisk> bios_disk_;
   std::unique_ptr<PcMotherboardC06> board_;
   GuestVgaFabricC09R vga_;
