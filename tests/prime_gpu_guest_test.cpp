@@ -143,6 +143,110 @@ std::string gpu_stats(const GuestGpuC08& gpu) {
   return out.str();
 }
 
+#ifdef REVERSE_WINDOWS_GLES_GUEST
+void verify_scheduled_dma(PcMachine& pc, PcMotherboardC06& board,
+                          const RwGpuVertex* vertices, unsigned count,
+                          const std::array<std::uint8_t, 4096>& reference) {
+  constexpr std::uint32_t idt = 0x480000, handler = 0xf000, receipt = 0xe200;
+  constexpr std::uint32_t command_ram = 0x500000, read_first = 0x510000, read_second = 0x530000;
+  constexpr std::uint32_t lapic = PcMachine::kLocalApicAddress;
+  constexpr unsigned vector = 0x5a;
+  constexpr std::uint64_t target = 0x1900010000ULL, scratch = target + RWGPU_PAGE_BYTES;
+  constexpr unsigned half = RWGPU_PAGE_BYTES / 2;
+  auto& cpu = pc.cpu;
+  cpu.idtr = {0x7ff, idt};
+  cpu.write64(idt + vector * 8, (handler & 0xffffU) |
+      (std::uint64_t(cpu.segments[Cpu::CS]) << 16) | (0x8eULL << 40) |
+      (std::uint64_t(handler >> 16) << 48));
+  Guest32 irq;
+  irq.emit({0x50}); // PUSH EAX.
+  irq.read(moved_bar + RWGPU_REG_IRQ_STATUS, receipt);
+  irq.emit({0xa3}); irq.word(moved_bar + RWGPU_REG_IRQ_ACK);
+  irq.read(moved_bar + RWGPU_REG_FENCE_LAST, receipt + 4);
+  irq.read(moved_bar + RWGPU_REG_FENCE_FAULT, receipt + 8);
+  irq.read(moved_bar + RWGPU_REG_FENCE_PREEMPT, receipt + 12);
+  irq.read(moved_bar + RWGPU_REG_PREEMPT_LAST, receipt + 16);
+  irq.emit({0xff,0x05}); irq.word(receipt + 20); // INC DWORD [count].
+  irq.write(lapic + 0xb0, 0);
+  irq.emit({0x58,0xcf}); // POP EAX; IRETD.
+  cpu.memory.write_block(handler, irq.bytes.data(), irq.bytes.size());
+  const auto store = [&](std::uint32_t address, const auto& value) {
+    cpu.memory.write_block(address, reinterpret_cast<const std::uint8_t*>(&value), sizeof(value));
+  };
+  const auto queue = [&](std::uint32_t offset, const void* data, unsigned size) {
+    cpu.memory.write_block(command_ram + offset, static_cast<const std::uint8_t*>(data), size);
+  };
+  struct Transfer {
+    RwGpuDmaTransfer command;
+    std::array<RwGpuDmaRange, 2> range;
+  };
+  const auto transfer = [&](unsigned op, std::uint64_t vram) {
+    return Transfer{{{op, sizeof(Transfer)}, vram, RWGPU_PAGE_BYTES, 2},
+                    {{{read_first, half, 0}, {read_second, half, 0}}}};
+  };
+  cpu.memory.write_block(read_first, reference.data(), half);
+  cpu.memory.write_block(read_second, reference.data() + half, half);
+  const auto upload = transfer(RWGPU_DMA_UPLOAD, scratch);
+  const RwGpuDmaCopy copy{{RWGPU_DMA_COPY, sizeof(copy)}, scratch, target, RWGPU_PAGE_BYTES, 0};
+  const RwGpuDmaFill fill{{RWGPU_DMA_FILL, sizeof(fill)}, scratch, RWGPU_PAGE_BYTES, 0x5aa51effU};
+  queue(0, &upload, sizeof(upload));
+  queue(sizeof(upload), &copy, sizeof(copy));
+  queue(sizeof(upload) + sizeof(copy), &fill, sizeof(fill));
+  const unsigned draw_bytes = rwgpu_dma_draw_bytes(count);
+  std::vector<std::uint8_t> draw_packet(draw_bytes);
+  const RwGpuDmaDraw draw{{RWGPU_DMA_DRAW, draw_bytes}, target, 32, 32, 0x741e140aU, count};
+  std::memcpy(draw_packet.data(), &draw, sizeof(draw));
+  std::memcpy(draw_packet.data() + sizeof(draw), vertices, count * sizeof(RwGpuVertex));
+  queue(0x1000, draw_packet.data(), draw_bytes);
+  const auto download = transfer(RWGPU_DMA_DOWNLOAD, target);
+  store(command_ram + 0x2000, download);
+  auto bad = download;
+  bad.range[1].ram = lapic;
+  store(command_ram + 0x3000, bad);
+  const auto copied = transfer(RWGPU_DMA_DOWNLOAD, scratch);
+  store(command_ram + 0x4000, copied);
+
+  Guest32 driver;
+  driver.cfg_read(4, receipt + 24);
+  driver.cfg_read(0x34, receipt + 28);
+  driver.cfg_read(RWGPU_PCI_MSI_CAP, receipt + 32);
+  driver.cfg_write(RWGPU_PCI_MSI_CAP + 4, 0xfee00000);
+  driver.cfg_write(RWGPU_PCI_MSI_CAP + 8, vector);
+  driver.cfg_write(RWGPU_PCI_MSI_CAP, 1u << 16);
+  driver.write(lapic + 0xf0, 0x1ff);
+  const auto submit = [&](unsigned ticket, unsigned offset, unsigned fence, unsigned bytes) {
+    driver.direct_command(RWGPU_SUBMIT_DMA, ticket, command_ram + offset, fence, bytes);
+    driver.emit({0xfb,0xf4,0xfa}); // STI; HLT until the MSI; CLI.
+  };
+  submit(29, 0, 101, sizeof(upload) + sizeof(copy) + sizeof(fill));
+  driver.read(moved_bar + RWGPU_REG_STATUS, receipt + 36);
+  submit(30, 0x4000, 102, sizeof(copied));
+  driver.read(read_first, receipt + 40);
+  submit(31, 0x1000, 103, draw_bytes);
+  submit(32, 0x2000, 104, sizeof(download));
+  submit(33, 0x3000, 105, sizeof(bad));
+  driver.read(moved_bar + RWGPU_REG_STATUS, receipt + 44);
+  driver.direct_command(RWGPU_PREEMPT, 34, 0, 205, 0);
+  driver.emit({0xfb,0xf4,0xfa});
+  driver.read(moved_bar + RWGPU_REG_SCHEDULED_DRAW_TICKET, receipt + 48);
+  driver.run(pc);
+  std::array<std::uint8_t, RWGPU_PAGE_BYTES> pixels{};
+  cpu.memory.read_block(read_first, pixels.data(), half);
+  cpu.memory.read_block(read_second, pixels.data() + half, half);
+  require(cpu.read32(receipt) == RWGPU_IRQ_PREEMPT && cpu.read32(receipt + 4) == 104 &&
+          cpu.read32(receipt + 8) == 105 && cpu.read32(receipt + 12) == 205 &&
+          cpu.read32(receipt + 16) == 104 && cpu.read32(receipt + 20) == 6 &&
+          (cpu.read32(receipt + 24) & 0x00100000U) && cpu.read32(receipt + 28) == RWGPU_PCI_MSI_CAP &&
+          cpu.read32(receipt + 32) == 5 && cpu.read32(receipt + 36) == RWGPU_OK &&
+          cpu.read32(receipt + 40) == 0x5aa51effU && cpu.read32(receipt + 44) == RWGPU_INVALID &&
+          cpu.read32(receipt + 48) == 31 && board.interrupt_state().in_service == 0 &&
+          pixels == reference && !pc.cpu.memory.write_watch()->pending(),
+          "VidMm DMA data, MSI fences, fault, or preemption diverged");
+  std::cout << "PRIME_C08_SCHEDULED_DMA_PASS msi=6 fence=104 fault=105 preempt=205 pixels=4096"
+               " pin=system-ram vbe_stores=0\n";
+}
+#endif
+
 void verify(const std::filesystem::path& volume) {
   std::array<std::uint8_t, RWGPU_PAGE_BYTES> payload{}, actual{};
   for (unsigned i = 0; i < payload.size(); ++i) payload[i] = (i * 17) ^ (i >> 8);
@@ -326,6 +430,8 @@ void verify(const std::filesystem::path& volume) {
             !pc.cpu.memory.write_watch()->pending(),
             "WDDM offscreen readback must preserve alpha without changing the boot display");
     std::cout << "PRIME_C08_BGRA_DMA_PASS alpha_ticket=18 vbe_stores=0 " << gpu_stats(*board.attached_gpu()) << '\n';
+    std::array<std::uint8_t, RWGPU_PAGE_BYTES> reference{};
+    pc.cpu.memory.read_block(color_target, reference.data(), reference.size());
 
     constexpr auto frame_target = 0x400000U;
     constexpr unsigned chunk_size = RWGPU_MAX_VERTICES * sizeof(RwGpuVertex);
@@ -361,6 +467,7 @@ void verify(const std::filesystem::path& volume) {
             !pc.cpu.memory.write_watch()->pending(),
             "Single-ticket readback did not deliver the same BGRA frame or corrupted VGA");
     std::cout << "PRIME_C08_SINGLE_DMA_PASS bytes=" << color_bytes << " legacy_commands=6 commands=1\n";
+    verify_scheduled_dma(pc, board, vertices, std::size(vertices), reference);
 #else
     require(pc.cpu.read32(0xe024) == RWGPU_UNAVAILABLE && pc.cpu.read32(0xe028) == 10,
             "Headless build must disclose its absent renderer");

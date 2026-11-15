@@ -2,7 +2,7 @@ name: Prime C08 Windows guest graphics transport and Direct3D reference
 
 on:
   pull_request:
-    paths: ["guest/windows/**", "src/c08_gpu_protocol.h", "src/c08_wddm_protocol.h", ".github/workflows/prime-c08-windows-guest.yml"]
+    paths: ["guest/windows/**", "src/c08_gpu_protocol.h", "src/c08_gpu_dma.h", "src/c08_wddm_protocol.h", ".github/workflows/prime-c08-windows-guest.yml"]
   workflow_dispatch:
 
 permissions:

@@ -33,7 +33,11 @@ enum RwGpuRegister {
   RWGPU_REG_VRAM_BATCH_BYTES = 0x48,
   RWGPU_REG_AUX_LO = 0x4c, RWGPU_REG_AUX_HI = 0x50,
   RWGPU_REG_LENGTH_HI = 0x54, RWGPU_REG_RESULT_LO = 0x58, RWGPU_REG_RESULT_HI = 0x5c,
-  RWGPU_REG_DIRECT_MAX = 0x60, RWGPU_REG_BUS_MASTER = 0x64
+  RWGPU_REG_DIRECT_MAX = 0x60, RWGPU_REG_BUS_MASTER = 0x64,
+  RWGPU_REG_FENCE_LAST = 0x68, RWGPU_REG_IRQ_STATUS = 0x6c,
+  RWGPU_REG_IRQ_ACK = 0x70, RWGPU_REG_FENCE_PREEMPT = 0x74,
+  RWGPU_REG_FENCE_FAULT = 0x78, RWGPU_REG_SCHEDULED_DRAW_TICKET = 0x7c,
+  RWGPU_REG_PREEMPT_LAST = 0x80, RWGPU_REG_ENGINE_RESET = 0x84
 };
 // UPLOAD, DOWNLOAD and COPY use OFFSET as source and AUX as destination.
 // RAM addresses are physical and require PCI bus mastering. VRAM addresses
@@ -44,15 +48,21 @@ enum RwGpuCommand {
   RWGPU_DRAW_VRAM = 9, RWGPU_READ_COLOR_RAM = 10, RWGPU_DRAW_RAM = 11,
   // OFFSET points at vertices and AUX at the BGRA output in guest RAM.
   // One ticket completes the draw and the entire readback.
-  RWGPU_DRAW_READBACK = 12
+  RWGPU_DRAW_READBACK = 12,
+  // OFFSET is the physical DMA buffer, LENGTH is its size and AUX the
+  // scheduler's fence. PREEMPT uses AUX for the preemption fence.
+  RWGPU_SUBMIT_DMA = 13, RWGPU_PREEMPT = 14
 };
 enum RwGpuStatus { RWGPU_IDLE = 0, RWGPU_OK = 1, RWGPU_BAD_COMMAND = 2,
                   RWGPU_INVALID = 3, RWGPU_UNAVAILABLE = 4, RWGPU_FAILED = 5 };
 enum RwGpuCaps {
   RWGPU_CAP_VRAM = 1, RWGPU_CAP_TRIANGLES = 2, RWGPU_CAP_DIRECT_VRAM = 4,
   RWGPU_CAP_SUM_INDICES = 8, RWGPU_CAP_DRAW_VRAM = 16, RWGPU_CAP_COLOR_DMA = 32,
-  RWGPU_CAP_DRAW_RAM = 64, RWGPU_CAP_COLOR_ALPHA = 128, RWGPU_CAP_DRAW_READBACK = 256
+  RWGPU_CAP_DRAW_RAM = 64, RWGPU_CAP_COLOR_ALPHA = 128, RWGPU_CAP_DRAW_READBACK = 256,
+  RWGPU_CAP_WDDM_SCHEDULER = 512
 };
+enum RwGpuIrq { RWGPU_IRQ_COMPLETE = 1, RWGPU_IRQ_PREEMPT = 2, RWGPU_IRQ_FAULT = 4 };
+#define RWGPU_PCI_MSI_CAP 0x50u
 // DRAW uses OFFSET as flags. DRAW_VRAM and DRAW_RAM use OFFSET as the source
 // in VRAM or guest physical RAM and AUX as flags. READ_COLOR and READ_COLOR_RAM
 // address the last tightly packed, top-down draw. READ_COLOR_RAM uses AUX for

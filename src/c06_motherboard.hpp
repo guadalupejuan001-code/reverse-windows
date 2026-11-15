@@ -603,6 +603,16 @@ class PcMotherboardC06 {
     }
     return true;
   }
+  bool signal_pci_msi(std::uint32_t address, std::uint16_t data) {
+    if (!lapic_on() || (address & 0xfff00ff3U) != 0xfee00000U) return false;
+    const unsigned vector = data & 255U, mode = (data >> 8) & 7U;
+    const bool logical = (address & 4U) != 0;
+    if (mode > 1 || (data & 0xb800U) || vector < 16 ||
+        !lapic_destination(logical ? 1U << 11 : 0, ((address >> 12) & 255U) << 24))
+      return false;
+    lapic_pending_.set(vector);
+    return true;
+  }
   void signal_apic_error(std::uint32_t bit) {
     apic_errors_|=bit;
     const auto lvt=apic_lvt_[kError];
@@ -765,7 +775,8 @@ class PcMotherboardC06 {
     if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_isa_irq(14);});
     if(optical)optical_=std::make_unique<AtapiCdrom>(
         std::move(optical),optical_bytes,[this](){signal_isa_irq(15);});
-    if(!graphics_vram.empty())gpu_=std::make_unique<GuestGpuC08>(pc_,graphics_vram);
+    if(!graphics_vram.empty())gpu_=std::make_unique<GuestGpuC08>(
+        pc_,graphics_vram,[this](auto address,auto data){return signal_pci_msi(address,data);});
     // The machine must be booted/mounted first. ACPI goes into reserved BIOS
     // memory and is never presented by E820 as allocatable guest RAM.
     prior_in_=pc_.cpu.in_hook;prior_out_=pc_.cpu.out_hook;

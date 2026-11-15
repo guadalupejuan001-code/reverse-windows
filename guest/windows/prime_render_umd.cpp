@@ -7,6 +7,7 @@ typedef _Return_type_success_(return >= 0) LONG NTSTATUS;
 #pragma warning(disable : 4201)
 #include <d3d10umddi.h>
 #pragma warning(pop)
+#include "../../src/c08_gpu_dma.h"
 #include "../../src/c08_wddm_protocol.h"
 #include <algorithm>
 #include <array>
@@ -124,7 +125,8 @@ Shader decode_shader(const UINT* code, bool vertex) {
 struct Resource {
     DXGI_FORMAT format{};
     UINT width = 0, height = 0, usage = 0, bind = 0;
-    bool buffer = false, mapped = false, initialized = false, dirty = false;
+    bool buffer = false, mapped = false, initialized = false, dirty = false, pending_readback = false;
+    D3DKMT_HANDLE allocation = 0;
     Resource* partner = nullptr;
     std::vector<std::uint8_t> data;
     std::vector<RwGpuVertex> triangles;
@@ -136,12 +138,17 @@ struct View { Resource* resource; };
 struct InputLayout { std::array<D3D10DDIARG_INPUT_ELEMENT_DESC, 2> items; };
 
 struct Device {
-    HANDLE runtime_adapter;
     D3D10DDI_HRTDEVICE runtime_device;
     D3D10DDI_HRTCORELAYER core;
     const D3DDDI_DEVICECALLBACKS* kernel;
     const D3D11DDI_CORELAYER_DEVICECALLBACKS* user;
     HANDLE context = nullptr;
+    void* command_buffer = nullptr;
+    UINT command_bytes = 0;
+    D3DDDI_ALLOCATIONLIST* allocations = nullptr;
+    UINT allocation_count = 0;
+    D3DDDI_PATCHLOCATIONLIST* patches = nullptr;
+    UINT patch_count = 0;
     Resource* vertex_buffer = nullptr;
     Resource* target = nullptr;
     Resource* depth = nullptr;
@@ -152,7 +159,6 @@ struct Device {
     D3D10_DDI_PRIMITIVE_TOPOLOGY topology{};
     D3D10_DDI_VIEWPORT viewport{};
     bool viewport_set = false, raster = false, depth_test = true, blend = true;
-    std::vector<std::uint8_t> packet;
     void error(HRESULT hr) const { user->pfnSetErrorCb(core, hr); }
 };
 
@@ -163,36 +169,64 @@ Resource* view_resource(void* handle) { return handle ? static_cast<View*>(handl
 HRESULT submit(Device& dev, Resource& target) {
     if (!target.dirty) return S_OK;
     const auto vertex_bytes = target.triangles.size() * sizeof(RwGpuVertex);
-    const auto required = sizeof(RwGpuWddmFrame) + vertex_bytes + target.data.size();
-    try {
-        auto& message = dev.packet;
-        message.resize(required);
-        RwGpuWddmFrame frame{{RWGPU_WDDM_MAGIC, RWGPU_WDDM_ABI, RWGPU_WDDM_DRAW, static_cast<UINT>(required)},
-            target.width, target.height, target.clear, static_cast<UINT>(target.triangles.size()), 0};
-        std::memcpy(message.data(), &frame, sizeof(frame));
-        if (vertex_bytes) std::memcpy(message.data() + sizeof(frame), target.triangles.data(), vertex_bytes);
-        D3DDDICB_ESCAPE request{};
-        request.hDevice = dev.runtime_device.handle;
-        request.hContext = dev.context;
-        request.Flags.HardwareAccess = 1;
-        request.pPrivateDriverData = message.data();
-        request.PrivateDriverDataSize = static_cast<UINT>(message.size());
-        const HRESULT status = dev.kernel->pfnEscapeCb(dev.runtime_adapter, &request);
-        if (FAILED(status)) return status;
-        std::memcpy(&frame, message.data(), sizeof(frame));
-        if (!frame.draw_ticket) return DXGI_ERROR_DEVICE_REMOVED;
-        const auto* bgra = message.data() + sizeof(frame) + vertex_bytes;
+    const auto required = sizeof(RwGpuWddmRender) + vertex_bytes;
+    if (!target.allocation || !dev.command_buffer || required > dev.command_bytes ||
+        !dev.allocations || !dev.allocation_count || !dev.patches || !dev.patch_count)
+        return DXGI_ERROR_DEVICE_REMOVED;
+
+    auto* command = static_cast<std::uint8_t*>(dev.command_buffer);
+    const RwGpuWddmRender render{{RWGPU_WDDM_MAGIC, RWGPU_WDDM_ABI, RWGPU_WDDM_RENDER, static_cast<UINT>(required)},
+        target.width, target.height, target.clear, static_cast<UINT>(target.triangles.size())};
+    std::memcpy(command, &render, sizeof(render));
+    if (vertex_bytes) std::memcpy(command + sizeof(render), target.triangles.data(), vertex_bytes);
+    dev.allocations[0] = {};
+    dev.allocations[0].hAllocation = target.allocation;
+    dev.allocations[0].WriteOperation = 1;
+    dev.patches[0] = {};
+    dev.patches[0].PatchOffset = offsetof(RwGpuDmaDraw, destination);
+    D3DDDICB_RENDER request{};
+    request.hContext = dev.context;
+    request.CommandLength = static_cast<UINT>(required);
+    request.NumAllocations = 1;
+    request.NumPatchLocations = 1;
+    const auto status = dev.kernel->pfnRenderCb(dev.runtime_device.handle, &request);
+    if (FAILED(status)) return status;
+    dev.command_buffer = request.pNewCommandBuffer;
+    dev.command_bytes = request.NewCommandBufferSize;
+    dev.allocations = request.pNewAllocationList;
+    dev.allocation_count = request.NewAllocationListSize;
+    dev.patches = request.pNewPatchLocationList;
+    dev.patch_count = request.NewPatchLocationListSize;
+    target.dirty = false;
+    target.pending_readback = true;
+    return S_OK;
+}
+
+HRESULT read_target(Device& dev, Resource& target) {
+    if (!target.pending_readback) return S_OK;
+    D3DDDICB_LOCK lock{};
+    lock.hAllocation = target.allocation;
+    lock.Flags.ReadOnly = 1;
+    lock.Flags.LockEntire = 1;
+    // This lock waits for the actual fence and asks VidMm for the contents
+    // of the GPU-written allocation in its system memory backing.
+    const auto status = dev.kernel->pfnLockCb(dev.runtime_device.handle, &lock);
+    if (FAILED(status)) return status;
+    if (lock.hAllocation) target.allocation = lock.hAllocation;
+    if (const auto* bgra = static_cast<const std::uint8_t*>(lock.pData)) {
         for (std::size_t i = 0; i < target.data.size(); i += 4) {
             target.data[i] = bgra[i + 2];
             target.data[i + 1] = bgra[i + 1];
             target.data[i + 2] = bgra[i];
             target.data[i + 3] = bgra[i + 3];
         }
-        target.dirty = false;
-        return S_OK;
-    } catch (const std::bad_alloc&) {
-        return E_OUTOFMEMORY;
     }
+    const D3DDDICB_UNLOCK unlock{1, &target.allocation};
+    const auto released = dev.kernel->pfnUnlockCb(dev.runtime_device.handle, &unlock);
+    if (FAILED(released)) return released;
+    if (!lock.pData) return DXGI_ERROR_DEVICE_REMOVED;
+    target.pending_readback = false;
+    return S_OK;
 }
 
 
@@ -243,6 +277,21 @@ void APIENTRY create_resource(D3D10DDI_HDEVICE handle, const D3D11DDIARG_CREATER
             out.initialized = true;
         } else if (out.format == DXGI_FORMAT_R8G8B8A8_UNORM) {
             out.data.resize(std::size_t(out.pitch()) * out.height);
+            if (out.bind == D3D10_DDI_BIND_RENDER_TARGET) {
+                RwGpuWddmAllocation desc{RWGPU_WDDM_MAGIC, RWGPU_WDDM_ABI, out.width, out.height};
+                D3DDDI_ALLOCATIONINFO allocation{};
+                allocation.pPrivateDriverData = &desc;
+                allocation.PrivateDriverDataSize = sizeof(desc);
+                D3DDDICB_ALLOCATE request{};
+                request.NumAllocations = 1;
+                request.pAllocationInfo = &allocation;
+                const auto hr = dev.kernel->pfnAllocateCb(dev.runtime_device.handle, &request);
+                if (FAILED(hr) || !allocation.hAllocation) {
+                    dev.error(FAILED(hr) ? hr : DXGI_ERROR_DEVICE_REMOVED);
+                    return;
+                }
+                out.allocation = allocation.hAllocation;
+            }
         }
     } catch (const std::bad_alloc&) {
         dev.error(E_OUTOFMEMORY);
@@ -256,6 +305,11 @@ void APIENTRY destroy_resource(D3D10DDI_HDEVICE handle, D3D10DDI_HRESOURCE value
     if (dev.target == current) dev.target = nullptr;
     if (dev.depth == current) dev.depth = nullptr;
     if (current->partner) current->partner->partner = nullptr;
+    if (current->allocation) {
+        const D3DDDICB_DEALLOCATE request{nullptr, 1, &current->allocation};
+        const auto hr = dev.kernel->pfnDeallocateCb(dev.runtime_device.handle, &request);
+        if (FAILED(hr)) dev.error(hr);
+    }
     current->~Resource();
 }
 
@@ -465,7 +519,8 @@ void APIENTRY copy_resource(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE out, D3D10DDI
         return;
     }
     auto& dev = device(h);
-    const HRESULT result = submit(dev, *src);
+    HRESULT result = submit(dev, *src);
+    if (SUCCEEDED(result)) result = read_target(dev, *src);
     if (FAILED(result)) { dev.error(result); return; }
     std::copy(src->data.begin(), src->data.end(), dst->data.begin());
     dst->initialized = true;
@@ -637,21 +692,30 @@ SIZE_T APIENTRY device_size(D3D10DDI_HADAPTER, const D3D10DDIARG_CALCPRIVATEDEVI
 }
 
 HRESULT APIENTRY create_device(D3D10DDI_HADAPTER adapter, D3D10DDIARG_CREATEDEVICE* args) {
+    (void)adapter;
     if (!args || args->Interface != D3DWDDM1_3_DDI_INTERFACE_VERSION ||
         D3D11DDI_EXTRACT_3DPIPELINELEVEL_FROM_FLAGS(args->Flags) != D3D11_1DDI_3DPIPELINELEVEL_9_1)
         return DXGI_ERROR_UNSUPPORTED;
     if (!args->hDrvDevice.pDrvPrivate || !args->pWDDM1_3DeviceFuncs ||
         !args->p11UMCallbacks || !args->p11UMCallbacks->pfnSetErrorCb || !args->pKTCallbacks ||
-        !args->pKTCallbacks->pfnEscapeCb || !args->pKTCallbacks->pfnCreateContextCb ||
-        !args->pKTCallbacks->pfnDestroyContextCb || !args->DXGIBaseDDI.pDXGIDDIBaseFunctions4)
+        !args->pKTCallbacks->pfnCreateContextCb || !args->pKTCallbacks->pfnDestroyContextCb ||
+        !args->pKTCallbacks->pfnAllocateCb || !args->pKTCallbacks->pfnDeallocateCb ||
+        !args->pKTCallbacks->pfnRenderCb || !args->pKTCallbacks->pfnLockCb ||
+        !args->pKTCallbacks->pfnUnlockCb || !args->DXGIBaseDDI.pDXGIDDIBaseFunctions4)
         return E_INVALIDARG;
     D3DDDICB_CREATECONTEXT request{};
     const HRESULT hr = args->pKTCallbacks->pfnCreateContextCb(args->hRTDevice.handle, &request);
     if (FAILED(hr)) return hr;
     if (!request.hContext) return DXGI_ERROR_DEVICE_REMOVED;
-    auto* state = new (args->hDrvDevice.pDrvPrivate) Device{adapter.pDrvPrivate, args->hRTDevice,
-        args->hRTCoreLayer, args->pKTCallbacks, args->p11UMCallbacks, request.hContext};
-    (void)state;
+    if (!request.pCommandBuffer || !request.CommandBufferSize || !request.pAllocationList ||
+        !request.AllocationListSize || !request.pPatchLocationList || !request.PatchLocationListSize) {
+        const D3DDDICB_DESTROYCONTEXT context{request.hContext};
+        args->pKTCallbacks->pfnDestroyContextCb(args->hRTDevice.handle, &context);
+        return DXGI_ERROR_DEVICE_REMOVED;
+    }
+    new (args->hDrvDevice.pDrvPrivate) Device{args->hRTDevice, args->hRTCoreLayer, args->pKTCallbacks,
+        args->p11UMCallbacks, request.hContext, request.pCommandBuffer, request.CommandBufferSize,
+        request.pAllocationList, request.AllocationListSize, request.pPatchLocationList, request.PatchLocationListSize};
     *args->pWDDM1_3DeviceFuncs = render_functions();
     *args->DXGIBaseDDI.pDXGIDDIBaseFunctions4 = dxgi_functions();
     return S_OK;
@@ -707,8 +771,7 @@ extern "C" __declspec(dllexport) HRESULT APIENTRY OpenAdapter10_2(D3D10DDIARG_OP
         adapter.header.command != RWGPU_WDDM_QUERY || adapter.header.bytes != sizeof(adapter) ||
         adapter.pci_id != ((RWGPU_DEVICE_ID << 16) | RWGPU_VENDOR_ID) ||
         adapter.logical_vram_bytes != RWGPU_LOGICAL_BYTES ||
-        (adapter.capabilities & (RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_DMA | RWGPU_CAP_COLOR_ALPHA)) !=
-            (RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_DMA | RWGPU_CAP_COLOR_ALPHA)) return DXGI_ERROR_UNSUPPORTED;
+        !(adapter.capabilities & RWGPU_CAP_WDDM_SCHEDULER)) return DXGI_ERROR_UNSUPPORTED;
 
     const D3D10_2DDI_ADAPTERFUNCS callbacks{device_size, create_device, close_adapter, versions, caps};
     *args->pAdapterFuncs_2 = callbacks;

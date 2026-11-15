@@ -262,14 +262,16 @@ int main(int argc, char** argv) {
             const auto before = transport.query();
             const auto actual = render_d3d11(adapter.Get());
             const auto after = transport.query();
-            if (!after.last_draw_ticket || before.last_draw_ticket == after.last_draw_ticket)
-                throw std::runtime_error("Direct3D did not produce a PrimeVGC PCI completion");
+            if (!after.last_scheduled_draw_ticket ||
+                before.last_scheduled_draw_ticket == after.last_scheduled_draw_ticket ||
+                after.last_draw_ticket != after.last_scheduled_draw_ticket)
+                throw std::runtime_error("Direct3D did not retire a new Dxgkrnl submission on PrimeVGC");
             const auto reference = render_d3d11();
             verify_reference(reference);
             if (actual != reference)
                 throw std::runtime_error("WDDM rendering differs from the Direct3D oracle");
-            std::printf("PRIME_C08_WDDM_SCENE_PASS pci=1b36:c083 ticket=%u samples=%zu\n",
-                        after.last_draw_ticket, checks.size());
+            std::printf("PRIME_C08_WDDM_SCENE_PASS pci=1b36:c083 ticket=%u samples=%zu scheduler=dxgkrnl\n",
+                        after.last_scheduled_draw_ticket, checks.size());
             return 0;
         }
         const auto samples = render_d3d11();
