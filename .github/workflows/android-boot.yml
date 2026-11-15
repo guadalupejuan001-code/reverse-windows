@@ -314,7 +314,7 @@ jobs:
 
           # Mount the optional data drive through its normal Android control.
           tap_visible resource-id "$ANDROID_APP_ID:id/vm_create_data_disk" down
-          tap_visible text Crear
+          tap_visible resource-id android:id/button1
           for attempt in {1..20}; do
             if adb shell run-as "$ANDROID_APP_ID" test -f files/windows-data.rqvd; then
               break
