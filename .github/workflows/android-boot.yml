@@ -8,6 +8,7 @@ on:
       - "tests/**"
       - "config/dependencies.lock.json"
       - "scripts/verify_deps.py"
+      - "cmake/**"
       - "CMakeLists.txt"
       - ".github/workflows/android-boot.yml"
   pull_request:
@@ -17,6 +18,7 @@ on:
       - "tests/**"
       - "config/dependencies.lock.json"
       - "scripts/verify_deps.py"
+      - "cmake/**"
       - "CMakeLists.txt"
       - ".github/workflows/android-boot.yml"
   workflow_dispatch:
@@ -49,22 +51,7 @@ jobs:
           java-version: "17"
       - name: Checkout exact component revisions
         run: |
-          python3 scripts/verify_deps.py --manifest-only
-          python3 - <<'PY'
-          import json
-          import pathlib
-          import subprocess
-
-          manifest = pathlib.Path("config/dependencies.lock.json")
-          for component in json.loads(manifest.read_text())["components"]:
-              target = component["checkout"]
-              url = "https://github.com/" + component["repository"] + ".git"
-              subprocess.run(["git", "init", "--quiet", target], check=True)
-              subprocess.run(["git", "-C", target, "fetch", "--quiet", "--depth", "1", url,
-                              component["commit"]], check=True)
-              subprocess.run(["git", "-C", target, "checkout", "--quiet", "--detach", "FETCH_HEAD"], check=True)
-          PY
-          python3 scripts/verify_deps.py
+          python3 scripts/verify_deps.py --checkout
           printf 'MUNDO_X_SHA=%s\n' "$(git -C deps/mundo-X rev-parse HEAD)" >> "$GITHUB_ENV"
       - name: Verify synthetic ISO boot, CPU mode transitions, keyboard and QSSD reboot
         if: matrix.abi == 'arm64-v8a'
@@ -75,6 +62,7 @@ jobs:
             -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" \
             -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
           cmake --build build --target reverse_windows_android_boot_session_test \
+            reverse_windows_ether_core_rules_test \
             reverse_windows_atapi_cdrom_guest_test reverse_windows_c06_motherboard_guest_test \
             reverse_windows_protected_entry_test reverse_windows_protected_real_transition_test \
             reverse_windows_cpu_profile_test reverse_windows_lock_rmw_test \
@@ -86,7 +74,7 @@ jobs:
             reverse_windows_x86_mmx_test reverse_windows_x86_x87_arithmetic_oracle_test \
             reverse_windows_x86_x87_state_test reverse_windows_c09r1_fxstate_test --parallel 2
           ctest --test-dir build --output-on-failure \
-            -R '^(reverse_windows_android_|reverse_windows_pc_video$|reverse_windows_c06_real_motherboard$|reverse_windows_protected_entry_stack$|reverse_windows_protected_real_transition$|reverse_windows_cpu_profile$|reverse_windows_lock_rmw$|reverse_windows_x64_optical_qssd$|reverse_windows_x86_(far_transfer64|system64|long_mode|long_null_ss|sse|mmx|x87)|reverse_windows_x86_c09r1_stage5_cvt_fxsr$|reverse_windows_c09r1_x87_fxsave_context$)'
+            -R '^(reverse_windows_android_|reverse_windows_ether_core_rules$|reverse_windows_pc_video$|reverse_windows_c06_real_motherboard$|reverse_windows_protected_entry_stack$|reverse_windows_protected_real_transition$|reverse_windows_cpu_profile$|reverse_windows_lock_rmw$|reverse_windows_x64_optical_qssd$|reverse_windows_x86_(far_transfer64|system64|long_mode|long_null_ss|sse|mmx|x87)|reverse_windows_x86_c09r1_stage5_cvt_fxsr$|reverse_windows_c09r1_x87_fxsave_context$)'
       - name: Install Android command-line tools and pinned packages
         uses: android-actions/setup-android@v3
         with:
@@ -121,6 +109,10 @@ jobs:
           grep -Fxq "native-code: '$ANDROID_ABI'" "$out/manifest.txt"
           entry="lib/$ANDROID_ABI/libreverse_windows_android.so"
           unzip -p "$apk" "$entry" > "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq "$MUNDO_X_SHA" "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'code_version_hits' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'code_byte_checks' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'code_bytes_read' "$RUNNER_TEMP/reverse-windows-android.so"
           readelf -h -lW "$RUNNER_TEMP/reverse-windows-android.so" > "$out/native-elf.txt"
           if [[ "$ANDROID_ABI" == arm64-v8a ]]; then
             grep -Fq 'AArch64' "$out/native-elf.txt"
@@ -313,6 +305,7 @@ jobs:
           done
           python3 - "$snapshot" "$RUNNER_TEMP/$iso" <<'PY'
           import json
+          import os
           from pathlib import Path
           import sys
           report = json.loads(Path(sys.argv[1]).read_text())
@@ -321,6 +314,9 @@ jobs:
           assert report["disk"]["logical_bytes"] == 64 * 1024**3 and report["disk"]["initial_commits"] == 0
           assert report["ata"]["identify_data_transfers"] == 1
           assert report["boot_progress"]["handed_off"] and report["boot_profile"]["checkpoint_interval_steps"] == 50_000_000
+          ether = report["ether_arm64"]
+          assert ether["mundo_x_source_sha"] == os.environ["MUNDO_X_SHA"]
+          assert ether["code_version_hits"] == ether["code_byte_checks"] == ether["code_bytes_read"] == 0
           print("PRIME_ANDROID_ISO_PICKER_PASS boot=el-torito qssd_created=1")
           PY
           BASH

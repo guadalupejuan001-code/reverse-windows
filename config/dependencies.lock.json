@@ -6,10 +6,10 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "b9eee187b96ab905821ee1ebc98c6e6173e1a34f",
+      "commit": "108d5505d609e4c1ca5a1d4eee5d3f4743686c29",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
-      "status": "candidate-prime-ether-arm64-infinitecore",
+      "status": "candidate-ether-core-arm64-integrated",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/pc_video.hpp",
@@ -25,6 +25,8 @@
         "pc-android/native/tests/pc_memory_fabric_test.cpp",
         "pc-android/native/memory_fabric.hpp",
         "native/include/mundo_x/infinite_session.hpp",
+        "native/include/mundo_x/ether_core.hpp",
+        "native/tests/ether_rules.cpp",
         "pc-android/native/x86_wide_integer.hpp",
         "pc-android/native/x86_ether_arm64.hpp",
         "pc-android/native/x86_ether_arm64.inc",

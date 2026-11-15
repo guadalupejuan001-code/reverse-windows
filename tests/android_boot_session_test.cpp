@@ -302,9 +302,24 @@ void verify_arm64_session(const std::filesystem::path& path) {
   std::cout << "PRIME_C10_WBINVD_SESSION_PASS count=1 resume=1\n";
   const auto arm64 = info.find("\"ether_arm64\":{");
   require(arm64 != std::string::npos, "C03 counts are missing from the Android diagnostic");
-  const auto native_steps = counter(info.substr(arm64), "guest_steps");
+  const auto ether = info.substr(arm64);
+  const auto native_steps = counter(ether, "guest_steps");
   require(cosmic_pc::Cpu::ether_arm64_host() ? native_steps >= 12 : native_steps == 0,
           "Android native session selected the wrong launch path");
+  const auto version_hits = counter(ether, "code_version_hits");
+  const auto byte_checks = counter(ether, "code_byte_checks");
+  const auto code_bytes = counter(ether, "code_bytes_read");
+  if (cosmic_pc::Cpu::ether_arm64_host()) {
+    require(version_hits > 0 && byte_checks > 0 && code_bytes > 0,
+            "Android native session did not reuse a validated code page");
+  } else {
+    require(version_hits == 0 && byte_checks == 0 && code_bytes == 0,
+            "Non-ARM64 session unexpectedly used the native code guard");
+  }
+#if defined(REVERSE_MUNDO_X_SOURCE_SHA)
+  require(ether.find("\"mundo_x_source_sha\":\"" REVERSE_MUNDO_X_SOURCE_SHA "\"") != std::string::npos,
+          "Android native session source SHA does not match its CMake lock");
+#endif
   std::cout << "PRIME_C03_NATIVE_SESSION_PASS translated_steps=" << native_steps << '\n';
 }
 
