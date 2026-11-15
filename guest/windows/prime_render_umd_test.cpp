@@ -8,12 +8,14 @@ typedef _Return_type_success_(return >= 0) LONG NTSTATUS;
 #pragma warning(disable : 4201)
 #include <d3d10umddi.h>
 #pragma warning(pop)
+#include "../../src/c08_gpu_dma.h"
 #include "../../src/c08_wddm_protocol.h"
 #include "gpu_scene_shaders.h"
 #include <array>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <stdexcept>
 #include <vector>
 
@@ -26,16 +28,24 @@ RwGpuVertex geometry[]{{-1.f,-1.f,.5f,1.f,0x800000ff},{1.f,-1.f,.5f,1.f,0x8000ff
     {.5f,-.5f,.25f,1.f,0x4000ff00},{0.f,.5f,.25f,1.f,0x40ff0000}};
 
 struct Runtime {
+    struct Buffer {
+        std::array<std::uint8_t, 1024> command{};
+        D3DDDI_ALLOCATIONLIST allocation{};
+        D3DDDI_PATCHLOCATIONLIST patch{};
+    };
     HRESULT error = S_OK;
-    unsigned draws = 0, contexts = 0;
-    bool supplies_ticket = true;
+    unsigned draws = 0, contexts = 0, reads = 0, current = 0;
+    bool complete = true, allocated = false, locked = false;
+    std::array<Buffer, 2> buffers{};
+    std::array<std::uint32_t, width * height> pixels{};
 };
+constexpr D3DKMT_HANDLE allocation_handle = 27;
 
 HRESULT APIENTRY query(HANDLE, const D3DDDICB_QUERYADAPTERINFO* info) {
     if (info->PrivateDriverDataSize != sizeof(RwGpuWddmAdapter)) return E_INVALIDARG;
     const RwGpuWddmAdapter out{{RWGPU_WDDM_MAGIC, RWGPU_WDDM_ABI, RWGPU_WDDM_QUERY, sizeof(out)},
         RWGPU_LOGICAL_BYTES, (RWGPU_DEVICE_ID << 16) | RWGPU_VENDOR_ID,
-        RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_DMA | RWGPU_CAP_COLOR_ALPHA, RWGPU_MAX_WIDTH, RWGPU_MAX_HEIGHT, 0, 0};
+        RWGPU_CAP_WDDM_SCHEDULER, RWGPU_MAX_WIDTH, RWGPU_MAX_HEIGHT, 0, 0};
     std::memcpy(info->pPrivateDriverData, &out, sizeof(out));
     return S_OK;
 }
@@ -44,6 +54,13 @@ HRESULT APIENTRY create_context(HANDLE device, D3DDDICB_CREATECONTEXT* context) 
     auto& rt = *static_cast<Runtime*>(device);
     if (rt.contexts || context->NodeOrdinal || context->PrivateDriverDataSize) return E_INVALIDARG;
     context->hContext = &rt.contexts;
+    auto& buffer = rt.buffers[0];
+    context->pCommandBuffer = buffer.command.data();
+    context->CommandBufferSize = static_cast<UINT>(buffer.command.size());
+    context->pAllocationList = &buffer.allocation;
+    context->AllocationListSize = 1;
+    context->pPatchLocationList = &buffer.patch;
+    context->PatchLocationListSize = 1;
     ++rt.contexts;
     return S_OK;
 }
@@ -59,27 +76,74 @@ void APIENTRY set_error(D3D10DDI_HRTCORELAYER core, HRESULT error) {
     static_cast<Runtime*>(core.handle)->error = error;
 }
 
-// Stand-in for the runtime callback. Validate the packet and return known
-// BGRA bytes so the test can distinguish UMD decoding from actual GPU rendering.
-HRESULT APIENTRY escape(HANDLE adapter, const D3DDDICB_ESCAPE* request) {
-    auto& rt = *static_cast<Runtime*>(adapter);
-    if (request->hDevice != &rt || request->hContext != &rt.contexts || !request->Flags.HardwareAccess ||
-        request->PrivateDriverDataSize != sizeof(RwGpuWddmFrame) + sizeof(geometry) + color_bytes)
+HRESULT APIENTRY allocate(HANDLE device, D3DDDICB_ALLOCATE* request) {
+    auto& rt = *static_cast<Runtime*>(device);
+    const auto* info = request->pAllocationInfo;
+    if (rt.allocated || request->NumAllocations != 1 || !info ||
+        info->PrivateDriverDataSize != sizeof(RwGpuWddmAllocation) || !info->pPrivateDriverData)
         return E_INVALIDARG;
-    auto* data = static_cast<std::uint8_t*>(request->pPrivateDriverData);
-    RwGpuWddmFrame frame{};
+    const auto& desc = *static_cast<const RwGpuWddmAllocation*>(info->pPrivateDriverData);
+    if (desc.magic != RWGPU_WDDM_MAGIC || desc.version != RWGPU_WDDM_ABI ||
+        desc.width != width || desc.height != height) return E_INVALIDARG;
+    rt.allocated = true;
+    request->pAllocationInfo->hAllocation = allocation_handle;
+    return S_OK;
+}
+
+HRESULT APIENTRY deallocate(HANDLE device, const D3DDDICB_DEALLOCATE* request) {
+    auto& rt = *static_cast<Runtime*>(device);
+    if (!rt.allocated || rt.locked || request->hResource || request->NumAllocations != 1 ||
+        !request->HandleList || *request->HandleList != allocation_handle) return E_INVALIDARG;
+    rt.allocated = false;
+    return S_OK;
+}
+
+HRESULT APIENTRY schedule(HANDLE device, D3DDDICB_RENDER* request) {
+    auto& rt = *static_cast<Runtime*>(device);
+    if (!rt.allocated || request->hContext != &rt.contexts || request->CommandOffset ||
+        request->CommandLength != sizeof(RwGpuWddmRender) + sizeof(geometry) ||
+        request->NumAllocations != 1 || request->NumPatchLocations != 1)
+        return E_INVALIDARG;
+    auto& current = rt.buffers[rt.current];
+    const auto* data = current.command.data();
+    RwGpuWddmRender frame{};
     std::memcpy(&frame, data, sizeof(frame));
-    uint32_t vertices = 0, pixels = 0;
     if (frame.header.magic != RWGPU_WDDM_MAGIC || frame.header.version != RWGPU_WDDM_ABI ||
-        frame.header.command != RWGPU_WDDM_DRAW || !rwgpu_wddm_frame_size(&frame, &vertices, &pixels) ||
-        frame.draw_ticket || frame.width != width || frame.height != height || frame.clear_rgba != clear ||
-        vertices != sizeof(geometry) || pixels != color_bytes ||
+        frame.header.command != RWGPU_WDDM_RENDER || frame.header.bytes != request->CommandLength ||
+        frame.width != width || frame.height != height || frame.clear_rgba != clear ||
+        frame.vertices != std::size(geometry) || current.allocation.hAllocation != allocation_handle ||
+        !current.allocation.WriteOperation || current.patch.AllocationIndex || current.patch.AllocationOffset ||
+        current.patch.PatchOffset != offsetof(RwGpuDmaDraw, destination) ||
         std::memcmp(data + sizeof(frame), geometry, sizeof(geometry))) return E_INVALIDARG;
     ++rt.draws;
-    if (rt.supplies_ticket) frame.draw_ticket = rt.draws;
-    std::memcpy(data, &frame, sizeof(frame));
-    for (UINT offset = 0; offset < pixels; offset += sizeof(bgra))
-        std::memcpy(data + sizeof(frame) + vertices + offset, &bgra, sizeof(bgra));
+    rt.current ^= 1;
+    auto& next = rt.buffers[rt.current];
+    request->pNewCommandBuffer = next.command.data();
+    request->NewCommandBufferSize = static_cast<UINT>(next.command.size());
+    request->pNewAllocationList = &next.allocation;
+    request->NewAllocationListSize = 1;
+    request->pNewPatchLocationList = &next.patch;
+    request->NewPatchLocationListSize = 1;
+    return S_OK;
+}
+
+HRESULT APIENTRY lock_target(HANDLE device, D3DDDICB_LOCK* args) {
+    auto& rt = *static_cast<Runtime*>(device);
+    if (!rt.allocated || rt.locked || !rt.draws || args->hAllocation != allocation_handle ||
+        !args->Flags.ReadOnly || !args->Flags.LockEntire || args->Flags.IgnoreSync) return E_INVALIDARG;
+    if (!rt.complete) return DXGI_ERROR_DEVICE_REMOVED;
+    rt.locked = true;
+    ++rt.reads;
+    rt.pixels.fill(bgra);
+    args->pData = rt.pixels.data();
+    return S_OK;
+}
+
+HRESULT APIENTRY unlock_target(HANDLE device, const D3DDDICB_UNLOCK* args) {
+    auto& rt = *static_cast<Runtime*>(device);
+    if (!rt.locked || args->NumAllocations != 1 || *args->phAllocations != allocation_handle)
+        return E_INVALIDARG;
+    rt.locked = false;
     return S_OK;
 }
 
@@ -145,7 +209,11 @@ void exercise(PFND3D10DDI_OPENADAPTER open) {
     check(open(&adapter), "OpenAdapter10_2");
     const auto a = adapter.hAdapter;
     D3DDDI_DEVICECALLBACKS kernel{};
-    kernel.pfnEscapeCb = escape;
+    kernel.pfnAllocateCb = allocate;
+    kernel.pfnDeallocateCb = deallocate;
+    kernel.pfnRenderCb = schedule;
+    kernel.pfnLockCb = lock_target;
+    kernel.pfnUnlockCb = unlock_target;
     kernel.pfnCreateContextCb = create_context;
     kernel.pfnDestroyContextCb = destroy_context;
     D3D11DDI_CORELAYER_DEVICECALLBACKS user{};
@@ -262,6 +330,7 @@ void exercise(PFND3D10DDI_OPENADAPTER open) {
     };
     render();
     require(!runtime.draws, "draws should be grouped until readback");
+    require(f.pfnFlush(d, 0) && runtime.draws == 1 && runtime.reads == 0, "Flush must enqueue without a CPU lock");
     f.pfnResourceCopy(d, output.value, color.value);
     check(runtime.error, "submit and copy");
     D3D10DDI_MAPPED_SUBRESOURCE mapped{};
@@ -270,16 +339,17 @@ void exercise(PFND3D10DDI_OPENADAPTER open) {
     UINT value = 0;
     require(mapped.pData && mapped.RowPitch == width * 4 && mapped.DepthPitch == color_bytes, "readback pitch");
     std::memcpy(&value, mapped.pData, sizeof(value));
-    require(value == rgba && runtime.draws == 1, "expected exactly one submission and RGBA bytes");
+    require(value == rgba && runtime.draws == 1 && runtime.reads == 1, "expected one submission and RGBA bytes");
     f.pfnStagingResourceUnmap(d, output.value, 0);
     f.pfnResourceCopy(d, output.value, color.value);
     check(runtime.error, "reuse completed render");
-    require(runtime.draws == 1, "unchanged color target resubmitted");
+    require(runtime.draws == 1 && runtime.reads == 1, "completed color target was sent or locked again");
 
-    runtime.supplies_ticket = false;
+    runtime.complete = false;
     render();
     f.pfnResourceCopy(d, output.value, color.value);
-    require(runtime.error == DXGI_ERROR_DEVICE_REMOVED && runtime.draws == 2, "missing PCI completion accepted");
+    require(runtime.error == DXGI_ERROR_DEVICE_REMOVED && runtime.draws == 2 && runtime.reads == 1,
+            "a draw without a lockable completed result was accepted");
     f.pfnDestroyRasterizerState(d, state.value);
     f.pfnDestroyElementLayout(d, layout.value);
     f.pfnDestroyDepthStencilView(d, depth_view.value);
@@ -287,7 +357,7 @@ void exercise(PFND3D10DDI_OPENADAPTER open) {
     for (auto r : {output.value, depth.value, color.value, buffer.value}) f.pfnDestroyResource(d, r);
     for (auto s : {rejected.value, pixel.value, vertex.value}) f.pfnDestroyShader(d, s);
     f.pfnDestroyDevice(d);
-    require(runtime.contexts == 0, "UMD context leaked");
+    require(runtime.contexts == 0 && !runtime.allocated && !runtime.locked, "UMD context or allocation leaked");
     check(api.pfnCloseAdapter(a), "CloseAdapter");
 }
 }

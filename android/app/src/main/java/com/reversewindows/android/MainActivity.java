@@ -8,6 +8,7 @@ import android.content.ComponentCallbacks2;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
+import android.content.res.Configuration;
 import android.database.Cursor;
 import android.graphics.Rect;
 import android.graphics.Typeface;
@@ -25,6 +26,7 @@ import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -40,13 +42,13 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private static final int ISO_PICKER = 21;
     private static final int DIAGNOSTIC_PICKER = 22;
     private static final long MIB = 1024L * 1024L;
-    private static final int BG = 0xff0c111a;
-    private static final int PANEL = 0xff151e2a;
-    private static final int BORDER = 0xff283547;
-    private static final int TEXT = 0xffeef4fc;
-    private static final int MUTED = 0xffa4b3c7;
-    private static final int ACCENT = 0xff77e5cb;
-    private static final int ERROR = 0xffffa9a4;
+    private static final int BG = 0xff101a20;
+    private static final int PANEL = 0xb8132026;
+    static final int BORDER = 0x66c4e4eb;
+    static final int TEXT = 0xfff1f7f8;
+    static final int MUTED = 0xffd6e4e8;
+    static final int ACCENT = 0xffbaf6e5;
+    static final int ERROR = 0xffffe0bb;
     private static final String[][] HARDWARE_CHECKS = {
             {"cpu_x64", "CPU x64"}, {"cpu_mmx", "MMX"}, {"cpu_sse", "SSE"},
             {"cpu_sse2", "SSE2"}, {"cpu_x87", "x87"},
@@ -65,6 +67,15 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private VmWorker worker;
     private GuestMonitor monitor;
     private ScrollView scroll;
+    private ScrollView traceScroll;
+    private LinearLayout workbench;
+    private LinearLayout viewer;
+    private FrameLayout guestSurface;
+    private VmTelemetry telemetry;
+    private TextView sessionSummary;
+    private Button screenTab;
+    private Button traceTab;
+    private Button expandMonitor;
     private TextView media;
     private TextView storage;
     private TextView status;
@@ -82,6 +93,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private Button hardwareCheck;
     private TextView hardwareResult;
     private LinearLayout controls;
+    private LinearLayout primaryActions;
+    private LinearLayout guestKeys;
     private LinearLayout setupPanel;
     private boolean pending;
     private boolean session;
@@ -124,7 +137,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private void buildScreen() {
         scroll = new ScrollView(this);
         scroll.setFillViewport(true);
-        scroll.setBackgroundColor(BG);
+        scroll.setBackground(new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                new int[]{0xff2a404a, BG, 0xff204038}));
         scroll.setClipToPadding(false);
         scroll.setOnApplyWindowInsetsListener((view, insets) -> {
             if (Build.VERSION.SDK_INT >= 30) {
@@ -136,55 +150,85 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             return insets;
         });
         LinearLayout body = column();
-        body.setPadding(dp(18), dp(14), dp(18), dp(20));
+        body.setPadding(dp(12), dp(8), dp(12), dp(12));
         scroll.addView(body);
 
-        TextView title = label("REVERSE Windows Prime", 24, TEXT);
+        LinearLayout header = row(body);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout identity = column();
+        header.addView(identity, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView title = label("REVERSE Windows", 20, TEXT);
         title.setTypeface(Typeface.DEFAULT_BOLD);
-        body.addView(title);
+        identity.addView(title);
         source = label(BuildConfig.VERSION_NAME + " · Invitado x86-64", 12, ACCENT);
         source.setTypeface(Typeface.MONOSPACE);
-        source.setLetterSpacing(0.07f);
-        add(body, source, 4);
+        add(identity, source, 2);
+        evidence = action("Diagnóstico", false, this::showDiagnostic);
+        evidence.setId(R.id.vm_copy_diagnostic);
+        LinearLayout.LayoutParams evidenceParams = new LinearLayout.LayoutParams(-2, -2);
+        evidenceParams.leftMargin = dp(8);
+        header.addView(evidence, evidenceParams);
 
-        setupPanel = card(body, 14);
-        LinearLayout display = card(body, 12);
-        status = label("Máquina apagada", 16, TEXT);
+        status = label("Máquina apagada", 14, TEXT);
         status.setId(R.id.vm_status);
         status.setTypeface(Typeface.DEFAULT_BOLD);
         status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
-        display.addView(status);
-        stats = label("", 13, MUTED);
-        stats.setTextIsSelectable(true);
-        add(display, stats, 5);
-        evidence = action("Diagnóstico", false, this::showDiagnostic);
-        evidence.setId(R.id.vm_copy_diagnostic);
-        add(display, evidence, 8);
+        add(body, status, 5);
+        setupPanel = card(body, 10);
+        LinearLayout display = card(body, 9);
+        workbench = row(display);
+        viewer = column();
+        workbench.addView(viewer);
 
+        LinearLayout viewTabs = row(viewer);
+        screenTab = action("Pantalla", false, () -> showTrace(false));
+        traceTab = action("Registro", false, () -> showTrace(true));
+        expandMonitor = action("Ampliar", false, this::toggleMonitorSize);
+        weighted(viewTabs, screenTab, 0);
+        weighted(viewTabs, traceTab, 6);
+        weighted(viewTabs, expandMonitor, 6);
+
+        guestSurface = new FrameLayout(this);
+        guestSurface.setBackground(panel(0x9910161a, 8, BORDER));
+        guestSurface.setClipToOutline(true);
+        add(viewer, guestSurface, 6);
         monitor = new GuestMonitor(this, this);
-        monitor.setBackground(panel(0xff080b10, 9, BORDER));
-        monitor.setClipToOutline(true);
-        int availableWidth = getResources().getConfiguration().screenWidthDp;
-        int displayHeight = Math.max(200, Math.min(370, (availableWidth - 62) * 5 / 8));
-        LinearLayout.LayoutParams monitorParams = new LinearLayout.LayoutParams(-1, dp(displayHeight));
-        monitorParams.topMargin = dp(10);
-        display.addView(monitor, monitorParams);
+        guestSurface.addView(monitor, new FrameLayout.LayoutParams(-1, -1));
+
+        traceScroll = new ScrollView(this);
+        traceScroll.setFillViewport(true);
+        stats = label("", 13, MUTED);
+        stats.setTypeface(Typeface.MONOSPACE);
+        stats.setTextIsSelectable(true);
+        stats.setPadding(dp(10), dp(9), dp(10), dp(9));
+        traceScroll.addView(stats);
+        guestSurface.addView(traceScroll, new FrameLayout.LayoutParams(-1, -1));
+        showTrace(false);
+
+        telemetry = new VmTelemetry(this);
+        workbench.addView(telemetry);
+
+        sessionSummary = label("", 11, MUTED);
+        sessionSummary.setTypeface(Typeface.MONOSPACE);
+        sessionSummary.setVisibility(View.GONE);
+        add(display, sessionSummary, 6);
 
         controls = column();
-        add(display, controls, 9);
-        LinearLayout sessionRow = row(controls);
+        add(display, controls, 6);
+        primaryActions = row(controls);
+        LinearLayout sessionRow = row(primaryActions);
         pause = action("Pausar", false, () -> worker.setRunning(!running));
         stop = action("Apagar", false, this::confirmStop);
         pair(sessionRow, pause, stop);
-        LinearLayout inputRow = row(controls);
-        LinearLayout.LayoutParams inputParams = (LinearLayout.LayoutParams) inputRow.getLayoutParams();
-        inputParams.topMargin = dp(6);
+        LinearLayout inputRow = row(primaryActions);
         pair(inputRow, action("Teclado", false, () -> {
+            showTrace(false);
             monitor.showKeyboard();
             scroll.postDelayed(() -> scroll.smoothScrollTo(0, 0), 220);
         }), action("Enter ↵", false, () -> sendGuestKey(13, 0x1c)));
-        LinearLayout arrows = row(controls);
-        ((LinearLayout.LayoutParams) arrows.getLayoutParams()).topMargin = dp(5);
+        guestKeys = row(controls);
+        ((LinearLayout.LayoutParams) guestKeys.getLayoutParams()).topMargin = dp(5);
+        LinearLayout arrows = row(guestKeys);
         String[] arrowsText = {"←", "↑", "↓", "→"};
         String[] arrowsDescription = {"Izquierda", "Arriba", "Abajo", "Derecha"};
         int[] arrowsScan = {0xe04b, 0xe048, 0xe050, 0xe04d};
@@ -194,8 +238,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             key.setContentDescription(arrowsDescription[i]);
             weighted(arrows, key, i == 0 ? 0 : 6);
         }
-        LinearLayout extraKeys = row(controls);
-        ((LinearLayout.LayoutParams) extraKeys.getLayoutParams()).topMargin = dp(5);
+        LinearLayout extraKeys = row(guestKeys);
         weighted(extraKeys, action("Esc", false, () -> sendGuestKey(27, 0x01)), 0);
         weighted(extraKeys, action("Tab", false, () -> sendGuestKey(9, 0x0f)), 6);
         weighted(extraKeys, action("F8", false, () -> sendGuestKey(0, 0x42)), 6);
@@ -242,7 +285,60 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         hardwareResult.setVisibility(View.GONE);
         hardwareResult.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         add(setup, hardwareResult, 6);
+        layoutWorkbench(getResources().getConfiguration());
         setContentView(scroll);
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration configuration) {
+        super.onConfigurationChanged(configuration);
+        layoutWorkbench(configuration);
+    }
+
+    private void layoutWorkbench(Configuration configuration) {
+        int width = configuration.screenWidthDp;
+        boolean landscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+                && width >= 600;
+        workbench.setOrientation(landscape ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
+        viewer.setLayoutParams(new LinearLayout.LayoutParams(landscape ? 0 : -1, -2, landscape ? 1 : 0));
+        LinearLayout.LayoutParams sidebar = new LinearLayout.LayoutParams(
+                landscape ? dp(Math.max(228, Math.min(320, width * 34 / 100))) : -1, -2);
+        sidebar.leftMargin = landscape ? dp(9) : 0;
+        sidebar.topMargin = landscape ? 0 : dp(9);
+        telemetry.setLayoutParams(sidebar);
+        int height = landscape ? configuration.screenHeightDp - 197 : (width - 48) * 5 / 8;
+        LinearLayout.LayoutParams screen = (LinearLayout.LayoutParams) guestSurface.getLayoutParams();
+        screen.height = dp(Math.max(145, Math.min(380, height)));
+        guestSurface.setLayoutParams(screen);
+        layoutActionBand(primaryActions, landscape);
+        layoutActionBand(guestKeys, landscape);
+    }
+
+    private void layoutActionBand(LinearLayout band, boolean landscape) {
+        band.setOrientation(landscape ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
+        for (int i = 0; i < band.getChildCount(); i++) {
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                    landscape ? 0 : -1, -2, landscape ? 1 : 0);
+            params.leftMargin = landscape && i > 0 ? dp(7) : 0;
+            params.topMargin = !landscape && i > 0 ? dp(5) : 0;
+            band.getChildAt(i).setLayoutParams(params);
+        }
+    }
+
+    private void showTrace(boolean visible) {
+        monitor.setVisibility(visible ? View.GONE : View.VISIBLE);
+        traceScroll.setVisibility(visible ? View.VISIBLE : View.GONE);
+        screenTab.setSelected(!visible);
+        traceTab.setSelected(visible);
+        if (!visible && session) monitor.requestFocus();
+    }
+
+    private void toggleMonitorSize() {
+        boolean expanded = !expandMonitor.isSelected();
+        expandMonitor.setSelected(expanded);
+        expandMonitor.setText(expanded ? "Restaurar" : "Ampliar");
+        telemetry.setVisibility(expanded ? View.GONE : View.VISIBLE);
+        if (!expanded) telemetry.render();
     }
 
     private void pickIso() {
@@ -341,7 +437,10 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         previousStepUs = -1;
         stepsPerSecond = -1;
         monitor.reset();
+        showTrace(false);
         monitor.requestFocus();
+        telemetry.clear();
+        sessionSummary.setVisibility(View.GONE);
         source.setText(switch (bootSource) {
             case NativeMachine.BOOT_ISO -> "BIOS · CD/DVD";
             case NativeMachine.BOOT_QSSD -> "BIOS · QSSD";
@@ -460,6 +559,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             status.setText("Máquina apagada");
             source.setText(BuildConfig.VERSION_NAME + " · Invitado x86-64");
             fault = false;
+            telemetry.clear();
+            sessionSummary.setVisibility(View.GONE);
         }
         if (!json.isEmpty()) {
             try {
@@ -493,6 +594,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             stats.setText("");
         }
         updateControls();
+        if (fault && !wasFault) showTrace(true);
+        if (session && !wasSession) restoreGuestFocus();
         if ((session && !wasSession) || (fault && !wasFault)) showBootStatus();
     }
 
@@ -517,6 +620,12 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         }
         previousStepUs = running ? stepUs : -1;
         previousSteps = sessionSteps;
+        if (session) {
+            telemetry.update(diagnostic, machine, modeName(machine.optString("cpu_mode")),
+                    sessionSteps, stepsPerSecond);
+            sessionSummary.setText(VmTelemetry.summary(diagnostic, machine, sessionSteps));
+            sessionSummary.setVisibility(View.VISIBLE);
+        }
         long reads = machine.optLong("disk_reads");
         long readSectors = ata == null ? 0 : ata.optLong("read_sectors");
         long identifyTransfers = ata == null ? 0 : ata.optLong("identify_data_transfers");
@@ -646,6 +755,11 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         status.setTextColor(ERROR);
         status.setText("Máquina detenida");
         stats.setText("Último bloqueo: " + message);
+        if (!session) {
+            telemetry.clear();
+            sessionSummary.setVisibility(View.GONE);
+        }
+        showTrace(true);
         lastJson = "{\"schema\":\"reverse-windows-android-error-v1\",\"status\":\"fault\",\"message\":"
                 + JSONObject.quote(message) + "}";
         updateControls();
@@ -760,8 +874,14 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         state.putString("diagnosticToExport", diagnosticToExport);
     }
 
+    private boolean canQueueGuestInput() {
+        // The worker, which also handles foreground changes, owns the
+        // running flag. The status broadcast can arrive after the first key.
+        return session && !pending && !fault && !terminal;
+    }
+
     private void sendGuestKey(int ascii, int scan) {
-        if (session && running && !pending && !fault) {
+        if (canQueueGuestInput()) {
             worker.key(ascii, scan, true);
             worker.key(ascii, scan, false);
         }
@@ -769,7 +889,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
 
     @Override
     public boolean onKey(KeyEvent event) {
-        if (!session || !running || pending || fault) return false;
+        if (!canQueueGuestInput()) return false;
         int ascii = GuestKeys.ascii(event);
         int scan = GuestKeys.scan(event.getKeyCode(), ascii);
         if (ascii == 0 && scan == 0) return false;
@@ -782,10 +902,11 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
 
     @Override
     public void onText(CharSequence text) {
+        if (!canQueueGuestInput()) return;
         for (int index = 0; index < Math.min(text.length(), 256); index++) {
             char key = text.charAt(index);
             int scan = GuestKeys.scanAscii(key);
-            if (scan == 0 || !session || !running || pending || fault) continue;
+            if (scan == 0) continue;
             boolean shift = GuestKeys.needsShift(key);
             if (shift) worker.key(0, 0x2a, true);
             sendGuestKey(key == '\n' ? 13 : key, scan);
@@ -797,6 +918,16 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     public boolean dispatchKeyEvent(KeyEvent event) {
         if (monitor != null && monitor.hasFocus() && onKey(event)) return true;
         return super.dispatchKeyEvent(event);
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) restoreGuestFocus();
+    }
+
+    private void restoreGuestFocus() {
+        if (monitor != null && monitor.isShown() && canQueueGuestInput()) monitor.requestFocus();
     }
 
     @Override
@@ -843,14 +974,14 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         return layout;
     }
 
-    private LinearLayout row(LinearLayout parent) {
+    LinearLayout row(LinearLayout parent) {
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.HORIZONTAL);
         parent.addView(layout, new LinearLayout.LayoutParams(-1, -2));
         return layout;
     }
 
-    private TextView label(String value, int size, int color) {
+    TextView label(String value, int size, int color) {
         TextView view = new TextView(this);
         view.setText(value);
         view.setTextSize(size);
@@ -858,7 +989,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         return view;
     }
 
-    private Button action(String value, boolean primary, Runnable onClick) {
+    Button action(String value, boolean primary, Runnable onClick) {
         Button button = new Button(this);
         button.setAllCaps(false);
         button.setText(value);
@@ -870,20 +1001,22 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         button.setMinWidth(0);
         button.setMinimumWidth(0);
         button.setPadding(dp(8), dp(5), dp(8), dp(5));
+        button.setStateListAnimator(null);
         int enabled = primary ? 0xff092019 : TEXT;
         int disabled = primary ? 0xff798986 : 0xff7e8ea2;
         button.setTextColor(new ColorStateList(
                 new int[][]{{-android.R.attr.state_enabled}, {}}, new int[]{disabled, enabled}));
-        int background = primary ? ACCENT : 0xff202d3d;
+        int background = primary ? 0xd9baf6e5 : 0x7043545c;
         android.graphics.drawable.StateListDrawable fills = new android.graphics.drawable.StateListDrawable();
-        fills.addState(new int[]{-android.R.attr.state_enabled}, panel(0xff1a252f, 9, BORDER));
+        fills.addState(new int[]{-android.R.attr.state_enabled}, panel(0x531f2c31, 9, BORDER));
+        fills.addState(new int[]{android.R.attr.state_selected}, panel(0x468be2c6, 9, 0x88baf6e5));
         fills.addState(new int[]{}, panel(background, 9, primary ? ACCENT : BORDER));
-        button.setBackground(new RippleDrawable(ColorStateList.valueOf(0x3377e5cb), fills, null));
+        button.setBackground(new RippleDrawable(ColorStateList.valueOf(0x33baf6e5), fills, null));
         button.setOnClickListener(v -> onClick.run());
         return button;
     }
 
-    private GradientDrawable panel(int color, int radius, int border) {
+    GradientDrawable panel(int color, int radius, int border) {
         GradientDrawable background = new GradientDrawable();
         background.setColor(color);
         background.setCornerRadius(dp(radius));
@@ -896,19 +1029,19 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         weighted(row, right, 7);
     }
 
-    private void weighted(LinearLayout row, Button view, int spacing) {
+    void weighted(LinearLayout row, Button view, int spacing) {
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1);
         params.leftMargin = dp(spacing);
         row.addView(view, params);
     }
 
-    private void add(LinearLayout parent, View view, int spacing) {
+    void add(LinearLayout parent, View view, int spacing) {
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
         params.topMargin = dp(spacing);
         parent.addView(view, params);
     }
 
-    private int dp(int amount) {
+    int dp(int amount) {
         return Math.round(getResources().getDisplayMetrics().density * amount);
     }
 }

@@ -26,39 +26,11 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - name: Checkout canonical Mundo X CPU (exact SHA)
-        uses: actions/checkout@v7
-        with:
-          repository: guadalupejuan001-code/mundo-X
-          ref: b9eee187b96ab905821ee1ebc98c6e6173e1a34f
-          path: deps/mundo-X
-          persist-credentials: false
-      - name: Checkout GPU-VIRTUAL C12.3 with guest triangle and PrimeVGC compute
-        uses: actions/checkout@v7
-        with:
-          repository: guadalupejuan001-code/GPU-VIRTUAL
-          ref: 933bbd7ea7679f661de7188fd4235691ab885567
-          path: deps/GPU-VIRTUAL
-          persist-credentials: false
-      - name: Checkout QSSD current StateBus plus graphics revisions
-        uses: actions/checkout@v7
-        with:
-          repository: guadalupejuan001-code/Virtual-qSSD-
-          ref: 5555f1cfc95e50d60df5d7481317380a6c5891d8
-          path: deps/Virtual-qSSD-
-          persist-credentials: false
-      - name: Checkout REgraphics guest triangle renderer
-        uses: actions/checkout@v7
-        with:
-          repository: guadalupejuan001-code/REVERSE-PC
-          ref: 5f4f9f6d80004cf9c21df740eff83f0742a53490
-          path: deps/REVERSE-PC
-          persist-credentials: false
-      - name: Enforce exact component SHAs and real source files
+      - name: Checkout and verify exact component revisions from the lock
         run: |
           test "$(uname -m)" = "${{ matrix.architecture }}"
           git rev-parse HEAD
-          python3 scripts/verify_deps.py
+          python3 scripts/verify_deps.py --checkout
       - name: Compile native boot probe against actual x86/x64 CPU
         run: |
           sudo apt-get update -qq
@@ -100,6 +72,7 @@ jobs:
           grep -q '^PRIME_C08_REGRAPHICS_PASS .*"vram_draw_requests":1.*"ram_draw_requests":3.*"color_dma_reads":2.*"submitted_triangles":3' build/prime-c08-gpu.log
           grep -q '^PRIME_C08_BGRA_DMA_PASS alpha_ticket=18 vbe_stores=0 .*"alpha_draw_ticket":18' build/prime-c08-gpu.log
           grep -q '^PRIME_C08_SINGLE_DMA_PASS bytes=1228800 legacy_commands=6 commands=1' build/prime-c08-gpu.log
+          grep -q '^PRIME_C08_SCHEDULED_DMA_PASS msi=6 fence=104 fault=105 preempt=205 pixels=4096' build/prime-c08-gpu.log
           grep -q '^PRIME_C08_PCI_VRAM_PASS logical_bytes=120000000000 last_byte=119999999999 .* exact=1' build/prime-c08-gpu.log
           grep -q '^PRIME_C08_VRAM_BATCH_PASS bytes=7864320 .* commits=128 .* exact=1' build/prime-c08-gpu.log
       - name: Record Prime BIOS keyboard and PS/2 regressions

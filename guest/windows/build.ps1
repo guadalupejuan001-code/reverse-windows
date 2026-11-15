@@ -1,4 +1,7 @@
-param([string]$OutDir = "$PSScriptRoot\out")
+param(
+    [string]$OutDir = "$PSScriptRoot\out",
+    [switch]$TestSignWddm
+)
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -91,5 +94,52 @@ Invoke-Checked $compiler (@('/nologo','/std:c++17','/EHsc','/W4','/O2','/MT',
     "/Fo$(Join-Path $out 'prime_wddm_probe.obj')","/Fe$(Join-Path $out 'prime_wddm_probe.exe')",
     $probe, 'dxgi.lib', 'gdi32.lib') + $graphicsInclude)
 New-DriverPackage 'wdm-package' @($driver, (Join-Path $PSScriptRoot 'ReversePrimeGpu.inf')) 'ReversePrimeGpu.cat'
-New-DriverPackage 'wddm-package' @($miniportSys, $umdDll,
-    (Join-Path $PSScriptRoot 'ReversePrimeRender.inf')) 'ReversePrimeRender.cat'
+
+$wddmInf = Join-Path $PSScriptRoot 'ReversePrimeRender.inf'
+if (!$TestSignWddm) {
+    New-DriverPackage 'wddm-package' @($miniportSys, $umdDll, $wddmInf) 'ReversePrimeRender.cat'
+    return
+}
+
+$sdkBin = Join-Path (Join-Path $env:WindowsSdkDir 'bin') $env:WindowsSDKVersion.TrimEnd('\')
+$signTool = Join-Path $sdkBin 'x64\signtool.exe'
+if (!(Test-Path $signTool)) { throw 'The Windows SDK x64 SignTool is required for the WDDM test package' }
+$certificateParams = @{
+    Type = 'CodeSigningCert'
+    Subject = 'CN=REVERSE PrimeVGC Development Test'
+    CertStoreLocation = 'Cert:\CurrentUser\My'
+    KeyAlgorithm = 'RSA'
+    KeyLength = 2048
+    HashAlgorithm = 'SHA256'
+    KeyExportPolicy = 'NonExportable'
+    NotAfter = (Get-Date).AddYears(1)
+}
+$cert = New-SelfSignedCertificate @certificateParams
+$thumb = $cert.Thumbprint
+$rootStore = 'Cert:\LocalMachine\Root'
+$root = Join-Path $rootStore $thumb
+try {
+    $sign = @('sign', '/fd', 'SHA256', '/s', 'My', '/sha1', $thumb)
+    Write-Output 'Signing the PrimeVGC binaries for development'
+    Invoke-Checked $signTool ($sign + @($miniportSys, $umdDll))
+    # Generate the catalog after embedding signatures so it describes the
+    # exact signed binaries that are actually shipped.
+    New-DriverPackage 'wddm-package' @($miniportSys, $umdDll, $wddmInf) 'ReversePrimeRender.cat'
+    $folder = Join-Path $out 'wddm-package'
+    $catalog = Join-Path $folder 'ReversePrimeRender.cat'
+    Invoke-Checked $signTool ($sign + @($catalog))
+    $certPath = Join-Path $folder 'PrimeVGC-Development-Test.cer'
+    Export-Certificate -Cert $cert -FilePath $certPath | Out-Null
+    # The per-user root store can display a Windows trust dialog on a headless runner.
+    Write-Output 'Verifying the signed PrimeVGC package'
+    Import-Certificate -FilePath $certPath -CertStoreLocation $rootStore -Confirm:$false | Out-Null
+    Invoke-Checked $signTool @('verify', '/pa', $miniportSys)
+    Invoke-Checked $signTool @('verify', '/pa', $catalog)
+    foreach ($name in @('ReversePrimeRender.sys', 'ReversePrimeRenderUmd.dll', 'ReversePrimeRender.inf')) {
+        Invoke-Checked $signTool @('verify', '/pa', '/c', $catalog, (Join-Path $folder $name))
+    }
+    Write-Output 'PRIME_C08_WDDM_TEST_SIGNATURE_PASS catalog=1 sys=1 umd=1'
+} finally {
+    if (Test-Path $root) { Remove-Item $root }
+    Remove-Item "Cert:\CurrentUser\My\$thumb"
+}

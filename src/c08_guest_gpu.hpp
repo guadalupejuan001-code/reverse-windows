@@ -1,5 +1,6 @@
 #pragma once
 
+#include "c08_gpu_dma.h"
 #include "graphics_memory.hpp"
 #include "guest_triangle_work.hpp"
 #include "pc_machine.hpp"
@@ -13,6 +14,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -32,8 +34,9 @@ class GuestGpuC08 {
                 pci_window_bytes == cosmic_pc::PcMachine::kPciMmioBytes &&
                 pci_window_end <= cosmic_pc::PcMachine::kIoApicAddress);
 
-  GuestGpuC08(cosmic_pc::PcMachine& machine, const std::filesystem::path& vram)
-      : pc_(machine), memory_(vram) {}
+  using Msi = std::function<bool(std::uint32_t, std::uint16_t)>;
+  GuestGpuC08(cosmic_pc::PcMachine& machine, const std::filesystem::path& vram, Msi msi = {})
+      : pc_(machine), memory_(vram), msi_(std::move(msi)) {}
 
   void reset() noexcept {
     pci_command_ = 0;
@@ -48,6 +51,9 @@ class GuestGpuC08 {
     stage_.clear();
     memory_.reset();
     resident_download_bytes_ = 0;
+    msi_address_ = msi_data_ = 0;
+    msi_enabled_ = false;
+    reset_engine();
     gpu_ns_.reset();
     renderer_name_.clear();
     hardware_ = false;
@@ -62,14 +68,29 @@ class GuestGpuC08 {
   std::uint32_t config_word(unsigned offset) const noexcept {
     switch (offset) {
       case 0: return pci_id;
-      case 4: return pci_command_;
+      case 4: return pci_command_ | (msi_ ? 0x00100000U : 0U); // PCI status capabilities bit.
       case 8: return 0x03020001; // 3D controller, independent of the boot display.
       case 0x10: return probe_bar_ ? ~(RWGPU_BAR_BYTES - 1) : bar_;
       case 0x2c: return pci_id;
+      case 0x34: return msi_ ? RWGPU_PCI_MSI_CAP : 0;
+      case RWGPU_PCI_MSI_CAP: return msi_ ? 0x05U | (std::uint32_t(msi_enabled_) << 16) : 0;
+      case RWGPU_PCI_MSI_CAP + 4: return msi_address_;
+      case RWGPU_PCI_MSI_CAP + 8: return msi_data_;
       default: return 0;
     }
   }
   bool config_write(unsigned offset, unsigned bytes, std::uint32_t value) noexcept {
+    if (msi_ && offset >= RWGPU_PCI_MSI_CAP && offset < RWGPU_PCI_MSI_CAP + 12) {
+      const auto reg = offset & ~3U;
+      const auto shift = (offset & 3U) * 8;
+      const auto mask = (bytes == 4 ? UINT32_MAX : (1U << (8 * bytes)) - 1) << shift;
+      const auto merged = (config_word(reg) & ~mask) | ((value << shift) & mask);
+      if (reg == RWGPU_PCI_MSI_CAP) msi_enabled_ = (merged & 0x10000U) != 0;
+      else if (reg == RWGPU_PCI_MSI_CAP + 4) msi_address_ = merged & ~3U;
+      else msi_data_ = std::uint16_t(merged);
+      if (irq_status_) send_msi();
+      return false; // The target address for BAR accesses did not change.
+    }
     const auto old_bar = bar_, old_decode = pci_command_;
     const bool old_probe = probe_bar_;
     if (offset == 4) pci_command_ = value & 6U; // Memory Space and Bus Master.
@@ -105,7 +126,8 @@ class GuestGpuC08 {
       return true;
     }
     const auto reg = offset & ~3u;
-    if (!command_register(reg) && !direct_register(reg)) {
+    if (!command_register(reg) && !direct_register(reg) &&
+        reg != RWGPU_REG_IRQ_ACK && reg != RWGPU_REG_ENGINE_RESET) {
       pending_ = {};
       return true;
     }
@@ -119,6 +141,8 @@ class GuestGpuC08 {
       const auto value = pending_.value;
       pending_ = {};
       if (reg == RWGPU_REG_DOORBELL) dispatch(value);
+      else if (reg == RWGPU_REG_IRQ_ACK) irq_status_ &= ~value;
+      else if (reg == RWGPU_REG_ENGINE_RESET) { if (value == 1) reset_engine(); }
       else if (command_register(reg)) params_[(reg - RWGPU_REG_OFFSET_LO) / 4] = value;
       else direct_params_[(reg - RWGPU_REG_AUX_LO) / 4] = value;
     }
@@ -153,6 +177,13 @@ class GuestGpuC08 {
         << ",\"frame_dma_requests\":" << commands_[RWGPU_DRAW_READBACK]
         << ",\"frame_dma_completions\":" << frame_dma_completions_
         << ",\"frame_dma_bytes\":" << frame_dma_bytes_
+        << ",\"scheduler_fence\":" << fence_last_
+        << ",\"scheduler_submissions\":" << commands_[RWGPU_SUBMIT_DMA]
+        << ",\"scheduler_faults\":" << scheduler_faults_
+        << ",\"scheduler_draw_ticket\":" << scheduled_draw_ticket_
+        << ",\"scheduler_upload_bytes\":" << paging_upload_bytes_
+        << ",\"scheduler_download_bytes\":" << paging_download_bytes_
+        << ",\"scheduler_msi\":" << msi_messages_
         << ",\"source_triangles\":" << source_triangles_ << ",\"submitted_triangles\":" << drawn_triangles_
         << ",\"vertex_bytes\":" << vertex_bytes_ << ",\"presented_bytes\":" << presented_bytes_
         << ",\"graphics_serial\":" << work_.snapshot()->serial
@@ -168,14 +199,17 @@ class GuestGpuC08 {
   struct Partial { unsigned reg = UINT32_MAX, value = 0, written = 0; };
   cosmic_pc::PcMachine& pc_;
   GpuVram memory_;
+  Msi msi_;
   xgpu::GuestTriangleWork planner_;
   using RenderPlan = std::shared_ptr<const xgpu::GuestTrianglePlan>;
   qssd::GraphicsWorkMemory<RenderPlan> work_;
-  std::array<std::uint64_t, RWGPU_DRAW_READBACK + 1> commands_{};
+  std::array<std::uint64_t, RWGPU_PREEMPT + 1> commands_{};
   std::uint64_t draws_ = 0, source_triangles_ = 0, drawn_triangles_ = 0;
   std::uint64_t vertex_bytes_ = 0, presented_bytes_ = 0, host_ns_ = 0, backend_ns_ = 0;
   std::uint64_t result_ = 0, resident_download_bytes_ = 0;
   std::uint64_t frame_dma_completions_ = 0, frame_dma_bytes_ = 0;
+  std::uint64_t scheduler_faults_ = 0, msi_messages_ = 0;
+  std::uint64_t paging_upload_bytes_ = 0, paging_download_bytes_ = 0;
   std::optional<std::uint64_t> gpu_ns_;
   bool hardware_ = false;
   std::string renderer_name_;
@@ -183,9 +217,14 @@ class GuestGpuC08 {
   std::array<std::uint32_t, 3> direct_params_{};
   std::uint32_t pci_command_ = 0, bar_ = pci_window_start, status_ = RWGPU_IDLE, completed_ = 0;
   std::uint32_t alpha_draw_ticket_ = 0;
+  std::uint32_t msi_address_ = 0;
+  std::uint16_t msi_data_ = 0;
+  bool msi_enabled_ = false;
+  std::uint32_t fence_last_ = 0, fence_preempt_ = 0, preempt_last_ = 0, fence_fault_ = 0;
+  std::uint32_t irq_status_ = 0, scheduled_draw_ticket_ = 0;
   Partial pending_{};
   bool probe_bar_ = false;
-  std::vector<std::uint8_t> stage_, transfer_;
+  std::vector<std::uint8_t> stage_, transfer_, dma_commands_;
 #ifdef REVERSE_WINDOWS_GLES_GUEST
   regraphics::GuestRenderer renderer_;
   std::vector<std::uint8_t> bgrx_, color_;
@@ -212,7 +251,8 @@ class GuestGpuC08 {
         return RWGPU_CAP_VRAM | RWGPU_CAP_DIRECT_VRAM | RWGPU_CAP_SUM_INDICES
 #ifdef REVERSE_WINDOWS_GLES_GUEST
             | RWGPU_CAP_TRIANGLES | RWGPU_CAP_DRAW_VRAM | RWGPU_CAP_COLOR_DMA |
-              RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_ALPHA | RWGPU_CAP_DRAW_READBACK
+              RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_ALPHA | RWGPU_CAP_DRAW_READBACK |
+              (msi_ ? RWGPU_CAP_WDDM_SCHEDULER : 0)
 #endif
             ;
       case RWGPU_REG_STATUS: return status_;
@@ -223,6 +263,12 @@ class GuestGpuC08 {
       case RWGPU_REG_VRAM_BATCH_BYTES: return RWGPU_VRAM_BATCH_BYTES;
       case RWGPU_REG_DIRECT_MAX: return GpuVram::kTransferBytes;
       case RWGPU_REG_BUS_MASTER: return (pci_command_ & 4U) != 0;
+      case RWGPU_REG_FENCE_LAST: return fence_last_;
+      case RWGPU_REG_IRQ_STATUS: return irq_status_;
+      case RWGPU_REG_FENCE_PREEMPT: return fence_preempt_;
+      case RWGPU_REG_PREEMPT_LAST: return preempt_last_;
+      case RWGPU_REG_FENCE_FAULT: return fence_fault_;
+      case RWGPU_REG_SCHEDULED_DRAW_TICKET: return scheduled_draw_ticket_;
       case RWGPU_REG_RESULT_LO: return std::uint32_t(result_);
       case RWGPU_REG_RESULT_HI: return std::uint32_t(result_ >> 32);
       default:
@@ -239,7 +285,7 @@ class GuestGpuC08 {
     if (ticket != next_ticket) { status_ = RWGPU_INVALID; return; }
     result_ = 0;
     try {
-      if (op >= RWGPU_WRITE && op <= RWGPU_DRAW_READBACK) ++commands_[op];
+      if (op >= RWGPU_WRITE && op <= RWGPU_PREEMPT) ++commands_[op];
       const auto offset = wide(params_[0], params_[1]);
       const auto auxiliary = wide(direct_params_[0], direct_params_[1]);
       const auto count = wide(params_[2], direct_params_[2]);
@@ -259,6 +305,10 @@ class GuestGpuC08 {
           status_ = direct_transfer(op, offset, auxiliary, count);
           break;
         case RWGPU_SUM_INDICES: status_ = sum_indices(count); break;
+        case RWGPU_SUBMIT_DMA: status_ = execute_dma(offset, auxiliary, count); break;
+        case RWGPU_PREEMPT:
+          status_ = msi_ && auxiliary <= UINT32_MAX && !offset && !count ? RWGPU_OK : RWGPU_INVALID;
+          break;
         default: status_ = RWGPU_BAD_COMMAND;
       }
     } catch (const std::invalid_argument&) {
@@ -267,6 +317,32 @@ class GuestGpuC08 {
       status_ = RWGPU_FAILED;
     }
     completed_ = ticket;
+    // The PCI ticket and any DMA writes are visible before raising the MSI.
+    if (op == RWGPU_SUBMIT_DMA && direct_params_[1] == 0) {
+      if (status_ == RWGPU_OK) {
+        fence_last_ = direct_params_[0];
+        irq_status_ |= RWGPU_IRQ_COMPLETE;
+      } else {
+        if (!(irq_status_ & RWGPU_IRQ_FAULT)) fence_fault_ = direct_params_[0];
+        irq_status_ |= RWGPU_IRQ_FAULT;
+        ++scheduler_faults_;
+      }
+      send_msi();
+    }
+    if (op == RWGPU_PREEMPT && status_ == RWGPU_OK) {
+      fence_preempt_ = direct_params_[0];
+      preempt_last_ = fence_last_;
+      irq_status_ |= RWGPU_IRQ_PREEMPT;
+      send_msi();
+    }
+  }
+
+  void reset_engine() noexcept {
+    fence_last_ = fence_preempt_ = preempt_last_ = fence_fault_ = irq_status_ = scheduled_draw_ticket_ = 0;
+  }
+
+  void send_msi() noexcept {
+    if (msi_enabled_ && msi_ && msi_(msi_address_, msi_data_)) ++msi_messages_;
   }
 
   static unsigned result_status(GpuVram::Result result) noexcept {
@@ -343,6 +419,140 @@ class GuestGpuC08 {
     return RWGPU_OK;
   }
 
+  template <class T>
+  static T dma_field(const std::uint8_t* data) noexcept {
+    T value;
+    std::memcpy(&value, data, sizeof(value));
+    return value;
+  }
+
+  unsigned execute_dma(std::uint64_t address, std::uint64_t fence, std::uint64_t bytes) {
+    if (!(pci_command_ & 4U) || !msi_) return RWGPU_UNAVAILABLE;
+    if (irq_status_ & RWGPU_IRQ_FAULT) return RWGPU_FAILED;
+    if (fence > UINT32_MAX || bytes > RWGPU_DMA_BUFFER_BYTES || (bytes & 7U) ||
+        (bytes && !ordinary_ram(address, std::size_t(bytes)))) return RWGPU_INVALID;
+    if (!bytes) return RWGPU_OK; // Scheduler signal packets have no GPU work.
+    dma_commands_.resize(std::size_t(bytes));
+    pc_.cpu.memory.read_block(address, dma_commands_.data(), dma_commands_.size());
+    for (std::size_t at = 0; at < dma_commands_.size();) {
+      const auto* record = dma_commands_.data() + at;
+      const auto header = dma_field<RwGpuDmaHeader>(record);
+      if (header.record_bytes < sizeof(header) || (header.record_bytes & 7U) ||
+          header.record_bytes > dma_commands_.size() - at) return RWGPU_INVALID;
+      const auto status = execute_dma_record(header, record);
+      if (status != RWGPU_OK) return status;
+      at += header.record_bytes;
+    }
+    return RWGPU_OK;
+  }
+
+  unsigned execute_dma_record(RwGpuDmaHeader header, const std::uint8_t* record) {
+    switch (header.opcode) {
+      case RWGPU_DMA_UPLOAD: case RWGPU_DMA_DOWNLOAD:
+        return paging_transfer(header, record);
+      case RWGPU_DMA_COPY: {
+        if (header.record_bytes != sizeof(RwGpuDmaCopy)) return RWGPU_INVALID;
+        const auto copy = dma_field<RwGpuDmaCopy>(record);
+        return copy.reserved ? unsigned(RWGPU_INVALID) :
+            direct_transfer(RWGPU_COPY, copy.source, copy.destination, copy.bytes);
+      }
+      case RWGPU_DMA_FILL: {
+        if (header.record_bytes != sizeof(RwGpuDmaFill)) return RWGPU_INVALID;
+        const auto fill = dma_field<RwGpuDmaFill>(record);
+        if (!valid_vram_write(fill.destination, fill.bytes) || (fill.bytes & 3U)) return RWGPU_INVALID;
+        transfer_.resize(fill.bytes);
+        for (std::size_t at = 0; at < fill.bytes; at += sizeof(fill.pattern))
+          std::memcpy(transfer_.data() + at, &fill.pattern, sizeof(fill.pattern));
+        return result_status(memory_.write(fill.destination, transfer_.data(), fill.bytes));
+      }
+      case RWGPU_DMA_DRAW:
+        return scheduled_draw(header, record);
+      default:
+        return RWGPU_BAD_COMMAND;
+    }
+  }
+
+  static bool valid_vram_write(std::uint64_t address, std::size_t bytes) {
+    return bytes && bytes <= GpuVram::kTransferBytes - address % GpuVram::kPageBytes &&
+           GpuVram::valid_range(address, bytes);
+  }
+
+  unsigned paging_transfer(RwGpuDmaHeader header, const std::uint8_t* record) {
+    if (header.record_bytes < sizeof(RwGpuDmaTransfer)) return RWGPU_INVALID;
+    const auto job = dma_field<RwGpuDmaTransfer>(record);
+    const bool upload = header.opcode == RWGPU_DMA_UPLOAD;
+    if (!job.ranges || job.ranges > RWGPU_DMA_MAX_RANGES || !job.bytes ||
+        header.record_bytes != sizeof(job) + job.ranges * sizeof(RwGpuDmaRange) ||
+        (upload ? !valid_vram_write(job.vram, job.bytes)
+                : (job.bytes > GpuVram::kTransferBytes || !GpuVram::valid_range(job.vram, job.bytes))))
+      return RWGPU_INVALID;
+    const auto range = [&](unsigned index) {
+      return dma_field<RwGpuDmaRange>(record + sizeof(job) + index * sizeof(RwGpuDmaRange));
+    };
+    std::size_t bytes = 0;
+    for (unsigned i = 0; i < job.ranges; ++i) {
+      const auto part = range(i);
+      if (part.reserved || !part.bytes || part.bytes > job.bytes - bytes ||
+          !ordinary_ram(part.ram, part.bytes)) return RWGPU_INVALID;
+      bytes += part.bytes;
+    }
+    if (bytes != job.bytes) return RWGPU_INVALID;
+    if (upload) {
+      transfer_.resize(bytes);
+      std::size_t at = 0;
+      for (unsigned i = 0; i < job.ranges; ++i) {
+        const auto part = range(i);
+        pc_.cpu.memory.read_block(part.ram, transfer_.data() + at, part.bytes);
+        at += part.bytes;
+      }
+      const auto result = memory_.write(job.vram, transfer_.data(), bytes);
+      if (result == GpuVram::Result::Complete) paging_upload_bytes_ += bytes;
+      return result_status(result);
+    }
+    const auto* resident = memory_.resident_read(job.vram, bytes);
+    const auto* source = resident;
+    if (!source) {
+      transfer_.resize(bytes);
+      const auto result = memory_.read(job.vram, transfer_.data(), bytes);
+      if (result != GpuVram::Result::Complete) return result_status(result);
+      source = transfer_.data();
+    }
+    auto& ram = pc_.cpu.memory;
+    const auto pins = ram.pin_writes();
+    for (unsigned i = 0; i < job.ranges; ++i) {
+      const auto part = range(i);
+      ram.prepare_write(part.ram, part.bytes);
+    }
+    std::size_t at = 0;
+    for (unsigned i = 0; i < job.ranges; ++i) {
+      const auto part = range(i);
+      ram.write_block(part.ram, source + at, part.bytes);
+      at += part.bytes;
+    }
+    paging_download_bytes_ += bytes;
+    if (resident) resident_download_bytes_ += bytes;
+    return RWGPU_OK;
+  }
+
+  unsigned scheduled_draw(RwGpuDmaHeader header, const std::uint8_t* data) {
+#ifdef REVERSE_WINDOWS_GLES_GUEST
+    if (header.record_bytes < sizeof(RwGpuDmaDraw)) return RWGPU_INVALID;
+    const auto job = dma_field<RwGpuDmaDraw>(data);
+    if (job.vertices > RWGPU_MAX_VERTICES || job.vertices % 3 ||
+        header.record_bytes != rwgpu_dma_draw_bytes(job.vertices) ||
+        !job.width || job.width > RWGPU_MAX_WIDTH || !job.height || job.height > RWGPU_MAX_HEIGHT ||
+        !valid_vram_write(job.destination, std::size_t(job.width) * job.height * 4)) return RWGPU_INVALID;
+    vertices_.resize(job.vertices);
+    if (job.vertices) std::memcpy(vertices_.data(), data + sizeof(job), job.vertices * sizeof(RwGpuVertex));
+    const auto result = render_frame(job.width, job.height, job.clear_rgba, false, true, {}, job.destination);
+    if (result == RWGPU_OK) scheduled_draw_ticket_ = params_.back();
+    return result;
+#else
+    (void)header; (void)data;
+    return RWGPU_UNAVAILABLE;
+#endif
+  }
+
   unsigned read_color(std::uint64_t offset, unsigned bytes) {
 #ifdef REVERSE_WINDOWS_GLES_GUEST
     if (color_.empty()) return RWGPU_UNAVAILABLE;
@@ -377,7 +587,6 @@ class GuestGpuC08 {
 #ifdef REVERSE_WINDOWS_GLES_GUEST
     static_assert(sizeof(RwGpuVertex) == sizeof(xgpu::GuestVertex) &&
                   RWGPU_MAX_VERTICES == xgpu::GuestTriangleWork::max_vertices);
-    const auto start = std::chrono::steady_clock::now();
     const auto display = pc_.video_info();
     const auto width = params_[3], height = params_[4], clear = params_[5];
     const auto present = flags == RWGPU_DRAW_PRESENT_VBE;
@@ -403,16 +612,32 @@ class GuestGpuC08 {
     } else if (bytes) {
       std::memcpy(vertices_.data(), stage_.data(), bytes);
     }
+    return render_frame(width, height, clear, present, alpha, dma_out, {});
+#else
+    (void)op; (void)flags; (void)bytes; (void)offset; (void)dma_out;
+    return RWGPU_UNAVAILABLE;
+#endif
+  }
+
+#ifdef REVERSE_WINDOWS_GLES_GUEST
+  unsigned render_frame(unsigned width, unsigned height, unsigned clear, bool present, bool alpha,
+                        std::optional<std::uint64_t> dma_out, std::optional<std::uint64_t> vram_out) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto pixels = std::size_t(width) * height * 4;
     // Preflight the entire DMA destination before GPU work. The pins keep
     // prepared pages resident until the frame is copied.
     const auto pins = pc_.cpu.memory.pin_writes();
     if (dma_out) pc_.cpu.memory.prepare_write(*dma_out, pixels);
     const auto plan = std::make_shared<const xgpu::GuestTrianglePlan>(planner_.plan(vertices_));
     auto receipt = renderer_.render(*plan, width, height, clear, bgrx_, alpha);
-    if (dma_out && bgrx_.size() != pixels) return RWGPU_FAILED;
+    if (bgrx_.size() != pixels) return RWGPU_FAILED;
     // Return the actual readback to the canonical guest display. C07 observes
     // this physical write the same way as BIOS or ordinary guest pixel stores.
-    if (present) pc_.cpu.memory.write_block(display.physical_address, bgrx_.data(), bgrx_.size());
+    if (present) pc_.cpu.memory.write_block(pc_.video_info().physical_address, bgrx_.data(), bgrx_.size());
+    if (vram_out) {
+      const auto result = memory_.write(*vram_out, bgrx_.data(), pixels);
+      if (result != GpuVram::Result::Complete) return result_status(result);
+    }
     work_.publish(plan, plan->revision, plan->revision);
     // The DMA destination is resident and pinned, so this copy cannot need
     // backing I/O or grow SparseRam after publishing the completed work.
@@ -436,11 +661,8 @@ class GuestGpuC08 {
     host_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - start).count();
     return RWGPU_OK;
-#else
-    (void)op; (void)flags; (void)bytes; (void)offset; (void)dma_out;
-    return RWGPU_UNAVAILABLE;
-#endif
   }
+#endif
 };
 
 }  // namespace reverse_windows

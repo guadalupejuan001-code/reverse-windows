@@ -3,7 +3,7 @@ Signature = "$WINDOWS NT$"
 Class = Display
 ClassGuid = {4d36e968-e325-11ce-bfc1-08002be10318}
 Provider = %Provider%
-DriverVer = 11/14/2026,0.8.3.0
+DriverVer = 11/15/2026,0.8.4.0
 CatalogFile = ReversePrimeRender.cat
 PnpLockdown = 1
 
@@ -28,6 +28,13 @@ ReversePrimeRenderUmd.dll = 1
 CopyFiles = Miniport,UserMode
 AddReg = AdapterSettings
 FeatureScore = F6
+
+[Install.NT.HW]
+AddReg = InterruptSettings
+
+[InterruptSettings]
+HKR,Interrupt Management\MessageSignaledInterruptProperties,MSISupported,0x00010001,1
+HKR,Interrupt Management\MessageSignaledInterruptProperties,MessageNumberLimit,0x00010001,1
 
 [Miniport]
 ReversePrimeRender.sys

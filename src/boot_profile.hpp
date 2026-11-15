@@ -20,6 +20,12 @@ inline void write_ether_arm64(std::ostream& out, const cosmic_pc::Cpu& cpu) {
       << ",\"invalidated\":" << stats.invalidated << ",\"data_fallbacks\":" << stats.data_fallbacks
       << ",\"compiled_evictions\":" << stats.compiled_evictions
       << ",\"native_compile_ns\":" << stats.native_compile_ns
+      << ",\"code_version_hits\":" << stats.code_version_hits
+      << ",\"code_byte_checks\":" << stats.code_byte_checks
+      << ",\"code_bytes_read\":" << stats.code_bytes_read
+#if defined(REVERSE_MUNDO_X_SOURCE_SHA)
+      << ",\"mundo_x_source_sha\":\"" REVERSE_MUNDO_X_SOURCE_SHA "\""
+#endif
       << '}';
 }
 

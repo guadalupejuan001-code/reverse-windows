@@ -18,12 +18,16 @@ foreach(required_header IN ITEMS
 endforeach()
 
 find_package(Threads REQUIRED)
+include("${REVERSE_WINDOWS_ROOT}/cmake/VerifyMundoX.cmake")
+reverse_windows_pin_mundo_x("${REVERSE_WINDOWS_ROOT}/config/dependencies.lock.json" "${REVERSE_MUNDO_X_ROOT}")
 add_library(reverse_windows_android SHARED
     native_machine.cpp
     "${REVERSE_MUNDO_X_ROOT}/native/src/ether_transform.cpp"
     "${REVERSE_MUNDO_X_ROOT}/native/src/ether_neon.cpp")
 target_compile_features(reverse_windows_android PRIVATE cxx_std_17)
-target_compile_definitions(reverse_windows_android PRIVATE MUNDO_X_PC_ETHER_NEXT=1 REVERSE_WINDOWS_GLES_GUEST=1)
+add_dependencies(reverse_windows_android reverse_windows_verify_mundo_x)
+target_compile_definitions(reverse_windows_android PRIVATE MUNDO_X_PC_ETHER_NEXT=1 REVERSE_WINDOWS_GLES_GUEST=1
+    REVERSE_MUNDO_X_SOURCE_SHA="${REVERSE_MUNDO_X_SOURCE_SHA}")
 target_include_directories(reverse_windows_android PRIVATE
     "${REVERSE_WINDOWS_ROOT}/src"
     "${REVERSE_MUNDO_X_ROOT}/pc-android/native"

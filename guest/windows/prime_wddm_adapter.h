@@ -38,27 +38,20 @@ public:
     Adapter(const Adapter&) = delete;
     Adapter& operator=(const Adapter&) = delete;
 
-    bool escape(void* packet, UINT bytes) const {
+    RwGpuWddmAdapter query() const {
+        RwGpuWddmAdapter info{};
+        info.header = {RWGPU_WDDM_MAGIC, RWGPU_WDDM_ABI, RWGPU_WDDM_QUERY, sizeof(info)};
         D3DKMT_ESCAPE request{};
         request.hAdapter = handle_;
         request.Type = D3DKMT_ESCAPE_DRIVERPRIVATE;
         request.Flags.HardwareAccess = 1;
-        request.pPrivateDriverData = packet;
-        request.PrivateDriverDataSize = bytes;
+        request.pPrivateDriverData = &info;
+        request.PrivateDriverDataSize = sizeof(info);
         const auto status = D3DKMTEscape(&request);
-        if (status == 0) return true;
-        std::fprintf(stderr, "PrimeVGC WDDM escape failed (0x%08lx)\n", static_cast<ULONG>(status));
-        return false;
-    }
-
-    RwGpuWddmAdapter query() const {
-        RwGpuWddmAdapter info{};
-        info.header = {RWGPU_WDDM_MAGIC, RWGPU_WDDM_ABI, RWGPU_WDDM_QUERY, sizeof(info)};
-        constexpr auto caps = RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_DMA | RWGPU_CAP_COLOR_ALPHA;
-        if (!escape(&info, sizeof(info)) || info.header.magic != RWGPU_WDDM_MAGIC ||
+        if (status != 0 || info.header.magic != RWGPU_WDDM_MAGIC ||
             info.header.version != RWGPU_WDDM_ABI || info.header.command != RWGPU_WDDM_QUERY ||
             info.header.bytes != sizeof(info) || info.pci_id != ((RWGPU_DEVICE_ID << 16) | RWGPU_VENDOR_ID) ||
-            info.logical_vram_bytes != RWGPU_LOGICAL_BYTES || (info.capabilities & caps) != caps)
+            info.logical_vram_bytes != RWGPU_LOGICAL_BYTES || !(info.capabilities & RWGPU_CAP_WDDM_SCHEDULER))
             throw std::runtime_error("validate PrimeVGC ABI and VRAM");
         return info;
     }
