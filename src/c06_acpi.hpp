@@ -17,6 +17,7 @@ class AcpiC06 {
   static constexpr std::uint32_t fadt_address=0xE0200;
   static constexpr std::uint32_t madt_address=0xE0400;
   static constexpr std::uint32_t dsdt_address=0xE0600;
+  static constexpr std::uint32_t smp_dsdt_address=0xE1000;
   static constexpr std::uint32_t facs_address=0xE0800;
   static constexpr std::uint32_t pci_config_ports=0xCF8;
   static constexpr std::uint32_t primary_ide_ports=0x1F0;
@@ -30,6 +31,9 @@ class AcpiC06 {
   static constexpr std::uint32_t pm_timer_mask=0x00ffffff;
   static constexpr std::uint32_t pm_timer_half_period=0x00800000;
   static constexpr std::size_t madt_bytes=74;
+  static constexpr unsigned ioapic_id(unsigned logical_processors) noexcept {
+    return logical_processors;
+  }
 
   static void u16(std::vector<std::uint8_t>& b,std::size_t at,std::uint16_t v){
     if(at+2>b.size())throw std::out_of_range("ACPI u16");
@@ -74,7 +78,7 @@ class AcpiC06 {
     table[at+3]=std::uint8_t(access);
     u64(table,at+4,port);
   }
-  static std::vector<std::uint8_t> dsdt_aml(bool ide, bool pci_mmio) {
+  static std::vector<std::uint8_t> dsdt_aml(bool ide, bool pci_mmio, unsigned processors) {
     // Name(\_S5, Package(){5, 5}).
     std::vector<std::uint8_t> aml{0x08,0x5c,'_','S','5','_',0x12,0x06,0x02,0x0a,0x05,0x0a,0x05};
     const auto finish_large_package=[&](std::size_t length_offset){
@@ -138,6 +142,16 @@ class AcpiC06 {
       0x79,0x00
     });
     finish_large_package(root_length);
+    constexpr char digits[] = "0123456789ABCDEF";
+    for (unsigned id = 0; processors > 1 && id < processors; ++id) {
+      const auto cpu_length = aml.size() + 2;
+      aml.insert(aml.end(), {
+        0x5b,0x82,0,0,'C','P','0',std::uint8_t(digits[id]),
+        0x08,'_','H','I','D',0x0d,'A','C','P','I','0','0','0','7',0,
+        0x08,'_','U','I','D',0x0a,std::uint8_t(id)
+      });
+      finish_large_package(cpu_length);
+    }
     finish_large_package(scope_length);
     return aml;
   }
@@ -145,6 +159,8 @@ class AcpiC06 {
  public:
   static void install(cosmic_pc::Cpu& cpu,bool ide,bool pci_mmio=false) {
     if(cpu.memory.size()<0x100000)throw std::runtime_error("ACPI BIOS RAM unavailable");
+    const auto processors = cpu.topology().logical_processors();
+    const auto dsdt_pointer = processors > 1 ? smp_dsdt_address : dsdt_address;
     // RSDP 2.0: ACPI 1.0 prefix plus 64-bit XSDT pointer and full checksum.
     std::vector<std::uint8_t> rsdp(36,0);
     std::memcpy(rsdp.data(),"RSD PTR ",8);
@@ -165,7 +181,7 @@ class AcpiC06 {
     // Legacy FADT registers are backed by the C06 ACPI PM I/O subset.
     auto fadt=table("FACP",244,4);
     u32(fadt,36,facs_address);
-    u32(fadt,40,dsdt_address); // DSDT 32-bit physical address
+    u32(fadt,40,dsdt_pointer); // DSDT 32-bit physical address
     u16(fadt,46,sci_irq);
     u32(fadt,56,pm_event_port);
     u32(fadt,64,pm_control_port);
@@ -175,7 +191,7 @@ class AcpiC06 {
     u16(fadt,109,0x0f);     // Legacy devices, 8042, no legacy VGA probing or MSI.
     u32(fadt,112,0x30);     // No fixed-feature power or sleep button.
     u64(fadt,132,facs_address);
-    u64(fadt,140,dsdt_address); // X_DSDT
+    u64(fadt,140,dsdt_pointer); // X_DSDT
     gas(fadt,148,32,2,pm_event_port); // Two 16-bit registers.
     gas(fadt,172,16,2,pm_control_port);
     gas(fadt,208,32,3,pm_timer_port);
@@ -188,19 +204,25 @@ class AcpiC06 {
     facs[32]=1;
     cpu.memory.write_block(facs_address,facs.data(),facs.size());
 
-    auto madt=table("APIC",madt_bytes,3);
+    auto madt=table("APIC",madt_bytes + 8 * (processors - 1),3);
     u32(madt,36,cosmic_pc::PcMachine::kLocalApicAddress);u32(madt,40,1); // 8259 PIC present.
-    madt[44]=0;madt[45]=8;madt[46]=0;madt[47]=0;u32(madt,48,1);
-    madt[52]=1;madt[53]=12;madt[54]=1;madt[55]=0; // IOAPIC ID1
-    u32(madt,56,cosmic_pc::PcMachine::kIoApicAddress);u32(madt,60,0);
-    madt[64]=2;madt[65]=10;madt[67]=sci_irq; // ISA SCI maps to the same GSI.
-    u32(madt,68,sci_irq);u16(madt,72,0x0f); // Active-low, level-triggered.
+    std::size_t entry = 44;
+    for (unsigned id = 0; id < processors; ++id, entry += 8) {
+      madt[entry + 1] = 8;
+      madt[entry + 2] = madt[entry + 3] = std::uint8_t(id);
+      u32(madt,entry + 4,1);
+    }
+    madt[entry]=1;madt[entry+1]=12;madt[entry+2]=std::uint8_t(ioapic_id(processors));
+    u32(madt,entry+4,cosmic_pc::PcMachine::kIoApicAddress);
+    entry+=12;
+    madt[entry]=2;madt[entry+1]=10;madt[entry+3]=sci_irq; // ISA SCI maps to the same GSI.
+    u32(madt,entry+4,sci_irq);u16(madt,entry+8,0x0f); // Active-low, level-triggered.
     publish(cpu,madt_address,std::move(madt));
 
-    const auto aml=dsdt_aml(ide,pci_mmio);
+    const auto aml=dsdt_aml(ide,pci_mmio,processors);
     auto dsdt=table("DSDT",36+aml.size(),2);
     std::copy(aml.begin(),aml.end(),dsdt.begin()+36);
-    publish(cpu,dsdt_address,std::move(dsdt));
+    publish(cpu,dsdt_pointer,std::move(dsdt));
   }
 };
 } // namespace reverse_windows

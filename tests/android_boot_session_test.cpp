@@ -411,12 +411,14 @@ int main(int argc, char** argv) {
       auto session = [&] {
         FileDescriptor iso(fixture, O_RDONLY);
         return Session(disk, 64, Session::BootSource::Iso, iso.value, original.size(),
-                       prime, dir.path, vram, data_disk);
+                       prime, dir.path, vram, data_disk, Session::kPrimeCpuTopology);
       }();
       run_until(session, Session::Step::WaitingKey,
                 "El Torito guest did not detect QSSD and return to the real-mode BIOS prompt", 1);
       frame = capture_cells(session);
       progress = session.diagnostic();
+      require(progress.find("\"cores\":8,\"threads_per_core\":2,\"logical_processors\":16,\"started\":1") !=
+                  std::string::npos, "Prime Android ISO boot uses the requested CPU topology");
       const auto live = session.diagnostic(false);
       require(live.size() < progress.size() && live.find("\"boot_profile\":") == std::string::npos &&
                   live.find("\"status\":\"waiting_key\"") != std::string::npos &&
@@ -507,13 +509,16 @@ int main(int argc, char** argv) {
     }
     require(bytes(disk)==with_tail, "Preflight modified the QSSD or recovered its tail in place");
     {
-      Session reboot(disk, 0, Session::BootSource::Disk, -1, 0, prime, dir.path, vram, data_disk);
+      Session reboot(disk, 0, Session::BootSource::Disk, -1, 0, prime, dir.path, vram, data_disk,
+                     Session::kPrimeCpuTopology);
       run_until(reboot, Session::Step::Halted, "QSSD guest did not complete its boot");
       require(screen(capture_cells(reboot)).find("QSSD REBOOT OK") != std::string::npos,
               "QSSD did not boot the MBR installed by the ISO guest");
       require(reboot.diagnostic().find("\"source\":\"qssd\"") != std::string::npos,
               "Reboot diagnostic did not identify QSSD");
       const auto disk_boot = reboot.diagnostic();
+      require(counter(disk_boot, "logical_processors") == 16,
+              "Direct QSSD boot keeps all 16 logical processors available");
       require(disk_boot.find("\"data_disk\":{\"logical_bytes\":9007199254740992,\"physical_bytes\":64,") !=
                   std::string::npos, "Direct boot did not reopen the data disk");
       require(counter(disk_boot, "usable_bytes") == Session::kPrimeRamBytes &&

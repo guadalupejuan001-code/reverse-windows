@@ -95,7 +95,8 @@ JNIEXPORT jstring JNICALL Java_com_reversewindows_android_NativeMachine_checkHar
         if (iso_bytes < 0) throw std::invalid_argument("Tamaño de medio inválido.");
         const auto result = Session::check_hardware(string_from(env, disk), iso_fd,
                 static_cast<std::uint64_t>(iso_bytes), string_from(env, iso_error),
-                ram_profile(available, threshold, low_memory, prime_ram), string_from(env, ram_cache));
+                ram_profile(available, threshold, low_memory, prime_ram),
+                string_from(env, ram_cache), Session::kPrimeCpuTopology);
         return env->NewStringUTF(result.c_str());
     });
 }
@@ -111,7 +112,8 @@ JNIEXPORT jlong JNICALL Java_com_reversewindows_android_NativeMachine_openWithRa
             string_from(env, disk), static_cast<unsigned>(capacity),
             static_cast<Session::BootSource>(source), iso_fd,
             static_cast<std::uint64_t>(iso_bytes), ram_profile(available, threshold, low_memory, prime_ram),
-            string_from(env, ram_cache), string_from(env, graphics_vram), string_from(env, data_disk));
+            string_from(env, ram_cache), string_from(env, graphics_vram), string_from(env, data_disk),
+            Session::kPrimeCpuTopology);
         auto instance = std::make_shared<Instance>(std::move(machine));
         std::lock_guard<std::mutex> lock(registry_mutex);
         if (next_handle == std::numeric_limits<jlong>::max())
