@@ -275,6 +275,7 @@ void verify_arm64_session(const std::filesystem::path& path) {
   const std::uint8_t handoff[] = {0xbb,std::uint8_t(destination),std::uint8_t(destination >> 8),0,0,0xff,0xe3};
   std::copy(std::begin(handoff), std::end(handoff), start);
   const std::uint8_t guest[]{
+      0x0f,0x09,                              // WBINVD at CPL0, then continue.
       0xbe,0xa0,0x7d,0,0,                    // ESI = first chain node.
       0x41,0xbe,0xe0,0x7d,0,0,               // R14D = end of chain.
       0x48,0x8b,0x36,0x49,0x3b,0xf6,0x75,0xf8,
@@ -297,6 +298,8 @@ void verify_arm64_session(const std::filesystem::path& path) {
   const auto info = session.diagnostic();
   require(session.is_stopped() && info.find("\"cpu_mode\":\"long64\"") != std::string::npos,
           "The Android native session did not execute the long-mode QSSD guest");
+  require(counter(info, "wbinvd_retired") == 1, "The Android session did not continue after WBINVD");
+  std::cout << "PRIME_C10_WBINVD_SESSION_PASS count=1 resume=1\n";
   const auto arm64 = info.find("\"ether_arm64\":{");
   require(arm64 != std::string::npos, "C03 counts are missing from the Android diagnostic");
   const auto native_steps = counter(info.substr(arm64), "guest_steps");

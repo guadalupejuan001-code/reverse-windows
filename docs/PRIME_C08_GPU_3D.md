@@ -23,6 +23,7 @@ Los registros de C08 conservan la ABI 1. Los bits de capacidad nuevos anuncian e
 | `DRAW_VRAM` (9) | Vértices en VRAM lógica | REgraphics y presentación VBE opcional |
 | `READ_COLOR_RAM` (10) | Último destino BGRX o BGRA renderizado | RAM física del invitado |
 | `DRAW_RAM` (11) | Vértices en RAM física del invitado | REgraphics y presentación VBE opcional |
+| `DRAW_READBACK` (12) | Vértices en RAM física del invitado | Render BGRA y devolución del cuadro completo a RAM con un ticket |
 
 Las órdenes directas usan `OFFSET` para el origen, `AUX` para el destino y `LENGTH_HI:LENGTH` para el tamaño o conteo. `DRAW_VRAM` y `DRAW_RAM` usan `AUX` para los indicadores de presentación. Todas las órdenes usan la misma secuencia de tickets. Las transferencias con RAM requieren PCI Bus Master y descartan los rangos reservados. PrimeVGC C03 amplía a **8 MiB** el tamaño máximo anunciado por orden directa. Las escrituras admiten hasta 2.048 páginas modificadas, incluido el desplazamiento inicial. Las órdenes de 512 KiB siguen disponibles.
 
@@ -46,6 +47,8 @@ La ejecución normal de `prime_gpu_scene.exe` comprueba y usa DMA en el transpor
 
 El módulo de usuario crea un contexto, valida las instrucciones DXBC de los shaders de la escena y agrupa dibujos de triángulos hasta el primer `CopyResource` o `Flush`. Las asignaciones de la escena son locales al módulo. El miniport recibe la geometría mediante un comando privado y la pasa a REgraphics por DMA. Devuelve píxeles BGRA y el ticket PCI. La lectura de Direct3D reordena esos canales a RGBA. El perfil experimental admite la escena fuera de pantalla, con shaders de paso directo, una lista de triángulos y prueba de profundidad fija. Los shaders con otras operaciones se rechazan.
 
+Cuando la VM anuncia `DRAW_READBACK` y el búfer DMA del miniport tiene capacidad para la geometría y el cuadro, una orden renderiza y devuelve todos los píxeles. El miniport conserva la transferencia por bloques para adaptadores anteriores y para cuadros que excedan su búfer contiguo. Una prueba x86 de 640 × 480 compara los 1.228.800 bytes del cuadro entre ambas rutas. La ruta nueva emite una orden, frente a una de dibujo y cinco de transferencia en la original. También rechaza un destino DMA en el BAR y comprueba que la superficie VBE queda intacta.
+
 CI ejerce el módulo de usuario mediante su tabla de funciones con shaders compilados por Microsoft. Verifica la geometría, una sola entrega de dos dibujos, la lectura RGBA y el rechazo de una respuesta sin ticket. El invitado x86 de prueba ejecuta las órdenes PCI reales y verifica los bytes BGRA, el ticket y la ausencia de escrituras VBE. En CI, WARP calcula el oráculo Direct3D y Mesa ejecuta el renderizador de la prueba PCI.
 
 `prime_wddm_probe.exe` comprueba el canal privado, la capacidad lógica y el ticket del miniport cargado. `prime_gpu_scene.exe --wddm` ejecuta la prueba Direct3D y exige un adaptador DXGI `1b36:c083`, cuatro píxeles exactos respecto a WARP y un nuevo ticket de PrimeVGC. Durante esa prueba se debe ejecutar solamente una escena a la vez. El ticket de la aplicación debe coincidir con `guest_gpu.alpha_draw_ticket`. Para medir la ejecución física, el diagnóstico debe identificar el renderizador del Samsung. `guest_gpu.gpu_query_ns` contiene el tiempo de la GPU cuando la consulta de temporizador es válida.
@@ -53,3 +56,13 @@ CI ejerce el módulo de usuario mediante su tabla de funciones con shaders compi
 El miniport implementa dispositivos y contextos. Siguen pendientes las asignaciones y paginación de VidMm y la planificación y finalización de comandos de Dxgkrnl. La carga del controlador dentro de Windows, la escena sobre el adaptador invitado y el tiempo en la GPU física del Samsung quedan por verificar.
 
 [Arquitectura de WDDM](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/windows-vista-and-later-display-driver-model-architecture) · [Envío de comandos](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/submitting-a-command-buffer) · [Recursos PCI traducidos](https://learn.microsoft.com/en-us/windows-hardware/drivers/wdf/raw-and-translated-resources).
+
+## Arranque Prime y uso de InfiniteCore
+
+La APK 0.2.0 probada en el Samsung llegó a modo x64. Se detuvo en `0F 09` a las 8.442.178.252 instrucciones de invitado. Con `WBINVD` implementado a nivel de privilegio 0, la compilación 0.2.1 registra `machine.wbinvd_retired` en el diagnóstico. La prueba de la sesión nativa Android ejecuta esa instrucción, continúa en x64 y comprueba el resultado después de arrancar desde un QSSD de prueba.
+
+Éter mantiene bloques ARM64 que antes podían expulsarse mutuamente al compartir una ranura. El traductor reconoce comparaciones con inmediato y las formas observadas de `TEST`. El diagnóstico incluye `compiled_evictions` y `native_compile_ns`. Para comparar el tiempo total, se mide el mismo tramo y número de instrucciones con el mismo medio y estado de QSSD.
+
+Las instrucciones de lectura y escritura de 16, 32 o 64 bits que caen dentro de la ventana de Éter usan la sesión compartida de InfiniteCore con una transacción por operando. `ether_span_reads` y `ether_span_writes` cuentan esas operaciones. El resto de la RAM conserva su ruta habitual. El ensayo de 1.024 pares de `MOV` mide el recorrido completo con idénticos registros, flags, instrucciones y bytes finales.
+
+La validación en el Samsung requiere que el diagnóstico avance más allá del punto de parada anterior, que el instalador termine y que el disco persistido arranque hasta el escritorio. Para Direct3D, `prime_gpu_scene.exe --wddm` debe registrar el adaptador `1b36:c083`, un ticket nuevo y píxeles correctos, y el diagnóstico de Android debe confirmar el mismo ticket. El tiempo de la GPU física se toma de una consulta válida de REgraphics.

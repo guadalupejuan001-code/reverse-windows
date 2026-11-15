@@ -18,6 +18,8 @@ inline void write_ether_arm64(std::ostream& out, const cosmic_pc::Cpu& cpu) {
       << ",\"translated\":" << stats.translated << ",\"cache_hits\":" << stats.hits
       << ",\"executed_blocks\":" << stats.blocks << ",\"guest_steps\":" << stats.steps
       << ",\"invalidated\":" << stats.invalidated << ",\"data_fallbacks\":" << stats.data_fallbacks
+      << ",\"compiled_evictions\":" << stats.compiled_evictions
+      << ",\"native_compile_ns\":" << stats.native_compile_ns
       << '}';
 }
 

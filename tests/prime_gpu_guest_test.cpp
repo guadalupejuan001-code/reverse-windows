@@ -326,6 +326,41 @@ void verify(const std::filesystem::path& volume) {
             !pc.cpu.memory.write_watch()->pending(),
             "WDDM offscreen readback must preserve alpha without changing the boot display");
     std::cout << "PRIME_C08_BGRA_DMA_PASS alpha_ticket=18 vbe_stores=0 " << gpu_stats(*board.attached_gpu()) << '\n';
+
+    constexpr auto frame_target = 0x400000U;
+    constexpr unsigned chunk_size = RWGPU_MAX_VERTICES * sizeof(RwGpuVertex);
+    static_assert(color_bytes / chunk_size == 5 && color_bytes % chunk_size == 0);
+    Guest32 paired;
+    paired.write(moved_bar + RWGPU_REG_WIDTH, width);
+    paired.write(moved_bar + RWGPU_REG_HEIGHT, height);
+    paired.read(moved_bar + RWGPU_REG_CAPS, 0xe078);
+    paired.direct_command(RWGPU_DRAW_RAM, 21, source, RWGPU_DRAW_COLOR_ALPHA, sizeof(vertices));
+    for (unsigned chunk = 0; chunk < 5; ++chunk) {
+      const auto offset = chunk * chunk_size;
+      paired.direct_command(RWGPU_READ_COLOR_RAM, 22 + chunk, offset, color_target + offset, chunk_size);
+      paired.read(moved_bar + RWGPU_REG_STATUS, 0xe0a0 + 4 * chunk);
+    }
+    paired.direct_command(RWGPU_DRAW_READBACK, 27, source, moved_bar, sizeof(vertices));
+    paired.read(moved_bar + RWGPU_REG_STATUS, 0xe07c);
+    paired.direct_command(RWGPU_DRAW_READBACK, 28, source, frame_target, sizeof(vertices));
+    paired.read(moved_bar + RWGPU_REG_STATUS, 0xe080);
+    paired.read(moved_bar + RWGPU_REG_COMPLETED, 0xe084);
+    paired.read(moved_bar + RWGPU_REG_RESULT_LO, 0xe088);
+    paired.run(pc);
+    for (unsigned chunk = 0; chunk < 5; ++chunk)
+      require(pc.cpu.read32(0xe0a0 + 4 * chunk) == RWGPU_OK, "Legacy BGRA readback failed");
+    pc.cpu.memory.read_block(color_target, via_dma.data(), via_dma.size());
+    pc.cpu.memory.read_block(frame_target, via_vbe.data(), via_vbe.size());
+    const auto frame_stats = gpu_stats(*board.attached_gpu());
+    require((pc.cpu.read32(0xe078) & RWGPU_CAP_DRAW_READBACK) && pc.cpu.read32(0xe07c) == RWGPU_INVALID &&
+            pc.cpu.read32(0xe080) == RWGPU_OK && pc.cpu.read32(0xe084) == 28 &&
+            pc.cpu.read32(0xe088) == color_bytes && via_dma == via_vbe &&
+            pc.cpu.read32(frame_target + color_bytes - 4) == 0x740a141eU &&
+            frame_stats.find("\"frame_dma_completions\":1,") != std::string::npos &&
+            frame_stats.find("\"alpha_draw_ticket\":28,") != std::string::npos &&
+            !pc.cpu.memory.write_watch()->pending(),
+            "Single-ticket readback did not deliver the same BGRA frame or corrupted VGA");
+    std::cout << "PRIME_C08_SINGLE_DMA_PASS bytes=" << color_bytes << " legacy_commands=6 commands=1\n";
 #else
     require(pc.cpu.read32(0xe024) == RWGPU_UNAVAILABLE && pc.cpu.read32(0xe028) == 10,
             "Headless build must disclose its absent renderer");

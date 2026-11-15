@@ -91,17 +91,26 @@ static NTSTATUS prime_allocate_dma(PrimeAdapter* gpu) {
     description.Master = TRUE;
     description.Dma32BitAddresses = TRUE;
     description.Dma64BitAddresses = TRUE;
-    // Every draw must fit at once. Readback uses repeated chunks of this buffer.
+    // Prefer one common buffer for both vertices and the complete BGRA frame.
+    // Systems with fragmented memory can retain the existing chunked readback.
     const ULONG geometry = RWGPU_MAX_VERTICES * (ULONG)sizeof(RwGpuVertex);
-    const ULONG buffer_bytes = (geometry + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1UL);
-    description.MaximumLength = buffer_bytes;
+    const ULONG minimum = (geometry + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1UL);
+    const ULONG preferred = rwgpu_read(gpu->bar, RWGPU_REG_CAPS) & RWGPU_CAP_DRAW_READBACK
+        ? RWGPU_DIRECT_TRANSFER_BYTES : minimum;
+    description.MaximumLength = preferred;
     ULONG registers = 0;
     gpu->adapter = IoGetDmaAdapter(gpu->physical, &description, &registers);
     if (!gpu->adapter) return STATUS_INSUFFICIENT_RESOURCES;
     gpu->dma = gpu->adapter->DmaOperations->AllocateCommonBuffer(
-        gpu->adapter, buffer_bytes, &gpu->bus, FALSE);
+        gpu->adapter, preferred, &gpu->bus, FALSE);
+    if (gpu->dma) {
+        gpu->dmaBytes = preferred;
+    } else if (preferred != minimum) {
+        gpu->dma = gpu->adapter->DmaOperations->AllocateCommonBuffer(
+            gpu->adapter, minimum, &gpu->bus, FALSE);
+        if (gpu->dma) gpu->dmaBytes = minimum;
+    }
     if (!gpu->dma) return STATUS_INSUFFICIENT_RESOURCES;
-    gpu->dmaBytes = buffer_bytes;
     return STATUS_SUCCESS;
 }
 
@@ -271,6 +280,17 @@ static NTSTATUS prime_draw(PrimeAdapter* gpu, RwGpuWddmFrame* frame, PUCHAR data
     rwgpu_write(gpu->bar, RWGPU_REG_WIDTH, frame->width);
     rwgpu_write(gpu->bar, RWGPU_REG_HEIGHT, frame->height);
     rwgpu_write(gpu->bar, RWGPU_REG_CLEAR_RGBA, frame->clear_rgba);
+    if (pixels <= gpu->dmaBytes - vertices &&
+        (rwgpu_read(gpu->bar, RWGPU_REG_CAPS) & RWGPU_CAP_DRAW_READBACK)) {
+        const NTSTATUS status = rwgpu_submit(gpu->bar, RWGPU_DRAW_READBACK, bus, bus + vertices, vertices);
+        if (!NT_SUCCESS(status)) return status;
+        if (rwgpu_read_wide(gpu->bar, RWGPU_REG_RESULT_LO) != pixels) return STATUS_DEVICE_DATA_ERROR;
+        KeMemoryBarrier();
+        RtlCopyMemory(data + vertices, gpu->dma + vertices, pixels);
+        frame->draw_ticket = rwgpu_read(gpu->bar, RWGPU_REG_COMPLETED);
+        gpu->drawTicket = frame->draw_ticket;
+        return STATUS_SUCCESS;
+    }
     NTSTATUS status = rwgpu_submit(gpu->bar, RWGPU_DRAW_RAM, bus, RWGPU_DRAW_COLOR_ALPHA, vertices);
     if (!NT_SUCCESS(status)) return status;
     const ULONG ticket = rwgpu_read(gpu->bar, RWGPU_REG_COMPLETED);

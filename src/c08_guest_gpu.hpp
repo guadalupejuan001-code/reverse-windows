@@ -143,12 +143,16 @@ class GuestGpuC08 {
         << ",\"vram_copies\":" << commands_[RWGPU_COPY] << ",\"index_sums\":" << commands_[RWGPU_SUM_INDICES]
         << ",\"status\":" << status_ << ",\"ticket\":" << completed_
         << ",\"writes\":" << commands_[RWGPU_WRITE] << ",\"reads\":" << commands_[RWGPU_READ]
-        << ",\"draw_requests\":" << commands_[RWGPU_DRAW] + commands_[RWGPU_DRAW_VRAM] + commands_[RWGPU_DRAW_RAM]
+        << ",\"draw_requests\":" << commands_[RWGPU_DRAW] + commands_[RWGPU_DRAW_VRAM] +
+                                     commands_[RWGPU_DRAW_RAM] + commands_[RWGPU_DRAW_READBACK]
         << ",\"vram_draw_requests\":" << commands_[RWGPU_DRAW_VRAM]
         << ",\"ram_draw_requests\":" << commands_[RWGPU_DRAW_RAM] << ",\"draws\":" << draws_
         << ",\"alpha_draw_ticket\":" << alpha_draw_ticket_
         << ",\"color_reads\":" << commands_[RWGPU_READ_COLOR] + commands_[RWGPU_READ_COLOR_RAM]
         << ",\"color_dma_reads\":" << commands_[RWGPU_READ_COLOR_RAM]
+        << ",\"frame_dma_requests\":" << commands_[RWGPU_DRAW_READBACK]
+        << ",\"frame_dma_completions\":" << frame_dma_completions_
+        << ",\"frame_dma_bytes\":" << frame_dma_bytes_
         << ",\"source_triangles\":" << source_triangles_ << ",\"submitted_triangles\":" << drawn_triangles_
         << ",\"vertex_bytes\":" << vertex_bytes_ << ",\"presented_bytes\":" << presented_bytes_
         << ",\"graphics_serial\":" << work_.snapshot()->serial
@@ -167,10 +171,11 @@ class GuestGpuC08 {
   xgpu::GuestTriangleWork planner_;
   using RenderPlan = std::shared_ptr<const xgpu::GuestTrianglePlan>;
   qssd::GraphicsWorkMemory<RenderPlan> work_;
-  std::array<std::uint64_t, RWGPU_DRAW_RAM + 1> commands_{};
+  std::array<std::uint64_t, RWGPU_DRAW_READBACK + 1> commands_{};
   std::uint64_t draws_ = 0, source_triangles_ = 0, drawn_triangles_ = 0;
   std::uint64_t vertex_bytes_ = 0, presented_bytes_ = 0, host_ns_ = 0, backend_ns_ = 0;
   std::uint64_t result_ = 0, resident_download_bytes_ = 0;
+  std::uint64_t frame_dma_completions_ = 0, frame_dma_bytes_ = 0;
   std::optional<std::uint64_t> gpu_ns_;
   bool hardware_ = false;
   std::string renderer_name_;
@@ -207,7 +212,7 @@ class GuestGpuC08 {
         return RWGPU_CAP_VRAM | RWGPU_CAP_DIRECT_VRAM | RWGPU_CAP_SUM_INDICES
 #ifdef REVERSE_WINDOWS_GLES_GUEST
             | RWGPU_CAP_TRIANGLES | RWGPU_CAP_DRAW_VRAM | RWGPU_CAP_COLOR_DMA |
-              RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_ALPHA
+              RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_ALPHA | RWGPU_CAP_DRAW_READBACK
 #endif
             ;
       case RWGPU_REG_STATUS: return status_;
@@ -234,7 +239,7 @@ class GuestGpuC08 {
     if (ticket != next_ticket) { status_ = RWGPU_INVALID; return; }
     result_ = 0;
     try {
-      if (op >= RWGPU_WRITE && op <= RWGPU_DRAW_RAM) ++commands_[op];
+      if (op >= RWGPU_WRITE && op <= RWGPU_DRAW_READBACK) ++commands_[op];
       const auto offset = wide(params_[0], params_[1]);
       const auto auxiliary = wide(direct_params_[0], direct_params_[1]);
       const auto count = wide(params_[2], direct_params_[2]);
@@ -243,6 +248,10 @@ class GuestGpuC08 {
         case RWGPU_DRAW: status_ = draw(op, offset, params_[2], 0); break;
         case RWGPU_DRAW_VRAM: case RWGPU_DRAW_RAM:
           status_ = count > UINT32_MAX ? unsigned(RWGPU_INVALID) : draw(op, auxiliary, params_[2], offset);
+          break;
+        case RWGPU_DRAW_READBACK:
+          status_ = count > UINT32_MAX ? unsigned(RWGPU_INVALID) :
+              draw(RWGPU_DRAW_RAM, RWGPU_DRAW_COLOR_ALPHA, params_[2], offset, auxiliary);
           break;
         case RWGPU_READ_COLOR: status_ = read_color(offset, params_[2]); break;
         case RWGPU_READ_COLOR_RAM: status_ = read_color_ram(offset, auxiliary, count); break;
@@ -363,7 +372,8 @@ class GuestGpuC08 {
 #endif
   }
 
-  unsigned draw(unsigned op, std::uint64_t flags, unsigned bytes, std::uint64_t offset) {
+  unsigned draw(unsigned op, std::uint64_t flags, unsigned bytes, std::uint64_t offset,
+                std::optional<std::uint64_t> dma_out = {}) {
 #ifdef REVERSE_WINDOWS_GLES_GUEST
     static_assert(sizeof(RwGpuVertex) == sizeof(xgpu::GuestVertex) &&
                   RWGPU_MAX_VERTICES == xgpu::GuestTriangleWork::max_vertices);
@@ -381,6 +391,8 @@ class GuestGpuC08 {
     if ((op == RWGPU_DRAW_RAM && !ordinary_ram(offset, bytes)) ||
         (op == RWGPU_DRAW_VRAM && !GpuVram::valid_range(offset, bytes)) ||
         (op == RWGPU_DRAW && bytes > stage_.size())) return RWGPU_INVALID;
+    const auto pixels = std::size_t(width) * height * 4;
+    if (dma_out && !ordinary_ram(*dma_out, pixels)) return RWGPU_INVALID;
     vertices_.resize(bytes / sizeof(RwGpuVertex));
     auto* vertex_data = reinterpret_cast<std::uint8_t*>(vertices_.data());
     if (op == RWGPU_DRAW_RAM) {
@@ -391,14 +403,24 @@ class GuestGpuC08 {
     } else if (bytes) {
       std::memcpy(vertices_.data(), stage_.data(), bytes);
     }
+    // Preflight the entire DMA destination before GPU work. The pins keep
+    // prepared pages resident until the frame is copied.
+    const auto pins = pc_.cpu.memory.pin_writes();
+    if (dma_out) pc_.cpu.memory.prepare_write(*dma_out, pixels);
     const auto plan = std::make_shared<const xgpu::GuestTrianglePlan>(planner_.plan(vertices_));
     auto receipt = renderer_.render(*plan, width, height, clear, bgrx_, alpha);
     // Return the actual readback to the canonical guest display. C07 observes
     // this physical write the same way as BIOS or ordinary guest pixel stores.
     if (present) pc_.cpu.memory.write_block(display.physical_address, bgrx_.data(), bgrx_.size());
+    if (dma_out) pc_.cpu.memory.write_block(*dma_out, bgrx_.data(), bgrx_.size());
     work_.publish(plan, plan->revision, plan->revision);
     bgrx_.swap(color_);
     ++draws_;
+    if (dma_out) {
+      result_ = pixels;
+      ++frame_dma_completions_;
+      frame_dma_bytes_ += pixels;
+    }
     if (alpha) alpha_draw_ticket_ = params_.back();
     source_triangles_ = plan->source_triangles;
     drawn_triangles_ = plan->vertices.size() / 3;
@@ -412,7 +434,7 @@ class GuestGpuC08 {
         std::chrono::steady_clock::now() - start).count();
     return RWGPU_OK;
 #else
-    (void)op; (void)flags; (void)bytes; (void)offset;
+    (void)op; (void)flags; (void)bytes; (void)offset; (void)dma_out;
     return RWGPU_UNAVAILABLE;
 #endif
   }

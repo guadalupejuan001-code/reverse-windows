@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: guadalupejuan001-code/mundo-X
-          ref: 88a51096f2d5c3f5428d1e3040a1207e355df5b5
+          ref: 6654cbd637dce28af3d0a07989c67e9bd30bb08f
           path: deps/mundo-X
           persist-credentials: false
       - name: Checkout GPU-VIRTUAL C12.3 with guest triangle and PrimeVGC compute
@@ -99,6 +99,7 @@ jobs:
           done | tee build/prime-c08-gpu.log
           grep -q '^PRIME_C08_REGRAPHICS_PASS .*"vram_draw_requests":1.*"ram_draw_requests":3.*"color_dma_reads":2.*"submitted_triangles":3' build/prime-c08-gpu.log
           grep -q '^PRIME_C08_BGRA_DMA_PASS alpha_ticket=18 vbe_stores=0 .*"alpha_draw_ticket":18' build/prime-c08-gpu.log
+          grep -q '^PRIME_C08_SINGLE_DMA_PASS bytes=1228800 legacy_commands=6 commands=1' build/prime-c08-gpu.log
           grep -q '^PRIME_C08_PCI_VRAM_PASS logical_bytes=120000000000 last_byte=119999999999 .* exact=1' build/prime-c08-gpu.log
           grep -q '^PRIME_C08_VRAM_BATCH_PASS bytes=7864320 .* commits=128 .* exact=1' build/prime-c08-gpu.log
       - name: Record Prime BIOS keyboard and PS/2 regressions
@@ -109,6 +110,12 @@ jobs:
             -R '^reverse_windows_(pc_bios_keyboard|android_bios_iso_qssd|c06_real_motherboard)$' \
             | tee build/prime-bios-keyboard.log
           grep -q 'PRIME_C03_NATIVE_SESSION_PASS translated_steps=' build/prime-bios-keyboard.log
+          grep -q 'PRIME_C10_WBINVD_SESSION_PASS count=1 resume=1' build/prime-bios-keyboard.log
+      - name: Measure InfiniteCore through x86 memory operands
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_pc_memory_fabric_test | tee build/prime-infinitecore.log
+          grep -q '^PRIME_C09_ETHER_INFINITECORE_PASS iterations=1024 ' build/prime-infinitecore.log
       - name: Verify Prime C02 timing and checkpoint evidence
         shell: bash
         run: |
@@ -472,6 +479,7 @@ jobs:
             build/prime-c07-vram.log
             build/prime-c07-vbe.log
             build/prime-c08-gpu.log
+            build/prime-infinitecore.log
             build/primevgc-transfer.log
             build/primevgc-bulk.log
             build/primevgc-compute.log
