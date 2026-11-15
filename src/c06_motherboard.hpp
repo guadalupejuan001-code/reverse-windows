@@ -8,6 +8,7 @@
 #include "atapi_cdrom.hpp"
 #include "pc_machine.hpp"
 #include "ps2_keyboard.hpp"
+#include "smp_workers.hpp"
 #include <algorithm>
 #include <array>
 #include <bitset>
@@ -16,6 +17,7 @@
 #include <ctime>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -156,22 +158,48 @@ class PcMotherboardC06 {
   std::uint64_t ticks_=0,irq_delivered_=0,pit_irqs_=0,apic_irqs_=0,sci_irqs_=0;
   static constexpr std::uint32_t kLvtMasked=1U<<16;
   static constexpr unsigned kTimer=0,kLint0=3,kLint1=4,kError=5;
-  std::uint32_t apic_svr_=0xff,apic_ldr_=0,apic_dfr_=0xffffffffU;
-  std::uint32_t apic_esr_=0,apic_errors_=0;
-  std::uint32_t apic_icr_low_=0,apic_icr_high_=0;
-  std::array<std::uint32_t,6> apic_lvt_{};
-  std::uint32_t apic_timer_reload_=0,apic_divider_=0;
-  std::uint64_t apic_timer_cycles_=0;
-  std::bitset<256> lapic_pending_,lapic_in_service_,lapic_pending_level_,lapic_in_service_level_;
-  std::bitset<256> lapic_pending_ata_,lapic_pending_sci_;
+  // Local state is private to one x86 logical processor. The I/O APIC,
+  // devices, E820 map, and Ether-backed RAM belong to the whole machine.
+  struct PendingWrite {
+    std::uint64_t aligned = 0;
+    std::uint32_t value = 0;
+    std::uint8_t bytes = 0;
+  };
+  struct LocalApic {
+    explicit LocalApic(cosmic_pc::Cpu* processor = nullptr) : cpu(processor) {
+      lvt.fill(kLvtMasked);
+    }
+    cosmic_pc::Cpu* cpu;
+    bool started = false, init_pending = false;
+    std::optional<std::uint8_t> startup_vector;
+    std::uint32_t svr = 0xff, ldr = 0, dfr = 0xffffffffU;
+    std::uint32_t esr = 0, errors = 0, icr_low = 0, icr_high = 0;
+    std::array<std::uint32_t,6> lvt{};
+    std::uint32_t timer_reload = 0, divider = 0;
+    std::uint64_t timer_cycles = 0, last_tick = 0;
+    std::bitset<256> pending, in_service, pending_level, in_service_level, pending_ata, pending_sci;
+    PendingWrite mmio_pending;
+  };
+  static constexpr auto kMaxProcessors = cosmic_pc::CpuTopology::kMaxLogical;
+  std::array<std::unique_ptr<cosmic_pc::Cpu>, kMaxProcessors> secondary_cpus_{};
+  std::array<LocalApic, kMaxProcessors> apics_;
+  std::array<std::uint64_t, kMaxProcessors> retired_before_init_{};
+  unsigned processor_count_ = 1;
+  unsigned next_cpu_ = 0;
+  std::optional<unsigned> faulted_processor_;
+  std::mutex bus_;
+  std::unique_ptr<SmpWorkers> workers_;
   bool prior_local_apic_=false;
+  const std::uint64_t* prior_clock_ = nullptr;
+  cosmic_pc::CpuTopology prior_topology_;
+  unsigned prior_apic_id_ = 0;
   std::uint32_t ioapic_select_=0;
   std::array<std::uint32_t,24> io_redir_low_{},io_redir_high_{};
   std::array<std::uint8_t,24> io_remote_vector_{};
-  // Register dword writes are assembled by the byte MMIO bridge, not applied
-  // once per byte. Incomplete writes don't expose partial device state.
-  struct PendingWrite {std::uint64_t aligned=0;std::uint32_t value=0;std::uint8_t bytes=0;};
-  PendingWrite mmio_pending_{};
+  std::array<std::uint32_t,24> io_remote_targets_{};
+  LocalApic& bsp() noexcept { return apics_[0]; }
+  const LocalApic& bsp() const noexcept { return apics_[0]; }
+
   static std::uint32_t part_mask(unsigned width){
     return width==4?UINT32_MAX:(std::uint32_t(1)<<(width*8))-1;
   }
@@ -199,17 +227,19 @@ class PcMotherboardC06 {
     if(optical_)optical_->reset();
     if(gpu_)gpu_->reset();
     pc_.cpu.set_apic_task_priority(0);
-    apic_svr_=0xff;apic_ldr_=0;apic_dfr_=0xffffffffU;apic_esr_=apic_errors_=0;
-    apic_icr_low_=apic_icr_high_=0;
-    apic_lvt_.fill(kLvtMasked);
-    apic_timer_reload_=apic_divider_=0;apic_timer_cycles_=0;
-    lapic_pending_.reset();lapic_in_service_.reset();
-    lapic_pending_level_.reset();lapic_in_service_level_.reset();lapic_pending_ata_.reset();
-    lapic_pending_sci_.reset();
+    bsp() = LocalApic{&pc_.cpu};
+    bsp().started = true;
+    for (unsigned id = 1; id < processor_count_; ++id) {
+      secondary_cpus_[id]->reset(0, 0);
+      apics_[id] = LocalApic{secondary_cpus_[id].get()};
+    }
+    retired_before_init_.fill(0);
+    faulted_processor_.reset();
+    next_cpu_ = 0;
     ioapic_select_=0;
     io_redir_low_.fill(0x10000U);io_redir_high_.fill(0);
     io_remote_vector_.fill(0);
-    mmio_pending_={};
+    io_remote_targets_.fill(0);
     build_config(host_cfg_,0x0001,0x00);
     build_config(isa_cfg_,0x0002,0x01);
     if(ide_present()){
@@ -455,48 +485,48 @@ class PcMotherboardC06 {
       if(vectors[first+i])result|=1U<<i;
     return result;
   }
-  unsigned processor_priority() const {
-    const auto tpr=pc_.cpu.apic_task_priority();
-    const auto service=highest_vector(lapic_in_service_)&0xf0U;
+  static unsigned processor_priority(const LocalApic& apic) {
+    const auto tpr=apic.cpu->apic_task_priority();
+    const auto service=highest_vector(apic.in_service)&0xf0U;
     return (tpr&0xf0U)>=service?tpr:service;
   }
-  unsigned timer_divisor() const {
-    const auto index=(apic_divider_&3U)|((apic_divider_&8U)>>1);
+  static unsigned timer_divisor(const LocalApic& apic) {
+    const auto index=(apic.divider&3U)|((apic.divider&8U)>>1);
     return 1U<<((index+1)&7U);
   }
-  std::uint32_t timer_count() const {
-    const auto divisor=timer_divisor();
-    return std::uint32_t((apic_timer_cycles_+divisor-1)/divisor);
+  static std::uint32_t timer_count(const LocalApic& apic) {
+    const auto divisor=timer_divisor(apic);
+    return std::uint32_t((apic.timer_cycles+divisor-1)/divisor);
   }
   static std::optional<unsigned> lvt_index(unsigned offset) {
     if(offset>=0x320&&offset<=0x370&&(offset&15U)==0)
       return (offset-0x320)/16;
     return std::nullopt;
   }
-  std::optional<std::uint32_t> mmio_register(std::uint64_t base) const {
+  std::optional<std::uint32_t> mmio_register(const LocalApic& apic, std::uint64_t base) const {
     if(base>=kLocalApic&&base<kLocalApic+4096) {
-      if(!pc_.cpu.apic_global_enabled())return std::nullopt;
+      if(!apic.cpu->apic_global_enabled())return std::nullopt;
       const auto r=unsigned(base-kLocalApic);
-      if(r>=0x100&&r<=0x170&&(r&15U)==0)return vector_register(lapic_in_service_,r);
+      if(r>=0x100&&r<=0x170&&(r&15U)==0)return vector_register(apic.in_service,r);
       if(r>=0x180&&r<=0x1f0&&(r&15U)==0)
-        return vector_register(lapic_pending_level_|lapic_in_service_level_,r);
-      if(r>=0x200&&r<=0x270&&(r&15U)==0)return vector_register(lapic_pending_,r);
-      if(const auto lvt=lvt_index(r))return apic_lvt_[*lvt];
+        return vector_register(apic.pending_level|apic.in_service_level,r);
+      if(r>=0x200&&r<=0x270&&(r&15U)==0)return vector_register(apic.pending,r);
+      if(const auto lvt=lvt_index(r))return apic.lvt[*lvt];
       switch(r) {
-        case 0x20:return 0; // LAPIC ID 0
+        case 0x20:return apic.cpu->apic_id() << 24;
         case 0x30:return 0x00050014U; // Version 0x14, six LVT entries.
-        case 0x80:return pc_.cpu.apic_task_priority();
-        case 0xa0:return processor_priority();
+        case 0x80:return apic.cpu->apic_task_priority();
+        case 0xa0:return processor_priority(apic);
         case 0xb0:return 0; // EOI write-only
-        case 0xd0:return apic_ldr_;
-        case 0xe0:return apic_dfr_;
-        case 0xf0:return apic_svr_;
-        case 0x280:return apic_esr_;
-        case 0x300:return apic_icr_low_;
-        case 0x310:return apic_icr_high_;
-        case 0x380:return apic_timer_reload_;
-        case 0x390:return timer_count();
-        case 0x3e0:return apic_divider_;
+        case 0xd0:return apic.ldr;
+        case 0xe0:return apic.dfr;
+        case 0xf0:return apic.svr;
+        case 0x280:return apic.esr;
+        case 0x300:return apic.icr_low;
+        case 0x310:return apic.icr_high;
+        case 0x380:return apic.timer_reload;
+        case 0x390:return timer_count(apic);
+        case 0x3e0:return apic.divider;
         default:return std::nullopt;
       }
     }
@@ -504,7 +534,7 @@ class PcMotherboardC06 {
       const auto r=unsigned(base-kIoApic);
       if(r==0)return ioapic_select_;
       if(r!=0x10)return std::nullopt;
-      if(ioapic_select_==0)return 0x01000000U; // IOAPIC ID1
+      if(ioapic_select_==0)return AcpiC06::ioapic_id(processor_count_) << 24;
       if(ioapic_select_==1)return 0x00170011U; // version and max RTE 23
       if(ioapic_select_==2)return 0;
       if(ioapic_select_>=0x10&&ioapic_select_<0x40) {
@@ -515,41 +545,41 @@ class PcMotherboardC06 {
     }
     return std::nullopt;
   }
-  std::optional<std::uint8_t> mmio_byte(std::uint64_t a) const{
-    const auto reg=mmio_register(a&~std::uint64_t{3});
+  std::optional<std::uint8_t> mmio_byte(const LocalApic& apic, std::uint64_t a) const{
+    const auto reg=mmio_register(apic, a&~std::uint64_t{3});
     if(!reg)return std::nullopt;
     return std::uint8_t((*reg>>((a&3)*8))&255U);
   }
-  bool mmio_commit(std::uint64_t base,std::uint32_t v) {
+  bool mmio_commit(LocalApic& apic, std::uint64_t base,std::uint32_t v) {
     if(base>=kLocalApic&&base<kLocalApic+4096){
-      if(!pc_.cpu.apic_global_enabled())return false;
+      if(!apic.cpu->apic_global_enabled())return false;
       const auto r=unsigned(base-kLocalApic);
       if(const auto lvt=lvt_index(r)){
         if(*lvt==kTimer&&(v&0x40000U))return false; // No TSC deadline.
         const std::uint32_t writable=*lvt==kTimer?0x300ffU:
             (*lvt==kLint0||*lvt==kLint1)?0x1a7ffU:
             (*lvt==kError?0x100ffU:0x107ffU);
-        apic_lvt_[*lvt]=(v&writable)|(lapic_on()?0:kLvtMasked);
+        apic.lvt[*lvt]=(v&writable)|(lapic_on(apic)?0:kLvtMasked);
         return true;
       }
       switch(r){
-        case 0x80:pc_.cpu.set_apic_task_priority(std::uint8_t(v));return true;
-        case 0xb0:complete_lapic_irq();return true;
-        case 0xd0:apic_ldr_=v&0xff000000U;return true;
-        case 0xe0:apic_dfr_=(v&0xf0000000U)|0x0fffffffU;return true;
+        case 0x80:apic.cpu->set_apic_task_priority(std::uint8_t(v));return true;
+        case 0xb0:complete_lapic_irq(apic);return true;
+        case 0xd0:apic.ldr=v&0xff000000U;return true;
+        case 0xe0:apic.dfr=(v&0xf0000000U)|0x0fffffffU;return true;
         case 0xf0:
-          apic_svr_=v&0x1ffU;
-          if(!lapic_on())for(auto& lvt:apic_lvt_)lvt|=kLvtMasked;
+          apic.svr=v&0x1ffU;
+          if(!lapic_on(apic))for(auto& lvt:apic.lvt)lvt|=kLvtMasked;
           if(sci_active_)deliver_sci();
           return true;
-        case 0x280:apic_esr_=std::exchange(apic_errors_,0);return true;
-        case 0x300:return send_local_ipi(v);
-        case 0x310:apic_icr_high_=v&0xff000000U;return true;
+        case 0x280:apic.esr=std::exchange(apic.errors,0);return true;
+        case 0x300:return send_local_ipi(apic,v);
+        case 0x310:apic.icr_high=v&0xff000000U;return true;
         case 0x380:
-          apic_timer_reload_=v;apic_timer_cycles_=std::uint64_t(v)*timer_divisor();return true;
+          apic.timer_reload=v;apic.timer_cycles=std::uint64_t(v)*timer_divisor(apic);return true;
         case 0x3e0:{
-          const auto count=timer_count();
-          apic_divider_=v&0x0bU;apic_timer_cycles_=std::uint64_t(count)*timer_divisor();return true;
+          const auto count=timer_count(apic);
+          apic.divider=v&0x0bU;apic.timer_cycles=std::uint64_t(count)*timer_divisor(apic);return true;
         }
         default:return false;
       }
@@ -569,74 +599,122 @@ class PcMotherboardC06 {
     }
     return false;
   }
-  bool mmio_write(std::uint64_t a,std::uint8_t byte) {
+  bool mmio_write(LocalApic& apic, std::uint64_t a,std::uint8_t byte) {
     const auto base=a&~std::uint64_t{3};
-    if(a%4==0)mmio_pending_={base,0,0};
-    if(mmio_pending_.aligned!=base||mmio_pending_.bytes!=(a&3))
+    if(a%4==0)apic.mmio_pending={base,0,0};
+    if(apic.mmio_pending.aligned!=base||apic.mmio_pending.bytes!=(a&3))
       return false; // no partial/out-of-order MMIO register commits
-    mmio_pending_.value|=std::uint32_t(byte)<<((a&3)*8);
-    ++mmio_pending_.bytes;
+    apic.mmio_pending.value|=std::uint32_t(byte)<<((a&3)*8);
+    ++apic.mmio_pending.bytes;
     if((a&3)==3){
-      const auto value=mmio_pending_.value;mmio_pending_={};
-      return mmio_commit(base,value);
+      const auto value=apic.mmio_pending.value;apic.mmio_pending={};
+      return mmio_commit(apic, base,value);
     }
     return true;
   }
-  bool lapic_on()const{return pc_.cpu.apic_global_enabled()&&(apic_svr_&0x100U);}
+  static bool lapic_on(const LocalApic& apic){return apic.cpu->apic_global_enabled()&&(apic.svr&0x100U);}
   bool pic_connected() const {
-    const auto lint=apic_lvt_[kLint0];
-    return !lapic_on()||(lint&(kLvtMasked|0x700U))==0x700U; // ExtINT.
+    const auto& apic = bsp();
+    const auto lint=apic.lvt[kLint0];
+    return !lapic_on(apic)||(lint&(kLvtMasked|0x700U))==0x700U; // ExtINT.
   }
-  unsigned deliverable_lapic_vector() const {
-    if(!lapic_on())return 0;
-    const auto vector=highest_vector(lapic_pending_);
-    return (vector&0xf0U)>(processor_priority()&0xf0U)?vector:0;
+  static unsigned deliverable_lapic_vector(const LocalApic& apic) {
+    if(!lapic_on(apic))return 0;
+    const auto vector=highest_vector(apic.pending);
+    return (vector&0xf0U)>(processor_priority(apic)&0xf0U)?vector:0;
   }
   bool interrupt_pending()const {
-    return (pic_connected()&&master_.pending())||deliverable_lapic_vector();
+    return (pic_connected()&&master_.pending())||deliverable_lapic_vector(bsp());
   }
-  bool lapic_destination(std::uint32_t command,std::uint32_t destination) const {
+  static bool lapic_destination(const LocalApic& apic, std::uint32_t command,std::uint32_t destination) {
     const auto id=destination>>24;
-    if(!(command&(1U<<11)))return id==0||id==255;
-    const auto logical=apic_ldr_>>24;
+    if(!(command&(1U<<11)))return id==apic.cpu->apic_id()||id==255;
+    const auto logical=apic.ldr>>24;
     if(id==255)return true;
-    if((apic_dfr_>>28)==15)return (id&logical)!=0;
+    if((apic.dfr>>28)==15)return (id&logical)!=0;
     return (id&0xf0U)==(logical&0xf0U)&&(id&logical&0x0fU)!=0;
   }
-  bool send_local_ipi(std::uint32_t value) {
-    const unsigned mode=(value>>8)&7U,shorthand=(value>>18)&3U,vector=value&255U;
-    const bool self=shorthand==1||shorthand==2||
-        (!shorthand&&lapic_destination(value,apic_icr_high_));
-    if(self&&mode>1)return false;
-    apic_icr_low_=value&0x000ccfffU;
-    if(self&&mode<=1&&lapic_on()){
-      if(vector>=16)lapic_pending_.set(vector);
-      else signal_apic_error(1U<<5);
+  std::uint32_t interrupt_targets(std::uint32_t command, std::uint32_t destination,
+                                  unsigned mode) const {
+    std::uint32_t mask = 0;
+    unsigned best = kMaxProcessors;
+    for (unsigned id = 0; id < processor_count_; ++id) {
+      const auto& apic = apics_[id];
+      if (!apic.started || apic.init_pending || !lapic_on(apic) ||
+          !lapic_destination(apic, command, destination)) continue;
+      if (mode != 1) mask |= 1U << id;
+      else if (best == kMaxProcessors || processor_priority(apic) < processor_priority(apics_[best]))
+        best = id;
     }
+    return best == kMaxProcessors ? mask : 1U << best;
+  }
+  bool send_local_ipi(LocalApic& source, std::uint32_t value) {
+    const unsigned mode=(value>>8)&7U,shorthand=(value>>18)&3U,vector=value&255U;
+    const auto sender = source.cpu->apic_id();
+    const auto selected = [&](unsigned id) {
+      return shorthand == 1 ? id == sender : shorthand == 2 ? true :
+             shorthand == 3 ? id != sender : lapic_destination(apics_[id], value, source.icr_high);
+    };
+    if (mode > 1 && mode != 5 && mode != 6) {
+      for (unsigned id = 0; id < processor_count_; ++id)
+        if (selected(id)) return false;
+    }
+    source.icr_low=value&0x000ccfffU;
+    if (mode == 5 || mode == 6) {
+      // INIT level deassert has no effect on xAPIC startup state. Queue INIT
+      // and SIPI so only the target's executor can reset its CPU or JIT cache.
+      if (mode == 5 && (value & 0xc000U) == 0x8000U) return true;
+      for (unsigned id = 1; id < processor_count_; ++id) {
+        auto& target = apics_[id];
+        if (!selected(id)) continue;
+        if (mode == 5) {
+          target.init_pending = true;
+          target.startup_vector.reset();
+        } else if ((!target.started || target.init_pending) && !target.startup_vector) {
+          target.startup_vector = std::uint8_t(vector);
+          if (sender == 0) pc_.yield_after_instruction();
+        }
+      }
+      return true;
+    }
+    unsigned best = kMaxProcessors;
+    for (unsigned id = 0; id < processor_count_; ++id) {
+      auto& target = apics_[id];
+      if (!selected(id) || !target.started || target.init_pending || !lapic_on(target)) continue;
+      if (vector < 16) { signal_apic_error(source, 1U << 5); break; }
+      if (mode == 0) target.pending.set(vector);
+      else if (best == kMaxProcessors || processor_priority(target) < processor_priority(apics_[best]))
+        best = id;
+    }
+    if (best != kMaxProcessors) apics_[best].pending.set(vector);
     return true;
   }
   bool signal_pci_msi(std::uint32_t address, std::uint16_t data) {
-    if (!lapic_on() || (address & 0xfff00ff3U) != 0xfee00000U) return false;
+    if ((address & 0xfff00ff3U) != 0xfee00000U) return false;
     const unsigned vector = data & 255U, mode = (data >> 8) & 7U;
-    const bool logical = (address & 4U) != 0;
-    if (mode > 1 || (data & 0xb800U) || vector < 16 ||
-        !lapic_destination(logical ? 1U << 11 : 0, ((address >> 12) & 255U) << 24))
-      return false;
-    lapic_pending_.set(vector);
-    return true;
+    if (mode > 1 || (data & 0xb800U) || vector < 16) return false;
+    const auto targets = interrupt_targets((address & 4U) ? 1U << 11 : 0,
+                                           ((address >> 12) & 255U) << 24, mode);
+    for (unsigned id = 0; id < processor_count_; ++id)
+      if (targets & (1U << id)) apics_[id].pending.set(vector);
+    return targets != 0;
   }
-  void signal_apic_error(std::uint32_t bit) {
-    apic_errors_|=bit;
-    const auto lvt=apic_lvt_[kError];
-    if(lapic_on()&&!(lvt&kLvtMasked)&&(lvt&255U)>=16)lapic_pending_.set(lvt&255U);
+  static void signal_apic_error(LocalApic& apic, std::uint32_t bit) {
+    apic.errors|=bit;
+    const auto lvt=apic.lvt[kError];
+    if(lapic_on(apic)&&!(lvt&kLvtMasked)&&(lvt&255U)>=16)apic.pending.set(lvt&255U);
   }
-  void complete_lapic_irq() {
-    const auto vector=highest_vector(lapic_in_service_);
+  void complete_lapic_irq(LocalApic& apic) {
+    const auto vector=highest_vector(apic.in_service);
     if(!vector)return;
-    lapic_in_service_.reset(vector);
-    if(!lapic_in_service_level_.test(vector))return;
-    lapic_in_service_level_.reset(vector);
-    for(auto& remote:io_remote_vector_)if(remote==vector)remote=0;
+    apic.in_service.reset(vector);
+    if(!apic.in_service_level.test(vector))return;
+    apic.in_service_level.reset(vector);
+    for (unsigned line = 0; line < io_remote_vector_.size(); ++line) {
+      if (io_remote_vector_[line] != vector) continue;
+      io_remote_targets_[line] &= ~(1U << apic.cpu->apic_id());
+      if (!io_remote_targets_[line]) io_remote_vector_[line] = 0;
+    }
     if(sci_active_)deliver_sci();
   }
   void signal_isa_irq(unsigned line) {
@@ -648,18 +726,23 @@ class PcMotherboardC06 {
   void route_ioapic(unsigned line) {
     const auto redirect=io_redir_low_[line];
     const unsigned vector=redirect&255U,mode=(redirect>>8)&7U;
-    if(lapic_on()&&!(redirect&(1U<<16))&&mode<=1&&
-       lapic_destination(redirect,io_redir_high_[line])){
-      if(vector<16){signal_apic_error(1U<<6);return;}
-      const bool level=(redirect&(1U<<15))!=0;
-      if(level&&io_remote_vector_[line])return;
-      if(level){
-        io_remote_vector_[line]=std::uint8_t(vector);
-        lapic_pending_level_.set(vector);
-      }
-      lapic_pending_.set(vector);
-      if(line==14)lapic_pending_ata_.set(vector);
-      if(line==AcpiC06::sci_irq)lapic_pending_sci_.set(vector);
+    if ((redirect & (1U << 16)) || mode > 1) return;
+    const auto targets = interrupt_targets(redirect, io_redir_high_[line], mode);
+    if (!targets) return;
+    if (vector < 16) { signal_apic_error(bsp(), 1U << 6); return; }
+    const bool level=(redirect&(1U<<15))!=0;
+    if (level) {
+      if (io_remote_vector_[line]) return;
+      io_remote_vector_[line] = std::uint8_t(vector);
+      io_remote_targets_[line] = targets;
+    }
+    for (unsigned id = 0; id < processor_count_; ++id) {
+      if (!(targets & (1U << id))) continue;
+      auto& apic = apics_[id];
+      apic.pending.set(vector);
+      if (level) apic.pending_level.set(vector);
+      if (line == 14) apic.pending_ata.set(vector);
+      if (line == AcpiC06::sci_irq) apic.pending_sci.set(vector);
     }
   }
   void deliver_sci() {
@@ -678,6 +761,36 @@ class PcMotherboardC06 {
   static constexpr unsigned kPitClockDivider=cosmic_pc::PcMachine::kPitClockDivider;
   unsigned pm_timer_edge_in()const noexcept {
     return AcpiC06::pm_timer_half_period-(pm_timer()&(AcpiC06::pm_timer_half_period-1));
+  }
+  static void advance_apic_timer(LocalApic& apic, std::uint64_t cycles) {
+    if (!apic.cpu->apic_global_enabled() || !apic.timer_cycles || !cycles) return;
+    if (cycles < apic.timer_cycles) {
+      apic.timer_cycles -= cycles;
+      return;
+    }
+    const auto lvt = apic.lvt[kTimer];
+    if (lapic_on(apic) && !(lvt & kLvtMasked)) {
+      if ((lvt & 255U) >= 16) apic.pending.set(lvt & 255U);
+      else signal_apic_error(apic, 1U << 6);
+    }
+    const auto period = (lvt & 0x20000U) ? std::uint64_t(apic.timer_reload)*timer_divisor(apic) : 0;
+    apic.timer_cycles = period ? period - (cycles - apic.timer_cycles) % period : 0;
+  }
+  bool deliver_lapic_irq(LocalApic& apic) {
+    const auto vector = deliverable_lapic_vector(apic);
+    if (!vector) return false;
+    if (apic.cpu->raise_external_irq(std::uint8_t(vector))) {
+      apic.in_service.set(vector);
+      apic.pending.reset(vector);
+      apic.in_service_level.set(vector, apic.pending_level[vector]);
+      apic.pending_level.reset(vector);
+      if (apic.pending_ata[vector]) ++ata_irq_delivered_;
+      if (apic.pending_sci[vector]) ++sci_irqs_;
+      apic.pending_ata.reset(vector);
+      apic.pending_sci.reset(vector);
+      ++apic_irqs_; ++irq_delivered_;
+    }
+    return true;
   }
   void poll(){
     ++ticks_;
@@ -705,34 +818,14 @@ class PcMotherboardC06 {
       signal_isa_irq(1);
       keyboard_->mark_irq();
     }
-    // The divisor uses deterministic board cycles as its input clock.
-    if(pc_.cpu.apic_global_enabled()&&apic_timer_cycles_&&!--apic_timer_cycles_){
-      const auto lvt=apic_lvt_[kTimer];
-      if(lapic_on()&&!(lvt&kLvtMasked)){
-        if((lvt&255U)>=16)lapic_pending_.set(lvt&255U);
-        else signal_apic_error(1U<<6);
-      }
-      if(lvt&0x20000U)apic_timer_cycles_=std::uint64_t(apic_timer_reload_)*timer_divisor();
-    }
+    advance_apic_timer(bsp(),1);
     // The slave's INT output reaches the master independently of CPU IF or
     // LAPIC acceptance. The guest can read both IRRs with interrupts disabled.
     const auto slave_irq=slave_.pending();
     if(slave_irq)master_.irr|=std::uint8_t(1U<<2);
     else if(!(master_.isr&(1U<<2)))master_.irr&=std::uint8_t(~(1U<<2));
     if(cpu.fault||!cpu.flag(cosmic_pc::Cpu::IF))return;
-    if(const auto vector=deliverable_lapic_vector()){
-      if(cpu.raise_external_irq(std::uint8_t(vector))){
-        lapic_in_service_.set(vector);lapic_pending_.reset(vector);
-        lapic_in_service_level_.set(vector,lapic_pending_level_[vector]);
-        lapic_pending_level_.reset(vector);
-        if(lapic_pending_ata_[vector])++ata_irq_delivered_;
-        lapic_pending_ata_.reset(vector);
-        if(lapic_pending_sci_[vector])++sci_irqs_;
-        lapic_pending_sci_.reset(vector);
-        ++apic_irqs_;++irq_delivered_;
-      }
-      return;
-    }
+    if (deliver_lapic_irq(bsp())) return;
     // 8259 cascade: a pending slave IRQ presents IRQ2 at the master PIC.
     // Deliver the SLAVE vector, not master IRQ2's vector. Both PICs must EOI.
     const auto master_irq=pic_connected()?master_.pending():0;
@@ -761,8 +854,8 @@ class PcMotherboardC06 {
     if((speaker_control_&1)&&pit2_.enabled)
       steps=std::min(steps,pit2_.counter*kPitClockDivider-pit_phase_);
     steps=std::min(steps,pm_timer_edge_in());
-    if(pc_.cpu.apic_global_enabled()&&apic_timer_cycles_&&apic_timer_cycles_<steps)
-      steps=unsigned(apic_timer_cycles_);
+    if(pc_.cpu.apic_global_enabled()&&bsp().timer_cycles&&bsp().timer_cycles<steps)
+      steps=unsigned(bsp().timer_cycles);
     return steps;
   }
   void advance_batch(unsigned extra_steps) {
@@ -771,7 +864,7 @@ class PcMotherboardC06 {
     if(pit_.enabled)pit_.counter-=pit_elapsed/kPitClockDivider;
     if((speaker_control_&1)&&pit2_.enabled)pit2_.counter-=pit_elapsed/kPitClockDivider;
     pit_phase_=pit_elapsed%kPitClockDivider;
-    if(pc_.cpu.apic_global_enabled()&&apic_timer_cycles_)apic_timer_cycles_-=extra_steps;
+    if(pc_.cpu.apic_global_enabled()&&bsp().timer_cycles)bsp().timer_cycles-=extra_steps;
   }
   unsigned advance_idle(unsigned max_extra) {
     if(!pc_.cpu.halted||!pc_.cpu.flag(cosmic_pc::Cpu::IF))return 0;
@@ -780,11 +873,107 @@ class PcMotherboardC06 {
     return extra;
   }
 
+  void attach_mmio(cosmic_pc::Cpu& cpu, LocalApic& apic) {
+    cpu.mmio_claim_hook = [this](std::uint64_t address) {
+      return mmio_claim(address) || (gpu_ && gpu_->claims(address)) ||
+             (prior_mmio_claim_ && prior_mmio_claim_(address));
+    };
+    cpu.mmio_range_claim_hook = [this](std::uint64_t start, std::size_t length) {
+      return mmio_range_claim(start, length);
+    };
+    cpu.mmio_read_hook = [this, &apic](std::uint64_t address) {
+      if (mmio_claim(address)) return mmio_byte(apic, address);
+      if (gpu_ && gpu_->claims(address)) return std::optional<std::uint8_t>(gpu_->read(address));
+      return prior_mmio_read_ ? prior_mmio_read_(address) : std::nullopt;
+    };
+    cpu.mmio_write_hook = [this, &apic](std::uint64_t address, std::uint8_t value) {
+      if (mmio_claim(address)) return mmio_write(apic, address, value);
+      if (gpu_ && gpu_->claims(address)) return gpu_->write(address, value);
+      return prior_mmio_write_ && prior_mmio_write_(address, value);
+    };
+  }
+
+  static bool needs_service(const LocalApic& apic) noexcept {
+    return apic.init_pending || apic.startup_vector ||
+           (apic.started && (!apic.cpu->halted || apic.cpu->flag(cosmic_pc::Cpu::IF)));
+  }
+  void apply_startup(LocalApic& apic) {
+    auto& cpu = *apic.cpu;
+    if (apic.init_pending) {
+      const auto id = cpu.apic_id();
+      const auto sipi = apic.startup_vector;
+      retired_before_init_[id] += cpu.instructions;
+      cpu.reset(0, 0);
+      apic = LocalApic{&cpu};
+      apic.startup_vector = sipi;
+      for (unsigned line = 0; line < io_remote_targets_.size(); ++line) {
+        io_remote_targets_[line] &= ~(1U << id);
+        if (!io_remote_targets_[line]) io_remote_vector_[line] = 0;
+      }
+    }
+    if (apic.startup_vector) {
+      cpu.reset(std::uint16_t(*apic.startup_vector) << 8, 0);
+      cpu.a20_enabled = pc_.cpu.a20_enabled;
+      apic.started = true;
+      apic.startup_vector.reset();
+      apic.last_tick = ticks_;
+    }
+  }
+  void run_secondary(unsigned id, unsigned budget) {
+    auto& apic = apics_[id];
+    auto& cpu = *apic.cpu;
+    for (unsigned used = 0; used < budget;) {
+      // Keep the entire scalar instruction and its undo journal atomic with
+      // respect to the other vCPUs and devices. Éter releases this lock during
+      // native blocks that operate solely on this CPU's private registers.
+      std::unique_lock<std::mutex> lock(bus_);
+      if (faulted_processor_ || powered_off_ ||
+          pc_.guest_restart() != cosmic_pc::PcMachine::GuestRestart::None) return;
+      apply_startup(apic);
+      if (!apic.started) return;
+      cpu.a20_enabled = pc_.cpu.a20_enabled;
+      advance_apic_timer(apic, ticks_ - apic.last_tick);
+      apic.last_tick = ticks_;
+      deliver_lapic_irq(apic);
+      if (cpu.fault) {
+        faulted_processor_ = id;
+        return;
+      }
+      if (cpu.halted) return;
+      const auto native_steps = cpu.try_ether_arm64_block(budget - used, &lock);
+      if (native_steps) {
+        used += native_steps;
+        continue;
+      }
+      const auto result = cpu.step();
+      if (result == cosmic_pc::StepResult::Faulted) faulted_processor_ = id;
+      if (result != cosmic_pc::StepResult::Executed) return;
+      ++used;
+    }
+  }
+
  public:
   explicit PcMotherboardC06(cosmic_pc::PcMachine& machine, BlockDisk* disk=nullptr,
                             AtapiCdrom::Reader optical={}, std::uint64_t optical_bytes=0,
                             const std::filesystem::path& graphics_vram={},
-                            BlockDisk* data_disk=nullptr):pc_(machine){
+                            BlockDisk* data_disk=nullptr, cosmic_pc::CpuTopology topology={})
+      :pc_(machine), processor_count_(topology.logical_processors()) {
+    if (!topology.valid()) throw std::invalid_argument("Invalid virtual processor topology");
+    prior_topology_ = pc_.cpu.topology();
+    prior_apic_id_ = pc_.cpu.apic_id();
+    for (unsigned id = 1; id < processor_count_; ++id) {
+      auto ap = std::make_unique<cosmic_pc::Cpu>(pc_.cpu.memory);
+      ap->configure_topology(topology,id);
+      ap->set_local_apic_present(true);
+      ap->set_shared_clock(&ticks_);
+      ap->enable_page_translation_cache();
+      ap->enable_ether_arm64_blocks();
+#if defined(MUNDO_X_PC_ETHER_NEXT)
+      ap->enable_ether_next();
+#endif
+      secondary_cpus_[id] = std::move(ap);
+    }
+    pc_.cpu.configure_topology(topology,0);
     if(data_disk&&!disk)throw std::invalid_argument("ATA data disk requires a primary disk");
     if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_isa_irq(14);});
     if(data_disk)data_ata_=std::make_unique<AtaC07>(
@@ -832,22 +1021,15 @@ class PcMotherboardC06 {
                selected_ata()->pio_batch_transfer(width,input,data,count);
       };
     }
-    pc_.cpu.mmio_claim_hook=[this](std::uint64_t a){
-      return mmio_claim(a)||(gpu_&&gpu_->claims(a))||(prior_mmio_claim_&&prior_mmio_claim_(a));
-    };
-    pc_.cpu.mmio_range_claim_hook=[this](std::uint64_t start,std::size_t length){
-      return mmio_range_claim(start,length);
-    };
-    pc_.cpu.mmio_read_hook=[this](std::uint64_t a){
-      if(mmio_claim(a))return mmio_byte(a);
-      if(gpu_&&gpu_->claims(a))return std::optional<std::uint8_t>(gpu_->read(a));
-      return prior_mmio_read_?prior_mmio_read_(a):std::nullopt;
-    };
-    pc_.cpu.mmio_write_hook=[this](std::uint64_t a,std::uint8_t v){
-      if(mmio_claim(a))return mmio_write(a,v);
-      if(gpu_&&gpu_->claims(a))return gpu_->write(a,v);
-      return prior_mmio_write_&&prior_mmio_write_(a,v);
-    };
+    attach_mmio(pc_.cpu, bsp());
+    for (unsigned id = 1; id < processor_count_; ++id) {
+      auto& ap = *secondary_cpus_[id];
+      ap.in_hook = pc_.cpu.in_hook;
+      ap.out_hook = pc_.cpu.out_hook;
+      ap.pio_batch_limit_hook = pc_.cpu.pio_batch_limit_hook;
+      ap.pio_batch_transfer_hook = pc_.cpu.pio_batch_transfer_hook;
+      attach_mmio(ap, apics_[id]);
+    }
     pc_.device_step_hook=[this](){
       if(prior_tick_)prior_tick_();
       poll();
@@ -861,10 +1043,13 @@ class PcMotherboardC06 {
     };
     prior_local_apic_=pc_.cpu.local_apic_present();
     pc_.cpu.set_local_apic_present(true);
+    if (processor_count_ > 1) prior_clock_ = pc_.cpu.set_shared_clock(&ticks_);
   }
   ~PcMotherboardC06(){
     // Never leave a hook pointing at a destroyed motherboard instance.
     pc_.cpu.set_local_apic_present(prior_local_apic_);
+    pc_.cpu.configure_topology(prior_topology_, prior_apic_id_);
+    if (processor_count_ > 1) pc_.cpu.set_shared_clock(prior_clock_);
     pc_.reserve_pci_mmio(prior_pci_reservation_);
     pc_.cpu.set_x87_ignne(false);
     pc_.cpu.in_hook=std::move(prior_in_);
@@ -887,8 +1072,71 @@ class PcMotherboardC06 {
     return {ticks_,irq_delivered_,pit_irqs_,apic_irqs_,true,true,powered_off_,ata_irq_delivered_,sci_irqs_};
   }
   InterruptState interrupt_state()const{
-    return {pc_.cpu.apic_global_enabled(),lapic_on(),highest_vector(lapic_pending_),
-            highest_vector(lapic_in_service_),processor_priority(),timer_count()};
+    return {pc_.cpu.apic_global_enabled(),lapic_on(bsp()),highest_vector(bsp().pending),
+            highest_vector(bsp().in_service),processor_priority(bsp()),timer_count(bsp())};
+  }
+  bool secondary_can_run() const noexcept {
+    for (unsigned id = 1; id < processor_count_; ++id)
+      if (needs_service(apics_[id])) return true;
+    return false;
+  }
+  unsigned processors_started() const noexcept {
+    return static_cast<unsigned>(std::count_if(apics_.begin(), apics_.begin() + processor_count_,
+        [](const LocalApic& apic) { return apic.started; }));
+  }
+  unsigned worker_count() const noexcept { return workers_ ? workers_->size() : 1; }
+  const cosmic_pc::Cpu* faulted_cpu() const noexcept {
+    return faulted_processor_ ? apics_[*faulted_processor_].cpu : nullptr;
+  }
+  std::uint64_t processor_steps(unsigned id) const noexcept {
+    return apics_[id].cpu->instructions + retired_before_init_[id];
+  }
+  std::uint64_t total_processor_steps() const noexcept {
+    std::uint64_t steps = 0;
+    for (unsigned id = 0; id < processor_count_; ++id) steps += processor_steps(id);
+    return steps;
+  }
+  void run(unsigned budget) {
+    budget = std::min(budget, 50000U);
+    if (!secondary_can_run()) {
+      pc_.run(budget);
+      return;
+    }
+    // The budget counts work across the whole VM. Small calls keep a rotating
+    // position so that every runnable processor gets a turn.
+    constexpr unsigned quantum = 32;
+    while (budget && !faulted_processor_ && !pc_.cpu.fault && !powered_off_ &&
+           pc_.guest_restart() == cosmic_pc::PcMachine::GuestRestart::None) {
+      std::array<unsigned, kMaxProcessors> runnable{};
+      unsigned count = 1;
+      for (unsigned id = 1; id < processor_count_; ++id)
+        if (needs_service(apics_[id])) runnable[count++] = id;
+      if (count == 1) {
+        pc_.run(budget);
+        return;
+      }
+      const auto chunk = std::min(budget, count * quantum);
+      std::array<unsigned, kMaxProcessors> work{};
+      for (unsigned i = 0; i < count; ++i)
+        work[(next_cpu_ + i) % count] = chunk / count + (i < chunk % count);
+      next_cpu_ = (next_cpu_ + chunk % count) % count;
+      if (work[0]) pc_.run(work[0]);
+      if (pc_.cpu.fault || pc_.waiting_key || powered_off_ ||
+          pc_.guest_restart() != cosmic_pc::PcMachine::GuestRestart::None) return;
+      std::array<unsigned, kMaxProcessors> jobs{};
+      unsigned job_count = 0;
+      for (unsigned i = 1; i < count; ++i)
+        if (work[i]) jobs[job_count++] = i;
+      if (job_count == 1) run_secondary(runnable[jobs[0]], work[jobs[0]]);
+      if (job_count > 1) {
+        if (!workers_) workers_ = std::make_unique<SmpWorkers>(pc_.cpu.topology().cores);
+        workers_->run(job_count, [&](unsigned job) {
+          const auto slot = jobs[job];
+          run_secondary(runnable[slot], work[slot]);
+        });
+      }
+      budget -= chunk;
+    }
   }
   // Deterministic single guest-cycle advance; no host sleeper or background
   // worker. PC's canonical run loop calls this once per guest step.

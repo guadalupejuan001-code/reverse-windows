@@ -599,7 +599,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
                         case "halted" -> terminal ? "La CPU invitada se detuvo"
                                 : "La CPU invitada espera una interrupción";
                         case "powered_off" -> "El invitado se apagó";
-                        case "fault" -> "Arranque detenido por un fallo";
+                        case "fault" -> faultDetail(diagnostic);
                         default -> boot != null && boot.optBoolean("handed_off")
                                 ? "Invitado en ejecución" : "Arranque en ejecución";
                     };
@@ -617,6 +617,17 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         if (fault && !wasFault) showTrace(true);
         if (session && !wasSession) restoreGuestFocus();
         if ((session && !wasSession) || (fault && !wasFault)) showBootStatus();
+    }
+
+    private static String faultDetail(JSONObject diagnostic) {
+        JSONObject cpuFault = diagnostic.optJSONObject("cpu_fault");
+        if (cpuFault != null) {
+            String message = cpuFault.optString("message");
+            if (!message.isEmpty()) return "CPU " + cpuFault.optInt("apic_id") + " · " + message;
+        }
+        JSONObject machine = diagnostic.optJSONObject("machine");
+        String message = (machine == null ? diagnostic : machine).optString("message");
+        return message.isEmpty() ? "Arranque detenido por un fallo" : message;
     }
 
     private void updateBootProgress(JSONObject diagnostic, JSONObject boot) {
@@ -660,6 +671,13 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         progress.append(String.format(Locale.getDefault(), "\n%,d pasos x86 en esta sesión", sessionSteps));
         if (stepsPerSecond >= 0) {
             progress.append(String.format(Locale.getDefault(), " · %,d pasos/s de ejecución", stepsPerSecond));
+        }
+        JSONObject topology = diagnostic.optJSONObject("cpu_topology");
+        if (topology != null) {
+            progress.append(String.format(Locale.getDefault(),
+                    "\nCPU · %d núcleos · %d/%d hilos iniciados · %d trabajadores Android",
+                    topology.optInt("cores"), topology.optInt("started"),
+                    topology.optInt("logical_processors"), topology.optInt("host_workers")));
         }
         if (ram != null) {
             progress.append(String.format(Locale.getDefault(), "\nRAM del invitado · %,d MiB",
@@ -710,7 +728,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             progress.append(String.format(Locale.getDefault(),
                     "\nSectores leídos por ATA: %,d · Operaciones guardadas en QSSD: %,d", readSectors, commits));
         }
-        String detail = machine.optString("message");
+        String detail = "fault".equals(diagnostic.optString("status")) ?
+                faultDetail(diagnostic) : machine.optString("message");
         if (irq != null && irq.optBoolean("halted_with_if")) {
             progress.append(String.format(Locale.getDefault(),
                     "\nInterrupciones entregadas: %,d · Temporizador APIC: %,d",

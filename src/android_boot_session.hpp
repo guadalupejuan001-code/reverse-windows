@@ -40,6 +40,7 @@ class AndroidBootSession final {
   };
   static constexpr unsigned kMaxVideoWidth = 960, kMaxVideoHeight = 720;
   static constexpr RamProfile kDefaultRamProfile{2048ULL * 1024 * 1024, 256ULL * 1024 * 1024};
+  static constexpr cosmic_pc::CpuTopology kPrimeCpuTopology{8, 2};
   static constexpr std::uint64_t kPrimeRamBytes = 64ULL << 30;
   static constexpr std::uint64_t kMaxResidentBytes = 1024ULL * 1024 * 1024;
   static constexpr std::uint64_t kMinResidentBytes = 16ULL * 1024 * 1024;
@@ -103,7 +104,8 @@ class AndroidBootSession final {
                      RamProfile profile=kDefaultRamProfile,
                      const std::filesystem::path& ram_cache={},
                      const std::filesystem::path& graphics_vram={},
-                     const std::filesystem::path& data_disk={})
+                     const std::filesystem::path& data_disk={},
+                     cosmic_pc::CpuTopology topology={})
       : source_(source), pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_), vbe_(pc_) {
     if (disk.empty() && (create_gib || source != BootSource::SelfTest))
       throw std::invalid_argument("Selecciona o crea un disco QSSD para iniciar.");
@@ -145,10 +147,10 @@ class AndroidBootSession final {
       board_ = std::make_unique<PcMotherboardC06>(pc_, disk_.get(),
           [reader = iso_](auto offset, auto* target, auto count) {
             return reader->read(offset, target, count);
-          }, iso_->size(), graphics_vram, data_disk_.get());
+          }, iso_->size(), graphics_vram, data_disk_.get(), topology);
     } else {
       board_ = std::make_unique<PcMotherboardC06>(
-          pc_, disk_.get(), AtapiCdrom::Reader{}, 0, graphics_vram, data_disk_.get());
+          pc_, disk_.get(), AtapiCdrom::Reader{}, 0, graphics_vram, data_disk_.get(), topology);
     }
     board_->enable_ps2_keyboard();
     if (source != BootSource::SelfTest) pc_.enable_guest_restart();
@@ -168,7 +170,8 @@ class AndroidBootSession final {
   static std::string check_hardware(const std::filesystem::path& disk, int iso_fd=-1,
                                     std::uint64_t iso_bytes=0, const std::string& iso_error={},
                                     RamProfile profile=kDefaultRamProfile,
-                                    const std::filesystem::path& ram_cache={}) {
+                                    const std::filesystem::path& ram_cache={},
+                                    cosmic_pc::CpuTopology topology={}) {
     cosmic_pc::PcMachine pc(profile.physical_bytes, profile.backing_bytes);
     if (profile.physical_bytes > cosmic_pc::PcMachine::kLegacyPhysicalLimit) pc.reserve_pci_mmio(true);
     const auto spill = configure_spill(pc, ram_cache);
@@ -203,7 +206,7 @@ class AndroidBootSession final {
             if (offset > optical_sector.size() || count > optical_sector.size() - offset) return false;
             std::copy_n(optical_sector.data()+offset, count, data);
             return true;
-          }, optical_sector.size());
+          }, optical_sector.size(), {}, nullptr, topology);
       basic = cpuid(1);
       constexpr unsigned probe = 0x1000;
       cpu.reset(0, probe);
@@ -272,7 +275,10 @@ class AndroidBootSession final {
     if (has_disk) out << disk_issue.empty(); else out << "null";
     out << ",\"qssd_ata\":";
     if (!has_disk || !disk_issue.empty()) out << "null"; else out << ata_issue.empty();
-    out << "},\"ram_profile\":";
+    out << "},\"cpu_topology\":{\"sockets\":1,\"cores\":" << topology.cores
+        << ",\"threads_per_core\":" << topology.threads_per_core
+        << ",\"logical_processors\":" << ((basic[cosmic_pc::Cpu::EBX] >> 16) & 255U)
+        << "},\"ram_profile\":";
     write_ram_profile(out, pc, spill);
     out << ",\"ready_for_windows10_install\":false,\"errors\":{"
         << "\"iso_boot\":" << cosmic_pc::PcMachine::quote(optical_issue)
@@ -282,18 +288,20 @@ class AndroidBootSession final {
   }
 
   Step step(unsigned budget) {
+    if (board_->faulted_cpu()) return Step::Fault;
     if (!is_stopped()) {
       const auto slice = boot_profile_ ? boot_profile_->budget(budget, pc_) : budget;
-      pc_.run(slice);
+      board_->run(slice);
       if (boot_profile_) boot_profile_->after_run(pc_, *board_);
     }
     if (!pc_.cpu.fault && pc_.host_error.empty() &&
         pc_.guest_restart() != cosmic_pc::PcMachine::GuestRestart::None) {
-      const auto steps = pc_.cpu.instructions;
+      const auto steps = board_->total_processor_steps();
+      const auto restart_count = restarts_;
       restart_guest();
-      if (pc_.cpu.instructions < steps) previous_boot_steps_ += steps;
+      if (restarts_ != restart_count) previous_boot_steps_ += steps;
     }
-    if (pc_.cpu.fault || !pc_.host_error.empty()) return Step::Fault;
+    if (board_->faulted_cpu() || pc_.cpu.fault || !pc_.host_error.empty()) return Step::Fault;
     if (pc_.waiting_key) return Step::WaitingKey;
     if (is_stopped()) return Step::Halted;
     return Step::Running;
@@ -301,7 +309,7 @@ class AndroidBootSession final {
 
   bool is_stopped() const noexcept {
     return board_->evidence().powered_off ||
-        (pc_.cpu.halted && !pc_.cpu.flag(cosmic_pc::Cpu::IF));
+        (pc_.cpu.halted && !pc_.cpu.flag(cosmic_pc::Cpu::IF) && !board_->secondary_can_run());
   }
 
   bool key(unsigned ascii, unsigned scancode, bool pressed) {
@@ -392,7 +400,9 @@ class AndroidBootSession final {
   std::string diagnostic(bool detailed = true) const {
     const auto platform = board_->evidence();
     const auto interrupts = board_->interrupt_state();
-    const auto status = platform.powered_off ? "powered_off" : pc_.status();
+    const auto* secondary_fault = board_->faulted_cpu();
+    auto status = platform.powered_off ? "powered_off" : secondary_fault ? "fault" : pc_.status();
+    if (status == "halted" && board_->secondary_can_run()) status = "running";
     const auto* ata = board_->attached_ata();
     const auto counts = ata ? ata->counters() : AtaC07::Counters{};
     std::ostringstream out;
@@ -421,6 +431,24 @@ class AndroidBootSession final {
     }
     out << ",\"storage_io\":";
     write_storage_profile(out, pc_, bios_disk_.get(), ata, disk_.get());
+    const auto topology = pc_.cpu.topology();
+    out << ",\"cpu_topology\":{\"sockets\":1,\"cores\":" << topology.cores
+        << ",\"threads_per_core\":" << topology.threads_per_core
+        << ",\"logical_processors\":" << topology.logical_processors()
+        << ",\"started\":" << board_->processors_started()
+        << ",\"host_workers\":" << board_->worker_count();
+    if (detailed) {
+      out << ",\"steps_by_logical_processor\":[";
+      for (unsigned id = 0; id < topology.logical_processors(); ++id)
+        out << (id ? "," : "") << board_->processor_steps(id);
+      out << ']';
+    }
+    out << '}';
+    const auto* faulted_cpu = secondary_fault ? secondary_fault : &pc_.cpu;
+    if (faulted_cpu->fault) {
+      out << ",\"cpu_fault\":{\"apic_id\":" << faulted_cpu->apic_id() << ",\"message\":"
+          << cosmic_pc::PcMachine::quote(faulted_cpu->fault->describe()) << '}';
+    }
     out << ",\"ram_profile\":";
     write_ram_profile(out, pc_, spill_, &pressure_);
     const auto gate_work = pc_.quantum_session->gate_work_stats();
@@ -473,7 +501,7 @@ class AndroidBootSession final {
     }
     const auto& mode = pc_.boot_mode_progress();
     out << ",\"boot_progress\":{\"handed_off\":" << (pc_.cpu.instructions ? "true" : "false")
-        << ",\"session_steps\":" << previous_boot_steps_ + pc_.cpu.instructions
+        << ",\"session_steps\":" << previous_boot_steps_ + board_->total_processor_steps()
         << ",\"mode_changes\":" << mode.changes << ",\"last_mode_from\":\"" << mode.from
         << "\",\"last_mode_to\":\"" << mode.to << "\",\"last_mode_step\":" << mode.step
         << ",\"restarts\":" << restarts_ << ",\"last_restart\":\"" << last_restart_ << "\"}";

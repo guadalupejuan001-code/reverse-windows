@@ -60,7 +60,7 @@ final class VmWorker {
     private static final int DATA_DISK_GIB = 8 * 1024 * 1024;
     private static final int INITIAL_SLICE_STEPS = 4096;
     private static final int MIN_SLICE_STEPS = 64;
-    private static final int MAX_SLICE_STEPS = 16384;
+    private static final int MAX_SLICE_STEPS = 50_000;
     private static final long TARGET_SLICE_NS = 8_000_000L;
     private static final long HALTED_POLL_DELAY_MS = 35;
     private static final long STATUS_INTERVAL_MS = 350;
@@ -408,6 +408,13 @@ final class VmWorker {
             videoDirty = (updated & NativeMachine.STEP_VIDEO_DIRTY) != 0;
             long elapsed = Math.max(1, SystemClock.elapsedRealtimeNanos() - started);
             stepNanos += elapsed;
+            if (outcome == NativeMachine.FAULT) {
+                running = false;
+                String snapshot = currentDiagnostic(false);
+                send(() -> listener.onState(snapshot, false, true, false, true));
+                publishState(true);
+                return;
+            }
             if (outcome == NativeMachine.RUNNING) {
                 long estimate = sliceSteps * TARGET_SLICE_NS / elapsed;
                 sliceSteps = (int) Math.max(MIN_SLICE_STEPS,
