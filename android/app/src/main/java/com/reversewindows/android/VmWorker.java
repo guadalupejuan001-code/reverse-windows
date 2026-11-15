@@ -4,6 +4,7 @@ import android.content.ContentResolver;
 import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Debug;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
@@ -63,6 +64,7 @@ final class VmWorker {
     private static final long HALTED_POLL_DELAY_MS = 35;
     private static final long STATUS_INTERVAL_MS = 350;
     private static final long DIAGNOSTIC_INTERVAL_MS = 5_000;
+    private static final long PSS_SAMPLE_INTERVAL_MS = 10_000;
     // Newer Android versions no longer send the running-low trim levels.
     private static final long RAM_SAMPLE_INTERVAL_MS = 10_000;
     private static final long RAM_RECLAIM_INTERVAL_MS = 16;
@@ -88,6 +90,8 @@ final class VmWorker {
     private long lastStatus;
     private long lastDiagnosticSave;
     private long sessionStarted;
+    private long nextPssSample;
+    private long androidPssKiB;
     private long stepNanos;
     private long frameNanos;
     private long statusNanos;
@@ -246,6 +250,7 @@ final class VmWorker {
                 lastStatus = 0;
                 lastDiagnosticSave = 0;
                 sessionStarted = SystemClock.elapsedRealtime();
+                nextPssSample = sessionStarted;
                 stepNanos = frameNanos = statusNanos = 0;
                 videoDirty = true;
                 running = true;
@@ -480,8 +485,14 @@ final class VmWorker {
     }
 
     private String currentDiagnostic(boolean detailed) {
+        long now = SystemClock.elapsedRealtime();
+        if (now >= nextPssSample) {
+            androidPssKiB = Debug.getPss();
+            nextPssSample = now + PSS_SAMPLE_INTERVAL_MS;
+        }
         return withBuildMetadata(NativeMachine.diagnostic(handle, detailed),
-                ",\"elapsed_ms\":" + (SystemClock.elapsedRealtime() - sessionStarted)
+                ",\"elapsed_ms\":" + (now - sessionStarted)
+                + ",\"android_pss_kib\":" + androidPssKiB
                 + ",\"worker_timing\":{\"step_us\":" + stepNanos / 1000
                 + ",\"frame_us\":" + frameNanos / 1000
                 + ",\"diagnostic_us\":" + statusNanos / 1000 + "}");
