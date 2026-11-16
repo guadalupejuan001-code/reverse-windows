@@ -95,6 +95,8 @@ final class VmWorker {
     private long nextPssSample;
     private long androidPssKiB;
     private long stepNanos;
+    private long lastSliceNanos;
+    private int lastSliceSteps;
     private long frameNanos;
     private long statusNanos;
     private boolean frameRequested; // Worker owns the capture until the UI applies or discards it.
@@ -259,6 +261,8 @@ final class VmWorker {
                 sessionStarted = SystemClock.elapsedRealtime();
                 nextPssSample = sessionStarted;
                 stepNanos = frameNanos = statusNanos = 0;
+                lastSliceNanos = 0;
+                lastSliceSteps = 0;
                 videoDirty = true;
                 running = true;
                 publishState(true);
@@ -403,10 +407,12 @@ final class VmWorker {
         try {
             int previous = outcome;
             long started = SystemClock.elapsedRealtimeNanos();
-            int updated = NativeMachine.step(handle, sliceSteps);
+            lastSliceSteps = sliceSteps;
+            int updated = NativeMachine.step(handle, lastSliceSteps);
             outcome = updated & ~NativeMachine.STEP_VIDEO_DIRTY;
             videoDirty = (updated & NativeMachine.STEP_VIDEO_DIRTY) != 0;
             long elapsed = Math.max(1, SystemClock.elapsedRealtimeNanos() - started);
+            lastSliceNanos = elapsed;
             stepNanos += elapsed;
             if (outcome == NativeMachine.FAULT) {
                 running = false;
@@ -510,6 +516,9 @@ final class VmWorker {
                 + ",\"worker_timing\":{\"step_us\":" + stepNanos / 1000
                 + ",\"frame_us\":" + frameNanos / 1000
                 + ",\"diagnostic_us\":" + statusNanos / 1000
+                + ",\"last_slice_steps_requested\":" + lastSliceSteps
+                + ",\"last_slice_us\":" + lastSliceNanos / 1000
+                + ",\"next_slice_steps_requested\":" + sliceSteps
                 + ",\"max_steps_per_slice\":" + MAX_SLICE_STEPS
                 + ",\"target_slice_us\":" + TARGET_SLICE_NS / 1000
                 + ",\"diagnostic_save_interval_ms\":" + DIAGNOSTIC_INTERVAL_MS + "}");

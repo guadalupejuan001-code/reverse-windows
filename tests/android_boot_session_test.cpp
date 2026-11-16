@@ -511,6 +511,10 @@ int main(int argc, char** argv) {
       require(progress.find("\"boot_profile\":{") != std::string::npos &&
                   progress.find("\"boot_time_samples\":{") != std::string::npos &&
                   progress.find("\"boot_code_regions\":{") != std::string::npos &&
+                  progress.find("\"instruction_page_reuses\":") != std::string::npos &&
+                  progress.find("\"sampled_profile_ns\":") != std::string::npos &&
+                  progress.find("\"sampled_arm64_execute_ns\":") != std::string::npos &&
+                  progress.find("\"sampled_bulk_execute_ns\":") != std::string::npos &&
                   counter(progress, "sampled_windows") > 0 &&
                   counter(progress, "initial_commits") == 0,
               "ISO profiling must report activity and the initial disk state");

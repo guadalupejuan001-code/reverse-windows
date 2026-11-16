@@ -91,6 +91,7 @@ class BootProfile {
     std::uint64_t steps = 0, ip = 0, cr3 = 0, ticks = 0, irq = 0;
     std::uint64_t disk_reads = 0, ata_commands = 0, atapi_packets = 0;
     std::uint64_t page_walks = 0, page_hits = 0, instruction_page_hits = 0, batched = 0;
+    std::uint64_t instruction_page_reuses = 0;
     std::uint64_t resident_bytes = 0, spill_reads = 0, spill_writes = 0, neon_steps = 0;
     std::uint64_t mode_changes = 0;
     std::uint32_t flags = 0;
@@ -125,6 +126,7 @@ class BootProfile {
     out.page_walks = cpu.page_walks;
     out.page_hits = cpu.page_translation_hits;
     out.instruction_page_hits = cpu.instruction_page_hits;
+    out.instruction_page_reuses = cpu.instruction_page_reuses;
     const auto memory = cpu.memory.metrics();
     out.resident_bytes = memory.allocated_bytes;
     out.spill_reads = memory.backing_reads;
@@ -149,6 +151,7 @@ class BootProfile {
         << ",\"atapi_packets\":" << s.atapi_packets << ",\"page_walks\":" << s.page_walks
         << ",\"page_translation_hits\":" << s.page_hits
         << ",\"instruction_page_hits\":" << s.instruction_page_hits
+        << ",\"instruction_page_reuses\":" << s.instruction_page_reuses
         << ",\"ram_resident_bytes\":" << s.resident_bytes << ",\"spill_reads\":" << s.spill_reads
         << ",\"spill_writes\":" << s.spill_writes << ",\"batched_steps\":" << s.batched
         << ",\"neon_steps\":" << s.neon_steps

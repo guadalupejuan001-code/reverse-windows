@@ -6,7 +6,7 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "b6f288da056171a04e900c330de3b52329e7ea27",
+      "commit": "5cdfbb27d392b201a8ef26d5985d86e36580fc24",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
       "status": "candidate-ether-arm64-ram64-rep-copy",

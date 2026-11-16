@@ -183,15 +183,23 @@ final class VmTelemetry extends LinearLayout {
     private void renderCpu() {
         JSONObject ether = snapshot.optJSONObject("ether_arm64");
         long elapsed = number(snapshot, "elapsed_ms");
-        long rate = stepRate >= 0 ? stepRate : elapsed > 0 ? Math.round(steps * 1000.0 / elapsed) : -1;
-        String value = rate >= 1_000_000 ? units(rate, 1_000_000, "M", 2) : count(rate);
-        heading("Pasos/s de ejecución", value,
-                stepRate >= 0 ? "Modo " + mode : "Promedio de la sesión · " + mode);
+        long sessionRate = elapsed > 0 && steps >= 0 ? Math.round(steps * 1000.0 / elapsed) : -1;
+        if (stepRate >= 0) {
+            heading("Pasos/s durante ejecución", formatRate(stepRate),
+                    "Promedio real " + formatRate(sessionRate) + " · " + mode);
+        } else {
+            heading("Promedio real de pasos/s", formatRate(sessionRate), mode);
+        }
         metric(0, "Pasos x86 de la sesión", count(steps));
-        metric(1, "Pasos en Éter ARM64", count(number(ether, "guest_steps")));
+        metric(1, "Pasos de esta fase en Éter ARM64", count(number(ether, "guest_steps")));
         metric(2, "Bloques Éter ejecutados", count(number(ether, "executed_blocks")));
-        metric(3, "Aciertos de caché Éter", count(number(ether, "cache_hits")));
+        metric(3, "Expulsiones de caché Éter", count(number(ether, "compiled_evictions")));
         showRows(4);
+    }
+
+    private static String formatRate(long stepsPerSecond) {
+        return stepsPerSecond >= 1_000_000
+                ? units(stepsPerSecond, 1_000_000, "M", 2) : count(stepsPerSecond);
     }
 
     private void renderDisk() {
