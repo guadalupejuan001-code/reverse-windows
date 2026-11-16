@@ -45,6 +45,7 @@ jobs:
           grep -q '^ETHER_WIDE_MULTIPLY_LOOP_PASS ' build/prime-x86-measure.log
           grep -q '^ETHER_ROTATE_XOR_PASS ' build/prime-x86-measure.log
           grep -q '^ETHER_TIMED_ROTATE_XOR_PASS steps=2000000$' build/prime-x86-measure.log
+          grep -q '^ETHER_AFFINE_RAM_ROTATE_PASS cases=12 changing_ram=1 mmio=1 device_clock=1$' build/prime-x86-measure.log
           ./build/prime-x86-measure --measure-wide-multiply | tee -a build/prime-x86-measure.log
           ./build/prime-x86-measure --measure-mixed | tee -a build/prime-x86-measure.log
           grep -q '^ETHER_X86_MIXED_PASS mode=interpreter steps=110000001 native_steps=0 ' build/prime-x86-measure.log
@@ -132,6 +133,7 @@ jobs:
           if [ "$(uname -m)" = "aarch64" ]; then
             grep -q '^PRIME_C03_ARM64_PASS ' build/prime-c03-ether-arm64.log
             grep -q '^PRIME_ETHER_ROTATION_PASS cases=96 flags=1 stack=1 exact_steps=1$' build/prime-c03-ether-arm64.log
+            grep -q '^PRIME_ETHER_VARIABLE_ROTATION_PASS cases=144 flags=1 ram=1$' build/prime-c03-ether-arm64.log
             grep -q '^PRIME_ARM64_PROTECTED32_PASS ' build/prime-c03-ether-arm64.log
             grep -q '^PRIME_ARM64_BYTE_COPY_PASS ' build/prime-c03-ether-arm64.log
             grep -q '^PRIME_ETHER_INTEGER_PASS mode=protected32 ' build/prime-c03-ether-arm64.log

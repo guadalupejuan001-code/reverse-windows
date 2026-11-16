@@ -73,9 +73,24 @@ void verify_ram_profile() {
   const auto report = Session::check_hardware({}, -1, 0, {}, prime);
   require(counter(report, "usable_bytes") == Session::kPrimeRamBytes &&
               counter(report, "address_space_bytes") == prime.physical_bytes &&
-              counter(report, "backing_budget_bytes") == 1920 * mib &&
+              counter(report, "backing_budget_bytes") == 3840 * mib &&
+              report.find("\"resident_policy\":\"android-surplus\"") != std::string::npos &&
               counter(report, "resident_bytes") < mib,
-          "Prime must expose all 64 GiB while allocating pages on demand");
+          "Prime must expose 64 GiB and use the full Android surplus on demand");
+  const auto phone = Session::ram_profile(768 * mib, 256 * mib, false, true);
+  require(phone.backing_bytes == 512 * mib, "Prime must not halve the phone's RAM surplus");
+  Session live({}, 0, Session::BootSource::SelfTest, -1, 0, phone);
+  const auto used = counter(live.diagnostic(), "resident_bytes");
+  constexpr std::uint64_t page = cosmic_pc::MemoryFabric::kPageSize;
+  live.sample_ram_pressure(1024 * mib, 256 * mib, false);
+  require(!live.maintain_ram_budget() &&
+              counter(live.diagnostic(), "backing_budget_bytes") == (768 * mib + used) / page * page,
+          "Prime must grow to the full live surplus plus its existing guest pages");
+  live.sample_ram_pressure(256 * mib, 256 * mib, false);
+  require(!live.maintain_ram_budget() &&
+              counter(live.diagnostic(), "backing_budget_bytes") == 16 * mib &&
+              counter(live.diagnostic(), "usable_bytes") == Session::kPrimeRamBytes,
+          "Reaching the Android threshold must reclaim payload without reducing guest RAM");
   try {
     (void)Session::ram_profile(300 * mib, 256 * mib, true);
   } catch (const std::runtime_error&) { return; }

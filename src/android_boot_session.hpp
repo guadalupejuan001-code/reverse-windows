@@ -49,7 +49,7 @@ class AndroidBootSession final {
                                 bool low_memory, bool prime_ram = false) {
     constexpr std::uint64_t MiB = 1024 * 1024;
     const auto headroom = available_bytes > low_threshold ? available_bytes - low_threshold : 0;
-    const auto backing = (headroom / 2) / cosmic_pc::MemoryFabric::kPageSize *
+    const auto backing = (prime_ram ? headroom : headroom / 2) / cosmic_pc::MemoryFabric::kPageSize *
                          cosmic_pc::MemoryFabric::kPageSize;
     if (low_memory || backing < kMinResidentBytes)
       throw std::runtime_error("Android tiene poca RAM disponible para iniciar el equipo virtual.");
@@ -68,17 +68,21 @@ class AndroidBootSession final {
     const auto& memory = pc_.cpu.memory;
     constexpr auto page = cosmic_pc::MemoryFabric::kPageSize;
     const auto headroom = available > threshold ? available - threshold : 0;
-    // Android's available RAM already reflects the VM's resident payload.
-    // Add that payload back before dividing the combined headroom.
     const auto limit = resident_limit(memory.size());
-    const auto half = std::min(headroom, 2 * limit) / 2 + memory.allocated_bytes() / 2;
+    const bool prime_ram = memory.size() > cosmic_pc::PcMachine::kLegacyPhysicalLimit;
+    const bool reclaim = low_memory || (prime_ram && !headroom);
+    // The current resident payload is already excluded from Android's
+    // available bytes. Prime can grow into the surplus above its threshold.
+    const auto backing = prime_ram
+        ? std::min(headroom, limit) + memory.allocated_bytes()
+        : std::min(headroom, 2 * limit) / 2 + memory.allocated_bytes() / 2;
     const auto floor = std::min(limit, kMinResidentBytes);
-    const auto target = low_memory ? floor : std::clamp<std::uint64_t>(half / page * page, floor, limit);
-    board_->set_gpu_cache_enabled(!low_memory && target > floor);
+    const auto target = reclaim ? floor : std::clamp<std::uint64_t>(backing / page * page, floor, limit);
+    board_->set_gpu_cache_enabled(!reclaim && target > floor);
     const auto old_target = pressure_.target ? pressure_.target : memory.budget_bytes();
     const auto delta = std::max(old_target, target) - std::min(old_target, target);
     pressure_.low_memory = low_memory;
-    if (low_memory || delta >= 8 * 1024 * 1024 || target == floor)
+    if (reclaim || delta >= 8 * 1024 * 1024 || target == floor)
       pressure_.target = target;
     else
       pressure_.target = old_target;
@@ -486,7 +490,9 @@ class AndroidBootSession final {
         << ",\"boot_wide_multiply_loop_batches\":" << boot_work.wide_multiply_loop_batches
         << ",\"boot_wide_multiply_loop_steps\":" << boot_work.wide_multiply_loop_steps
         << ",\"boot_rotate_xor_loop_batches\":" << boot_work.rotate_xor_loop_batches
-        << ",\"boot_rotate_xor_loop_steps\":" << boot_work.rotate_xor_loop_steps;
+        << ",\"boot_rotate_xor_loop_steps\":" << boot_work.rotate_xor_loop_steps
+        << ",\"boot_affine_ram_rotate_batches\":" << boot_work.affine_ram_rotate_batches
+        << ",\"boot_affine_ram_rotate_steps\":" << boot_work.affine_ram_rotate_steps;
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     const auto ether = pc_.cpu.ether_next_stats();
     out << ",\"neon_requested\":" << (pc_.cpu.ether_next_enabled() ? "true" : "false")
@@ -620,6 +626,9 @@ class AndroidBootSession final {
     out << "{\"address_space_bytes\":" << pc.cpu.memory.size()
         << ",\"usable_bytes\":" << pc.usable_ram_bytes()
         << ",\"backing_budget_bytes\":" << pc.cpu.memory.budget_bytes()
+        << ",\"resident_policy\":\""
+        << (pc.cpu.memory.size() > cosmic_pc::PcMachine::kLegacyPhysicalLimit
+            ? "android-surplus" : "android-half-surplus") << "\""
         << ",\"resident_bytes\":" << metrics.allocated_bytes
         << ",\"resident_metadata_bytes\":" << metrics.metadata_bytes
         << ",\"pattern_pages\":" << metrics.pattern_pages
