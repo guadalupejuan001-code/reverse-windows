@@ -37,9 +37,9 @@ jobs:
         abi: [arm64-v8a, x86_64]
     env:
       ANDROID_ABI: ${{ matrix.abi }}
-      ANDROID_APP_ID: com.reversewindows.android.prime.smp.r031
-      ANDROID_VERSION: "0.3.1"
-      ANDROID_VERSION_CODE: "29"
+      ANDROID_APP_ID: com.reversewindows.android.prime.smp.r032
+      ANDROID_VERSION: "0.3.2"
+      ANDROID_VERSION_CODE: "30"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -116,6 +116,8 @@ jobs:
           grep -aFq 'code_byte_checks' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'code_bytes_read' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'boot_counter_loop_steps' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'pattern_delta_pages' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'boot_rep_direct_page_copy_bytes' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'wbinvd_retired' "$RUNNER_TEMP/reverse-windows-android.so"
           readelf -h -lW "$RUNNER_TEMP/reverse-windows-android.so" > "$out/native-elf.txt"
           if [[ "$ANDROID_ABI" == arm64-v8a ]]; then
