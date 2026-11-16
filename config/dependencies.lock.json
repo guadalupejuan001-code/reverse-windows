@@ -6,10 +6,10 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "85bb8394f0865d951018cfc00930e62bb3eb40dd",
+      "commit": "8e61100400c8052071707c8238dbbd1608daa271",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
-      "status": "candidate-windows-x64-arm64-cache-ioapic",
+      "status": "candidate-windows-x64-arm64-native-rotations",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/pc_video.hpp",

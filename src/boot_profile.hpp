@@ -29,6 +29,7 @@ inline void write_ether_arm64(std::ostream& out, const cosmic_pc::Cpu& cpu) {
       << ",\"coalesced_ram_writes\":" << stats.coalesced_ram_writes
       << ",\"repeated_loop_dispatches\":" << stats.repeated_loop_dispatches
       << ",\"repeated_loop_steps\":" << stats.repeated_loop_steps
+      << ",\"rotate_guest_steps\":" << stats.rotate_steps
 #if defined(REVERSE_MUNDO_X_SOURCE_SHA)
       << ",\"mundo_x_source_sha\":\"" REVERSE_MUNDO_X_SOURCE_SHA "\""
 #endif

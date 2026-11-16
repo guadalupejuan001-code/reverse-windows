@@ -37,9 +37,9 @@ jobs:
         abi: [arm64-v8a, x86_64]
     env:
       ANDROID_ABI: ${{ matrix.abi }}
-      ANDROID_APP_ID: com.reversewindows.android.prime.smp.r045
-      ANDROID_VERSION: "0.3.15"
-      ANDROID_VERSION_CODE: "43"
+      ANDROID_APP_ID: com.reversewindows.android.prime.smp.r046
+      ANDROID_VERSION: "0.3.16"
+      ANDROID_VERSION_CODE: "44"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -117,6 +117,7 @@ jobs:
           grep -aFq 'code_bytes_read' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'staged_ram_blocks' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'coalesced_ram_writes' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'rotate_guest_steps' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'cpuid_vendor' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'GenuineIntel' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'boot_counter_loop_steps' "$RUNNER_TEMP/reverse-windows-android.so"
