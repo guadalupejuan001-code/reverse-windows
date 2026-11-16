@@ -1272,6 +1272,7 @@ void timed_rotate_xor_guest() {
   auto& cpu = pc.cpu;
   need(cpu.is_long_mode() && !cpu.fault, "timed rotate/XOR fixture did not enter x64");
   cpu.enable_page_translation_cache();
+  cpu.enable_ether_arm64_blocks();
   pc.enable_boot_acceleration();
   constexpr std::uint32_t entry = 0xa000;
   constexpr unsigned steps = 32'000'028, rounds = steps / 4 + 13;
