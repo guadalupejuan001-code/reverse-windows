@@ -364,6 +364,10 @@ void verify_arm64_session(const std::filesystem::path& path) {
   const auto native_steps = counter(ether, "guest_steps");
   require(cosmic_pc::Cpu::ether_arm64_host() ? native_steps >= 12 : native_steps == 0,
           "Android native session selected the wrong launch path");
+  const auto loop_dispatches = counter(ether, "repeated_loop_dispatches");
+  const auto loop_steps = counter(ether, "repeated_loop_steps");
+  require(loop_steps <= native_steps && ((loop_dispatches == 0) == (loop_steps == 0)),
+          "Android diagnostics must report repeated loops within native retired steps");
   const auto version_hits = counter(ether, "code_version_hits");
   const auto byte_checks = counter(ether, "code_byte_checks");
   const auto code_bytes = counter(ether, "code_bytes_read");
