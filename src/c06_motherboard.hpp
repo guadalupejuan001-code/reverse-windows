@@ -613,6 +613,7 @@ class PcMotherboardC06 {
       const auto r=unsigned(base-kIoApic);
       if(r==0){ioapic_select_=v&0xffU;return true;}
       if(r!=0x10)return false;
+      if(ioapic_select_==1)return true; // IOAPICVER is read-only; writes leave its value unchanged.
       if(ioapic_select_>=0x10&&ioapic_select_<0x40){
         const unsigned pin=(ioapic_select_-0x10)/2;
         if(ioapic_select_&1)io_redir_high_[pin]=v&0xff000000U;
