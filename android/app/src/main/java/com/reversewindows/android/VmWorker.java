@@ -62,7 +62,7 @@ final class VmWorker {
     private static final int DATA_DISK_GIB = 8 * 1024 * 1024;
     private static final int INITIAL_SLICE_STEPS = 4096;
     private static final int MIN_SLICE_STEPS = 64;
-    private static final int MAX_SLICE_STEPS = 50_000;
+    private static final int MAX_SLICE_STEPS = Integer.MAX_VALUE;
     private static final long TARGET_SLICE_NS = 8_000_000L;
     private static final long HALTED_POLL_DELAY_MS = 35;
     private static final long STATUS_INTERVAL_MS = 350;
@@ -102,6 +102,7 @@ final class VmWorker {
     private long stepNanos;
     private long lastSliceNanos;
     private int lastSliceSteps;
+    private long lastSliceCompleted;
     private long frameNanos;
     private long statusNanos;
     private boolean frameRequested; // Worker owns the capture until the UI applies or discards it.
@@ -270,6 +271,7 @@ final class VmWorker {
                 stepNanos = frameNanos = statusNanos = 0;
                 lastSliceNanos = 0;
                 lastSliceSteps = 0;
+                lastSliceCompleted = 0;
                 videoDirty = true;
                 running = true;
                 publishState(true);
@@ -415,7 +417,9 @@ final class VmWorker {
             int previous = outcome;
             long started = SystemClock.elapsedRealtimeNanos();
             lastSliceSteps = sliceSteps;
-            int updated = NativeMachine.step(handle, lastSliceSteps);
+            long step = NativeMachine.step(handle, lastSliceSteps, TARGET_SLICE_NS);
+            int updated = (int) step;
+            lastSliceCompleted = step >>> 32;
             outcome = updated & ~NativeMachine.STEP_VIDEO_DIRTY;
             videoDirty = (updated & NativeMachine.STEP_VIDEO_DIRTY) != 0;
             long elapsed = Math.max(1, SystemClock.elapsedRealtimeNanos() - started);
@@ -429,7 +433,7 @@ final class VmWorker {
                 return;
             }
             if (outcome == NativeMachine.RUNNING) {
-                long estimate = sliceSteps * TARGET_SLICE_NS / elapsed;
+                long estimate = lastSliceCompleted * TARGET_SLICE_NS / elapsed;
                 sliceSteps = (int) Math.max(MIN_SLICE_STEPS,
                         Math.min(MAX_SLICE_STEPS, (sliceSteps + estimate) / 2));
             }
@@ -532,6 +536,7 @@ final class VmWorker {
                 + ",\"frame_us\":" + frameNanos / 1000
                 + ",\"diagnostic_us\":" + statusNanos / 1000
                 + ",\"last_slice_steps_requested\":" + lastSliceSteps
+                + ",\"last_slice_steps_completed\":" + lastSliceCompleted
                 + ",\"last_slice_us\":" + lastSliceNanos / 1000
                 + ",\"next_slice_steps_requested\":" + sliceSteps
                 + ",\"max_steps_per_slice\":" + MAX_SLICE_STEPS

@@ -1145,10 +1145,13 @@ class PcMotherboardC06 {
     for (unsigned id = 0; id < processor_count_; ++id) steps += processor_steps(id);
     return steps;
   }
-  void run(unsigned budget) {
-    budget = std::min(budget, 50000U);
+  void run(unsigned budget, cosmic_pc::PcMachine::RunClock::time_point deadline=
+           cosmic_pc::PcMachine::RunClock::time_point::max()) {
+    using Clock=cosmic_pc::PcMachine::RunClock;
+    const bool timed=deadline!=Clock::time_point::max();
+    if(!timed)budget=std::min(budget,cosmic_pc::PcMachine::kDefaultRunSteps);
     if (!secondary_can_run()) {
-      pc_.run(budget);
+      pc_.run(budget,deadline);
       return;
     }
     // The budget counts work across the whole VM. Small calls keep a rotating
@@ -1156,12 +1159,13 @@ class PcMotherboardC06 {
     constexpr unsigned quantum = 32;
     while (budget && !faulted_processor_ && !pc_.cpu.fault && !powered_off_ &&
            pc_.guest_restart() == cosmic_pc::PcMachine::GuestRestart::None) {
+      if(timed&&Clock::now()>=deadline)return;
       std::array<unsigned, kMaxProcessors> runnable{};
       unsigned count = 1;
       for (unsigned id = 1; id < processor_count_; ++id)
         if (needs_service(apics_[id])) runnable[count++] = id;
       if (count == 1) {
-        pc_.run(budget);
+        pc_.run(budget,deadline);
         return;
       }
       const auto chunk = std::min(budget, count * quantum);

@@ -6,10 +6,10 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "6f1471b49d9467ca3644a729dce36b75b43bee92",
+      "commit": "aafc339ac38e067fcd1bc8c9c727d7eb7390f887",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
-      "status": "candidate-windows-x64-mul-adc",
+      "status": "candidate-windows-x64-rotate-xor-sse",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/pc_video.hpp",
@@ -49,6 +49,7 @@
         "pc-android/native/x86_platform_profile.inc",
         "pc-android/native/x86_sse_copy_loop.inc",
         "pc-android/native/x86_wide_multiply_loop.inc",
+        "pc-android/native/x86_rotate_xor_loop.inc",
         "pc-android/native/tests/pc_group6_iso_test.cpp",
         "native/include/mundo_x/autonomous_core_c02.hpp",
         "pc-android/native/tests/x86_idt_c04_test.cpp",

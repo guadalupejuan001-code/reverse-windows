@@ -43,6 +43,8 @@ jobs:
           ./build/prime-x86-measure | tee build/prime-x86-measure.log
           grep -q '^ETHER_ACCUMULATOR_64BIT_BUDGET_PASS equivalent_steps=369000000000000 ' build/prime-x86-measure.log
           grep -q '^ETHER_WIDE_MULTIPLY_LOOP_PASS ' build/prime-x86-measure.log
+          grep -q '^ETHER_ROTATE_XOR_PASS ' build/prime-x86-measure.log
+          grep -q '^ETHER_TIMED_ROTATE_XOR_PASS steps=2000000$' build/prime-x86-measure.log
           ./build/prime-x86-measure --measure-wide-multiply | tee -a build/prime-x86-measure.log
           ./build/prime-x86-measure --measure-mixed | tee -a build/prime-x86-measure.log
           grep -q '^ETHER_X86_MIXED_PASS mode=interpreter steps=110000001 native_steps=0 ' build/prime-x86-measure.log
@@ -103,6 +105,7 @@ jobs:
           grep -q 'PRIME_C03_NATIVE_SESSION_PASS translated_steps=' build/prime-bios-keyboard.log
           grep -q 'PRIME_C10_WBINVD_SESSION_PASS count=1 resume=1' build/prime-bios-keyboard.log
           grep -q 'PRIME_UNIFIED_SESSION_PASS ram=68719476736 vram=120000000000 ' build/prime-bios-keyboard.log
+          grep -q 'C06_TIMED_ROTATE_XOR_PASS steps=32000028 ' build/prime-bios-keyboard.log
       - name: Measure InfiniteCore through x86 memory operands
         run: |
           set -euo pipefail

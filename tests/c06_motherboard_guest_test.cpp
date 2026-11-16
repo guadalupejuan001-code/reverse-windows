@@ -2,6 +2,7 @@
 #include "pc_machine.hpp"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
@@ -1263,6 +1264,46 @@ void cr8_lapic_priority_guest(){
   need(cpu.apic_task_priority()==0&&cpu.read32(apic+0x80)==0,"reset retained a previous CR8/TPR value");
   std::cout<<"C06_CR8_LAPIC_TPR_PASS mmio=1 pending_irq=1 precise_faults=1 reset=1\n";
 }
+void timed_rotate_xor_guest() {
+  PcMachine pc(4U << 20);
+  pc.boot_long_mode_demo();
+  PcMotherboardC06 board(pc);
+  board.run(4000);
+  auto& cpu = pc.cpu;
+  need(cpu.is_long_mode() && !cpu.fault, "timed rotate/XOR fixture did not enter x64");
+  cpu.enable_page_translation_cache();
+  pc.enable_boot_acceleration();
+  constexpr std::uint32_t entry = 0xa000;
+  constexpr unsigned steps = 32'000'028, rounds = steps / 4 + 13;
+  constexpr std::uint64_t initial = 0x92ba8401381c0fffULL;
+  code(cpu,entry,{0x49,0xc1,0xc0,17,0x49,0x83,0xf0,0xf3,0x49,0xff,0xc9,0x75,0xf3});
+  auto expected = initial;
+  for (unsigned i = 0; i < (steps / 4 + 1) % 128; ++i)
+    expected = ((expected << 17) | (expected >> 47)) ^ 0xfffffffffffffff3ULL;
+
+  std::array<std::int64_t, 31> elapsed{};
+  for (auto& ns : elapsed) {
+    cpu.eip = entry;
+    cpu.halted = false;
+    cpu.eflags = 2 | Cpu::DF;
+    cpu.regs[Cpu::R8] = initial;
+    cpu.regs[Cpu::R9] = rounds;
+    board.run(4);
+    const auto retired = cpu.instructions, ticks = board.evidence().ticks;
+    const auto completed = pc.boot_acceleration().rotate_xor_loop_steps;
+    const auto start = PcMachine::RunClock::now();
+    board.run(steps,start+std::chrono::seconds(1));
+    ns = std::chrono::duration_cast<std::chrono::nanoseconds>(PcMachine::RunClock::now()-start).count();
+    need(!cpu.fault && cpu.instructions - retired == steps && board.evidence().ticks - ticks == steps &&
+             cpu.eip == entry && cpu.regs[Cpu::R9] == 12 && cpu.regs[Cpu::R8] == expected &&
+             pc.boot_acceleration().rotate_xor_loop_steps > completed,
+         "timed rotate/XOR changed guest state or skipped the motherboard clock");
+  }
+  std::sort(elapsed.begin(),elapsed.end());
+  const auto ns=elapsed[elapsed.size()/2];
+  std::cout<<"C06_TIMED_ROTATE_XOR_PASS steps="<<steps<<" median_ns="<<ns
+           <<" equivalent_steps_per_s="<<double(steps)*1e9/double(ns)<<'\n';
+}
 }
 int main(){
   try{
@@ -1270,6 +1311,7 @@ int main(){
     rep_boot_with_pit_guest(false);
     rep_boot_with_pit_guest(true);
     paged_boot_batches_with_timer();
+    timed_rotate_xor_guest();
     shift_boot_with_pit_guest();
     std::cout<<"ETHER_BOOT_IRQ_TIMING_PASS pit=1 lapic=1 shift_loop=1\n";
     zero_boot_with_lapic_guest();

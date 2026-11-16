@@ -76,7 +76,8 @@ final class NativeMachine {
                                            boolean lowMemory, boolean primeRam,
                                            String ramCacheDirectory, String graphicsVram, String dataDiskPath);
     static native void close(long handle);
-    static native int step(long handle, int instructions);
+    // Low 32 bits contain the result flags. High 32 bits count retired guest steps.
+    static native long step(long handle, int instructions, long hostBudgetNs);
     private static native boolean sampleRamPressure(long handle, long available, long threshold,
                                                     boolean lowMemory);
     static native boolean maintainRamBudget(long handle);
