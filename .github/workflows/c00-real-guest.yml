@@ -42,6 +42,8 @@ jobs:
             -o build/prime-x86-measure
           ./build/prime-x86-measure | tee build/prime-x86-measure.log
           grep -q '^ETHER_ACCUMULATOR_64BIT_BUDGET_PASS equivalent_steps=369000000000000 ' build/prime-x86-measure.log
+          grep -q '^ETHER_WIDE_MULTIPLY_LOOP_PASS ' build/prime-x86-measure.log
+          ./build/prime-x86-measure --measure-wide-multiply | tee -a build/prime-x86-measure.log
           ./build/prime-x86-measure --measure-mixed | tee -a build/prime-x86-measure.log
           grep -q '^ETHER_X86_MIXED_PASS mode=interpreter steps=110000001 native_steps=0 ' build/prime-x86-measure.log
           if [ "$(uname -m)" = "aarch64" ]; then

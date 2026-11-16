@@ -330,6 +330,9 @@ int main(int argc, char** argv) {
         reverse_windows::write_storage_profile(performance,pc,hdd.get(),motherboard.attached_ata(),qdisk);
         performance << ",\"ether_arm64\":";
         reverse_windows::write_ether_arm64(performance, pc.cpu);
+        const auto& boot_work = pc.boot_acceleration();
+        performance << ",\"boot_wide_multiply_loop_batches\":" << boot_work.wide_multiply_loop_batches
+                    << ",\"boot_wide_multiply_loop_steps\":" << boot_work.wide_multiply_loop_steps;
         if (opts.profile_every && !profile)
             throw std::runtime_error("Guest stopped before the requested profile start");
         if (profile) {
