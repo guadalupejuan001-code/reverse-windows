@@ -1007,6 +1007,7 @@ class PcMotherboardC06 {
     for (unsigned id = 1; id < processor_count_; ++id) {
       auto ap = std::make_unique<cosmic_pc::Cpu>(pc_.cpu.memory);
       ap->configure_topology(topology,id);
+      ap->use_windows_x64_profile(pc_.cpu.windows_x64_profile());
       ap->set_local_apic_present(true);
       ap->set_shared_clock(&ticks_);
       ap->enable_page_translation_cache();

@@ -109,6 +109,7 @@ class AndroidBootSession final {
       : source_(source), pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_), vbe_(pc_) {
     if (disk.empty() && (create_gib || source != BootSource::SelfTest))
       throw std::invalid_argument("Selecciona o crea un disco QSSD para iniciar.");
+    pc_.cpu.use_windows_x64_profile(source != BootSource::SelfTest);
     if (profile.physical_bytes > cosmic_pc::PcMachine::kLegacyPhysicalLimit)
       pc_.reserve_pci_mmio(true); // Match the installed RAM profile even without a graphics device.
     spill_ = configure_spill(pc_, ram_cache);
@@ -177,6 +178,7 @@ class AndroidBootSession final {
     const auto spill = configure_spill(pc, ram_cache);
     pc.boot_demo();
     auto& cpu = pc.cpu;
+    cpu.use_windows_x64_profile();
     const auto cpuid = [&](std::uint32_t leaf) {
       constexpr unsigned address = 0x1000;
       cpu.reset(0, address);
