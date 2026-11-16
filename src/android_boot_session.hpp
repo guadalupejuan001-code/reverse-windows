@@ -69,7 +69,7 @@ class AndroidBootSession final {
     constexpr auto page = cosmic_pc::MemoryFabric::kPageSize;
     const auto headroom = available > threshold ? available - threshold : 0;
     const auto limit = resident_limit(memory.size());
-    const bool prime_ram = memory.size() > cosmic_pc::PcMachine::kLegacyPhysicalLimit;
+    const bool prime_ram = high_ram_profile(memory.size());
     const bool reclaim = low_memory || (prime_ram && !headroom);
     // The current resident payload is already excluded from Android's
     // available bytes. Prime can grow into the surplus above its threshold.
@@ -114,7 +114,7 @@ class AndroidBootSession final {
     if (disk.empty() && (create_gib || source != BootSource::SelfTest))
       throw std::invalid_argument("Selecciona o crea un disco QSSD para iniciar.");
     pc_.cpu.use_windows_x64_profile(source != BootSource::SelfTest);
-    if (profile.physical_bytes > cosmic_pc::PcMachine::kLegacyPhysicalLimit)
+    if (high_ram_profile(profile.physical_bytes))
       pc_.reserve_pci_mmio(true); // Match the installed RAM profile even without a graphics device.
     spill_ = configure_spill(pc_, ram_cache);
     switch (source) {
@@ -574,8 +574,12 @@ class AndroidBootSession final {
   }
 
  private:
+  static bool high_ram_profile(std::uint64_t physical) noexcept {
+    return physical > cosmic_pc::PcMachine::kLegacyPhysicalLimit;
+  }
+
   static std::uint64_t resident_limit(std::uint64_t physical) noexcept {
-    return physical > cosmic_pc::PcMachine::kLegacyPhysicalLimit
+    return high_ram_profile(physical)
         ? physical : std::min(physical, kMaxResidentBytes);
   }
 
@@ -598,7 +602,8 @@ class AndroidBootSession final {
     SpillInfo info;
     if (directory.empty()) return info;
     auto& memory = pc.cpu.memory;
-    if (memory.budget_bytes() >= memory.size()) return info;
+    const auto packed = high_ram_profile(memory.size());
+    if (!packed && memory.budget_bytes() >= memory.size()) return info;
     info.limit = std::min(AndroidRamBacking::spill_budget(directory), memory.size());
     if (!info.limit) {
       info.state = "unavailable";
@@ -606,7 +611,7 @@ class AndroidBootSession final {
       return info;
     }
     try {
-      auto file = std::make_unique<AndroidRamBacking>(directory, memory.size(), info.limit);
+      auto file = std::make_unique<AndroidRamBacking>(directory, memory.size(), info.limit, packed);
       auto* file_stats = file.get();
       memory.attach_page_backing(std::move(file));
       info.file = file_stats;
@@ -627,7 +632,7 @@ class AndroidBootSession final {
         << ",\"usable_bytes\":" << pc.usable_ram_bytes()
         << ",\"backing_budget_bytes\":" << pc.cpu.memory.budget_bytes()
         << ",\"resident_policy\":\""
-        << (pc.cpu.memory.size() > cosmic_pc::PcMachine::kLegacyPhysicalLimit
+        << (high_ram_profile(pc.cpu.memory.size())
             ? "android-surplus" : "android-half-surplus") << "\""
         << ",\"resident_bytes\":" << metrics.allocated_bytes
         << ",\"resident_metadata_bytes\":" << metrics.metadata_bytes
@@ -652,6 +657,8 @@ class AndroidBootSession final {
         << ",\"spill_limit_bytes\":" << spill.limit
         << ",\"spilled_bytes\":" << metrics.backing_bytes
         << ",\"spill_file_payload_bytes\":" << (spill.file ? spill.file->file_payload_bytes() : 0)
+        << ",\"spill_compression\":" << (spill.file && spill.file->compression_enabled() ? "true" : "false")
+        << ",\"spill_packed_pages\":" << (spill.file ? spill.file->packed_pages() : 0)
         << ",\"spill_reads\":" << metrics.backing_reads
         << ",\"spill_writes\":" << metrics.backing_writes
         << ",\"spill_read_us\":" << (spill.file ? spill.file->read_us() : 0)

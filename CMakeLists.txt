@@ -19,6 +19,7 @@ if(NOT EXISTS "${REVERSE_MUNDO_X_ROOT}/pc-android/native/pc_machine.hpp")
 endif()
 
 find_package(Threads REQUIRED)
+find_package(ZLIB REQUIRED)
 include(cmake/VerifyMundoX.cmake)
 reverse_windows_pin_mundo_x("${CMAKE_CURRENT_SOURCE_DIR}/config/dependencies.lock.json" "${REVERSE_MUNDO_X_ROOT}")
 add_library(reverse_windows_component_headers INTERFACE)
@@ -31,7 +32,7 @@ target_include_directories(reverse_windows_component_headers INTERFACE
   "${REVERSE_MUNDO_X_ROOT}/native/include"
   "${REVERSE_QSSD_ROOT}/include"
   "${REVERSE_GPU_VIRTUAL_ROOT}/include")
-target_link_libraries(reverse_windows_component_headers INTERFACE Threads::Threads)
+target_link_libraries(reverse_windows_component_headers INTERFACE Threads::Threads ZLIB::ZLIB)
 option(REVERSE_WINDOWS_GLES_GUEST "Compile the REgraphics EGL/GLES2 guest renderer" ON)
 if(REVERSE_WINDOWS_GLES_GUEST)
   find_path(REVERSE_EGL_INCLUDE EGL/egl.h)

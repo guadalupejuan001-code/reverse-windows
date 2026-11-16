@@ -55,7 +55,7 @@ jobs:
       - name: Compile native boot probe against actual x86/x64 CPU
         run: |
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri zlib1g-dev
           cmake -S . -B build -DREVERSE_MUNDO_X_ROOT="$PWD/deps/mundo-X" -DREVERSE_QSSD_ROOT="$PWD/deps/Virtual-qSSD-" -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
       - name: Verify PrimeVGC guest transfers and measure bulk QSSD bandwidth
         shell: bash
@@ -105,6 +105,7 @@ jobs:
             | tee build/prime-bios-keyboard.log
           grep -q 'PRIME_C03_NATIVE_SESSION_PASS translated_steps=' build/prime-bios-keyboard.log
           grep -q 'PRIME_C10_WBINVD_SESSION_PASS count=1 resume=1' build/prime-bios-keyboard.log
+          grep -q 'PRIME_RAM64_QSSD_PACKED_PASS guest_bytes=68719476736 .*guest_test_bytes=65536 qssd_test_bytes=32768 ' build/prime-bios-keyboard.log
           grep -q 'PRIME_UNIFIED_SESSION_PASS ram=68719476736 vram=120000000000 ' build/prime-bios-keyboard.log
           grep -q 'C06_TIMED_ROTATE_XOR_PASS steps=32000028 ' build/prime-bios-keyboard.log
           grep -q 'PRIME_IOAPIC_ID_X64_PASS paged=1 version=1 arbitration=1 reset=1' build/prime-bios-keyboard.log
