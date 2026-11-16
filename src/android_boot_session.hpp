@@ -74,7 +74,7 @@ class AndroidBootSession final {
     // The current resident payload is already excluded from Android's
     // available bytes. Prime can grow into the surplus above its threshold.
     const auto backing = prime_ram
-        ? std::min(headroom, limit) + memory.allocated_bytes()
+        ? std::min(headroom, limit) + memory.allocated_bytes() + memory.backing_cache_bytes()
         : std::min(headroom, 2 * limit) / 2 + memory.allocated_bytes() / 2;
     const auto floor = std::min(limit, kMinResidentBytes);
     const auto target = reclaim ? floor : std::clamp<std::uint64_t>(backing / page * page, floor, limit);
@@ -613,7 +613,8 @@ class AndroidBootSession final {
     try {
       auto file = std::make_unique<AndroidRamBacking>(directory, memory.size(), info.limit, packed);
       auto* file_stats = file.get();
-      memory.attach_page_backing(std::move(file));
+      using CachePolicy = cosmic_pc::SparseRam::BackingCachePolicy;
+      memory.attach_page_backing(std::move(file), packed ? CachePolicy::Adaptive : CachePolicy::Fixed);
       info.file = file_stats;
       info.state = "file";
     } catch (const std::exception& error) {
@@ -661,6 +662,10 @@ class AndroidBootSession final {
         << ",\"spill_packed_pages\":" << (spill.file ? spill.file->packed_pages() : 0)
         << ",\"spill_reads\":" << metrics.backing_reads
         << ",\"spill_writes\":" << metrics.backing_writes
+        << ",\"spill_cache_hits\":" << metrics.backing_cache_hits
+        << ",\"spill_cache_bytes\":" << metrics.backing_cache_bytes
+        << ",\"spill_cache_capacity_bytes\":" << metrics.backing_cache_capacity_bytes
+        << ",\"spill_overwrite_pages\":" << metrics.backing_overwrite_pages
         << ",\"spill_read_us\":" << (spill.file ? spill.file->read_us() : 0)
         << ",\"spill_write_us\":" << (spill.file ? spill.file->write_us() : 0) << '}';
   }
