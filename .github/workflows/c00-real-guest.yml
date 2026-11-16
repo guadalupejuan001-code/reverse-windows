@@ -45,6 +45,7 @@ jobs:
           grep -q '^ETHER_WIDE_MULTIPLY_LOOP_PASS ' build/prime-x86-measure.log
           grep -q '^ETHER_ROTATE_XOR_PASS ' build/prime-x86-measure.log
           grep -q '^ETHER_TIMED_ROTATE_XOR_PASS steps=2000000$' build/prime-x86-measure.log
+          grep -q '^ETHER_AFFINE_RAM_ROTATE_PASS cases=12 changing_ram=1 mmio=1 device_clock=1$' build/prime-x86-measure.log
           ./build/prime-x86-measure --measure-wide-multiply | tee -a build/prime-x86-measure.log
           ./build/prime-x86-measure --measure-mixed | tee -a build/prime-x86-measure.log
           grep -q '^ETHER_X86_MIXED_PASS mode=interpreter steps=110000001 native_steps=0 ' build/prime-x86-measure.log
@@ -54,7 +55,7 @@ jobs:
       - name: Compile native boot probe against actual x86/x64 CPU
         run: |
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri zlib1g-dev
           cmake -S . -B build -DREVERSE_MUNDO_X_ROOT="$PWD/deps/mundo-X" -DREVERSE_QSSD_ROOT="$PWD/deps/Virtual-qSSD-" -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
       - name: Verify PrimeVGC guest transfers and measure bulk QSSD bandwidth
         shell: bash
@@ -104,6 +105,7 @@ jobs:
             | tee build/prime-bios-keyboard.log
           grep -q 'PRIME_C03_NATIVE_SESSION_PASS translated_steps=' build/prime-bios-keyboard.log
           grep -q 'PRIME_C10_WBINVD_SESSION_PASS count=1 resume=1' build/prime-bios-keyboard.log
+          grep -q 'PRIME_RAM64_QSSD_PACKED_PASS guest_bytes=68719476736 .*guest_test_bytes=65536 qssd_test_bytes=32768 ' build/prime-bios-keyboard.log
           grep -q 'PRIME_UNIFIED_SESSION_PASS ram=68719476736 vram=120000000000 ' build/prime-bios-keyboard.log
           grep -q 'C06_TIMED_ROTATE_XOR_PASS steps=32000028 ' build/prime-bios-keyboard.log
           grep -q 'PRIME_IOAPIC_ID_X64_PASS paged=1 version=1 arbitration=1 reset=1' build/prime-bios-keyboard.log
@@ -132,6 +134,7 @@ jobs:
           if [ "$(uname -m)" = "aarch64" ]; then
             grep -q '^PRIME_C03_ARM64_PASS ' build/prime-c03-ether-arm64.log
             grep -q '^PRIME_ETHER_ROTATION_PASS cases=96 flags=1 stack=1 exact_steps=1$' build/prime-c03-ether-arm64.log
+            grep -q '^PRIME_ETHER_VARIABLE_ROTATION_PASS cases=144 flags=1 ram=1$' build/prime-c03-ether-arm64.log
             grep -q '^PRIME_ARM64_PROTECTED32_PASS ' build/prime-c03-ether-arm64.log
             grep -q '^PRIME_ARM64_BYTE_COPY_PASS ' build/prime-c03-ether-arm64.log
             grep -q '^PRIME_ETHER_INTEGER_PASS mode=protected32 ' build/prime-c03-ether-arm64.log

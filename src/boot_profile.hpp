@@ -30,6 +30,7 @@ inline void write_ether_arm64(std::ostream& out, const cosmic_pc::Cpu& cpu) {
       << ",\"repeated_loop_dispatches\":" << stats.repeated_loop_dispatches
       << ",\"repeated_loop_steps\":" << stats.repeated_loop_steps
       << ",\"rotate_guest_steps\":" << stats.rotate_steps
+      << ",\"variable_rotate_guest_steps\":" << stats.variable_rotate_steps
 #if defined(REVERSE_MUNDO_X_SOURCE_SHA)
       << ",\"mundo_x_source_sha\":\"" REVERSE_MUNDO_X_SOURCE_SHA "\""
 #endif
@@ -138,7 +139,7 @@ class BootProfile {
     out.spill_reads = memory.backing_reads;
     out.spill_writes = memory.backing_writes;
     out.batched = work.rep_elements + work.shift_loop_steps + work.zero_loop_steps +
-        work.scan_loop_steps + work.arm64_block_steps + work.counter_loop_steps;
+        work.scan_loop_steps + work.arm64_block_steps + work.counter_loop_steps + work.affine_ram_rotate_steps;
     out.mode_changes = pc.boot_mode_progress().changes;
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     out.neon_steps = cpu.ether_next_stats().native_instructions;
