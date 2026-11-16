@@ -37,6 +37,7 @@ class PcMotherboardC06 {
     bool global_enabled, software_enabled;
     unsigned pending, in_service, priority;
     std::uint32_t timer_count;
+    std::uint32_t ioapic_select, ioapic_id;
   };
 
  private:
@@ -225,6 +226,7 @@ class PcMotherboardC06 {
   cosmic_pc::CpuTopology prior_topology_;
   unsigned prior_apic_id_ = 0;
   std::uint32_t ioapic_select_=0;
+  std::uint8_t ioapic_id_=0;
   std::array<std::uint32_t,24> io_redir_low_{},io_redir_high_{};
   std::array<std::uint8_t,24> io_remote_vector_{};
   std::array<std::uint32_t,24> io_remote_targets_{};
@@ -268,6 +270,7 @@ class PcMotherboardC06 {
     faulted_processor_.reset();
     next_cpu_ = 0;
     ioapic_select_=0;
+    ioapic_id_=std::uint8_t(AcpiC06::ioapic_id(processor_count_));
     io_redir_low_.fill(0x10000U);io_redir_high_.fill(0);
     io_remote_vector_.fill(0);
     io_remote_targets_.fill(0);
@@ -559,9 +562,8 @@ class PcMotherboardC06 {
       const auto r=unsigned(base-kIoApic);
       if(r==0)return ioapic_select_;
       if(r!=0x10)return std::nullopt;
-      if(ioapic_select_==0)return AcpiC06::ioapic_id(processor_count_) << 24;
+      if(ioapic_select_==0||ioapic_select_==2)return std::uint32_t(ioapic_id_)<<24;
       if(ioapic_select_==1)return 0x00170011U; // version and max RTE 23
-      if(ioapic_select_==2)return 0;
       if(ioapic_select_>=0x10&&ioapic_select_<0x40) {
         const unsigned pin=(ioapic_select_-0x10)/2;
         return (ioapic_select_&1)?io_redir_high_[pin]:
@@ -613,7 +615,9 @@ class PcMotherboardC06 {
       const auto r=unsigned(base-kIoApic);
       if(r==0){ioapic_select_=v&0xffU;return true;}
       if(r!=0x10)return false;
-      if(ioapic_select_==1)return true; // IOAPICVER is read-only; writes leave its value unchanged.
+      // C06 advertises an eight-bit APIC ID for the I/O controller in the MADT.
+      if(ioapic_select_==0){ioapic_id_=std::uint8_t(v>>24);return true;}
+      if(ioapic_select_==1||ioapic_select_==2)return true; // Version and arbitration are read-only.
       if(ioapic_select_>=0x10&&ioapic_select_<0x40){
         const unsigned pin=(ioapic_select_-0x10)/2;
         if(ioapic_select_&1)io_redir_high_[pin]=v&0xff000000U;
@@ -1122,7 +1126,8 @@ class PcMotherboardC06 {
   }
   InterruptState interrupt_state()const{
     return {pc_.cpu.apic_global_enabled(),lapic_on(bsp()),bsp().pending.highest(),
-            bsp().in_service.highest(),processor_priority(bsp()),timer_count(bsp())};
+            bsp().in_service.highest(),processor_priority(bsp()),timer_count(bsp()),
+            ioapic_select_,ioapic_id_};
   }
   bool secondary_can_run() const noexcept {
     for (unsigned id = 1; id < processor_count_; ++id)
