@@ -463,7 +463,7 @@ int main(int argc, char** argv) {
     const auto missing = Session::check_hardware({});
     for (const auto* marker : {"\"iso_boot\":null", "\"qssd\":null", "\"qssd_ata\":null", "\"cpu_x64\":true",
                               "\"cpu_mmx\":true", "\"cpu_sse\":true", "\"cpu_sse2\":true",
-                              "\"cpu_x87\":false", "\"cpu_fxsr\":true",
+                              "\"cpu_x87\":true", "\"cpu_fxsr\":true",
                               "\"lapic\":true", "\"ram\":true", "\"vga\":true", "\"pci_ide\":true",
                               "\"ready_for_windows10_install\":false"})
       require(missing.find(marker) != std::string::npos, marker);
@@ -502,6 +502,8 @@ int main(int argc, char** argv) {
                 "El Torito guest did not detect QSSD and return to the real-mode BIOS prompt", 1);
       frame = capture_cells(session);
       progress = session.diagnostic();
+      require(progress.find("\"cpuid_vendor\":\"GenuineIntel\"") != std::string::npos,
+              "ISO startup did not select the Windows x64 processor profile");
       require(progress.find("\"cores\":8,\"threads_per_core\":2,\"logical_processors\":16,\"started\":1") !=
                   std::string::npos, "Prime Android ISO boot uses the requested CPU topology");
       const auto live = session.diagnostic(false);

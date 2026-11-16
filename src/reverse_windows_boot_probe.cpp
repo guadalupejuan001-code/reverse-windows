@@ -186,6 +186,8 @@ int main(int argc, char** argv) {
         cosmic_pc::PcMachine pc(
             static_cast<std::size_t>(opts.ram_mib * 1024ULL * 1024ULL),
             static_cast<std::size_t>(opts.resident_mib * 1024ULL * 1024ULL));
+        pc.cpu.use_windows_x64_profile(
+            opts.source == Options::Source::Iso || opts.source == Options::Source::Disk);
         reverse_windows::AndroidRamBacking* ram_spill = nullptr;
         if (!opts.ram_spill_directory.empty() && pc.cpu.memory.budget_bytes() < pc.cpu.memory.size()) {
             const auto spill_budget = std::min(pc.cpu.memory.size(),
