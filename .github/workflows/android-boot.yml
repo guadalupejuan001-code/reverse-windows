@@ -257,8 +257,10 @@ jobs:
           assert snapshot["boot_progress"]["session_steps"] == snapshot["machine"]["instructions"]
           assert snapshot["iso_read_us"] == 0
           assert snapshot["ram_profile"]["spill_read_us"] == snapshot["ram_profile"]["spill_write_us"] == 0
-          assert snapshot["worker_timing"]["step_us"] > 0
-          cpu_us = snapshot["worker_timing"]["host_thread_cpu_us"]
+          timing = snapshot["worker_timing"]
+          assert timing["step_us"] > 0
+          assert 0 <= timing["last_slice_steps_completed"] <= timing["last_slice_steps_requested"], timing
+          cpu_us = timing["host_thread_cpu_us"]
           assert cpu_us is None or cpu_us > 0
           thermal = snapshot["android_thermal_status"]
           assert thermal is None or 0 <= thermal <= 6
@@ -368,7 +370,9 @@ jobs:
           assert report["boot_progress"]["handed_off"] and report["boot_profile"]["checkpoint_interval_steps"] == 50_000_000
           assert report["boot_progress"]["checkpoint_interval_steps"] == 50_000_000
           timing = report["worker_timing"]
-          assert timing["max_steps_per_slice"] == 50_000 and timing["target_slice_us"] == 8_000
+          assert timing["max_steps_per_slice"] == (1 << 31) - 1 and timing["target_slice_us"] == 8_000, timing
+          assert 0 <= timing["last_slice_steps_completed"] <= timing["last_slice_steps_requested"] <= timing["max_steps_per_slice"], timing
+          assert 0 < timing["next_slice_steps_requested"] <= timing["max_steps_per_slice"], timing
           assert timing["diagnostic_save_interval_ms"] == 5_000
           topology = report["cpu_topology"]
           assert (topology["cores"], topology["threads_per_core"], topology["logical_processors"]) == (8, 2, 16)
