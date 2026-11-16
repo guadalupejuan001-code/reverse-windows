@@ -22,6 +22,7 @@ constexpr std::uint32_t kContinuation = 0xb000;
 constexpr std::uint32_t kOpticalBuffer = 0x11000;
 constexpr std::uint32_t kPciId = 0x9000;
 constexpr std::uint32_t kCdIrqs = 0x9004, kDiskIrqs = 0x9008;
+constexpr std::uint32_t kIoApicVersionAfterZero = 0x900c, kIoApicVersionAfterOnes = 0x9010;
 constexpr std::uint32_t kStack = 0x190000;
 constexpr std::uint32_t kBootMarker = 0x8000;
 constexpr std::uint16_t kMarker = 0x4d57;
@@ -179,6 +180,15 @@ void verify() {
     continuation.emit({0xef});
     continuation.port(0xcfc);
     continuation.emit({0xed, 0x89, 0x04, 0x25}); continuation.dword(kPciId);
+    continuation.emit({0xbb}); continuation.dword(ioapic);
+    // The x64 boot probes IOAPICVER through IOREGSEL/IOWIN before programming interrupts.
+    for (const auto result : {kIoApicVersionAfterZero, kIoApicVersionAfterOnes}) {
+      continuation.emit({0xc7, 0x03}); continuation.dword(1);
+      continuation.emit({0xc7, 0x43, 0x10});
+      continuation.dword(result == kIoApicVersionAfterZero ? 0 : UINT32_MAX);
+      continuation.emit({0xc7, 0x03}); continuation.dword(1);
+      continuation.emit({0x8b, 0x43, 0x10, 0x89, 0x04, 0x25}); continuation.dword(result);
+    }
     continuation.store_dword(lapic+0xf0,0x1ff);
     continuation.store_dword(ioapic,0x10+2*14);
     continuation.store_dword(ioapic+0x10,disk_vector);
@@ -197,6 +207,9 @@ void verify() {
     require(cpu.halted && !cpu.flag(Cpu::IF) && cpu.is_long_mode() && cpu.segments[Cpu::SS] == 0 &&
                 cpu.regs[Cpu::ESP] == kStack && cpu.read32(kPciId) == 0xc0711b36,
             "long-mode transfer did not reach the PCI IDE guest driver");
+    require(cpu.read32(kIoApicVersionAfterZero) == 0x00170011 &&
+                cpu.read32(kIoApicVersionAfterOnes) == 0x00170011,
+            "IOAPICVER must retain its version and redirection count after guest writes");
     std::array<std::uint8_t, 2048> readback{};
     cpu.memory.read_block(kOpticalBuffer, readback.data(), readback.size());
     require(readback == optical, "guest ATAPI read corrupted optical bytes");

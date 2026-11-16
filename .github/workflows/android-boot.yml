@@ -37,9 +37,9 @@ jobs:
         abi: [arm64-v8a, x86_64]
     env:
       ANDROID_ABI: ${{ matrix.abi }}
-      ANDROID_APP_ID: com.reversewindows.android.prime.smp.r040
-      ANDROID_VERSION: "0.3.10"
-      ANDROID_VERSION_CODE: "38"
+      ANDROID_APP_ID: com.reversewindows.android.prime.smp.r041
+      ANDROID_VERSION: "0.3.11"
+      ANDROID_VERSION_CODE: "39"
     steps:
       - uses: actions/checkout@v4
         with:
