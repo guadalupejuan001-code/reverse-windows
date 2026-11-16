@@ -529,6 +529,10 @@ int main(int argc, char** argv) {
                   counter(progress, "resident_bytes") <= prime.backing_bytes &&
                   progress.find("\"spill_backend\":\"qssd-transient\"") != std::string::npos,
               "Prime ISO must boot with 64 GiB, bounded RAM backing and the PrimeVGC attached");
+      const auto direct_copy_bytes = counter(progress, "boot_rep_direct_page_copy_bytes");
+      require(direct_copy_bytes % cosmic_pc::MemoryFabric::kPageSize == 0 &&
+                  direct_copy_bytes <= counter(progress, "boot_rep_bytes"),
+              "The Android diagnostic must report a bounded count of direct page copies");
       require(text.compare(0, 14, "EL TORITO BIOS") == 0 &&
                   text.compare(80, 20, "QSSD 64 GiB DETECTED") == 0 &&
                   text.compare(3 * 80, 32, "ENTER: WRITE TEST MBR AND REBOOT") == 0,
