@@ -289,11 +289,14 @@ class AndroidBootSession final {
     return out.str();
   }
 
-  Step step(unsigned budget) {
+  std::uint64_t session_steps() const noexcept { return previous_boot_steps_+board_->total_processor_steps(); }
+
+  Step step(unsigned budget, cosmic_pc::PcMachine::RunClock::time_point deadline=
+            cosmic_pc::PcMachine::RunClock::time_point::max()) {
     if (board_->faulted_cpu()) return Step::Fault;
     if (!is_stopped()) {
       const auto slice = boot_profile_ ? boot_profile_->budget(budget, pc_) : budget;
-      board_->run(slice);
+      board_->run(slice,deadline);
       if (boot_profile_) boot_profile_->after_run(pc_, *board_);
     }
     if (!pc_.cpu.fault && pc_.host_error.empty() &&
@@ -481,7 +484,9 @@ class AndroidBootSession final {
         << ",\"boot_counter_loop_batches\":" << boot_work.counter_loop_batches
         << ",\"boot_counter_loop_steps\":" << boot_work.counter_loop_steps
         << ",\"boot_wide_multiply_loop_batches\":" << boot_work.wide_multiply_loop_batches
-        << ",\"boot_wide_multiply_loop_steps\":" << boot_work.wide_multiply_loop_steps;
+        << ",\"boot_wide_multiply_loop_steps\":" << boot_work.wide_multiply_loop_steps
+        << ",\"boot_rotate_xor_loop_batches\":" << boot_work.rotate_xor_loop_batches
+        << ",\"boot_rotate_xor_loop_steps\":" << boot_work.rotate_xor_loop_steps;
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     const auto ether = pc_.cpu.ether_next_stats();
     out << ",\"neon_requested\":" << (pc_.cpu.ether_next_enabled() ? "true" : "false")
@@ -517,7 +522,7 @@ class AndroidBootSession final {
     }
     const auto& mode = pc_.boot_mode_progress();
     out << ",\"boot_progress\":{\"handed_off\":" << (pc_.cpu.instructions ? "true" : "false")
-        << ",\"session_steps\":" << previous_boot_steps_ + board_->total_processor_steps()
+        << ",\"session_steps\":" << session_steps()
         << ",\"checkpoint_interval_steps\":" << (boot_profile_ ? BootProfile::kDefaultCheckpointSteps : 0)
         << ",\"mode_changes\":" << mode.changes << ",\"last_mode_from\":\"" << mode.from
         << "\",\"last_mode_to\":\"" << mode.to << "\",\"last_mode_step\":" << mode.step
