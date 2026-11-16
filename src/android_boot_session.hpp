@@ -553,6 +553,8 @@ class AndroidBootSession final {
         << ",\"lapic_in_service_vector\":" << interrupts.in_service
         << ",\"lapic_priority\":" << interrupts.priority
         << ",\"lapic_timer_count\":" << interrupts.timer_count
+        << ",\"ioapic_select\":" << interrupts.ioapic_select
+        << ",\"ioapic_id\":" << interrupts.ioapic_id
         << "},\"vga\":{\"qssd_graphics_serial\":"
         << vga_serial_ << ",\"planned_update_bytes\":" << vga_transfer_bytes_
         << "},\"vbe\":";

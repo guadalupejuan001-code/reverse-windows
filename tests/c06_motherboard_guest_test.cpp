@@ -1305,6 +1305,54 @@ void timed_rotate_xor_guest() {
   std::cout<<"C06_TIMED_ROTATE_XOR_PASS steps="<<steps<<" median_ns="<<ns
            <<" equivalent_steps_per_s="<<double(steps)*1e9/double(ns)<<'\n';
 }
+
+void ioapic_id_x64_guest() {
+  PcMachine pc(16U << 20);
+  pc.boot_long_mode_demo();
+  PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {8, 2});
+  board.run(4000);
+  auto& cpu = pc.cpu;
+  need(cpu.halted && cpu.is_long_mode() && !cpu.fault, "I/O APIC fixture failed to enter long mode");
+  constexpr std::uint64_t alias = 0xfffff7f58000a000ULL, pdpt = 0x4000, pd = 0x5000, pt = 0x6000;
+  constexpr std::uint32_t entry = 0xa000;
+  constexpr std::uint32_t default_id = 16U << 24, moved_id = 0x23U << 24;
+  constexpr auto ioapic = PcMotherboardC06::kIoApic;
+  cpu.write64(cpu.cr3 + ((alias >> 39) & 511) * 8, pdpt | 3);
+  cpu.write64(pdpt + ((alias >> 30) & 511) * 8, pd | 3);
+  cpu.write64(pd + ((alias >> 21) & 511) * 8, pt | 3);
+  cpu.write64(pt + ((alias >> 12) & 511) * 8, ioapic | 3);
+  need(cpu.read32(ioapic + 0x10) == default_id, "I/O APIC reset ID differs from the MADT");
+
+  // Use the high virtual alias and exact dword IOWIN store from the boot fault.
+  code(cpu, entry, {0x89,0x13, 0x89,0x4b,0x10, 0x8b,0x43,0x10, 0xf4});
+  const auto prepare = [&](unsigned select, std::uint32_t value) {
+    cpu.eip = entry;
+    cpu.halted = false;
+    cpu.eflags = 2 | Cpu::DF;
+    cpu.regs[Cpu::EBX] = alias;
+    cpu.regs[Cpu::ECX] = value;
+    cpu.regs[Cpu::EDX] = select;
+  };
+  const auto check = [&](unsigned select, std::uint32_t value, std::uint32_t expected) {
+    prepare(select, value);
+    board.run(8);
+    if (cpu.fault) throw std::runtime_error(cpu.fault->describe());
+    need(cpu.halted && cpu.regs[Cpu::EAX] == expected && cpu.eflags == (2 | Cpu::DF),
+         "paged I/O APIC register write changed flags or returned the wrong value");
+  };
+  check(0, default_id, default_id);
+  check(0, moved_id | 0xffffffU, moved_id);
+  check(1, UINT32_MAX, 0x00170011);
+  check(2, UINT32_MAX, moved_id);
+  prepare(0xf, 0);
+  board.run(8);
+  need(cpu.fault && cpu.eip == entry + 2 &&
+       cpu.fault->reason.find("physical=0xfec00010, bytes=4") != std::string::npos,
+       "unsupported I/O APIC register must expose its physical address and width");
+  pc.reset();
+  need(cpu.read32(ioapic + 0x10) == default_id, "I/O APIC ID did not reset with the VM");
+  std::cout << "PRIME_IOAPIC_ID_X64_PASS paged=1 version=1 arbitration=1 reset=1\n";
+}
 }
 int main(){
   try{
@@ -1322,6 +1370,7 @@ int main(){
     pci_acpi_cmos_guest();
     prime_pci_inventory();
     ioapic_lapic_guest();
+    ioapic_id_x64_guest();
     nested_apic_guest();
     apic_timer_divisor_and_global_enable();
     tsc_across_halt();
