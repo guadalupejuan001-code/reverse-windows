@@ -77,14 +77,17 @@ auto session(jlong handle, Action action) {
 
 Session::RamProfile ram_profile(jlong available, jlong threshold, jboolean low_memory,
                                 jboolean prime_ram) {
-    if (available == -1) {
+    const bool have_memory_info = available != -1;
+    if (!have_memory_info) {
         available = 2 * Session::kDefaultRamProfile.backing_bytes;
         threshold = 0;
     }
     if (available < 0 || threshold < 0)
         throw std::invalid_argument("Android devolvió un perfil de RAM inválido.");
-    return Session::ram_profile(static_cast<std::uint64_t>(available),
+    auto profile = Session::ram_profile(static_cast<std::uint64_t>(available),
             static_cast<std::uint64_t>(threshold), low_memory == JNI_TRUE, prime_ram == JNI_TRUE);
+    if (!have_memory_info) profile.backing_bytes = Session::kDefaultRamProfile.backing_bytes;
+    return profile;
 }
 } // namespace
 

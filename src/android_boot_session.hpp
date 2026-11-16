@@ -49,8 +49,7 @@ class AndroidBootSession final {
                                 bool low_memory, bool prime_ram = false) {
     constexpr std::uint64_t MiB = 1024 * 1024;
     const auto headroom = available_bytes > low_threshold ? available_bytes - low_threshold : 0;
-    const auto backing = (headroom / 2) / cosmic_pc::MemoryFabric::kPageSize *
-                         cosmic_pc::MemoryFabric::kPageSize;
+    const auto backing = resident_budget(headroom, prime_ram);
     if (low_memory || backing < kMinResidentBytes)
       throw std::runtime_error("Android tiene poca RAM disponible para iniciar el equipo virtual.");
     using Pc = cosmic_pc::PcMachine;
@@ -66,14 +65,14 @@ class AndroidBootSession final {
 
   void sample_ram_pressure(std::uint64_t available, std::uint64_t threshold, bool low_memory) {
     const auto& memory = pc_.cpu.memory;
-    constexpr auto page = cosmic_pc::MemoryFabric::kPageSize;
     const auto headroom = available > threshold ? available - threshold : 0;
     // Android's available RAM already reflects the VM's resident payload.
     // Add that payload back before dividing the combined headroom.
     const auto limit = resident_limit(memory.size());
-    const auto half = std::min(headroom, 2 * limit) / 2 + memory.allocated_bytes() / 2;
+    const auto combined = std::min(headroom, 2 * limit) + memory.allocated_bytes();
+    const auto budget = resident_budget(combined, high_ram_profile(memory.size()));
     const auto floor = std::min(limit, kMinResidentBytes);
-    const auto target = low_memory ? floor : std::clamp<std::uint64_t>(half / page * page, floor, limit);
+    const auto target = low_memory ? floor : std::clamp(budget, floor, limit);
     board_->set_gpu_cache_enabled(!low_memory && target > floor);
     const auto old_target = pressure_.target ? pressure_.target : memory.budget_bytes();
     const auto delta = std::max(old_target, target) - std::min(old_target, target);
@@ -568,8 +567,21 @@ class AndroidBootSession final {
   }
 
  private:
+  static bool high_ram_profile(std::uint64_t physical) noexcept {
+    return physical > cosmic_pc::PcMachine::kLegacyPhysicalLimit;
+  }
+
+  static std::uint64_t resident_budget(std::uint64_t headroom, bool prime) noexcept {
+    constexpr auto page = cosmic_pc::MemoryFabric::kPageSize;
+    // Keep at least 64 MiB above Android's low-memory threshold for host work.
+    constexpr std::uint64_t min_reserve = 64ULL << 20;
+    const auto reserve = prime ? std::max(min_reserve, headroom / 8 + (headroom % 8 != 0))
+                               : headroom / 2 + headroom % 2;
+    return headroom > reserve ? (headroom - reserve) / page * page : 0;
+  }
+
   static std::uint64_t resident_limit(std::uint64_t physical) noexcept {
-    return physical > cosmic_pc::PcMachine::kLegacyPhysicalLimit
+    return high_ram_profile(physical)
         ? physical : std::min(physical, kMaxResidentBytes);
   }
 
@@ -592,7 +604,8 @@ class AndroidBootSession final {
     SpillInfo info;
     if (directory.empty()) return info;
     auto& memory = pc.cpu.memory;
-    if (memory.budget_bytes() >= memory.size()) return info;
+    const auto packed = high_ram_profile(memory.size());
+    if (!packed && memory.budget_bytes() >= memory.size()) return info;
     info.limit = std::min(AndroidRamBacking::spill_budget(directory), memory.size());
     if (!info.limit) {
       info.state = "unavailable";
@@ -600,7 +613,7 @@ class AndroidBootSession final {
       return info;
     }
     try {
-      auto file = std::make_unique<AndroidRamBacking>(directory, memory.size(), info.limit);
+      auto file = std::make_unique<AndroidRamBacking>(directory, memory.size(), info.limit, packed);
       auto* file_stats = file.get();
       memory.attach_page_backing(std::move(file));
       info.file = file_stats;
@@ -643,6 +656,8 @@ class AndroidBootSession final {
         << ",\"spill_limit_bytes\":" << spill.limit
         << ",\"spilled_bytes\":" << metrics.backing_bytes
         << ",\"spill_file_payload_bytes\":" << (spill.file ? spill.file->file_payload_bytes() : 0)
+        << ",\"spill_compression\":" << (spill.file && spill.file->compression_enabled() ? "true" : "false")
+        << ",\"spill_packed_pages\":" << (spill.file ? spill.file->packed_pages() : 0)
         << ",\"spill_reads\":" << metrics.backing_reads
         << ",\"spill_writes\":" << metrics.backing_writes
         << ",\"spill_read_us\":" << (spill.file ? spill.file->read_us() : 0)

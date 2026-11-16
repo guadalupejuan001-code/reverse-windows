@@ -6,10 +6,10 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "8e61100400c8052071707c8238dbbd1608daa271",
+      "commit": "e5ac4fcb0bee641a58495f3d15a572d29bcea737",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
-      "status": "candidate-windows-x64-arm64-native-rotations",
+      "status": "candidate-windows-x64-ram64-reclaim",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/pc_video.hpp",
@@ -110,13 +110,14 @@
     {
       "key": "qssd",
       "repository": "guadalupejuan001-code/Virtual-qSSD-",
-      "commit": "87886658aa390aedbbfff7776773e6ef19da6d0c",
+      "commit": "333915b23896ceb38eb989185e51e617d48cc114",
       "checkout": "deps/Virtual-qSSD-",
       "role": "complete-revisioned-state-and-graphics-work-PR8",
       "status": "candidate-qssd-transient-ram",
       "required_paths": [
         "include/qssd/state_bus.hpp",
         "include/qssd/transient_pages.hpp",
+        "include/qssd/packed_transient_pages.hpp",
         "include/qssd/graphics_work_state.hpp",
         "tests/graphics_work_memory.cpp"
       ]
