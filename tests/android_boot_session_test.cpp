@@ -73,9 +73,13 @@ void verify_ram_profile() {
   const auto report = Session::check_hardware({}, -1, 0, {}, prime);
   require(counter(report, "usable_bytes") == Session::kPrimeRamBytes &&
               counter(report, "address_space_bytes") == prime.physical_bytes &&
-              counter(report, "backing_budget_bytes") == 1920 * mib &&
+              counter(report, "backing_budget_bytes") == 3360 * mib &&
               counter(report, "resident_bytes") < mib,
           "Prime must expose all 64 GiB while allocating pages on demand");
+  const auto phone = Session::ram_profile(856 * mib, 256 * mib, false, true);
+  require(phone.backing_bytes == 525 * mib &&
+              Session::ram_profile(356 * mib, 256 * mib, false, true).backing_bytes == 36 * mib,
+          "Prime must use more of Android's headroom with both reserve bounds");
   try {
     (void)Session::ram_profile(300 * mib, 256 * mib, true);
   } catch (const std::runtime_error&) { return; }
@@ -234,6 +238,115 @@ void verify_ram_spill(const std::filesystem::path& directory) {
   std::cout << "REVERSE_WINDOWS_ANDROID_RAM_SPILL_PASS anonymous_file=true resident_cap=true"
                " limit_failure_preserves_data=true reset_releases_slots=true\n";
   require(std::filesystem::is_empty(cache), "Temporary RAM must disappear on session close");
+}
+
+void verify_packed_ram64(const std::filesystem::path& directory) {
+  using Backing = reverse_windows::AndroidRamBacking;
+  using Pc = cosmic_pc::PcMachine;
+  constexpr auto page = Backing::kPageSize;
+  constexpr std::uint64_t mib = 1024 * 1024;
+  constexpr auto threshold = 256 * mib;
+  const auto cache = directory / "packed-ram-cache";
+  std::filesystem::create_directory(cache);
+  require(Backing::spill_budget(cache) >= 8 * page, "Packed RAM test requires a writable disk");
+
+  const auto prime = Session::ram_profile(threshold + 600 * mib, threshold, false, true);
+  Session live({}, 0, Session::BootSource::SelfTest, -1, 0, prime, cache);
+  const auto initial = live.diagnostic();
+  require(initial.find("\"spill_compression\":true") != std::string::npos &&
+              counter(initial, "backing_budget_bytes") == 525 * mib,
+          "A normal Prime session must attach the compressed QSSD store");
+  live.sample_ram_pressure(threshold, threshold, true);
+  require(!live.maintain_ram_budget() &&
+              counter(live.diagnostic(), "backing_budget_bytes") == 16 * mib,
+          "Android pressure must still reclaim the additional RAM");
+  live.sample_ram_pressure(threshold + 600 * mib - 32 * 1024, threshold, false);
+  require(!live.maintain_ram_budget() &&
+              counter(live.diagnostic(), "pressure_target_bytes") >= 524 * mib &&
+              counter(live.diagnostic(), "usable_bytes") == Session::kPrimeRamBytes,
+          "Prime must restore its resident budget with the same E820 map");
+
+  std::array<std::uint8_t, page> raw{}, first{}, second{}, restored{};
+  std::uint32_t random = 0x13579bdfU;
+  for (auto& byte : raw) {
+    random ^= random << 13;
+    random ^= random >> 17;
+    random ^= random << 5;
+    byte = std::uint8_t(random);
+  }
+  std::copy_n(raw.begin(), 1500, first.begin() + 256);
+  second = first;
+  second.back() = 0x8e;
+  const auto end = prime.physical_bytes / page - 1;
+  {
+    Backing backing(cache, prime.physical_bytes, 2 * page, true);
+    backing.write(end, first.data());
+    backing.write(1, second.data());
+    backing.write(0, raw.data());
+    require(backing.packed_pages() == 2 && backing.file_payload_bytes() == 2 * page,
+            "Two compressed pages and one raw page must fit in two QSSD blocks");
+    bool full = false;
+    try { backing.write(end, raw.data()); }
+    catch (const std::runtime_error&) { full = true; }
+    backing.read(end, restored.data());
+    require(full && restored == first, "A full QSSD pool must keep the previous valid page");
+    backing.read(1, restored.data());
+    require(restored == second, "A failed expansion must preserve the neighboring record");
+    backing.discard(1);
+    backing.write(end, raw.data());
+    backing.read(end, restored.data());
+    require(restored == raw && !backing.packed_pages(), "A sole half can grow in its old block");
+    backing.write(end, first.data());
+    backing.write(2, second.data());
+    backing.read(2, restored.data());
+    require(restored == second && backing.packed_pages() == 2 &&
+                backing.file_payload_bytes() == 2 * page,
+            "Shrinking a raw record must make its other half available");
+    backing.reset();
+    require(backing.file_payload_bytes() == 0 && backing.packed_pages() == 0,
+            "Reset must clear the compressed slot index");
+  }
+
+  Pc pc(prime.physical_bytes, 8 * page);
+  pc.reserve_pci_mmio(true);
+  pc.cpu.a20_enabled = true;
+  auto backing = std::make_unique<Backing>(cache, prime.physical_bytes, 8 * page, true);
+  auto* stats = backing.get();
+  auto& memory = pc.cpu.memory;
+  memory.reset_zero();
+  memory.attach_page_backing(std::move(backing));
+  using Adjustment = cosmic_pc::SparseRam::BudgetAdjustment;
+  require(memory.adjust_payload_budget(2 * page, 0) == Adjustment::Applied,
+          "The high-memory test must start with a two-page resident budget");
+  const auto address = (end - 15) * page;
+  for (unsigned i = 0; i < 16; ++i) {
+    first[0] = std::uint8_t(i + 1);
+    memory.write_block(address + i * page, first.data(), first.size());
+  }
+  require(memory.adjust_payload_budget(0, 16) == Adjustment::Applied &&
+              memory.metrics().spilled_pages == 16 && stats->packed_pages() == 16 &&
+              stats->file_payload_bytes() == 8 * page,
+          "Mundo X must back sixteen distinct high RAM pages with eight storage blocks");
+  for (unsigned i = 0; i < 16; ++i) {
+    first[0] = std::uint8_t(i + 1);
+    memory.read_block(address + i * page, restored.data(), restored.size());
+    require(restored == first, "Every high guest page must round-trip byte for byte");
+  }
+  memory.fill(address, 0, page);
+  require(stats->packed_pages() == 15 && pc.cpu.read32(address) == 0,
+          "Zeroing a spilled guest page must release its slot");
+  require(memory.adjust_payload_budget(2 * page, 0) == Adjustment::Applied,
+          "Mundo X must be able to restore a two-page resident budget");
+  memory.write_block(address - page, second.data(), second.size());
+  require(memory.adjust_payload_budget(0, 16) == Adjustment::Applied &&
+              stats->packed_pages() == 16 && stats->file_payload_bytes() == 8 * page,
+          "New guest addresses must be able to reuse the released QSSD slot");
+  memory.read_block(address - page, restored.data(), restored.size());
+  require(restored == second, "Reusing a slot must preserve the new guest page");
+  std::cout << "PRIME_RAM64_QSSD_PACKED_PASS guest_bytes=" << Session::kPrimeRamBytes
+            << " highest_test_address=" << end * page
+            << " guest_test_bytes=" << 16 * page << " qssd_test_bytes="
+            << stats->file_payload_bytes() << " prime_phone_budget_mib=525\n";
 }
 
 void run_until(Session& session, Session::Step expected, const char* message, unsigned budget = 64) {
@@ -447,6 +560,7 @@ int main(int argc, char** argv) {
     require(argc == 2 || argc == 3, "Pass the synthetic BIOS fixture and optional evidence path");
     const TestDiskDirectory dir;
     verify_ram_spill(dir.path);
+    verify_packed_ram64(dir.path);
     verify_real_mode_ps2(dir.path / "keyboard-irq.rqvd", true);
     verify_real_mode_ps2(dir.path / "keyboard-poll.rqvd", false);
     verify_arm64_session(dir.path / "ether-arm64.rqvd");
