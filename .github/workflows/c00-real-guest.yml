@@ -154,7 +154,7 @@ jobs:
           ctest --test-dir build --output-on-failure -V \
             -R '^reverse_windows_(sparse_ram|pc_memory|pc_memory_fabric|x86_long_mode|x86_ether_rep_batch|android_bios_iso_qssd)$' \
             | tee build/prime-c04-ram.log
-          for marker in SPARSE_WORD TRANSLATION REP_FILL ANDROID_PRESSURE; do
+          for marker in SPARSE_WORD TRANSLATION REP_FILL ANDROID_PRESSURE SHARED_RAM; do
             grep -q "PRIME_C04_${marker}_PASS" build/prime-c04-ram.log
           done
       - name: Capture BIOS disk boot and guest VGA evidence

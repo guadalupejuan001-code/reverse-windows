@@ -2,6 +2,7 @@
 #include "long_mode_guest.hpp"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
@@ -265,11 +266,13 @@ void verify_packed_ram64(const std::filesystem::path& directory) {
   Session live({}, 0, Session::BootSource::SelfTest, -1, 0, prime, cache);
   const auto initial = live.diagnostic();
   require(initial.find("\"spill_compression\":true") != std::string::npos &&
-              counter(initial, "backing_budget_bytes") == 600 * mib,
+              counter(initial, "backing_budget_bytes") == 600 * mib &&
+              counter(initial, "spill_cache_capacity_bytes") == 2 * mib,
           "A normal Prime session must attach the compressed QSSD store");
   live.sample_ram_pressure(threshold, threshold, true);
   require(!live.maintain_ram_budget() &&
-              counter(live.diagnostic(), "backing_budget_bytes") == 16 * mib,
+              counter(live.diagnostic(), "backing_budget_bytes") == 16 * mib &&
+              counter(live.diagnostic(), "spill_cache_capacity_bytes") == 128 * 1024,
           "Android pressure must still reclaim the additional RAM");
   live.sample_ram_pressure(threshold + 600 * mib - 32 * 1024, threshold, false);
   require(!live.maintain_ram_budget() &&
@@ -358,6 +361,90 @@ void verify_packed_ram64(const std::filesystem::path& directory) {
             << " highest_test_address=" << end * page
             << " guest_test_bytes=" << 16 * page << " qssd_test_bytes="
             << stats->file_payload_bytes() << " prime_phone_budget_mib=600\n";
+}
+
+void verify_shared_ram(const std::filesystem::path& directory) {
+  using Backing = reverse_windows::AndroidRamBacking;
+  using Ram = cosmic_pc::SparseRam;
+  using CachePolicy = Ram::BackingCachePolicy;
+  constexpr auto page = Backing::kPageSize;
+  constexpr auto base = cosmic_pc::PcVideo::kFramebufferAddress;
+  constexpr std::uint64_t mib = 1024 * 1024;
+  constexpr unsigned rows = 96, rounds = 12;
+  const auto cache = directory / "shared-ram-cache";
+  std::filesystem::create_directory(cache);
+
+  struct Result { std::uint64_t reads, hits; std::int64_t us; };
+  const auto run = [&](CachePolicy policy) -> Result {
+    cosmic_pc::PcMachine pc(2048 * mib, 64 * mib);
+    auto& cpu = pc.cpu;
+    auto& ram = cpu.memory;
+    ram.reset_zero();
+    cpu.a20_enabled = true;
+    cosmic_pc::PcVideo video;
+    cpu.set_reg16(cosmic_pc::Cpu::EAX, 0x4f02);
+    cpu.set_reg16(cosmic_pc::Cpu::EBX, 0x4142);
+    video.bios(cpu);
+    require(video.info().graphics && video.info().pitch == page,
+            "The VBE fixture needs one framebuffer page per row");
+    auto qssd = std::make_unique<Backing>(cache, ram.size(), 2 * rows * page, true);
+    ram.attach_page_backing(std::move(qssd), policy);
+
+    std::array<std::uint8_t, page> original{}, disk_buffer{};
+    std::array<std::uint8_t, rows * 4> pixels{};
+    for (unsigned i = 128; i < 896; ++i) original[i] = std::uint8_t(i * 13);
+    original[1] = 0xd4;
+    original[2] = 0x3b;
+    for (unsigned row = 0; row < rows; ++row) {
+      original[0] = std::uint8_t(row);
+      ram.write_block(base + row * page, original.data(), original.size());
+    }
+    const auto spilled = ram.adjust_payload_budget(0, rows);
+    require(spilled == Ram::BudgetAdjustment::Applied && ram.metrics().spilled_pages == rows &&
+                ram.adjust_payload_budget(64 * mib, 0) == Ram::BudgetAdjustment::Applied,
+            "Shared RAM fixture must put each row in real QSSD backing");
+
+    bool exact = true;
+    const auto started = std::chrono::steady_clock::now();
+    for (unsigned round = 0; round < rounds; ++round) {
+      for (unsigned row = 0; row < rows; ++row)
+        exact &= cpu.read32(base + row * page) == (0x003bd400U | row);
+      for (unsigned row = 0; row < rows; ++row) {
+        original[0] = std::uint8_t(row);
+        exact &= cpu.try_read_ram_block(base + row * page, disk_buffer.data(), page) && disk_buffer == original;
+      }
+      video.copy_rgba(ram, 0, 0, 1, rows, pixels.data(), pixels.size());
+      for (unsigned row = 0; row < rows; ++row) {
+        const auto* pixel = pixels.data() + 4 * row;
+        exact &= pixel[0] == 0x3b && pixel[1] == 0xd4 && pixel[2] == row && pixel[3] == 255;
+      }
+    }
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    require(exact, "CPU, BIOS transfers and VBE must see exactly the same guest bytes");
+    const auto stats = ram.metrics();
+    if (policy == CachePolicy::Adaptive) {
+      require(stats.backing_cache_bytes == rows * page &&
+                  ram.adjust_payload_budget(16 * mib, 0) == Ram::BudgetAdjustment::Applied &&
+                  ram.backing_cache_bytes() == 0 && ram.metrics().backing_cache_capacity_bytes == 128 * 1024,
+              "Reducing the Android budget must release and bound the decoded cache");
+    }
+    original[0] = 0xa1;
+    require(cpu.try_write_ram_block(base, original.data(), page) &&
+                ram.metrics().backing_reads == stats.backing_reads && ram.metrics().backing_overwrite_pages == 1,
+            "A full BIOS transfer into backed RAM must skip the old page");
+    require(cpu.read32(base) == 0x003bd4a1, "A full BIOS transfer must publish its new bytes");
+    return {stats.backing_reads, stats.backing_cache_hits, us};
+  };
+
+  const auto fixed = run(CachePolicy::Fixed);
+  const auto adaptive = run(CachePolicy::Adaptive);
+  require(fixed.reads == 3 * rows * rounds && adaptive.reads == rows &&
+              adaptive.hits == 3 * rows * rounds - rows,
+          "The adaptive cache must retrieve shared pages once across CPU, disk and video");
+  std::cout << "PRIME_C04_SHARED_RAM_PASS fixed_reads=" << fixed.reads << " adaptive_reads=" << adaptive.reads
+            << " cache_hits=" << adaptive.hits << " fixed_us=" << fixed.us << " adaptive_us=" << adaptive.us
+            << " exact=1\n";
 }
 
 void run_until(Session& session, Session::Step expected, const char* message, unsigned budget = 64) {
@@ -572,6 +659,7 @@ int main(int argc, char** argv) {
     const TestDiskDirectory dir;
     verify_ram_spill(dir.path);
     verify_packed_ram64(dir.path);
+    verify_shared_ram(dir.path);
     verify_real_mode_ps2(dir.path / "keyboard-irq.rqvd", true);
     verify_real_mode_ps2(dir.path / "keyboard-poll.rqvd", false);
     verify_arm64_session(dir.path / "ether-arm64.rqvd");
