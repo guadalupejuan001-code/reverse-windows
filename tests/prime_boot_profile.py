@@ -79,6 +79,12 @@ def validate(report, timed, start, interval, stop):
               for part in ("device", "batch_dispatch", "batch_execute", "scalar", "loop_other")) and
           timing["run_ns"] >= timing["sampled_iteration_ns"],
           "device and CPU samples overlap or exceed the run")
+    check(timing["sampled_batch_execute_ns"] ==
+          timing["sampled_arm64_execute_ns"] + timing["sampled_bulk_execute_ns"],
+          "native and specialized execution must account for all successful batch time")
+    check(timing["sampled_profile_ns"] > 0 and timing["sampled_loop_other_ns"] ==
+          timing["sampled_profile_ns"] + timing["sampled_loop_unattributed_ns"],
+          "the existing loop subtotal must include the profiling work")
     parts = ("fetch_decode", "other_ram", "guest_io") if stop is None else ("fetch_decode", "other_ram")
     for part in parts:
         check(timing["sampled_scalar_" + part + "_ns"] > 0, f"fixture did not sample {part}")
