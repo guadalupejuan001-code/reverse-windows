@@ -465,6 +465,7 @@ class AndroidBootSession final {
         << ",\"boot_rep_batches\":" << boot_work.batches
         << ",\"boot_rep_elements\":" << boot_work.rep_elements
         << ",\"boot_rep_bytes\":" << boot_work.bytes
+        << ",\"boot_rep_direct_page_copy_bytes\":" << boot_work.rep_direct_page_copy_bytes
         << ",\"boot_paged_rep_elements\":" << boot_work.paged_rep_elements
         << ",\"boot_shift_loop_batches\":" << boot_work.shift_loop_batches
         << ",\"boot_shift_loop_steps\":" << boot_work.shift_loop_steps
