@@ -4,11 +4,13 @@ import android.content.ContentResolver;
 import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Debug;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import android.provider.OpenableColumns;
 import android.util.AtomicFile;
@@ -65,7 +67,7 @@ final class VmWorker {
     private static final long HALTED_POLL_DELAY_MS = 35;
     private static final long STATUS_INTERVAL_MS = 350;
     private static final long DIAGNOSTIC_INTERVAL_MS = 5_000;
-    private static final long PSS_SAMPLE_INTERVAL_MS = 10_000;
+    private static final long ANDROID_SAMPLE_INTERVAL_MS = 10_000;
     // Newer Android versions no longer send the running-low trim levels.
     private static final long RAM_SAMPLE_INTERVAL_MS = 10_000;
     private static final long RAM_RECLAIM_INTERVAL_MS = 16;
@@ -73,6 +75,7 @@ final class VmWorker {
 
     private final Context context;
     private final ContentResolver resolver;
+    private final PowerManager powerManager;
     private final File disk;
     private final File dataDisk;
     private final AtomicFile diagnosticFile;
@@ -92,8 +95,10 @@ final class VmWorker {
     private long lastStatus;
     private long lastDiagnosticSave;
     private long sessionStarted;
-    private long nextPssSample;
+    private long sessionWorkerCpuStartNs = -1;
+    private long nextAndroidSample;
     private long androidPssKiB;
+    private int androidThermalStatus = -1;
     private long stepNanos;
     private long lastSliceNanos;
     private int lastSliceSteps;
@@ -112,6 +117,7 @@ final class VmWorker {
     VmWorker(Context context, File disk, File dataDisk, Listener listener) {
         this.context = context.getApplicationContext();
         this.resolver = this.context.getContentResolver();
+        this.powerManager = this.context.getSystemService(PowerManager.class);
         this.disk = disk;
         this.dataDisk = dataDisk;
         this.diagnosticFile = new AtomicFile(new File(this.context.getFilesDir(), DIAGNOSTIC_FILE));
@@ -259,7 +265,8 @@ final class VmWorker {
                 lastStatus = 0;
                 lastDiagnosticSave = 0;
                 sessionStarted = SystemClock.elapsedRealtime();
-                nextPssSample = sessionStarted;
+                sessionWorkerCpuStartNs = Debug.threadCpuTimeNanos();
+                nextAndroidSample = sessionStarted;
                 stepNanos = frameNanos = statusNanos = 0;
                 lastSliceNanos = 0;
                 lastSliceSteps = 0;
@@ -506,14 +513,22 @@ final class VmWorker {
 
     private String currentDiagnostic(boolean detailed) {
         long now = SystemClock.elapsedRealtime();
-        if (now >= nextPssSample) {
+        if (now >= nextAndroidSample) {
             androidPssKiB = Debug.getPss();
-            nextPssSample = now + PSS_SAMPLE_INTERVAL_MS;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && powerManager != null)
+                androidThermalStatus = powerManager.getCurrentThermalStatus();
+            nextAndroidSample = now + ANDROID_SAMPLE_INTERVAL_MS;
         }
+        long workerCpuNs = Debug.threadCpuTimeNanos();
+        String workerCpuUs = sessionWorkerCpuStartNs >= 0 && workerCpuNs >= sessionWorkerCpuStartNs
+                ? Long.toString((workerCpuNs - sessionWorkerCpuStartNs) / 1000) : "null";
         return withBuildMetadata(NativeMachine.diagnostic(handle, detailed),
                 ",\"elapsed_ms\":" + (now - sessionStarted)
                 + ",\"android_pss_kib\":" + androidPssKiB
+                + ",\"android_thermal_status\":" + (androidThermalStatus >= 0
+                        ? Integer.toString(androidThermalStatus) : "null")
                 + ",\"worker_timing\":{\"step_us\":" + stepNanos / 1000
+                + ",\"host_thread_cpu_us\":" + workerCpuUs
                 + ",\"frame_us\":" + frameNanos / 1000
                 + ",\"diagnostic_us\":" + statusNanos / 1000
                 + ",\"last_slice_steps_requested\":" + lastSliceSteps
