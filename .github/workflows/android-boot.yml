@@ -37,9 +37,9 @@ jobs:
         abi: [arm64-v8a, x86_64]
     env:
       ANDROID_ABI: ${{ matrix.abi }}
-      ANDROID_APP_ID: com.reversewindows.android.prime.smp.r034
-      ANDROID_VERSION: "0.3.4"
-      ANDROID_VERSION_CODE: "32"
+      ANDROID_APP_ID: com.reversewindows.android.prime.smp.r035
+      ANDROID_VERSION: "0.3.5"
+      ANDROID_VERSION_CODE: "33"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -116,6 +116,8 @@ jobs:
           grep -aFq 'code_byte_checks' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'code_bytes_read' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'boot_counter_loop_steps' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'interrupt_origin' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'idt_bulk_reads' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'pattern_delta_pages' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'boot_rep_direct_page_copy_bytes' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'wbinvd_retired' "$RUNNER_TEMP/reverse-windows-android.so"

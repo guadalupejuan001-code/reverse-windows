@@ -452,6 +452,10 @@ class AndroidBootSession final {
         out << ",\"idt_attempts\":";
         cosmic_pc::PcMachine::write_idt_attempts(out, *faulted_cpu->fault);
       }
+      if (detailed && faulted_cpu->fault->interrupt_origin) {
+        out << ",\"interrupt_origin\":";
+        cosmic_pc::PcMachine::write_interrupt_origin(out, *faulted_cpu->fault->interrupt_origin);
+      }
       out << '}';
     }
     out << ",\"ram_profile\":";

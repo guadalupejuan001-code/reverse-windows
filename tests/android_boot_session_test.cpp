@@ -407,6 +407,13 @@ void verify_idt_diagnostic(const std::filesystem::path& path) {
               live.find("\"source\":\"exception\",\"vector\":8,") != std::string::npos &&
               counter(live, "checkpoint_interval_steps") == 50'000'000,
           "Android fault must carry nested IDT failures and the profile interval");
+  const auto exported = session.diagnostic(true);
+  require(exported.find("\"interrupt_origin\":") != std::string::npos &&
+              exported.find("\"last_lidt\":{") != std::string::npos &&
+              exported.find("\"base_hex\":\"0000000000015000\"") != std::string::npos &&
+              exported.find("\"code_hex\":\"CC") != std::string::npos &&
+              exported.find("\"stack_hex\":\"") != std::string::npos,
+          "Android export must preserve LIDT, faulting code and readable stack");
   std::cout << "PRIME_ANDROID_IDT_DIAGNOSTIC_PASS vector=3 gate_bytes=16 nested_vectors=13,8\n";
 }
 
