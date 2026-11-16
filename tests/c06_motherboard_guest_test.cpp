@@ -1046,6 +1046,35 @@ void prime_bios_clock() {
        "BIOS midnight flag must clear after the first guest read");
   std::cout<<"PRIME_C05_BIOS_CLOCK_PASS int1a=1 midnight=1\n";
 }
+void prime_vga_graphics_ports() {
+  PcMachine pc(16U << 20);
+  pc.cpu.use_windows_x64_profile();
+  pc.boot_long_mode_demo();
+  PcMotherboardC06 board(pc);
+  board.run(4000);
+  auto& cpu = pc.cpu;
+  need(cpu.halted && cpu.is_long_mode() && !cpu.fault, "VGA probe fixture must reach long64");
+  constexpr unsigned entry = 0xa000;
+  code(cpu, entry, {0xec,                    // IN AL,DX (the failing instruction)
+                    0x66,0xb8,0x08,0xa5,     // MOV AX,0xa508
+                    0x66,0xef,               // OUT DX,AX
+                    0x66,0x31,0xc0,          // XOR AX,AX
+                    0x66,0xed,               // IN AX,DX
+                    0xf4});
+  cpu.eip = entry;
+  cpu.halted = false;
+  cpu.eflags = 2;
+  cpu.regs[Cpu::EDX] = 0x3ce;
+  cpu.regs[Cpu::EAX] = 0xfffff8071ff65001ULL;
+  board.run(1);
+  if (cpu.fault) throw std::runtime_error(cpu.fault->describe());
+  need(cpu.eip == entry + 1 && cpu.regs[Cpu::EAX] == 0xfffff8071ff65000ULL && cpu.eflags == 2,
+       "Prime must retire the VGA index read through C06 with correct RAX and flags");
+  board.run(5);
+  need(cpu.halted && !cpu.fault && cpu.reg16(Cpu::EAX) == 0xa508,
+       "The C06 bus must forward the VGA index and data pair");
+  std::cout << "PRIME_VGA_GRAPHICS_PORTS_PASS long64=1 index=03ce data=03cf\n";
+}
 void ps2_keyboard_guest(){
   PcMachine pc(16*1024*1024);boot32(pc);
   PcMotherboardC06 board(pc);
@@ -1251,6 +1280,7 @@ int main(){
     prime_acpi_sci_timer();
     prime_pit_channel2_calibration();
     prime_bios_clock();
+    prime_vga_graphics_ports();
     ps2_keyboard_guest();
     queued_lapic_requests_guest();
     cr8_lapic_priority_guest();
