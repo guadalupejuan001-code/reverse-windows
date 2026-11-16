@@ -1055,25 +1055,30 @@ void prime_vga_graphics_ports() {
   auto& cpu = pc.cpu;
   need(cpu.halted && cpu.is_long_mode() && !cpu.fault, "VGA probe fixture must reach long64");
   constexpr unsigned entry = 0xa000;
-  code(cpu, entry, {0xec,                    // IN AL,DX (the failing instruction)
-                    0x66,0xb8,0x08,0xa5,     // MOV AX,0xa508
-                    0x66,0xef,               // OUT DX,AX
-                    0x66,0x31,0xc0,          // XOR AX,AX
-                    0x66,0xed,               // IN AX,DX
-                    0xf4});
-  cpu.eip = entry;
-  cpu.halted = false;
-  cpu.eflags = 2;
-  cpu.regs[Cpu::EDX] = 0x3ce;
-  cpu.regs[Cpu::EAX] = 0xfffff8071ff65001ULL;
-  board.run(1);
-  if (cpu.fault) throw std::runtime_error(cpu.fault->describe());
-  need(cpu.eip == entry + 1 && cpu.regs[Cpu::EAX] == 0xfffff8071ff65000ULL && cpu.eflags == 2,
-       "Prime must retire the VGA index read through C06 with correct RAX and flags");
-  board.run(5);
-  need(cpu.halted && !cpu.fault && cpu.reg16(Cpu::EAX) == 0xa508,
-       "The C06 bus must forward the VGA index and data pair");
+  const auto check = [&](std::uint16_t port, std::uint16_t value) {
+    code(cpu, entry, {0xec,                    // IN AL,DX
+                      0x66,0xb8,std::uint8_t(value),std::uint8_t(value >> 8),
+                      0x66,0xef,               // OUT DX,AX
+                      0x66,0x31,0xc0,          // XOR AX,AX
+                      0x66,0xed,               // IN AX,DX
+                      0xf4});
+    cpu.eip = entry;
+    cpu.halted = false;
+    cpu.eflags = 2;
+    cpu.regs[Cpu::EDX] = port;
+    cpu.regs[Cpu::EAX] = 0xfffff8071ff65001ULL;
+    board.run(1);
+    if (cpu.fault) throw std::runtime_error(cpu.fault->describe());
+    need(cpu.eip == entry + 1 && cpu.regs[Cpu::EAX] == 0xfffff8071ff65000ULL && cpu.eflags == 2,
+         "Prime must retire the VGA index read through C06 with correct RAX and flags");
+    board.run(5);
+    need(cpu.halted && !cpu.fault && cpu.reg16(Cpu::EAX) == value,
+         "The C06 bus must forward the VGA index and data pair");
+  };
+  check(0x3ce, 0xa508);
   std::cout << "PRIME_VGA_GRAPHICS_PORTS_PASS long64=1 index=03ce data=03cf\n";
+  check(0x3c4, 0x0a04);
+  std::cout << "PRIME_VGA_SEQUENCER_PORTS_PASS long64=1 index=03c4 data=03c5\n";
 }
 void ps2_keyboard_guest(){
   PcMachine pc(16*1024*1024);boot32(pc);
