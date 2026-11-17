@@ -445,7 +445,10 @@ class AndroidBootSession final {
         << ",\"threads_per_core\":" << topology.threads_per_core
         << ",\"logical_processors\":" << topology.logical_processors()
         << ",\"started\":" << board_->processors_started()
-        << ",\"host_workers\":" << board_->worker_count();
+        << ",\"host_workers\":" << board_->worker_count()
+        << ",\"parallel_register_batches\":" << board_->parallel_register_batches()
+        << ",\"parallel_register_steps\":" << board_->parallel_register_steps()
+        << ",\"longest_parallel_register_slice\":" << board_->longest_parallel_register_slice();
     if (detailed) {
       out << ",\"steps_by_logical_processor\":[";
       for (unsigned id = 0; id < topology.logical_processors(); ++id)

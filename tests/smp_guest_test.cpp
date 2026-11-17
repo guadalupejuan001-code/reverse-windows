@@ -1,5 +1,6 @@
 #include "c06_motherboard.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
@@ -111,7 +112,7 @@ void test_eight_cores_sixteen_threads() {
     require(!board.faulted_cpu(), "all startup guest code must execute");
     require(board.processors_started() == kProcessors && pc.cpu.read32(kSharedCounter) == 15,
             "all 15 APs ran x86 LOCK INC on one shared RAM word");
-    require(board.worker_count() >= 1 && board.worker_count() <= 8, "bounded host worker count");
+    require(board.worker_count() >= 1 && board.worker_count() <= kProcessors, "bounded host worker count");
     for (unsigned id = 1; id < kProcessors; ++id) {
         const auto offset = id * 4;
         require(pc.cpu.read32(0x3000 + offset) == 1 && pc.cpu.read32(0x3040 + offset) == 2 &&
@@ -219,6 +220,88 @@ void test_ether_worker_block() {
     }
     require(steps == 3 && cpu.regs[Cpu::EAX] == 42 && lock.owns_lock(),
             "the private ARM64 block retires and returns with the bus lock held");
+
+    constexpr unsigned loop = address + 32;
+    constexpr std::uint8_t loop_code[] = {
+        0x48,0x83,0xc0,7, 0x48,0xff,0xc6, // ADD RAX,7; INC RSI.
+        0x48,0xff,0xc2, 0x48,0xff,0xc2, 0x48,0xff,0xc2,
+        0x48,0xff,0xc2, 0x48,0xff,0xc2, 0x48,0xff,0xc2,
+        0x48,0xff,0xc2, 0x48,0xff,0xc2, 0x48,0xff,0xc2,
+        0x48,0xff,0xc2, 0x48,0xff,0xc2, 0x48,0xff,0xc2, // 12 INC RDX.
+        0x83,0xe9,1, 0x75,0xd0 // SUB ECX,1; JNZ.
+    };
+    constexpr unsigned rounds = 256, loop_steps = rounds * 16;
+    cpu.memory.write_block(loop, loop_code, sizeof(loop_code));
+    const auto prepare = [&](bool irq_enabled) {
+        cpu.eip = loop;
+        cpu.eflags = 2 | (irq_enabled ? Cpu::IF : 0);
+        cpu.regs[Cpu::EAX] = 0;
+        cpu.regs[Cpu::ECX] = rounds;
+        cpu.regs[Cpu::EDX] = 0;
+        cpu.regs[Cpu::ESI] = 0;
+    };
+    const auto before = cpu.ether_arm64_stats().private_loop_steps;
+    steps = 0;
+    for (unsigned attempt = 0; attempt < 4 && !steps; ++attempt) {
+        prepare(false);
+        steps = cpu.try_ether_arm64_block(loop_steps, &lock);
+    }
+    require(steps == loop_steps && cpu.regs[Cpu::EAX] == rounds * 7 && cpu.regs[Cpu::ECX] == 0 &&
+            cpu.regs[Cpu::EDX] == rounds * 12 && cpu.regs[Cpu::ESI] == rounds &&
+            cpu.eip == loop + sizeof(loop_code) && lock.owns_lock() &&
+            cpu.ether_arm64_stats().private_loop_steps == before + steps,
+            "the worker must retire 4096 private steps within one grant");
+
+    const auto native_regs = cpu.regs;
+    const auto native_flags = cpu.eflags;
+    prepare(false);
+    for (unsigned i = 0; i < steps; ++i)
+        require(cpu.step() == cosmic_pc::StepResult::Executed, "scalar loop failed");
+    require(cpu.regs == native_regs && cpu.eflags == native_flags && cpu.eip == loop + sizeof(loop_code),
+            "the private rounds changed the scalar result");
+
+    prepare(true);
+    require(cpu.try_ether_arm64_block(loop_steps, &lock) == 16 && cpu.regs[Cpu::ECX] == rounds - 1 &&
+            cpu.eip == loop && lock.owns_lock(), "the worker must return for IRQ polling with IF set");
+
+    prepare(true);
+    require(cpu.ether_arm64_register_loop_length() == 16 &&
+            cpu.try_ether_arm64_register_loop(loop_steps, lock) == loop_steps && lock.owns_lock() &&
+            cpu.regs == native_regs && cpu.eflags == (native_flags | Cpu::IF) &&
+            cpu.eip == loop + sizeof(loop_code), "a motherboard-bounded register dispatch retires the whole budget");
+
+    constexpr unsigned long_rounds = 8193, long_steps = long_rounds * 16;
+    Cpu::EtherRegisterWork work;
+    prepare(false);
+    cpu.regs[Cpu::ECX] = long_rounds;
+    require(cpu.prepare_ether_arm64_register_loop(long_steps, work), "prepare a continuous register loop");
+    work.run(Cpu::EtherRegisterWork::Clock::now());
+    require(cpu.retire_ether_arm64_register_loop(work) == 0 && cpu.regs[Cpu::ECX] == long_rounds,
+            "an expired deadline retires nothing");
+    require(cpu.prepare_ether_arm64_register_loop(long_steps, work), "prepare again after a deadline");
+    work.run(Cpu::EtherRegisterWork::Clock::now() + std::chrono::seconds(5));
+    require(cpu.retire_ether_arm64_register_loop(work) == long_steps && cpu.regs[Cpu::ECX] == 0 &&
+            cpu.regs[Cpu::EAX] == long_rounds * 7 && cpu.regs[Cpu::EDX] == long_rounds * 12 &&
+            cpu.regs[Cpu::ESI] == long_rounds && cpu.eip == loop + sizeof(loop_code) &&
+            cpu.eflags == native_flags, "the worker finishes a long private loop with exact x86 state");
+    require(work.instruction_at(16).ip == loop && work.instruction_at(16).bytes[0] == 0x48,
+            "the compiled loop supplies exact hotspot sample addresses");
+
+    prepare(false);
+    constexpr unsigned shared_data = 0x9400;
+    cpu.regs[Cpu::EAX] = shared_data;
+    cpu.write64(shared_data, 42);
+    require(cpu.prepare_ether_arm64_register_loop(32, work), "capture the guarded loop before a write");
+    cpu.write8(loop + 2, 0x00); // Change the ADD destination from RAX to shared RAM at [RAX].
+    const auto retired_before_edit = cpu.instructions;
+    work.run();
+    require(cpu.retire_ether_arm64_register_loop(work) == 0 &&
+            !cpu.prepare_ether_arm64_register_loop(32, work) && lock.owns_lock() &&
+            cpu.instructions == retired_before_edit && cpu.read64(shared_data) == 42,
+            "a rewritten private loop cannot enter the parallel path");
+    require(cpu.step() == cosmic_pc::StepResult::Executed && cpu.read64(shared_data) == 49,
+            "the rewritten shared instruction remains executable on the scalar path");
+    std::cout << "SMP_ETHER_PRIVATE_LOOP_PASS rounds=256 steps=4096 irq_enabled_steps=16\n";
 }
 } // namespace
 

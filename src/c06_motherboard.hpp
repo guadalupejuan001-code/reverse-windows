@@ -17,7 +17,6 @@
 #include <ctime>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -213,14 +212,16 @@ class PcMotherboardC06 {
     PendingWrite mmio_pending;
   };
   static constexpr auto kMaxProcessors = cosmic_pc::CpuTopology::kMaxLogical;
+  static constexpr unsigned kMinParallelRegisterSteps = 128;
   std::array<std::unique_ptr<cosmic_pc::Cpu>, kMaxProcessors> secondary_cpus_{};
   std::array<LocalApic, kMaxProcessors> apics_;
   std::array<std::uint64_t, kMaxProcessors> retired_before_init_{};
   unsigned processor_count_ = 1;
   unsigned next_cpu_ = 0;
   std::optional<unsigned> faulted_processor_;
-  std::mutex bus_;
   std::unique_ptr<SmpWorkers> workers_;
+  std::uint64_t parallel_register_batches_ = 0, parallel_register_steps_ = 0;
+  unsigned longest_parallel_register_slice_ = 0;
   bool prior_local_apic_=false;
   const std::uint64_t* prior_clock_ = nullptr;
   cosmic_pc::CpuTopology prior_topology_;
@@ -269,6 +270,8 @@ class PcMotherboardC06 {
     retired_before_init_.fill(0);
     faulted_processor_.reset();
     next_cpu_ = 0;
+    parallel_register_batches_ = parallel_register_steps_ = 0;
+    longest_parallel_register_slice_ = 0;
     ioapic_select_=0;
     ioapic_id_=std::uint8_t(AcpiC06::ioapic_id(processor_count_));
     io_redir_low_.fill(0x10000U);io_redir_high_.fill(0);
@@ -967,16 +970,34 @@ class PcMotherboardC06 {
       apic.last_tick = ticks_;
     }
   }
-  void run_secondary(unsigned id, unsigned budget) {
+  static constexpr unsigned kSmpQuantum = 32;
+  static constexpr unsigned kExtendedSmpQuantum = 4096;
+
+  unsigned smp_quantum(const std::array<unsigned, kMaxProcessors>& runnable, unsigned count) const {
+    for (unsigned slot = 0; slot < count; ++slot) {
+      const auto& apic = apics_[runnable[slot]];
+      const auto& cpu = *apic.cpu;
+      if (!apic.started || apic.init_pending || apic.startup_vector || apic.timer_cycles ||
+          apic.pending.highest() || cpu.halted || cpu.flag(cosmic_pc::Cpu::IF | cosmic_pc::Cpu::TF) ||
+          !cpu.is_long_mode() || !cpu.ether_arm64_block_candidate()) return kSmpQuantum;
+    }
+    return std::max(kSmpQuantum, batch_limit(kExtendedSmpQuantum));
+  }
+
+  void run_secondary(unsigned id, unsigned budget, cosmic_pc::PcMachine::RunClock::time_point deadline,
+                     bool preserve_ether_loop_entry) {
+    using Clock = cosmic_pc::PcMachine::RunClock;
+    const bool timed = deadline != Clock::time_point::max();
     auto& apic = apics_[id];
     auto& cpu = *apic.cpu;
+    unsigned dispatches = 0;
     for (unsigned used = 0; used < budget;) {
-      // Keep the entire scalar instruction and its undo journal atomic with
-      // respect to the other vCPUs and devices. Éter releases this lock during
-      // native blocks that operate solely on this CPU's private registers.
-      std::unique_lock<std::mutex> lock(bus_);
+      // The register workers have joined before shared RAM or devices run.
+      if (timed && (dispatches++ & 7U) == 0 && Clock::now() >= deadline) return;
       if (faulted_processor_ || powered_off_ ||
           pc_.guest_restart() != cosmic_pc::PcMachine::GuestRestart::None) return;
+      if (preserve_ether_loop_entry && used && budget - used < cosmic_pc::ether_arm64::Block::kMaxInstructions &&
+          budget - used < cpu.ether_arm64_register_loop_length()) return;
       apply_startup(apic);
       if (!apic.started) return;
       cpu.a20_enabled = pc_.cpu.a20_enabled;
@@ -988,7 +1009,7 @@ class PcMotherboardC06 {
         return;
       }
       if (cpu.halted) return;
-      const auto native_steps = cpu.try_ether_arm64_block(budget - used, &lock);
+      const auto native_steps = cpu.try_ether_arm64_block(budget - used);
       if (native_steps) {
         used += native_steps;
         continue;
@@ -998,6 +1019,73 @@ class PcMotherboardC06 {
       if (result != cosmic_pc::StepResult::Executed) return;
       ++used;
     }
+  }
+
+  unsigned run_parallel_register_loops(const std::array<unsigned, kMaxProcessors>& runnable,
+                                       unsigned count, unsigned budget,
+                                       cosmic_pc::PcMachine::RunClock::time_point deadline) {
+    if (!pc_.boot_acceleration_enabled() || !pc_.cpu.ether_arm64_register_loop_length() ||
+        (pc_.cpu.flag(cosmic_pc::Cpu::IF) && slave_.pending()) ||
+        (sci_active_ && (io_redir_low_[AcpiC06::sci_irq] & 0x8000U))) return 0;
+
+    auto limit = budget;
+    std::array<unsigned, kMaxProcessors> jobs{};
+    unsigned job_count = 1;
+    for (unsigned i = 1; i < count; ++i) {
+      const auto& apic = apics_[runnable[i]];
+      const auto& cpu = *apic.cpu;
+      if (apic.init_pending || apic.startup_vector ||
+          (cpu.flag(cosmic_pc::Cpu::IF) && deliverable_lapic_vector(apic))) return 0;
+      if (cpu.apic_global_enabled() && apic.timer_cycles) {
+        const auto elapsed = ticks_ - apic.last_tick;
+        if (elapsed >= apic.timer_cycles) return 0;
+        limit = static_cast<unsigned>(std::min<std::uint64_t>(limit, apic.timer_cycles - elapsed - 1));
+      }
+      if (cpu.halted) continue;
+      if (!cpu.ether_arm64_register_loop_length()) return 0;
+      jobs[job_count++] = runnable[i];
+    }
+    if (job_count < 2) return 0;
+    // Bound one independent execution by the earliest device edge and the
+    // caller's aggregate budget. The serial quantum does not apply here.
+    limit = batch_limit(std::min(limit, budget / job_count) + 1) - 1;
+    if (limit < kMinParallelRegisterSteps) return 0;
+
+    std::array<cosmic_pc::Cpu::EtherRegisterWork, kMaxProcessors> work{};
+    if (!pc_.prepare_ether_register_loop(limit, work[0])) return 0;
+    for (unsigned i = 1; i < job_count; ++i)
+      if (!apics_[jobs[i]].cpu->prepare_ether_arm64_register_loop(limit, work[i])) return 0;
+    if (!workers_) workers_ = std::make_unique<SmpWorkers>(processor_count_);
+    if (workers_->prepare(job_count) != job_count) return 0;
+
+    // All shared validation is finished. The workers only read native code
+    // and write their own frames until every job has returned.
+    using Clock = cosmic_pc::PcMachine::RunClock;
+    const bool profile_bsp = pc_.boot_hotspots() || pc_.boot_timing();
+    Clock::duration bsp_elapsed{};
+    workers_->run(job_count, [&](unsigned job) {
+      const bool measure = job == 0 && profile_bsp;
+      const auto start = measure ? Clock::now() : Clock::time_point{};
+      work[job].run(deadline);
+      if (measure) bsp_elapsed = Clock::now() - start;
+    });
+    unsigned total = 0, processors = 0, longest = 0;
+    for (unsigned i = 1; i < job_count; ++i) {
+      const auto completed = apics_[jobs[i]].cpu->retire_ether_arm64_register_loop(work[i]);
+      total += completed;
+      processors += completed != 0;
+      longest = std::max(longest, completed);
+    }
+    const auto bsp_completed = pc_.retire_ether_register_loop(work[0], bsp_elapsed);
+    advance_batch(bsp_completed);
+    total += bsp_completed;
+    processors += bsp_completed != 0;
+    if (processors > 1) {
+      ++parallel_register_batches_;
+      parallel_register_steps_ += total;
+      longest_parallel_register_slice_ = std::max({longest_parallel_register_slice_, longest, bsp_completed});
+    }
+    return total;
   }
 
  public:
@@ -1139,6 +1227,9 @@ class PcMotherboardC06 {
         [](const LocalApic& apic) { return apic.started; }));
   }
   unsigned worker_count() const noexcept { return workers_ ? workers_->size() : 1; }
+  std::uint64_t parallel_register_batches() const noexcept { return parallel_register_batches_; }
+  std::uint64_t parallel_register_steps() const noexcept { return parallel_register_steps_; }
+  unsigned longest_parallel_register_slice() const noexcept { return longest_parallel_register_slice_; }
   const cosmic_pc::Cpu* faulted_cpu() const noexcept {
     return faulted_processor_ ? apics_[*faulted_processor_].cpu : nullptr;
   }
@@ -1161,7 +1252,6 @@ class PcMotherboardC06 {
     }
     // The budget counts work across the whole VM. Small calls keep a rotating
     // position so that every runnable processor gets a turn.
-    constexpr unsigned quantum = 32;
     while (budget && !faulted_processor_ && !pc_.cpu.fault && !powered_off_ &&
            pc_.guest_restart() == cosmic_pc::PcMachine::GuestRestart::None) {
       if(timed&&Clock::now()>=deadline)return;
@@ -1173,26 +1263,22 @@ class PcMotherboardC06 {
         pc_.run(budget,deadline);
         return;
       }
-      const auto chunk = std::min(budget, count * quantum);
+      if (const auto completed = run_parallel_register_loops(runnable, count, budget, deadline)) {
+        budget -= completed;
+        continue;
+      }
+      const auto chunk = std::min(budget, count * smp_quantum(runnable, count));
       std::array<unsigned, kMaxProcessors> work{};
       for (unsigned i = 0; i < count; ++i)
         work[(next_cpu_ + i) % count] = chunk / count + (i < chunk % count);
       next_cpu_ = (next_cpu_ + chunk % count) % count;
-      if (work[0]) pc_.run(work[0]);
+      const bool preserve_ether_loop_entry = cosmic_pc::Cpu::ether_arm64_host() &&
+          pc_.boot_acceleration_enabled() && budget >= count * kMinParallelRegisterSteps;
+      if (work[0]) pc_.run(work[0], deadline, preserve_ether_loop_entry);
       if (pc_.cpu.fault || pc_.waiting_key || powered_off_ ||
           pc_.guest_restart() != cosmic_pc::PcMachine::GuestRestart::None) return;
-      std::array<unsigned, kMaxProcessors> jobs{};
-      unsigned job_count = 0;
       for (unsigned i = 1; i < count; ++i)
-        if (work[i]) jobs[job_count++] = i;
-      if (job_count == 1) run_secondary(runnable[jobs[0]], work[jobs[0]]);
-      if (job_count > 1) {
-        if (!workers_) workers_ = std::make_unique<SmpWorkers>(pc_.cpu.topology().cores);
-        workers_->run(job_count, [&](unsigned job) {
-          const auto slot = jobs[job];
-          run_secondary(runnable[slot], work[slot]);
-        });
-      }
+        if (work[i]) run_secondary(runnable[i], work[i], deadline, preserve_ether_loop_entry);
       budget -= chunk;
     }
   }
