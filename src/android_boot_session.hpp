@@ -5,6 +5,7 @@
 #include "c06_motherboard.hpp"
 #include "boot_profile.hpp"
 #include "c09r_guest_vga_fabric.hpp"
+#include "ether_x86_check.hpp"
 #include "guest_vbe_fabric.hpp"
 #include "qssd_disk.hpp"
 #include "storage_profile.hpp"
@@ -49,13 +50,13 @@ class AndroidBootSession final {
                                 bool low_memory, bool prime_ram = false) {
     constexpr std::uint64_t MiB = 1024 * 1024;
     const auto headroom = available_bytes > low_threshold ? available_bytes - low_threshold : 0;
-    const auto backing = (prime_ram ? headroom : headroom / 2) / cosmic_pc::MemoryFabric::kPageSize *
-                         cosmic_pc::MemoryFabric::kPageSize;
+    using Pc = cosmic_pc::PcMachine;
+    const auto prime_space = Pc::high_ram_address_space(kPrimeRamBytes, true);
+    const auto backing = page_floor(prime_ram ? headroom - std::min(headroom, prime_reserve(headroom, low_threshold))
+                                              : headroom / 2);
     if (low_memory || backing < kMinResidentBytes)
       throw std::runtime_error("Android tiene poca RAM disponible para iniciar el equipo virtual.");
-    using Pc = cosmic_pc::PcMachine;
-    auto physical = prime_ram ? Pc::high_ram_address_space(kPrimeRamBytes, true)
-                              : std::uint64_t(kDefaultRamProfile.physical_bytes);
+    auto physical = prime_ram ? prime_space : std::uint64_t(kDefaultRamProfile.physical_bytes);
     if (!prime_ram && backing >= 768 * MiB && Pc::max_ram_mib() >= 4096)
       physical = Pc::kLegacyPhysicalLimit;
     if (physical > std::numeric_limits<std::size_t>::max())
@@ -66,23 +67,40 @@ class AndroidBootSession final {
 
   void sample_ram_pressure(std::uint64_t available, std::uint64_t threshold, bool low_memory) {
     const auto& memory = pc_.cpu.memory;
-    constexpr auto page = cosmic_pc::MemoryFabric::kPageSize;
     const auto headroom = available > threshold ? available - threshold : 0;
     const auto limit = resident_limit(memory.size());
     const bool prime_ram = high_ram_profile(memory.size());
-    const bool reclaim = low_memory || (prime_ram && !headroom);
-    // The current resident payload is already excluded from Android's
-    // available bytes. Prime can grow into the surplus above its threshold.
-    const auto backing = prime_ram
-        ? std::min(headroom, limit) + memory.allocated_bytes() + memory.backing_cache_bytes()
-        : std::min(headroom, 2 * limit) / 2 + memory.allocated_bytes() / 2;
+    const bool background_trim = low_memory && available == 0 && threshold == 0;
     const auto floor = std::min(limit, kMinResidentBytes);
-    const auto target = reclaim ? floor : std::clamp<std::uint64_t>(backing / page * page, floor, limit);
-    board_->set_gpu_cache_enabled(!reclaim && target > floor);
     const auto old_target = pressure_.target ? pressure_.target : memory.budget_bytes();
-    const auto delta = std::max(old_target, target) - std::min(old_target, target);
+    auto target = floor;
+    pressure_.reserve = 0;
+    if (prime_ram && !background_trim) {
+      auto occupied = std::min(memory.allocated_bytes(), limit);
+      occupied += std::min(memory.backing_cache_bytes(), limit - occupied);
+      // Estimate the available host surplus before this session's resident
+      // payload. Releasing bytes should not cause the next sample to grow it.
+      const auto missing = threshold > available ? threshold - available : 0;
+      const auto max_growth = std::numeric_limits<std::uint64_t>::max() - occupied;
+      const auto surplus = occupied + std::min(headroom, max_growth)
+                         - std::min(occupied, missing);
+      pressure_.reserve = prime_reserve(surplus, threshold);
+      auto backing = surplus - std::min(surplus, pressure_.reserve);
+      if (low_memory || missing) backing = std::min({backing, old_target, occupied});
+      target = std::clamp(page_floor(backing), floor, limit);
+    } else if (!low_memory) {
+      const auto backing = std::min(headroom, 2 * limit) / 2 + memory.allocated_bytes() / 2;
+      target = std::clamp(page_floor(backing), floor, limit);
+    }
+    board_->set_gpu_cache_enabled(!low_memory && (!prime_ram || headroom) && target > floor);
+    pressure_.available = available;
+    pressure_.threshold = threshold;
+    pressure_.background_trim = background_trim;
     pressure_.low_memory = low_memory;
-    if (reclaim || delta >= 8 * 1024 * 1024 || target == floor)
+    // Reserve reductions take effect immediately. Small growth can wait for
+    // another sample instead of invalidating the spill cache repeatedly.
+    const auto delta = std::max(old_target, target) - std::min(old_target, target);
+    if ((prime_ram && target < old_target) || low_memory || target == floor || delta >= 8 * 1024 * 1024)
       pressure_.target = target;
     else
       pressure_.target = old_target;
@@ -90,16 +108,33 @@ class AndroidBootSession final {
 
   bool maintain_ram_budget() {
     if (!pressure_.target) return false;
+    using Clock = cosmic_pc::SparseRam::ReclaimClock;
     using Adjustment = cosmic_pc::SparseRam::BudgetAdjustment;
-    const auto started = std::chrono::steady_clock::now();
+    auto& memory = pc_.cpu.memory;
+    const auto before = memory.allocated_bytes();
+    const auto cache_before = memory.backing_cache_bytes();
+    const auto encode_before = spill_.file ? spill_.file->codec_stats().encode.wall_ns : 0;
+    const auto started = Clock::now();
     try {
-      pressure_.status = pc_.cpu.memory.adjust_payload_budget(pressure_.target, 128);
+      pressure_.status = memory.adjust_payload_budget(pressure_.target, 128, started + kRamReclaimWindow);
       pressure_.error.clear();
     } catch (const std::exception& error) {
       pressure_.status = Adjustment::Blocked;
       pressure_.error = error.what();
     }
-    pressure_.maintenance_time += std::chrono::steady_clock::now() - started;
+    const auto elapsed = Clock::now() - started;
+    if (spill_.file) pressure_.encode_ns += spill_.file->codec_stats().encode.wall_ns - encode_before;
+    const auto after = memory.allocated_bytes();
+    const auto cache_after = memory.backing_cache_bytes();
+    pressure_.maintenance_time += elapsed;
+    pressure_.last_maintenance = elapsed;
+    pressure_.max_maintenance = std::max(pressure_.max_maintenance, elapsed);
+    ++pressure_.maintenance_batches;
+    pressure_.reclaimed_bytes += before - std::min(before, after);
+    const auto resident_before = before + cache_before;
+    const auto resident_after = after + cache_after;
+    pressure_.last_released_bytes = resident_before - std::min(resident_before, resident_after);
+    pressure_.released_bytes += pressure_.last_released_bytes;
     return pressure_.status == Adjustment::Reclaiming;
   }
 
@@ -109,14 +144,15 @@ class AndroidBootSession final {
                      const std::filesystem::path& ram_cache={},
                      const std::filesystem::path& graphics_vram={},
                      const std::filesystem::path& data_disk={},
-                     cosmic_pc::CpuTopology topology={})
-      : source_(source), pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_), vbe_(pc_) {
+                     cosmic_pc::CpuTopology topology={}, bool active_guest_clock=false)
+      : source_(source), use_active_guest_clock_(active_guest_clock && source != BootSource::SelfTest),
+        pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_), vbe_(pc_) {
     if (disk.empty() && (create_gib || source != BootSource::SelfTest))
       throw std::invalid_argument("Selecciona o crea un disco QSSD para iniciar.");
     pc_.cpu.use_windows_x64_profile(source != BootSource::SelfTest);
     if (high_ram_profile(profile.physical_bytes))
       pc_.reserve_pci_mmio(true); // Match the installed RAM profile even without a graphics device.
-    spill_ = configure_spill(pc_, ram_cache);
+    spill_ = configure_spill(pc_, ram_cache, source != BootSource::SelfTest);
     switch (source) {
       case BootSource::Iso:
         iso_ = std::make_shared<OpticalReader>(iso_fd, iso_bytes);
@@ -204,6 +240,7 @@ class AndroidBootSession final {
     const bool vga = pc.waiting_key && text.find("Pulsa una tecla:") != std::string::npos;
     pc.reset();
     bool pci_ide = false, local_apic = false;
+    EtherX86Check x86_sessions;
     decltype(cpu.regs) basic{};
     {
       const std::array<std::uint8_t,2048> optical_sector{};
@@ -234,6 +271,9 @@ class AndroidBootSession final {
       pci_ide = true;
       for (unsigned i=0;i<5 && pci_ide;++i) pci_ide = cpu.step() == cosmic_pc::StepResult::Executed;
       pci_ide = pci_ide && (cpu.regs[cosmic_pc::Cpu::EAX] >> 16) == 0x0101;
+      if (cosmic_pc::Cpu::ether_arm64_host() &&
+          topology.logical_processors() == kPrimeCpuTopology.logical_processors())
+        x86_sessions = check_ether_x86_sessions(board);
     }
 
     auto optical_issue = iso_error;
@@ -286,6 +326,16 @@ class AndroidBootSession final {
         << ",\"logical_processors\":" << ((basic[cosmic_pc::Cpu::EBX] >> 16) & 255U)
         << "},\"ram_profile\":";
     write_ram_profile(out, pc, spill);
+    if (x86_sessions.requested_jobs) {
+      out << ",\"ether_x86_sessions\":{\"passed\":" << x86_sessions.passed()
+          << ",\"owners\":" << x86_sessions.owners << ",\"host_workers\":" << x86_sessions.host_workers
+          << ",\"requested_jobs\":" << x86_sessions.requested_jobs
+          << ",\"completed_jobs\":" << x86_sessions.completed_jobs
+          << ",\"guest_steps\":" << x86_sessions.guest_steps
+          << ",\"projected_steps\":" << x86_sessions.projected_steps
+          << ",\"elapsed_ns\":" << x86_sessions.elapsed_ns
+          << ",\"error\":" << cosmic_pc::PcMachine::quote(x86_sessions.error) << '}';
+    }
     out << ",\"ready_for_windows10_install\":false,\"errors\":{"
         << "\"iso_boot\":" << cosmic_pc::PcMachine::quote(optical_issue)
         << ",\"qssd\":" << cosmic_pc::PcMachine::quote(disk_issue)
@@ -295,10 +345,20 @@ class AndroidBootSession final {
 
   std::uint64_t session_steps() const noexcept { return previous_boot_steps_+board_->total_processor_steps(); }
 
+  void configure_ether_x86_sessions(unsigned workers, unsigned max_sessions_per_vcpu) {
+    board_->configure_ether_x86_sessions(workers, max_sessions_per_vcpu);
+  }
+
+  std::optional<EtherX86Sessions::Ticket> submit_ether_x86_session(unsigned vcpu, EtherX86Sessions::Job job) {
+    return board_->submit_ether_x86_session(vcpu, std::move(job));
+  }
+
   Step step(unsigned budget, cosmic_pc::PcMachine::RunClock::time_point deadline=
             cosmic_pc::PcMachine::RunClock::time_point::max()) {
     if (board_->faulted_cpu()) return Step::Fault;
     if (!is_stopped()) {
+      if (use_active_guest_clock_ && pc_.cpu.is_long_mode() && !board_->active_clock_enabled())
+        board_->enable_active_clock();
       const auto slice = boot_profile_ ? boot_profile_->budget(budget, pc_) : budget;
       board_->run(slice,deadline);
       if (boot_profile_) boot_profile_->after_run(pc_, *board_);
@@ -441,18 +501,51 @@ class AndroidBootSession final {
     out << ",\"storage_io\":";
     write_storage_profile(out, pc_, bios_disk_.get(), ata, disk_.get());
     const auto topology = pc_.cpu.topology();
+    const auto execution = board_->cpu_execution_totals();
+    const auto startup = board_->startup_ipis();
     out << ",\"cpu_topology\":{\"sockets\":1,\"cores\":" << topology.cores
         << ",\"threads_per_core\":" << topology.threads_per_core
         << ",\"logical_processors\":" << topology.logical_processors()
         << ",\"started\":" << board_->processors_started()
-        << ",\"host_workers\":" << board_->worker_count();
+        << ",\"host_workers\":" << board_->worker_count()
+        << ",\"phase_x86_steps\":" << execution.guest_steps
+        << ",\"phase_ether_arm64_steps\":" << execution.ether_steps
+        << ",\"phase_projected_steps\":" << execution.projected_steps
+        << ",\"vcpus_with_projected_steps\":" << execution.processors_with_projected_steps
+        << ",\"parallel_register_batches\":" << board_->parallel_register_batches()
+        << ",\"parallel_register_steps\":" << board_->parallel_register_steps()
+        << ",\"parallel_register_continuations\":" << board_->parallel_register_continuations()
+        << ",\"parallel_ram_batches\":" << board_->parallel_ram_batches()
+        << ",\"parallel_ram_steps\":" << board_->parallel_ram_steps()
+        << ",\"longest_parallel_register_slice\":" << board_->longest_parallel_register_slice()
+        << ",\"startup_ipis\":{\"init_icr_writes\":" << startup.init_icr_writes
+        << ",\"sipi_icr_writes\":" << startup.sipi_icr_writes
+        << ",\"init_targets_queued\":" << startup.init_targets_queued
+        << ",\"sipi_targets_queued\":" << startup.sipi_targets_queued
+        << ",\"sipi_targets_applied\":" << startup.sipi_targets_applied << '}';
     if (detailed) {
       out << ",\"steps_by_logical_processor\":[";
       for (unsigned id = 0; id < topology.logical_processors(); ++id)
         out << (id ? "," : "") << board_->processor_steps(id);
+      out << "],\"ether_arm64_steps_by_logical_processor\":[";
+      for (unsigned id = 0; id < topology.logical_processors(); ++id)
+        out << (id ? "," : "") << board_->processor_ether_arm64_steps(id);
+      out << "],\"state_vector_steps_by_logical_processor\":[";
+      for (unsigned id = 0; id < topology.logical_processors(); ++id)
+        out << (id ? "," : "") << board_->processor_state_vector_steps(id);
       out << ']';
     }
     out << '}';
+    if (const auto workers = board_->ether_x86_session_workers()) {
+      out << ",\"ether_x86_sessions\":{\"host_workers\":" << workers << ",\"by_vcpu\":[";
+      for (unsigned id = 0; id < topology.logical_processors(); ++id) {
+        const auto stats = board_->ether_x86_session_stats(id);
+        out << (id ? "," : "") << "{\"id\":" << id
+            << ",\"submitted\":" << stats.submitted << ",\"completed\":" << stats.completed
+            << ",\"in_flight\":" << stats.in_flight << ",\"peak_in_flight\":" << stats.peak_in_flight << '}';
+      }
+      out << "]}";
+    }
     const auto* faulted_cpu = secondary_fault ? secondary_fault : &pc_.cpu;
     if (faulted_cpu->fault) {
       out << ",\"cpu_fault\":{\"apic_id\":" << faulted_cpu->apic_id() << ",\"message\":"
@@ -471,6 +564,18 @@ class AndroidBootSession final {
     write_ram_profile(out, pc_, spill_, &pressure_);
     const auto gate_work = pc_.quantum_session->gate_work_stats();
     const auto& boot_work = pc_.boot_acceleration();
+    const auto batched_steps = boot_work.rep_elements + boot_work.shift_loop_steps +
+        boot_work.zero_loop_steps + boot_work.scan_loop_steps + boot_work.counter_loop_steps +
+        boot_work.affine_ram_rotate_steps + boot_work.movntdq_store_steps;
+    const auto accelerated_steps = execution.ether_steps + batched_steps;
+    out << ",\"ether_coverage\":{\"phase_steps\":" << execution.guest_steps
+        << ",\"translated_steps\":" << execution.ether_steps
+        << ",\"batched_steps\":" << batched_steps
+        << ",\"projected_steps\":" << execution.projected_steps
+        << ",\"interpreted_steps\":";
+    if (accelerated_steps <= execution.guest_steps) out << execution.guest_steps - accelerated_steps;
+    else out << "null";
+    out << '}';
     out << ",\"ether_next\":{\"quantum_gates_in\":" << gate_work.input_gates
         << ",\"quantum_gates_run\":" << gate_work.executed_gates
         << ",\"quantum_gates_cancelled\":" << gate_work.cancelled_gates
@@ -492,7 +597,9 @@ class AndroidBootSession final {
         << ",\"boot_rotate_xor_loop_batches\":" << boot_work.rotate_xor_loop_batches
         << ",\"boot_rotate_xor_loop_steps\":" << boot_work.rotate_xor_loop_steps
         << ",\"boot_affine_ram_rotate_batches\":" << boot_work.affine_ram_rotate_batches
-        << ",\"boot_affine_ram_rotate_steps\":" << boot_work.affine_ram_rotate_steps;
+        << ",\"boot_affine_ram_rotate_steps\":" << boot_work.affine_ram_rotate_steps
+        << ",\"boot_movntdq_store_batches\":" << boot_work.movntdq_store_batches
+        << ",\"boot_movntdq_store_steps\":" << boot_work.movntdq_store_steps;
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     const auto ether = pc_.cpu.ether_next_stats();
     out << ",\"neon_requested\":" << (pc_.cpu.ether_next_enabled() ? "true" : "false")
@@ -542,9 +649,18 @@ class AndroidBootSession final {
           << ",\"last_packet\":" << unsigned(cd.last_packet)
           << ",\"last_rejected_packet\":" << unsigned(cd.last_rejected_packet)
           << ",\"last_sense\":" << unsigned(cd.last_sense)
-          << ",\"last_asc\":" << unsigned(cd.last_asc) << '}';
+          << ",\"last_asc\":" << unsigned(cd.last_asc)
+          << ",\"read_bytes\":" << cd.read_sectors * AtapiCdrom::sector_bytes << '}';
     }
-    out << ",\"ata\":{\"commands\":" << counts.commands
+    const auto rtc = board_->rtc_evidence();
+    out << ",\"rtc\":{\"selected_register\":" << rtc.selected_register
+        << ",\"nmi_masked\":" << (rtc.nmi_masked ? "true" : "false")
+        << ",\"register_a\":" << rtc.register_a
+        << ",\"register_b\":" << rtc.register_b
+        << ",\"register_c\":" << rtc.register_c
+        << ",\"irq8_assertions\":" << rtc.irq8_assertions
+        << ",\"data_writes\":" << rtc.data_writes
+        << "},\"ata\":{\"commands\":" << counts.commands
         << ",\"identify_data_transfers\":" << counts.identify_data_transfers
         << ",\"read_sectors\":" << counts.read_sectors
         << ",\"write_sectors\":" << counts.write_sectors << ",\"flushes\":" << counts.flushes
@@ -552,6 +668,9 @@ class AndroidBootSession final {
         << ",\"irq14\":" << platform.ata_irqs << ",\"lapic_delivered\":" << platform.apic_irqs
         << ",\"sci_delivered\":" << platform.sci_irqs
         << ",\"virtual_clock_hz\":" << cosmic_pc::PcMachine::kVirtualCyclesPerSecond
+        << ",\"clock_source\":\"" << (board_->active_clock_enabled() ? "host-active-monotonic" : "guest-cycles") << '"'
+        << ",\"active_clock_elapsed_ns\":" << board_->active_clock_elapsed_ns()
+        << ",\"active_clock_ticks\":" << board_->active_clock_ticks()
         << ",\"halted_with_if\":" << (pc_.cpu.halted && pc_.cpu.flag(cosmic_pc::Cpu::IF) ? "true" : "false")
         << ",\"lapic_global_enabled\":" << (interrupts.global_enabled ? "true" : "false")
         << ",\"lapic_software_enabled\":" << (interrupts.software_enabled ? "true" : "false")
@@ -574,6 +693,8 @@ class AndroidBootSession final {
   }
 
  private:
+  static constexpr auto kRamReclaimWindow = std::chrono::milliseconds(3);
+
   static bool high_ram_profile(std::uint64_t physical) noexcept {
     return physical > cosmic_pc::PcMachine::kLegacyPhysicalLimit;
   }
@@ -583,12 +704,27 @@ class AndroidBootSession final {
         ? physical : std::min(physical, kMaxResidentBytes);
   }
 
+  static std::uint64_t page_floor(std::uint64_t bytes) noexcept {
+    constexpr auto page = cosmic_pc::MemoryFabric::kPageSize;
+    return bytes / page * page;
+  }
+
+  static std::uint64_t prime_reserve(std::uint64_t surplus, std::uint64_t threshold) noexcept {
+    constexpr std::uint64_t pressure_reserve_max = 256ULL << 20;
+    const auto pressure_reserve = std::clamp(threshold / 2, kMinResidentBytes, pressure_reserve_max);
+    return std::max(surplus / 4, pressure_reserve);
+  }
+
   struct RamPressure {
     std::uint64_t target = 0;
+    std::uint64_t available = 0, threshold = 0, reserve = 0;
     bool low_memory = false;
+    bool background_trim = false;
     cosmic_pc::SparseRam::BudgetAdjustment status = cosmic_pc::SparseRam::BudgetAdjustment::Applied;
     std::string error;
-    std::chrono::steady_clock::duration maintenance_time{};
+    std::chrono::steady_clock::duration maintenance_time{}, last_maintenance{}, max_maintenance{};
+    std::uint64_t maintenance_batches = 0, reclaimed_bytes = 0, encode_ns = 0;
+    std::uint64_t last_released_bytes = 0, released_bytes = 0;
   };
 
   struct SpillInfo {
@@ -598,7 +734,8 @@ class AndroidBootSession final {
     std::string detail;
   };
 
-  static SpillInfo configure_spill(cosmic_pc::PcMachine& pc, const std::filesystem::path& directory) {
+  static SpillInfo configure_spill(cosmic_pc::PcMachine& pc, const std::filesystem::path& directory,
+                                  bool defer_pressure_packing = false) {
     SpillInfo info;
     if (directory.empty()) return info;
     auto& memory = pc.cpu.memory;
@@ -611,7 +748,8 @@ class AndroidBootSession final {
       return info;
     }
     try {
-      auto file = std::make_unique<AndroidRamBacking>(directory, memory.size(), info.limit, packed);
+      auto file = std::make_unique<AndroidRamBacking>(directory, memory.size(), info.limit, packed,
+                                                      defer_pressure_packing);
       auto* file_stats = file.get();
       using CachePolicy = cosmic_pc::SparseRam::BackingCachePolicy;
       memory.attach_page_backing(std::move(file), packed ? CachePolicy::Adaptive : CachePolicy::Fixed);
@@ -628,28 +766,55 @@ class AndroidBootSession final {
   static void write_ram_profile(std::ostream& out, const cosmic_pc::PcMachine& pc,
                                 const SpillInfo& spill, const RamPressure* pressure = nullptr) {
     const auto metrics = pc.cpu.memory.metrics();
+    const auto compaction = pc.ram_compaction_stats();
+    const auto codec = spill.file ? spill.file->codec_stats() : AndroidRamBacking::CodecStats{};
+    const auto deferred = spill.file ? spill.file->staging_stats() : AndroidRamBacking::StagingStats{};
+    const auto usable = pc.usable_ram_bytes();
+    const auto resident_cap = std::min(usable, metrics.budget_bytes);
+    const auto raw_backing_capacity = resident_cap + std::min(usable - resident_cap, spill.limit);
     using Adjustment = cosmic_pc::SparseRam::BudgetAdjustment;
     out << "{\"address_space_bytes\":" << pc.cpu.memory.size()
-        << ",\"usable_bytes\":" << pc.usable_ram_bytes()
+        << ",\"usable_bytes\":" << usable
         << ",\"backing_budget_bytes\":" << pc.cpu.memory.budget_bytes()
+        << ",\"raw_backing_capacity_bytes\":" << raw_backing_capacity
         << ",\"resident_policy\":\""
         << (high_ram_profile(pc.cpu.memory.size())
             ? "android-surplus" : "android-half-surplus") << "\""
         << ",\"resident_bytes\":" << metrics.allocated_bytes
         << ",\"resident_metadata_bytes\":" << metrics.metadata_bytes
+        << ",\"page_state_vectors\":" << metrics.page_state_vectors
+        << ",\"pages_per_state_vector\":" << cosmic_pc::SparseRam::kPagesPerTable
         << ",\"pattern_pages\":" << metrics.pattern_pages
         << ",\"sparse_word_pages\":" << metrics.sparse_word_pages
         << ",\"pattern_delta_pages\":" << metrics.pattern_delta_pages
-        << ",\"pattern_delta_bytes\":" << metrics.pattern_delta_bytes;
+        << ",\"pattern_delta_bytes\":" << metrics.pattern_delta_bytes
+        << ",\"compaction_passes\":" << compaction.passes
+        << ",\"compaction_pages\":" << compaction.pages_compacted
+        << ",\"compaction_interval_steps\":" << compaction.interval_steps;
     if (pressure && pressure->target) {
       const auto status = pressure->status == Adjustment::Applied ? "applied" :
                           pressure->status == Adjustment::Reclaiming ? "reclaiming" : "blocked";
       out << ",\"pressure_target_bytes\":" << pressure->target
           << ",\"pressure_status\":" << cosmic_pc::PcMachine::quote(status)
+          << ",\"pressure_host_available_bytes\":" << pressure->available
+          << ",\"pressure_host_threshold_bytes\":" << pressure->threshold
+          << ",\"pressure_host_reserve_bytes\":" << pressure->reserve
+          << ",\"pressure_background_trim\":" << (pressure->background_trim ? "true" : "false")
           << ",\"android_low_memory\":" << (pressure->low_memory ? "true" : "false")
           << ",\"pressure_error\":" << cosmic_pc::PcMachine::quote(pressure->error)
           << ",\"pressure_maintenance_us\":"
-          << std::chrono::duration_cast<std::chrono::microseconds>(pressure->maintenance_time).count();
+          << std::chrono::duration_cast<std::chrono::microseconds>(pressure->maintenance_time).count()
+          << ",\"pressure_maintenance_target_us\":"
+          << std::chrono::duration_cast<std::chrono::microseconds>(kRamReclaimWindow).count()
+          << ",\"pressure_last_maintenance_us\":"
+          << std::chrono::duration_cast<std::chrono::microseconds>(pressure->last_maintenance).count()
+          << ",\"pressure_max_maintenance_us\":"
+          << std::chrono::duration_cast<std::chrono::microseconds>(pressure->max_maintenance).count()
+          << ",\"pressure_maintenance_batches\":" << pressure->maintenance_batches
+          << ",\"pressure_spill_encode_ns\":" << pressure->encode_ns
+          << ",\"pressure_reclaimed_bytes\":" << pressure->reclaimed_bytes
+          << ",\"pressure_last_released_resident_bytes\":" << pressure->last_released_bytes
+          << ",\"pressure_released_resident_bytes\":" << pressure->released_bytes;
     }
     out
         << ",\"spill_mode\":" << cosmic_pc::PcMachine::quote(spill.state)
@@ -662,12 +827,35 @@ class AndroidBootSession final {
         << ",\"spill_packed_pages\":" << (spill.file ? spill.file->packed_pages() : 0)
         << ",\"spill_reads\":" << metrics.backing_reads
         << ",\"spill_writes\":" << metrics.backing_writes
+        << ",\"spill_write_calls\":" << (spill.file ? spill.file->write_calls() : 0)
+        << ",\"spill_grouped_batches\":" << (spill.file ? spill.file->write_batches() : 0)
+        << ",\"spill_grouped_pages\":" << (spill.file ? spill.file->grouped_pages() : 0)
+        << ",\"spill_deferred_enabled\":" << (deferred.enabled ? "true" : "false")
+        << ",\"spill_deferred_staged_pages\":" << deferred.staged_pages
+        << ",\"spill_deferred_pending_pages\":" << deferred.pending_pages
+        << ",\"spill_deferred_packed_pages\":" << deferred.packed_pages
+        << ",\"spill_deferred_failures\":" << deferred.failures
+        << ",\"spill_deferred_yielded_batches\":" << deferred.yielded_batches
+        << ",\"spill_deferred_background_encode_ns\":" << deferred.background_encode_ns
+        << ",\"spill_deferred_foreground_settled_pages\":" << deferred.foreground_settled_pages
+        << ",\"spill_clean_resident_pages\":" << metrics.backing_clean_pages
+        << ",\"spill_clean_reclaims\":" << metrics.backing_clean_reclaims
         << ",\"spill_cache_hits\":" << metrics.backing_cache_hits
         << ",\"spill_cache_bytes\":" << metrics.backing_cache_bytes
         << ",\"spill_cache_capacity_bytes\":" << metrics.backing_cache_capacity_bytes
         << ",\"spill_overwrite_pages\":" << metrics.backing_overwrite_pages
         << ",\"spill_read_us\":" << (spill.file ? spill.file->read_us() : 0)
-        << ",\"spill_write_us\":" << (spill.file ? spill.file->write_us() : 0) << '}';
+        << ",\"spill_write_us\":" << (spill.file ? spill.file->write_us() : 0)
+        << ",\"spill_codec\":{\"encode_attempts\":" << codec.encode_attempts
+        << ",\"encode_packed\":" << codec.encode_packed
+        << ",\"encode_raw\":" << codec.encode_raw
+        << ",\"encode_bypassed\":" << codec.encode_bypassed
+        << ",\"encode_sparse\":" << codec.encode_sparse
+        << ",\"encode_deflate\":" << codec.encode_deflate
+        << ",\"decode_attempts\":" << codec.decode_attempts
+        << ",\"decode_sparse\":" << codec.decode_sparse
+        << ",\"encode_wall_ns\":" << codec.encode.wall_ns
+        << ",\"decode_wall_ns\":" << codec.decode.wall_ns << "}}";
   }
 
   static void check_ata_identify(cosmic_pc::PcMachine& pc, QssdDisk& volume) {
@@ -823,6 +1011,7 @@ class AndroidBootSession final {
 
   enum class KeyRoute : std::uint8_t { None, Bios, Ps2 };
   BootSource source_;
+  const bool use_active_guest_clock_;
   std::array<KeyRoute, 512> key_routes_{};
   std::optional<BootProfile> boot_profile_;
   std::optional<std::string> previous_boot_profile_;

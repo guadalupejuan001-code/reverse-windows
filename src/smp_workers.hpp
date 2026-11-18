@@ -1,51 +1,56 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <functional>
 #include <mutex>
+#include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <vector>
 
 namespace reverse_windows {
 
-// One synchronous dispatch at a time. The VM thread participates and waits
-// for all workers before it touches the machine again.
+// Each job owns one host thread, including the participating VM thread.
+// Workers share a start and a join at the boundary of a dispatch.
 class SmpWorkers {
  public:
-  explicit SmpWorkers(unsigned maximum) {
-    const auto total = std::min(maximum, std::max(1U, std::thread::hardware_concurrency()));
-    try {
-      for (unsigned i = 1; i < total; ++i)
-        workers_.emplace_back([this] { worker(); });
-    } catch (...) {
-      shutdown();
-      throw;
-    }
-  }
+  explicit SmpWorkers(unsigned maximum) : maximum_(maximum) {}
   ~SmpWorkers() { shutdown(); }
 
   unsigned size() const noexcept { return static_cast<unsigned>(workers_.size()) + 1; }
 
+  unsigned prepare(unsigned count) {
+    const auto total = std::min(count, maximum_);
+    try {
+      while (size() < total) {
+        const auto index = size();
+        workers_.emplace_back([this, index] { worker(index); });
+      }
+    } catch (const std::system_error&) {
+      maximum_ = size();
+    }
+    return std::min(count, size());
+  }
+
   void run(unsigned count, const std::function<void(unsigned)>& task) {
-    if (count <= 1 || workers_.empty()) {
-      for (unsigned i = 0; i < count; ++i) task(i);
+    if (count > size()) throw std::logic_error("SMP dispatch requires one worker per job");
+    if (count < 2) {
+      if (count) task(0);
       return;
     }
     {
       std::lock_guard<std::mutex> lock(mutex_);
       task_ = &task;
-      count_ = count;
-      next_.store(0, std::memory_order_relaxed);
-      remaining_ = workers_.size();
+      participants_ = count;
+      remaining_ = count - 1;
       failure_ = {};
       ++generation_;
     }
     ready_.notify_all();
-    execute(count, task);
+    execute(0, task);
     std::unique_lock<std::mutex> lock(mutex_);
     finished_.wait(lock, [this] { return remaining_ == 0; });
     task_ = nullptr;
@@ -53,29 +58,24 @@ class SmpWorkers {
   }
 
  private:
-  void execute(unsigned count, const std::function<void(unsigned)>& task) {
+  void execute(unsigned index, const std::function<void(unsigned)>& task) {
     try {
-      for (;;) {
-        const auto slot = next_.fetch_add(1, std::memory_order_relaxed);
-        if (slot >= count) return;
-        task(slot);
-      }
+      task(index);
     } catch (...) {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!failure_) failure_ = std::current_exception();
     }
   }
-  void worker() {
+  void worker(unsigned index) {
     std::uint64_t seen = 0;
     std::unique_lock<std::mutex> lock(mutex_);
     for (;;) {
-      ready_.wait(lock, [&] { return stopping_ || generation_ != seen; });
+      ready_.wait(lock, [&] { return stopping_ || (generation_ != seen && index < participants_); });
       if (stopping_) return;
       seen = generation_;
       const auto* task = task_;
-      const auto count = count_;
       lock.unlock();
-      execute(count, *task);
+      execute(index, *task);
       lock.lock();
       if (--remaining_ == 0) finished_.notify_one();
     }
@@ -92,10 +92,8 @@ class SmpWorkers {
   std::mutex mutex_;
   std::condition_variable ready_, finished_;
   std::vector<std::thread> workers_;
-  std::atomic<unsigned> next_{0};
   const std::function<void(unsigned)>* task_ = nullptr;
-  unsigned count_ = 0;
-  std::size_t remaining_ = 0;
+  unsigned maximum_, participants_ = 0, remaining_ = 0;
   std::uint64_t generation_ = 0;
   bool stopping_ = false;
   std::exception_ptr failure_;

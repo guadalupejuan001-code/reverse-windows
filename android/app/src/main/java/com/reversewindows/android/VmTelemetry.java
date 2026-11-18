@@ -39,7 +39,7 @@ final class VmTelemetry extends LinearLayout {
     private final TextView resident;
     private final TextView occupancy;
     private final ProgressBar meter;
-    private final LinearLayout[] rows = new LinearLayout[4];
+    private final LinearLayout[] rows = new LinearLayout[5];
     private final TextView[] keys = new TextView[rows.length];
     private final TextView[] values = new TextView[rows.length];
 
@@ -84,7 +84,7 @@ final class VmTelemetry extends LinearLayout {
         backing.setOrientation(VERTICAL);
         activity.add(this, backing, 5);
         LinearLayout backingHeader = activity.row(backing);
-        TextView residentLabel = activity.label("RAM residente", 12, MainActivity.TEXT);
+        TextView residentLabel = activity.label("Datos de RAM residentes", 12, MainActivity.TEXT);
         residentLabel.setTypeface(Typeface.DEFAULT_BOLD);
         backingHeader.addView(residentLabel, new LayoutParams(0, -2, 1));
         occupancy = activity.label("", 11, MainActivity.ERROR);
@@ -166,35 +166,44 @@ final class VmTelemetry extends LinearLayout {
         long usable = number(ram, "usable_bytes", number(machine, "ram_usable_bytes"));
         long used = number(ram, "resident_bytes", number(machine, "ram_allocated_bytes"));
         long limit = number(ram, "backing_budget_bytes", number(machine, "ram_budget_bytes"));
+        long rawCapacity = number(ram, "raw_backing_capacity_bytes");
         boolean knownOccupancy = used >= 0 && limit > 0;
         double ratio = knownOccupancy ? (double) used / limit : 0;
-        heading("RAM utilizable por el invitado", units(usable >= 0 ? usable : logical, GIB, "GiB", 2), "");
+        heading("RAM utilizable por el invitado", units(usable >= 0 ? usable : logical, GIB, "GiB", 2),
+                rawCapacity >= 0 ? "Capacidad estimada sin comprimir · " + units(rawCapacity, GIB, "GiB", 2) : "");
         put(resident, formatted(used, MIB, 1) + " / " + formatted(limit, MIB, 1) + " MiB");
         put(occupancy, knownOccupancy ? String.format(Locale.getDefault(), "%.1f %%", ratio * 100) : "");
         meter.setVisibility(knownOccupancy ? View.VISIBLE : View.GONE);
         if (knownOccupancy) meter.setProgress((int) Math.round(Math.min(ratio, 1) * 1000));
         long pssKiB = number(snapshot, "android_pss_kib");
-        metric(0, "Páginas en archivo", units(number(ram, "spilled_bytes"), MIB, "MiB", 1));
-        metric(1, "Proceso Android (PSS)", pssKiB > 0 ? units(pssKiB, KIB, "MiB", 1) : UNKNOWN);
+        metric(0, "Datos lógicos en respaldo", units(number(ram, "spilled_bytes"), MIB, "MiB", 1));
+        metric(1, "Datos en el archivo temporal", storage(number(ram, "spill_file_payload_bytes")));
         metric(2, "Metadatos de RAM", storage(number(ram, "resident_metadata_bytes")));
-        showRows(3);
+        metric(3, "Vectores de páginas", count(number(ram, "page_state_vectors")));
+        metric(4, "Proceso Android (PSS)", pssKiB > 0 ? units(pssKiB, KIB, "MiB", 1) : UNKNOWN);
+        showRows(5);
     }
 
     private void renderCpu() {
         JSONObject ether = snapshot.optJSONObject("ether_arm64");
+        JSONObject topology = snapshot.optJSONObject("cpu_topology");
         long elapsed = number(snapshot, "elapsed_ms");
         long sessionRate = elapsed > 0 && steps >= 0 ? Math.round(steps * 1000.0 / elapsed) : -1;
         if (stepRate >= 0) {
-            heading("Pasos/s durante ejecución", formatRate(stepRate),
-                    "Promedio real " + formatRate(sessionRate) + " · " + mode);
+            heading("Pasos/s durante las tandas", formatRate(stepRate),
+                    "Desde el inicio " + formatRate(sessionRate) + " pasos/s · " + mode);
         } else {
-            heading("Promedio real de pasos/s", formatRate(sessionRate), mode);
+            heading("Pasos/s desde el inicio", formatRate(sessionRate), mode);
         }
         metric(0, "Pasos x86 de la sesión", count(steps));
-        metric(1, "Pasos de esta fase en Éter ARM64", count(number(ether, "guest_steps")));
-        metric(2, "Bloques Éter ejecutados", count(number(ether, "executed_blocks")));
-        metric(3, "Expulsiones de caché Éter", count(number(ether, "compiled_evictions")));
-        showRows(4);
+        long nativeSteps = number(topology, "phase_ether_arm64_steps");
+        metric(1, nativeSteps >= 0 ? "Pasos Éter ARM64 de la fase" : "Pasos Éter ARM64 de la vCPU de arranque",
+                count(nativeSteps >= 0 ? nativeSteps : number(ether, "guest_steps")));
+        metric(2, "Pasos proyectados por vectores", count(number(topology, "phase_projected_steps")));
+        metric(3, "Bloques encadenados en paralelo", count(number(topology, "parallel_register_continuations")));
+        metric(4, "vCPU iniciadas / configuradas", count(number(topology, "started")) + " / "
+                + count(number(topology, "logical_processors")));
+        showRows(5);
     }
 
     private static String formatRate(long stepsPerSecond) {
@@ -206,11 +215,16 @@ final class VmTelemetry extends LinearLayout {
         JSONObject disk = snapshot.optJSONObject("disk");
         JSONObject io = snapshot.optJSONObject("storage_io");
         JSONObject optical = io == null ? null : io.optJSONObject("bios_boot_media");
+        JSONObject atapi = snapshot.optJSONObject("atapi");
         boolean iso = "iso".equals(snapshot.optString("source"));
         long capacity = number(disk, "logical_bytes");
-        heading(iso ? "Leído del ISO por BIOS" : "Disco lógico QSSD",
-                iso ? units(number(optical, "read_bytes"), MIB, "MiB", 1) : units(capacity, GIB, "GiB", 1),
-                iso ? "CD/DVD · BIOS" : "");
+        long biosBytes = number(optical, "read_bytes");
+        long atapiBytes = number(atapi, "read_bytes", number(atapi, "read_sectors", 0) * 2048);
+        long isoBytesRead = biosBytes >= 0 ? biosBytes + atapiBytes : -1;
+        heading(iso ? "ISO leída en esta fase" : "Disco lógico QSSD",
+                iso ? units(isoBytesRead, MIB, "MiB", 1) : units(capacity, GIB, "GiB", 1),
+                iso ? "BIOS " + units(biosBytes, MIB, "MiB", 1) + " · ATAPI "
+                        + units(atapiBytes, MIB, "MiB", 1) : "");
         metric(0, iso ? "Disco lógico QSSD" : "Lecturas por BIOS",
                 iso ? units(capacity, GIB, "GiB", 1) : count(number(machine, "disk_reads")));
         metric(1, "Archivo QSSD en el teléfono", storage(number(disk, "physical_bytes")));

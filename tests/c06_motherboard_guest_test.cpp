@@ -496,6 +496,8 @@ void pci_acpi_cmos_guest(){
        "ACPI table pointers do not describe the actual firmware");
   need(pc.cpu.read32(AcpiC06::madt_address+36)==0xfee00000U,
        "MADT LAPIC base does not match the mapped MMIO device");
+  need((pc.cpu.read16(AcpiC06::fadt_address+109)&0x0fU)==0x0fU,
+       "FADT must keep MSI disabled when the PCI GPU is absent");
   const auto facs=pc.cpu.read32(AcpiC06::fadt_address+36);
   need(facs==AcpiC06::facs_address && (facs&63U)==0 &&
        pc.cpu.read64(AcpiC06::fadt_address+132)==facs &&
@@ -605,6 +607,116 @@ void pci_acpi_cmos_guest(){
   std::cout<<"C06_PCI_ACPI_CMOS_REAL_GUEST_PASS pci=0x"<<std::hex
            <<guest_pci_id<<std::dec<<" tables=5 reboot=PASS\n";
 }
+void prime_rtc_cmos_guest() {
+  const auto exercise = [](bool apic, bool accelerate) {
+    PcMachine pc(16U << 20);
+    pc.boot_long_mode_demo();
+    run(pc, 4000);
+    auto& cpu = pc.cpu;
+    need(cpu.halted && cpu.is_long_mode() && cpu.cpl() == 0,
+         "RTC fixture did not enter long mode at CPL0");
+    PcMotherboardC06 board(pc);
+    pc.enable_boot_acceleration(accelerate);
+    constexpr std::uint32_t entry=0xa000, handler=0x13000, stack=0x190000;
+    const std::uint8_t vector=apic ? 0x58 : 0x70;
+    cpu.idtr = {0x1000, 0x15000};
+    const auto descriptor = cpu.idtr.base + 16 * vector;
+    cpu.write64(descriptor, (handler & 0xffffU) |
+        (std::uint64_t(cpu.segments[Cpu::CS]) << 16) | (0x8eULL << 40) |
+        (std::uint64_t(handler >> 16) << 48));
+    cpu.write64(descriptor + 8, 0);
+    if (apic) {
+      constexpr auto lapic=PcMotherboardC06::kLocalApic, ioapic=PcMotherboardC06::kIoApic;
+      cpu.write64(0x2000 + 3 * 8, 0x4003);
+      cpu.write64(0x4000 + ((ioapic >> 21) & 511) * 8, ioapic | 0x83);
+      cpu.write64(0x4000 + ((lapic >> 21) & 511) * 8, lapic | 0x83);
+      cpu.write32(lapic + 0xf0, 0x1ff);
+      cpu.write32(ioapic, 0x21);
+      cpu.write32(ioapic + 0x10, 0); // Destination LAPIC ID 0.
+      cpu.write32(ioapic, 0x20);
+      cpu.write32(ioapic + 0x10, vector); // GSI8, edge-triggered, unmasked.
+    }
+
+    const auto out = [](auto& bytes, std::uint8_t port, std::uint8_t value) {
+      emit(bytes, {0x66,0xba,port,0,0xb0,value,0xee}); // MOV DX,port; OUT DX,AL
+    };
+    const auto store = [](auto& bytes, std::uint8_t offset, std::uint8_t opcode) {
+      emit(bytes, {opcode,0x04,0x25,offset,0x90,0,0}); // MOV [0x9000+offset],AL/EAX
+    };
+    const auto read_cmos = [&](auto& bytes, std::uint8_t index, std::uint8_t offset) {
+      out(bytes, 0x70, index);
+      emit(bytes, {0x66,0xba,0x71,0,0xec}); // IN AL,DX
+      store(bytes, offset, 0x88);
+    };
+    const auto write_cmos = [&](auto& bytes, std::uint8_t index, std::uint8_t value) {
+      out(bytes, 0x70, index);
+      out(bytes, 0x71, value);
+    };
+
+    std::vector<std::uint8_t> irq{0x50,0x52}; // PUSH RAX; PUSH RDX
+    read_cmos(irq, 0x0c, 0x07);
+    read_cmos(irq, 0x0c, 0x08);
+    if (apic) {
+      emit(irq, {0xb8,0xb0,0x00,0xe0,0xfe,0xc7,0x00,0,0,0,0}); // LAPIC EOI.
+    } else {
+      out(irq, 0xa0, 0x20);
+      out(irq, 0x20, 0x20);
+    }
+    emit(irq, {0x5a,0x58,0x48,0xcf}); // POP RDX; POP RAX; IRETQ
+    code(cpu, handler, irq);
+
+    std::vector<std::uint8_t> program{0xfa};
+    read_cmos(program, 0x0a, 0x00);
+    write_cmos(program, 0x8a, 0x25); // Select status A with NMI masked, then exact OUT from the fault.
+    read_cmos(program, 0x8a, 0x01);
+    write_cmos(program, 0x0c, 0xff);
+    read_cmos(program, 0x0c, 0x02);
+    write_cmos(program, 0x0d, 0);
+    read_cmos(program, 0x0d, 0x03);
+    write_cmos(program, 0x01, 0xc0); // Seconds alarm wildcard.
+    read_cmos(program, 0x01, 0x04);
+    write_cmos(program, 0x38, 0xa5);
+    read_cmos(program, 0x38, 0x05);
+    if (!apic) {
+      out(program, 0x21, 0xfb); // Master PIC cascade.
+      out(program, 0xa1, 0xfe); // Slave PIC IRQ8.
+    }
+    write_cmos(program, 0x0b, 0x42);
+    read_cmos(program, 0x0b, 0x06);
+    emit(program, {0xfb,0xf4,0x0f,0x31}); // STI; HLT; RDTSC
+    store(program, 0x10, 0x89);
+    emit(program, {0xf4,0x0f,0x31}); // Wait for the second RTC interrupt.
+    store(program, 0x14, 0x89);
+    emit(program, {0xfa,0xf4});
+    code(cpu, entry, program);
+    cpu.eip = entry;
+    cpu.halted = false;
+    cpu.regs[Cpu::ESP] = stack;
+    run(pc, 512);
+    need(cpu.halted && (cpu.read8(0x9000) & 0x7fU) == 0x26 &&
+         (cpu.read8(0x9001) & 0x7fU) == 0x25 && !(cpu.read8(0x9002) & 0x80U) &&
+         cpu.read8(0x9003) == 0x80 && cpu.read8(0x9004) == 0xc0 &&
+         cpu.read8(0x9005) == 0xa5 && cpu.read8(0x9006) == 0x42 &&
+         board.evidence().irq_delivered == 0,
+         "RTC indexed write/read semantics or the first IRQ8 deadline are incorrect");
+    run(pc, 1536);
+    need(cpu.halted && board.evidence().irq_delivered == 1 && cpu.read32(0x9010) &&
+         !cpu.read32(0x9014), "RTC did not wake the guest through the selected interrupt route");
+    run(pc, 1600);
+    constexpr auto period = PcMachine::kVirtualCyclesPerSecond / 2048U;
+    const auto elapsed = cpu.read32(0x9014) - cpu.read32(0x9010);
+    need(cpu.halted && !cpu.flag(Cpu::IF) && cpu.regs[Cpu::ESP] == stack &&
+         board.evidence().irq_delivered == 2 && board.evidence().apic_irqs == (apic ? 2U : 0U) &&
+         (cpu.read8(0x9007) & 0xc0U) == 0xc0U &&
+         !(cpu.read8(0x9008) & 0xc0U) && elapsed >= period * Cpu::kTscTicksPerCycle &&
+         elapsed <= (period + 1) * Cpu::kTscTicksPerCycle,
+         "RTC periodic IRQ8 interval or status C acknowledgment is incorrect");
+  };
+  for (bool apic : {false, true})
+    for (bool accelerate : {false, true}) exercise(apic, accelerate);
+  std::cout << "PRIME_RTC_CMOS_X64_PASS rate_hz=2048 pic_irq8=2 ioapic_irq8=2 status_c_read_clear=1\n";
+}
+
 void prime_pci_inventory() {
   struct Disk final : reverse_windows::BlockDisk {
     std::uint64_t bytes()const noexcept override{return 512;}
@@ -1022,6 +1134,142 @@ void prime_pit_channel2_calibration() {
   std::cout<<"PRIME_C05_PIT_CALIBRATION_PASS pit_counts=4096 pm_delta="<<elapsed
            <<" irq=0 gate=1\n";
 }
+void silent_timer_batching() {
+  constexpr unsigned elapsed=47002;
+  const auto exercise=[](bool accelerate,bool periodic){
+    PcMachine pc(16U<<20);boot32(pc);
+    PcMotherboardC06 board(pc);
+    if(accelerate)pc.enable_boot_acceleration();
+    auto& cpu=pc.cpu;
+    constexpr auto apic=PcMotherboardC06::kLocalApic;
+    cpu.write32(apic+0xf0,0x1ff);
+    cpu.write32(apic+0x320,periodic?0x30042:0x10042);
+    cpu.write32(apic+0x3e0,0x0b);
+    cpu.write32(apic+0x380,7);
+    need(cpu.out_hook(0x43,1,periodic?0xb4:0xb0)&&cpu.out_hook(0x42,1,5)&&
+         cpu.out_hook(0x42,1,0)&&cpu.out_hook(0x61,1,1),"could not configure PIT channel 2");
+    need(pc.device_batch_limit_hook(elapsed)==elapsed,"an IRQ-free timer clipped the batch");
+
+    code(cpu,0xa000,{0xfb,0xf4}); // STI; HLT, retiring the interrupt shadow.
+    cpu.eip=0xa000;
+    cpu.step();
+    cpu.step();
+    need(cpu.halted&&cpu.flag(Cpu::IF),"guest could not enter interruptible HLT");
+    const auto retired=cpu.instructions;
+    run(pc,elapsed);
+    const auto count=cpu.in_hook(0x42,1).value_or(256);
+    const auto speaker=cpu.in_hook(0x61,1).value_or(0)&0x20U;
+    const auto lapic_count=board.interrupt_state().timer_count;
+    need(cpu.halted&&cpu.instructions==retired&&board.evidence().ticks==elapsed&&
+         board.evidence().irq_delivered==0&&board.interrupt_state().pending==0,
+         "silent timers changed retirement, time, or IRQ state");
+    need(count==(periodic?3U:0U)&&lapic_count==(periodic?3U:0U)&&speaker==0x20,
+         "silent timers lost the exact countdown or speaker output");
+
+    cpu.idtr={0x1000,0x15000};
+    cpu.regs[Cpu::ESP]=0x190000;
+    gate(cpu,0x42,0x13000);
+    cpu.write32(apic+0x320,periodic?0x20042:0x42);
+    if(!periodic)cpu.write32(apic+0x380,3);
+    need(pc.device_batch_limit_hook(elapsed)==3,"an IRQ-capable timer must limit the batch");
+    board.advance_one();
+    board.advance_one();
+    need(board.evidence().irq_delivered==0&&cpu.halted,"timer woke the guest early after unmasking");
+    board.advance_one();
+    need(board.evidence().irq_delivered==1&&!cpu.halted&&cpu.eip==0x13000,
+         "timer did not wake the guest at the exact expiry after unmasking");
+  };
+  for(const bool periodic:{false,true}){
+    exercise(false,periodic);
+    exercise(true,periodic);
+  }
+  std::cout<<"PRIME_SILENT_TIMERS_BATCH_PASS ticks="<<elapsed<<" pit2=1 masked_lapic=1 wake_tick=3\n";
+}
+void active_clock_devices_and_pause(){
+  PcMachine pc(16U<<20);boot32(pc);
+  PcMotherboardC06 board(pc);
+  pc.enable_boot_acceleration();
+  auto& cpu=pc.cpu;
+  using namespace std::chrono_literals;
+  auto now=PcMotherboardC06::Clock::time_point{};
+  PcMotherboardC06::Clock::duration advance{};
+  board.enable_active_clock([&] {
+    const auto observed=now;
+    now+=std::exchange(advance,{});
+    return observed;
+  });
+  const auto out=[&](unsigned port,unsigned value){
+    need(cpu.out_hook(port,1,value),"clock fixture could not write timer port");
+  };
+  out(0x43,0x34);out(0x40,5);out(0x40,0);
+  out(0x70,0x0a);out(0x71,0x25);
+  out(0x70,0x0b);out(0x71,0x42);
+  constexpr auto apic=PcMotherboardC06::kLocalApic;
+  cpu.write32(apic+0xf0,0x1ff);
+  cpu.write32(apic+0x320,0x20042);
+  cpu.write32(apic+0x3e0,0x0b);
+  cpu.write32(apic+0x380,7);
+  code(cpu,0xa000,{0xfa,0xf4});
+  cpu.eip=0xa000;
+  advance=1ms;
+  board.run(16);
+  need(board.active_clock_ticks()==3579&&board.active_clock_elapsed_ns()==1000000,
+       "one host millisecond must advance the shared clock exactly");
+  now+=2h;
+  board.run(16);
+  need(board.active_clock_ticks()==3579,"host time between native grants leaked into guest time");
+  advance=1ms;
+  board.run(16);
+  const auto rtc=board.rtc_evidence();
+  need(board.active_clock_ticks()==7159&&board.evidence().ticks==7159&&
+       board.active_clock_elapsed_ns()==2000000&&cpu.in_hook(AcpiC06::pm_timer_port,4)==7159&&
+       board.evidence().pit_irqs==477&&board.interrupt_state().timer_count==2&&
+       rtc.irq8_assertions==1&&rtc.register_c==0xc0&&board.interrupt_state().pending==0x42&&
+       board.evidence().irq_delivered==0,
+       "active elapsed time must preserve fractional ticks and queue overdue interrupts exactly once");
+
+  cpu.idtr={0x1000,0x15000};cpu.regs[Cpu::ESP]=0x190000;
+  gate(cpu,0x42,0x13000);
+  code(cpu,0x13000,{0xfa,0xf4});
+  code(cpu,0xa000,{0xfb,0xf4});
+  cpu.eip=0xa000;cpu.halted=false;
+  board.run(16);
+  need(cpu.halted&&board.evidence().irq_delivered==1&&cpu.eip==0x13002,
+       "active timing dropped a pending IRQ or duplicated elapsed timer edges");
+  advance=2h;
+  board.run(16);
+  need(board.active_clock_elapsed_ns()==7200002000000ULL&&
+       board.active_clock_ticks()==7200ULL*PcMachine::kVirtualCyclesPerSecond+7159,
+       "a long active interval overflowed the oscillator conversion");
+  pc.reset();
+  need(!board.active_clock_enabled()&&board.active_clock_ticks()==0,
+       "warm reboot must restart in deterministic firmware time");
+  std::cout<<"PRIME_ACTIVE_CLOCK_DEVICES_PASS host_ms=2 ticks=7159 pit_edges=477 rtc_edges=1 pause=1 long=1\n";
+}
+void active_clock_on_application_processor(){
+  PcMachine pc(4U<<20);pc.boot_demo();
+  PcMotherboardC06 board(pc,nullptr,{},0,{},nullptr,{2,1});
+  auto& cpu=pc.cpu;
+  cpu.reset(0,0x7200);cpu.a20_enabled=true;
+  cpu.write16(0x7200,0xfeeb);
+  code(cpu,0x9000,{
+      0x0f,0x31,0x66,0xa3,0x00,0x93,0x90,
+      0x0f,0x31,0x66,0xa3,0x04,0x93,
+      0xba,0x08,0x06,0x66,0xed,0x66,0xa3,0x08,0x93,0x90,
+      0x66,0xed,0x66,0xa3,0x0c,0x93,0xfa,0xf4});
+  constexpr auto apic=PcMotherboardC06::kLocalApic;
+  cpu.write32(apic+0x310,1U<<24);
+  cpu.write32(apic+0x300,0x609U);
+  auto now=PcMotherboardC06::Clock::time_point{};
+  board.enable_active_clock([&]{return now+=std::chrono::microseconds(1);});
+  board.run(64);
+  const auto tsc1=cpu.read32(0x9300),tsc2=cpu.read32(0x9304);
+  const auto pm1=cpu.read32(0x9308),pm2=cpu.read32(0x930c);
+  need(!board.faulted_cpu()&&board.processor_steps(1)==13&&tsc2>tsc1&&pm2>pm1&&
+       pm1>=tsc2/cosmic_pc::Cpu::kTscTicksPerCycle&&pm2<=board.evidence().ticks,
+       "RDTSC and PM timer must progress on the AP during a single grant");
+  std::cout<<"PRIME_AP_CLOCK_PASS tsc_delta="<<tsc2-tsc1<<" pm_delta="<<pm2-pm1<<'\n';
+}
 void prime_bios_clock() {
   PcMachine pc(16U<<20);
   pc.boot_demo();
@@ -1368,6 +1616,7 @@ int main(){
     optical_irq_wakes_sti_hlt();
     pic_legacy_x87_guest();
     pci_acpi_cmos_guest();
+    prime_rtc_cmos_guest();
     prime_pci_inventory();
     ioapic_lapic_guest();
     ioapic_id_x64_guest();
@@ -1376,6 +1625,9 @@ int main(){
     tsc_across_halt();
     prime_acpi_sci_timer();
     prime_pit_channel2_calibration();
+    silent_timer_batching();
+    active_clock_devices_and_pause();
+    active_clock_on_application_processor();
     prime_bios_clock();
     prime_vga_graphics_ports();
     ps2_keyboard_guest();

@@ -157,7 +157,7 @@ class AcpiC06 {
   }
 
  public:
-  static void install(cosmic_pc::Cpu& cpu,bool ide,bool pci_mmio=false) {
+  static void install(cosmic_pc::Cpu& cpu,bool ide,bool graphics_device=false) {
     if(cpu.memory.size()<0x100000)throw std::runtime_error("ACPI BIOS RAM unavailable");
     const auto processors = cpu.topology().logical_processors();
     const auto dsdt_pointer = processors > 1 ? smp_dsdt_address : dsdt_address;
@@ -188,7 +188,10 @@ class AcpiC06 {
     u32(fadt,76,pm_timer_port);
     fadt[88]=4;fadt[89]=2;fadt[91]=4;
     fadt[108]=0x32;          // CMOS century register
-    u16(fadt,109,0x0f);     // Legacy devices, 8042, no legacy VGA probing or MSI.
+    // Legacy devices and 8042 are present, legacy VGA probing is disabled.
+    // The PCI graphics device delivers its message interrupts through LAPIC.
+    constexpr std::uint16_t legacy_boot_flags=0x07, msi_not_supported=0x08;
+    u16(fadt,109,legacy_boot_flags | (graphics_device ? 0 : msi_not_supported));
     u32(fadt,112,0x30);     // No fixed-feature power or sleep button.
     u64(fadt,132,facs_address);
     u64(fadt,140,dsdt_pointer); // X_DSDT
@@ -219,7 +222,7 @@ class AcpiC06 {
     u32(madt,entry+4,sci_irq);u16(madt,entry+8,0x0f); // Active-low, level-triggered.
     publish(cpu,madt_address,std::move(madt));
 
-    const auto aml=dsdt_aml(ide,pci_mmio,processors);
+    const auto aml=dsdt_aml(ide,graphics_device,processors);
     auto dsdt=table("DSDT",36+aml.size(),2);
     std::copy(aml.begin(),aml.end(),dsdt.begin()+36);
     publish(cpu,dsdt_pointer,std::move(dsdt));

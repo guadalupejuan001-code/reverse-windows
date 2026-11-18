@@ -32,6 +32,13 @@ class GuestVbeFabric {
     try {
       width_ = width;
       height_ = height;
+      // Each captured row reuses the same nearest-neighbor source columns.
+      if (source_width_ != info.width || sample_columns_.size() != width) {
+        sample_columns_.resize(width);
+        for (unsigned x = 0; x < width; ++x)
+          sample_columns_[x] = x * info.width / width;
+        source_width_ = info.width;
+      }
       rows_.assign(height, xgpu::FramebufferSpan{width, 0});
       if (full) pixels_.resize(std::size_t(width) * height);
       ++stats_.captures;
@@ -80,9 +87,10 @@ class GuestVbeFabric {
   xgpu::FramebufferWorkAuthority gpu_;
   qssd::GraphicsWorkMemory<xgpu::FramebufferWorkPlan> work_{4};
   Stats stats_;
-  unsigned width_ = 0, height_ = 0;
+  unsigned width_ = 0, height_ = 0, source_width_ = 0;
   bool initialized_ = false;
   std::vector<xgpu::FramebufferSpan> rows_;
+  std::vector<unsigned> sample_columns_;
   std::vector<std::uint32_t> sorted_pages_;
   std::vector<std::uint8_t> source_;
   std::vector<std::uint32_t> pixels_, packet_;
@@ -122,8 +130,8 @@ class GuestVbeFabric {
       const auto first_x = ceil_scale(first_source_x, width_, info.width);
       const auto last_x = ceil_scale(end_source_x, width_, info.width);
       if (first_x == last_x) continue;
-      const auto source_x = first_x * info.width / width_;
-      const auto read_bytes = std::size_t((last_x - 1) * info.width / width_ - source_x + 1) * 4;
+      const auto source_x = sample_columns_[first_x];
+      const auto read_bytes = std::size_t(sample_columns_[last_x - 1] - source_x + 1) * 4;
       source_.resize(read_bytes);
       machine_.cpu.memory.read_block(info.physical_address + offset + source_x * 4,
                                      source_.data(), read_bytes);
@@ -132,7 +140,7 @@ class GuestVbeFabric {
       auto& changed = rows_[y];
       auto* output = pixels_.data() + std::size_t(y) * width_;
       for (unsigned x = first_x; x < last_x; ++x) {
-        const auto* bgrx = source_.data() + std::size_t(x * info.width / width_ - source_x) * 4;
+        const auto* bgrx = source_.data() + std::size_t(sample_columns_[x] - source_x) * 4;
         const auto argb = 0xff000000U | (std::uint32_t(bgrx[2]) << 16) |
             (std::uint32_t(bgrx[1]) << 8) | bgrx[0];
         if (!full && output[x] == argb) continue;
