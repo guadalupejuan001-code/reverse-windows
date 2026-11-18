@@ -11,6 +11,8 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 #include <unistd.h>
 
 namespace {
@@ -74,19 +76,27 @@ void verify_ram_profile() {
   const auto report = Session::check_hardware({}, -1, 0, {}, prime);
   require(counter(report, "usable_bytes") == Session::kPrimeRamBytes &&
               counter(report, "address_space_bytes") == prime.physical_bytes &&
-              counter(report, "backing_budget_bytes") == 3840 * mib &&
+              counter(report, "backing_budget_bytes") == 2880 * mib &&
               report.find("\"resident_policy\":\"android-surplus\"") != std::string::npos &&
               counter(report, "resident_bytes") < mib,
-          "Prime must expose 64 GiB and use the full Android surplus on demand");
+          "Prime must expose 64 GiB while reserving host memory");
   const auto phone = Session::ram_profile(768 * mib, 256 * mib, false, true);
-  require(phone.backing_bytes == 512 * mib, "Prime must not halve the phone's RAM surplus");
+  require(phone.backing_bytes == 384 * mib, "Prime must reserve 128 MiB above the Android threshold");
+  const auto abundant_prime = Session::ram_profile(UINT64_MAX, 0, false, true);
+  require(abundant_prime.backing_bytes == abundant_prime.physical_bytes,
+          "Overflow must not limit backing on a host with abundant RAM");
   Session live({}, 0, Session::BootSource::SelfTest, -1, 0, phone);
   const auto used = counter(live.diagnostic(), "resident_bytes");
   constexpr std::uint64_t page = cosmic_pc::MemoryFabric::kPageSize;
-  live.sample_ram_pressure(1024 * mib, 256 * mib, false);
+  live.sample_ram_pressure(768 * mib - used, 256 * mib, false);
   require(!live.maintain_ram_budget() &&
-              counter(live.diagnostic(), "backing_budget_bytes") == (768 * mib + used) / page * page,
-          "Prime must grow to the full live surplus plus its existing guest pages");
+              counter(live.diagnostic(), "backing_budget_bytes") == phone.backing_bytes,
+          "Accounting for already resident bytes must not grow the budget on a stable host");
+  live.sample_ram_pressure(1024 * mib, 256 * mib, false);
+  const auto surplus = 768 * mib + used;
+  require(!live.maintain_ram_budget() &&
+              counter(live.diagnostic(), "backing_budget_bytes") == (surplus - surplus / 4) / page * page,
+          "Prime must use only the live surplus left after the reserve");
   live.sample_ram_pressure(256 * mib, 256 * mib, false);
   require(!live.maintain_ram_budget() &&
               counter(live.diagnostic(), "backing_budget_bytes") == 16 * mib &&
@@ -266,17 +276,18 @@ void verify_packed_ram64(const std::filesystem::path& directory) {
   Session live({}, 0, Session::BootSource::SelfTest, -1, 0, prime, cache);
   const auto initial = live.diagnostic();
   require(initial.find("\"spill_compression\":true") != std::string::npos &&
-              counter(initial, "backing_budget_bytes") == 600 * mib &&
+              counter(initial, "backing_budget_bytes") == 450 * mib &&
               counter(initial, "spill_cache_capacity_bytes") == 2 * mib,
           "A normal Prime session must attach the compressed QSSD store");
-  live.sample_ram_pressure(threshold, threshold, true);
+  live.sample_ram_pressure(0, 0, true);
   require(!live.maintain_ram_budget() &&
               counter(live.diagnostic(), "backing_budget_bytes") == 16 * mib &&
-              counter(live.diagnostic(), "spill_cache_capacity_bytes") == 128 * 1024,
-          "Android pressure must still reclaim the additional RAM");
+              counter(live.diagnostic(), "spill_cache_capacity_bytes") == 128 * 1024 &&
+              live.diagnostic().find("\"pressure_background_trim\":true") != std::string::npos,
+          "Explicit background trim must still reclaim all but the floor");
   live.sample_ram_pressure(threshold + 600 * mib - 32 * 1024, threshold, false);
   require(!live.maintain_ram_budget() &&
-              counter(live.diagnostic(), "pressure_target_bytes") >= 599 * mib &&
+              counter(live.diagnostic(), "pressure_target_bytes") >= 449 * mib &&
               counter(live.diagnostic(), "usable_bytes") == Session::kPrimeRamBytes,
           "Prime must restore its resident budget with the same E820 map");
 
@@ -310,15 +321,85 @@ void verify_packed_ram64(const std::filesystem::path& directory) {
     backing.write(end, raw.data());
     backing.read(end, restored.data());
     require(restored == raw && !backing.packed_pages(), "A sole half can grow in its old block");
+    auto changed_raw = raw;
+    changed_raw.back() ^= 1;
+    backing.write(end, changed_raw.data());
+    backing.read(end, restored.data());
+    require(restored == changed_raw, "A byte change must invalidate the exact raw candidate");
     backing.write(end, first.data());
     backing.write(2, second.data());
     backing.read(2, restored.data());
     require(restored == second && backing.packed_pages() == 2 &&
                 backing.file_payload_bytes() == 2 * page,
             "Shrinking a raw record must make its other half available");
+    const auto codec = backing.codec_stats();
+    require(codec.encode_attempts == 6 && codec.encode_packed == 4 && codec.encode_raw == 2 &&
+                codec.encode_bypassed == 2 && codec.decode_attempts == 3 &&
+                codec.encode.wall_ns > 0 && codec.decode.wall_ns > 0,
+            "Codec work must exclude raw reads and exact repeats of a rejected page");
     backing.reset();
     require(backing.file_payload_bytes() == 0 && backing.packed_pages() == 0,
-            "Reset must clear the compressed slot index");
+            "Reset must clear every slot in the temporary compressed backing");
+    backing.write(0, changed_raw.data());
+    const auto after_reset = backing.codec_stats();
+    require(backing.file_payload_bytes() == page && backing.packed_pages() == 0 &&
+                after_reset.encode_attempts == 1 && after_reset.encode_raw == 1 &&
+                after_reset.encode_bypassed == 0 && after_reset.decode_attempts == 0,
+            "Reset must clear the compressed slot index and remembered codec work");
+    std::cout << "PRIME_RAM_CODEC_SPLIT_PASS encode=" << codec.encode_attempts
+              << " decode=" << codec.decode_attempts << " bypass=" << codec.encode_bypassed
+              << " encode_ns=" << codec.encode.wall_ns << " decode_ns=" << codec.decode.wall_ns << '\n';
+  }
+
+  {
+    // A deadline during compression must leave the uncommitted suffix in
+    // the caller's RAM. The next write can group it with a new page.
+    using Ram = cosmic_pc::SparseRam;
+    Backing backing(cache, prime.physical_bytes, 3 * page, true);
+    const Backing::PageWrite first_batch[]{{0, raw.data()}, {1, first.data()}};
+    require(backing.write_pages(first_batch, 2, Ram::ReclaimClock::time_point::min()) == 1 &&
+                backing.write_calls() == 1 && backing.write_batches() == 0,
+            "An expired codec grant must commit only its first page");
+    const Backing::PageWrite second_batch[]{{1, first.data()}, {end, second.data()}};
+    require(backing.write_pages(second_batch, 2, Ram::ReclaimClock::time_point::max()) == 2 &&
+                backing.write_calls() == 2 && backing.write_batches() == 1 &&
+                backing.grouped_pages() == 2 && backing.file_payload_bytes() == 2 * page,
+            "Adjacent packed halves must use one file write with correct accounting");
+    backing.read(0, restored.data());
+    require(restored == raw, "The first committed page must remain intact");
+    backing.read(1, restored.data());
+    require(restored == first, "The resumed page must match its caller's RAM");
+    backing.read(end, restored.data());
+    require(restored == second, "The other packed half must match its caller's RAM");
+  }
+
+  {
+    // Store the two packed formats next to each other in one QSSD block.
+    // The sparse page has 247 live words, the largest mask that fits.
+    std::array<std::uint8_t, page> sparse{}, repeated;
+    for (std::size_t word = 0; word < 246; ++word) {
+      std::copy_n(raw.data() + word * 8, 8, sparse.data() + word * 16);
+      sparse[word * 16] |= 1;
+    }
+    sparse.back() = 0x91;
+    for (std::size_t offset = 0; offset < repeated.size(); offset += 128)
+      std::copy_n(raw.data(), 128, repeated.data() + offset);
+
+    using Ram = cosmic_pc::SparseRam;
+    Backing backing(cache, prime.physical_bytes, 2 * page, true);
+    const Backing::PageWrite mixed[]{{0, sparse.data()}, {1, repeated.data()}, {2, raw.data()}};
+    require(backing.write_pages(mixed, 3, Ram::ReclaimClock::time_point::max()) == 3 &&
+                backing.packed_pages() == 2 && backing.file_payload_bytes() == 2 * page,
+            "Sparse, dictionary and raw pages must share the original file quota");
+    for (const auto& write : mixed) {
+      backing.read(write.page, restored.data());
+      require(std::equal(restored.begin(), restored.end(), write.bytes),
+              "Each mixed spill format must restore all 4096 bytes");
+    }
+    const auto codec = backing.codec_stats();
+    require(codec.encode_sparse == 1 && codec.encode_deflate == 2 && codec.decode_sparse == 1 &&
+                codec.encode_raw == 1 && codec.decode_attempts == 2,
+            "Mixed spill metrics must distinguish sparse, deflate and raw pages");
   }
 
   Pc pc(prime.physical_bytes, 8 * page);
@@ -360,7 +441,137 @@ void verify_packed_ram64(const std::filesystem::path& directory) {
   std::cout << "PRIME_RAM64_QSSD_PACKED_PASS guest_bytes=" << Session::kPrimeRamBytes
             << " highest_test_address=" << end * page
             << " guest_test_bytes=" << 16 * page << " qssd_test_bytes="
-            << stats->file_payload_bytes() << " prime_phone_budget_mib=600\n";
+            << stats->file_payload_bytes() << " prime_phone_budget_mib=" << prime.backing_bytes / mib << '\n';
+}
+
+void verify_deferred_ram_reclaim(const std::filesystem::path& directory) {
+  using Backing = reverse_windows::AndroidRamBacking;
+  using Ram = cosmic_pc::SparseRam;
+  using Clock = Ram::ReclaimClock;
+  using Adjustment = Ram::BudgetAdjustment;
+  constexpr auto page = Backing::kPageSize;
+  constexpr auto wait_limit = std::chrono::seconds(10);
+  constexpr auto grant = std::chrono::milliseconds(3);
+  constexpr std::size_t sparse_pages = 64, raw_pages = 128;
+  constexpr std::size_t total_pages = sparse_pages + raw_pages;
+  constexpr std::uint64_t capacity = (sparse_pages / 2 + raw_pages) * page;
+  constexpr std::uint64_t roomier_capacity = 1024 * page;
+  constexpr std::uint64_t logical = 2048 * page;
+  constexpr auto cache_policy = Ram::BackingCachePolicy::Adaptive;
+  const auto cache = directory / "deferred-ram-cache";
+  std::filesystem::create_directory(cache);
+  require(Backing::spill_budget(cache) >= roomier_capacity, "Deferred RAM test needs storage headroom");
+
+  std::vector<std::uint8_t> input(total_pages * page);
+  std::uint32_t random = 0x193ac6e5U;
+  for (std::size_t index = 0; index < total_pages; ++index) {
+    const auto bytes = index < sparse_pages ? 1450 : page;
+    auto* first = input.data() + index * page;
+    for (std::size_t byte = 0; byte < bytes; ++byte) {
+      random ^= random << 13;
+      random ^= random >> 17;
+      random ^= random << 5;
+      first[byte] = std::uint8_t(random);
+    }
+  }
+  const auto wait_for_worker = [&](const Backing& backing) {
+    const auto deadline = Clock::now() + wait_limit;
+    while (backing.staging_stats().pending_pages && Clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    require(backing.staging_stats().pending_pages == 0, "Deferred RAM work must settle");
+  };
+  const auto packed_write = [&](Backing& backing, std::uint64_t index, const std::uint8_t* source) {
+    const Backing::PageWrite write{index, source};
+    const auto deadline = Clock::now() + wait_limit;
+    while (Clock::now() < deadline) {
+      if (backing.write_pages(&write, 1, Clock::now() + grant) == 1) return;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    throw std::runtime_error("Deferred backed page must make progress");
+  };
+
+  {
+    Ram ram(logical, logical);
+    auto backing = std::make_unique<Backing>(cache, logical, roomier_capacity, true, true);
+    auto& store = *backing;
+    ram.attach_page_backing(std::move(backing), cache_policy);
+    ram.write_block(0, input.data(), page);
+    const auto deadline = Clock::now() + wait_limit;
+    auto result = Adjustment::Reclaiming;
+    while (result == Adjustment::Reclaiming && Clock::now() < deadline)
+      result = ram.adjust_payload_budget(0, 1, Clock::now() + grant);
+    const auto enabled = store.staging_stats().enabled;
+    require(result == Adjustment::Applied && ram.allocated_bytes() == 0 &&
+                store.staging_stats().staged_pages == unsigned(enabled),
+            "A finite single-page reclaim must use staging when the worker is available");
+    std::array<std::uint8_t, page> restored;
+    ram.read_block(0, restored.data(), restored.size());
+    require(std::equal(restored.begin(), restored.end(), input.data()),
+            "Raw staged RAM must be visible before compression finishes");
+    wait_for_worker(store);
+    const auto staged = store.staging_stats();
+    require(staged.packed_pages == unsigned(enabled) && store.packed_pages() == 1 &&
+                (staged.background_encode_ns > 0) == enabled && staged.failures == 0,
+            "Deferred or synchronous packing must finish the single page");
+    std::cout << "PRIME_DEFERRED_RAM_SINGLE_PASS worker_enabled=" << enabled << '\n';
+  }
+
+  for (const bool allow_deferred : {false, true}) {
+    Ram ram(logical, logical);
+    auto backing = std::make_unique<Backing>(cache, logical, capacity, true, allow_deferred);
+    auto& store = *backing;
+    ram.attach_page_backing(std::move(backing), cache_policy);
+    ram.write_block(0, input.data(), input.size());
+    const auto deadline = Clock::now() + wait_limit;
+    std::vector<std::uint8_t> restored(input.size());
+    auto result = Adjustment::Reclaiming;
+    do {
+      result = ram.adjust_payload_budget(0, 128, Clock::now() + grant);
+      ram.read_block(0, restored.data(), restored.size());
+      require(restored == input, "Spill must preserve all bytes during deferred compression");
+      if (result == Adjustment::Reclaiming) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (result == Adjustment::Reclaiming && Clock::now() < deadline);
+    require(result == Adjustment::Applied && ram.allocated_bytes() == 0 &&
+                ram.spilled_pages() == total_pages,
+            "Mixed RAM reclaim must fit at the exact packed capacity");
+    wait_for_worker(store);
+    const auto staged = store.staging_stats();
+    require(store.file_payload_bytes() == capacity && store.packed_pages() == sparse_pages &&
+                staged.failures == 0 &&
+                (staged.enabled ? staged.staged_pages > 0 && staged.staged_pages < total_pages
+                                : staged.staged_pages == 0) &&
+                (allow_deferred || !staged.enabled),
+            "Deferred packing must preserve the quota and single-core fallback");
+    bool full = false;
+    try { store.write(total_pages, input.data() + sparse_pages * page); }
+    catch (const Backing::CapacityExceeded&) { full = true; }
+    ram.read_block(0, restored.data(), restored.size());
+    require(full && restored == input, "Quota exhaustion must preserve all backed RAM");
+  }
+
+  {
+    Backing backing(cache, logical, roomier_capacity, true, true);
+    std::array<std::uint8_t, page> restored;
+    for (unsigned attempt = 0; attempt < 18; ++attempt) {
+      // A pending worker must never publish a copy after the guest releases
+      // its record and replaces that page or after the whole store is reset.
+      packed_write(backing, 0, input.data());
+      if (attempt % 3 == 0) backing.discard(0);
+      if (attempt % 3 == 1) backing.reset();
+      backing.write(0, input.data() + sparse_pages * page);
+      // Follow the replacement with another job so an in-flight worker
+      // must finish processing its older snapshot before we read it back.
+      packed_write(backing, 1, input.data() + page);
+      wait_for_worker(backing);
+      backing.read(0, restored.data());
+      require(std::equal(restored.begin(), restored.end(), input.data() + sparse_pages * page),
+              "A worker snapshot must not overwrite a reused page after discard or reset");
+      backing.discard(0);
+      backing.discard(1);
+    }
+  }
+  std::cout << "PRIME_DEFERRED_RAM_RECLAIM_PASS exact_capacity=1 single_page=1"
+               " single_core_fallback=1 generation_checked=1\n";
 }
 
 void verify_shared_ram(const std::filesystem::path& directory) {
@@ -434,6 +645,20 @@ void verify_shared_ram(const std::filesystem::path& directory) {
                 ram.metrics().backing_reads == stats.backing_reads && ram.metrics().backing_overwrite_pages == 1,
             "A full BIOS transfer into backed RAM must skip the old page");
     require(cpu.read32(base) == 0x003bd4a1, "A full BIOS transfer must publish its new bytes");
+    if (policy == CachePolicy::Adaptive) {
+      reverse_windows::SmpWorkers workers(2);
+      require(workers.prepare(2) == 2, "Shared QSSD test needs two readers");
+      std::array<std::array<std::uint8_t, page>, 2> restored;
+      original[0] = 1;
+      workers.run(2, [&](unsigned worker) {
+        ram.read_parallel_ram_block(base + page, restored[worker].data(), page);
+      });
+      const auto shared = ram.metrics();
+      require(restored[0] == original && restored[1] == original &&
+                  shared.backing_reads == stats.backing_reads + 1 &&
+                  shared.backing_cache_hits == stats.backing_cache_hits + 1,
+              "Both workers must reuse one real QSSD read and the exact decoded bytes");
+    }
     return {stats.backing_reads, stats.backing_cache_hits, us};
   };
 
@@ -538,6 +763,114 @@ auto long_mode_test_sector(const std::uint8_t (&guest)[N]) {
   return boot;
 }
 
+void verify_late_prime_pressure(const std::filesystem::path& path) {
+  constexpr std::uint64_t mib = 1024 * 1024;
+  constexpr auto threshold = 64 * mib;
+  constexpr std::uint64_t page = cosmic_pc::MemoryFabric::kPageSize;
+  const std::uint8_t guest[] = {
+      0xbf,0x08,0x30,0,0, 0xb8,0x83,0,0x20,0, 0xb9,0x20,0,0,0, // PDE[1..32], 2 MiB identity pages.
+      0x48,0xab,0x05,0,0,0x20,0,0xe2,0xf7,                     // STOSQ; advance physical base; LOOP.
+      0xbf,0,0,0x20,0, 0xb8,0x78,0x56,0x34,0x12, 0xbb,0,0x40,0,0,
+      0xb9,0x28,0,0,0,0xf3,0x48,0xab,                          // 40 words per page, too many to compact.
+      0x48,0x81,0xc7,0xc0,0x0e,0,0,0xff,0xcb,0x75,0xed,0xfa,0xf4}; // Next of 16384 pages; CLI; HLT.
+  const auto boot = long_mode_test_sector(guest);
+  Session::create_disk(path, 1);
+  {
+    reverse_windows::QssdDisk disk(path);
+    require(disk.write(0, 1, boot.data()), "Could not persist the Prime pressure guest");
+  }
+  const auto profile = Session::ram_profile(512 * mib, threshold, false, true);
+  Session live(path, 0, Session::BootSource::Disk, -1, 0, profile, path.parent_path());
+  auto result = Session::Step::Running;
+  for (unsigned slice = 0; result == Session::Step::Running && slice < 20; ++slice)
+    result = live.step(50000);
+  if (result != Session::Step::Halted)
+    throw std::runtime_error("Prime pressure guest did not populate RAM: " + live.diagnostic());
+  const auto before = live.diagnostic(false);
+  const auto resident = counter(before, "resident_bytes");
+  require(resident >= 64 * mib && counter(before, "spill_writes") == 0,
+          "Prime pressure guest must start with a populated resident working set");
+
+  live.sample_ram_pressure(threshold, threshold, true);
+  require(live.maintain_ram_budget(), "Foreground pressure must reclaim in bounded batches");
+  auto partial = live.diagnostic(false);
+  // A short grant can expire while searching through hot pages before its
+  // first write, especially when a test host is running the ARM64 binary.
+  for (unsigned batch = 0; batch < 32 && counter(partial, "spill_writes") == 0; ++batch) {
+    require(live.maintain_ram_budget(), "Foreground RAM search must remain resumable");
+    partial = live.diagnostic(false);
+  }
+  const auto target = counter(partial, "pressure_target_bytes");
+  const auto spills = counter(partial, "spill_writes");
+  require(target == (resident - 32 * mib) / page * page &&
+              spills != 0 && spills <= 128 &&
+              counter(partial, "pressure_maintenance_target_us") == 3000 &&
+              (counter(partial, "pressure_spill_encode_ns") > 0 ||
+               counter(partial, "spill_deferred_staged_pages") > 0) &&
+              counter(partial, "spill_write_calls") > 0 &&
+              counter(partial, "pressure_reclaimed_bytes") >= spills * page &&
+              counter(partial, "pressure_released_resident_bytes") ==
+                  resident + counter(before, "spill_cache_bytes") -
+                  counter(partial, "resident_bytes") - counter(partial, "spill_cache_bytes") &&
+              counter(partial, "pressure_last_released_resident_bytes") > 0 &&
+              counter(partial, "pressure_last_released_resident_bytes") <=
+                  counter(partial, "pressure_released_resident_bytes") &&
+              counter(partial, "raw_backing_capacity_bytes") <= Session::kPrimeRamBytes &&
+              partial.find("\"pressure_background_trim\":false") != std::string::npos,
+          "Foreground pressure must reserve host headroom without targeting the 16 MiB floor");
+
+  // A fresh surplus supersedes an unfinished reclaim before another page is evicted.
+  live.sample_ram_pressure(512 * mib, threshold, false);
+  require(!live.maintain_ram_budget() && !live.maintain_ram_budget(),
+          "A fresh healthy reading must cancel stale pressure maintenance");
+  const auto recovered = live.diagnostic(false);
+  require(counter(recovered, "spill_writes") == spills &&
+              counter(recovered, "pressure_target_bytes") >= 380 * mib &&
+              counter(recovered, "usable_bytes") == Session::kPrimeRamBytes,
+          "Recovering headroom must keep remaining guest pages and the original E820 map");
+
+  live.sample_ram_pressure(UINT64_MAX, 0, false);
+  require(!live.maintain_ram_budget() &&
+              counter(live.diagnostic(false), "backing_budget_bytes") == profile.physical_bytes,
+          "Live surplus accounting must saturate before adding resident bytes");
+  std::cout << "PRIME_FOREGROUND_RAM_PRESSURE_PASS target_bytes=" << target
+            << " first_batch_spills=" << spills
+            << " maintenance_us=" << counter(partial, "pressure_maintenance_us")
+            << " stale_reclaim_stopped=1 logical_gib=64\n";
+}
+
+void verify_active_guest_clock(const std::filesystem::path& path) {
+  const std::uint8_t guest[]{
+      0xb9,0,0x10,0,0,          // MOV ECX,4096
+      0x0f,0x31,0x90,0xe2,0xfb, // RDTSC; NOP; LOOP
+      0xfa,0xf4};
+  const auto boot = long_mode_test_sector(guest);
+  Session::create_disk(path, 1);
+  {
+    reverse_windows::QssdDisk disk(path);
+    require(disk.write(0, 1, boot.data()), "Could not write the clock fixture");
+  }
+  Session session(path, 0, Session::BootSource::Disk, -1, 0, Session::kDefaultRamProfile,
+                  {}, {}, {}, Session::kPrimeCpuTopology, true);
+  require(session.diagnostic(false).find("\"clock_source\":\"guest-cycles\"") != std::string::npos,
+          "Firmware must start with the deterministic clock");
+  for (unsigned slice = 0; slice < 1024 && !session.is_stopped(); ++slice) {
+    const auto deadline = cosmic_pc::PcMachine::RunClock::now() + std::chrono::milliseconds(8);
+    if (session.step(32, deadline) == Session::Step::Fault)
+      throw std::runtime_error(session.diagnostic());
+  }
+  const auto result = session.diagnostic(false);
+  require(session.is_stopped() &&
+              result.find("\"clock_source\":\"host-active-monotonic\"") != std::string::npos,
+          "The x64 guest must complete with the active monotonic clock");
+  constexpr std::uint64_t second = 1'000'000'000, hz = cosmic_pc::PcMachine::kVirtualCyclesPerSecond;
+  const auto elapsed = counter(result, "active_clock_elapsed_ns");
+  const auto ticks = counter(result, "active_clock_ticks");
+  require(ticks > 0 && ticks == elapsed / second * hz + elapsed % second * hz / second,
+          "Active clock ticks must follow the declared oscillator rate");
+  std::cout << "PRIME_ANDROID_ACTIVE_CLOCK_PASS deterministic_firmware=1 long64=1 ticks=" << ticks << '\n';
+}
+
 void verify_arm64_session(const std::filesystem::path& path) {
   const std::uint8_t guest[]{
       0x0f,0x09,                              // WBINVD at CPL0, then continue.
@@ -575,10 +908,20 @@ void verify_arm64_session(const std::filesystem::path& path) {
   const auto native_steps = counter(ether, "guest_steps");
   require(cosmic_pc::Cpu::ether_arm64_host() ? native_steps >= 12 : native_steps == 0,
           "Android native session selected the wrong launch path");
+  require(counter(info, "phase_ether_arm64_steps") == native_steps &&
+              counter(info, "phase_projected_steps") == 0 &&
+              counter(info, "phase_x86_steps") == counter(info, "session_steps"),
+          "Live Android metrics must report the whole phase and its native and projected subsets");
+  require(counter(info, "translated_steps") == native_steps &&
+              counter(info, "translated_steps") + counter(info, "batched_steps") +
+                  counter(info, "interpreted_steps") == counter(info, "phase_x86_steps"),
+          "Coverage must account for all guest steps in the phase without counting subsets twice");
   const auto loop_dispatches = counter(ether, "repeated_loop_dispatches");
   const auto loop_steps = counter(ether, "repeated_loop_steps");
   require(loop_steps <= native_steps && ((loop_dispatches == 0) == (loop_steps == 0)),
           "Android diagnostics must report repeated loops within native retired steps");
+  require(counter(ether, "state_vector_steps") == 0 && counter(ether, "state_vector_dispatches") == 0,
+          "The pointer loop must stay on the guarded RAM path");
   const auto version_hits = counter(ether, "code_version_hits");
   const auto byte_checks = counter(ether, "code_byte_checks");
   const auto code_bytes = counter(ether, "code_bytes_read");
@@ -659,9 +1002,12 @@ int main(int argc, char** argv) {
     const TestDiskDirectory dir;
     verify_ram_spill(dir.path);
     verify_packed_ram64(dir.path);
+    verify_deferred_ram_reclaim(dir.path);
     verify_shared_ram(dir.path);
     verify_real_mode_ps2(dir.path / "keyboard-irq.rqvd", true);
     verify_real_mode_ps2(dir.path / "keyboard-poll.rqvd", false);
+    verify_late_prime_pressure(dir.path / "ram-pressure.rqvd");
+    verify_active_guest_clock(dir.path / "active-clock.rqvd");
     verify_arm64_session(dir.path / "ether-arm64.rqvd");
     verify_idt_diagnostic(dir.path / "idt-diagnostic.rqvd");
     const auto disk = dir.path / "android-test.rqvd";
@@ -724,6 +1070,11 @@ int main(int argc, char** argv) {
                   live.find("\"status\":\"waiting_key\"") != std::string::npos &&
                   counter(live, "session_steps") == counter(progress, "session_steps"),
               "Live status must preserve guest progress without serializing detailed profiles");
+      const auto atapi = live.find("\"atapi\":{");
+      require(atapi != std::string::npos &&
+                  counter(live.substr(atapi), "read_bytes") ==
+                      counter(live.substr(atapi), "read_sectors") * reverse_windows::AtapiCdrom::sector_bytes,
+              "Live CD-ROM byte metrics must account for full ATAPI sectors");
       require(counter(progress, "session_steps") == counter(progress, "instructions") &&
                   counter(progress, "session_steps") > 0,
               "Before the first restart, session and CPU steps must match");

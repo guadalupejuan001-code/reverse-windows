@@ -65,6 +65,9 @@ int main() {
            "QSSD exact dedup/zero/pattern not activated");
       need(stats.commits==5&&stats.qssd_serial>=6,"QSSD StateBus not recording guest transactions");
       need(stats.physical_bytes<8192,"QSSD storage failed to avoid repeated physical blocks");
+      const auto syncs=disk.io_stats().sync_calls;
+      need(syncs==stats.commits&&disk.flush()&&disk.flush()&&disk.io_stats().sync_calls==syncs,
+           "Clean flush resynced an already durable QSSD journal");
       std::cout<<"REVERSE_QSSD_STORAGE_PASS logical="<<stats.logical_bytes
                <<" physical="<<stats.physical_bytes
                <<" commits="<<stats.commits
@@ -123,6 +126,9 @@ int main() {
       std::array<std::uint8_t,512> sector{};
       need(reboot.read(7,1,sector.data())&&sector[0]==0xef&&sector[1]==0xbe,
            "real x86 guest write did not persist");
+      need(reboot.io_stats().sync_calls==0&&reboot.flush()&&reboot.flush()&&
+           reboot.io_stats().sync_calls==1,
+           "An existing QSSD image must keep the first flush barrier");
       std::array<std::uint8_t,512> mbr{};
       mbr[0]=0xb8;mbr[1]=0x34;mbr[2]=0x12; // MOV AX,1234
       mbr[3]=0xa3;mbr[4]=0x00;mbr[5]=0x91; // MOV [9100],AX

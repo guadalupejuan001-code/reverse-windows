@@ -105,6 +105,8 @@ class QssdDisk final : public BlockDisk {
   const Access access_;
   std::filesystem::path path_;
   std::uint64_t capacity_=0, committed_end_=kHeader, generation_=0;
+  bool rollback_pending_=false;
+  bool journal_synced_=false;
   unsigned index_levels_=8;
   RecoveryStats recovery_{};
   std::mutex writer_;
@@ -228,9 +230,18 @@ class QssdDisk final : public BlockDisk {
     const auto started=std::chrono::steady_clock::now();
     const auto result=::fsync(fd_);
     const auto error=errno;
+    journal_synced_=result==0;
     physical_syncs_.add(0,started);
     errno=error;
     return result;
+  }
+  // Called with writer_ held. A failed recovery must stay pending until the
+  // append is discarded durably, before another write or guest flush succeeds.
+  bool discard_uncommitted_tail() noexcept {
+    if(!rollback_pending_)return true;
+    if(::ftruncate(fd_,static_cast<off_t>(committed_end_))!=0||sync_volume()!=0)return false;
+    rollback_pending_=false;
+    return true;
   }
   std::uint64_t file_size() const {
     struct stat info{};
@@ -910,7 +921,10 @@ class QssdDisk final : public BlockDisk {
       throw std::invalid_argument("QSSD capacity must be block aligned and within 1 GiB .. 8 PiB");
     const auto name=path.string();
     int fd=::open(name.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
-    if(fd<0)throw std::system_error(errno,std::generic_category(),"QSSD create without overwrite");
+    if(fd<0) {
+      const auto error=errno;
+      throw std::system_error(error,std::generic_category(),"QSSD create without overwrite");
+    }
     bool complete=false;
     try{
       std::array<std::uint8_t,kHeader> head{};
@@ -932,7 +946,11 @@ class QssdDisk final : public BlockDisk {
     check_path(path);
     const bool writable=access_==Access::ReadWrite;
     fd_=::open(path.c_str(),(writable?O_RDWR:O_RDONLY)|O_CLOEXEC|O_NOFOLLOW);
-    if(fd_<0)throw std::system_error(errno,std::generic_category(),"QSSD open");
+    if(fd_<0) {
+      // Preserve ENOENT for lazy creation even if exception allocation changes errno.
+      const auto error=errno;
+      throw std::system_error(error,std::generic_category(),"QSSD open");
+    }
     try{
       if(::flock(fd_,(writable?LOCK_EX:LOCK_SH)|LOCK_NB)!=0)
         throw std::runtime_error("QSSD volume already mounted for writing or maintenance");
@@ -1027,7 +1045,9 @@ class QssdDisk final : public BlockDisk {
   bool flush() override {
     if(access_==Access::ReadOnly)return false;
     std::lock_guard<std::mutex> hold(writer_);
-    return fd_ >= 0 && sync_volume() == 0;
+    // The first barrier on an existing image may still need to sync it.
+    // Successful writes and replay truncations already sync the journal.
+    return fd_ >= 0 && discard_uncommitted_tail() && (journal_synced_ || sync_volume()==0);
   }
 
   bool write(std::uint64_t lba,std::uint16_t count,const std::uint8_t* source) override {
@@ -1040,6 +1060,7 @@ class QssdDisk final : public BlockDisk {
        total>kMaxBulkTransactionBytes-first%kBlockSize||(!source&&total))return false;
     if(!total)return true;
     std::lock_guard<std::mutex> hold(writer_);
+    if(!discard_uncommitted_tail())return false;
     bool appending=false;
     try{
       const auto old=states_.snapshot();
@@ -1163,8 +1184,8 @@ class QssdDisk final : public BlockDisk {
     }catch(const std::exception&){
       // Discard any uncommitted append. A failed write is never acknowledged.
       if(appending){
-        (void)::ftruncate(fd_,static_cast<off_t>(committed_end_));
-        (void)sync_volume();
+        rollback_pending_=true;
+        (void)discard_uncommitted_tail();
       }
       return false;
     }

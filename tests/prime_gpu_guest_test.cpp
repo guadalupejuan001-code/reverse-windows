@@ -131,6 +131,9 @@ void check_firmware(PcMachine& pc) {
     require(token < 9, "E820 did not finish");
   } while (token);
   require(saw_window && usable == (64ULL << 30), "E820 did not separate PCI from 64 GiB of RAM");
+  const auto fadt = reverse_windows::AcpiC06::fadt_address;
+  require((cpu.read16(fadt + 109) & 0x0fU) == 0x07U,
+          "FADT must allow MSI with the PCI GPU attached");
   const auto dsdt = reverse_windows::AcpiC06::dsdt_address;
   std::vector<std::uint8_t> aml(cpu.read32(dsdt + 4));
   cpu.memory.read_block(dsdt, aml.data(), aml.size());
@@ -145,35 +148,49 @@ std::string gpu_stats(const GuestGpuC08& gpu) {
   return out.str();
 }
 
-#ifdef REVERSE_WINDOWS_GLES_GUEST
-void verify_scheduled_dma(PcMachine& pc, PcMotherboardC06& board,
-                          const RwGpuVertex* vertices, unsigned count,
-                          const std::array<std::uint8_t, 4096>& reference) {
-  constexpr std::uint32_t idt = 0x480000, handler = 0xf000, receipt = 0xe200;
-  constexpr std::uint32_t read_first = 0x510000;
-  constexpr std::uint64_t command_ram = 0x1'0050'0000ULL;
-  constexpr std::uint64_t read_second = command_ram + 0x30000;
-  constexpr std::uint32_t lapic = PcMachine::kLocalApicAddress;
-  constexpr unsigned vector = 0x5a;
-  constexpr std::uint64_t target = 0x1900010000ULL, scratch = target + RWGPU_PAGE_BYTES;
-  constexpr unsigned half = RWGPU_PAGE_BYTES / 2;
+constexpr std::uint32_t msi_receipt = 0xe200;
+constexpr unsigned msi_vector = 0x5a;
+
+void install_gpu_msi_handler(PcMachine& pc) {
+  constexpr std::uint32_t idt = 0x480000, handler = 0xf000;
   auto& cpu = pc.cpu;
   cpu.idtr = {0x7ff, idt};
-  cpu.write64(idt + vector * 8, (handler & 0xffffU) |
+  cpu.write64(idt + msi_vector * 8, (handler & 0xffffU) |
       (std::uint64_t(cpu.segments[Cpu::CS]) << 16) | (0x8eULL << 40) |
       (std::uint64_t(handler >> 16) << 48));
   Guest32 irq;
   irq.emit({0x50}); // PUSH EAX.
-  irq.read(moved_bar + RWGPU_REG_IRQ_STATUS, receipt);
+  irq.read(moved_bar + RWGPU_REG_IRQ_STATUS, msi_receipt);
   irq.emit({0xa3}); irq.word(moved_bar + RWGPU_REG_IRQ_ACK);
-  irq.read(moved_bar + RWGPU_REG_FENCE_LAST, receipt + 4);
-  irq.read(moved_bar + RWGPU_REG_FENCE_FAULT, receipt + 8);
-  irq.read(moved_bar + RWGPU_REG_FENCE_PREEMPT, receipt + 12);
-  irq.read(moved_bar + RWGPU_REG_PREEMPT_LAST, receipt + 16);
-  irq.emit({0xff,0x05}); irq.word(receipt + 20); // INC DWORD [count].
-  irq.write(lapic + 0xb0, 0);
+  irq.read(moved_bar + RWGPU_REG_FENCE_LAST, msi_receipt + 4);
+  irq.read(moved_bar + RWGPU_REG_FENCE_FAULT, msi_receipt + 8);
+  irq.read(moved_bar + RWGPU_REG_FENCE_PREEMPT, msi_receipt + 12);
+  irq.read(moved_bar + RWGPU_REG_PREEMPT_LAST, msi_receipt + 16);
+  irq.emit({0xff,0x05}); irq.word(msi_receipt + 20); // INC DWORD [count].
+  irq.write(PcMachine::kLocalApicAddress + 0xb0, 0);
   irq.emit({0x58,0xcf}); // POP EAX; IRETD.
   cpu.memory.write_block(handler, irq.bytes.data(), irq.bytes.size());
+}
+
+void enable_gpu_msi(Guest32& driver) {
+  driver.cfg_write(RWGPU_PCI_MSI_CAP + 4, PcMachine::kLocalApicAddress);
+  driver.cfg_write(RWGPU_PCI_MSI_CAP + 8, msi_vector);
+  driver.cfg_write(RWGPU_PCI_MSI_CAP, 1u << 16);
+  driver.write(PcMachine::kLocalApicAddress + 0xf0, 0x1ff);
+}
+
+#ifdef REVERSE_WINDOWS_GLES_GUEST
+void verify_scheduled_dma(PcMachine& pc, PcMotherboardC06& board,
+                          const RwGpuVertex* vertices, unsigned count,
+                          const std::array<std::uint8_t, 4096>& reference) {
+  constexpr auto receipt = msi_receipt;
+  constexpr std::uint32_t read_first = 0x510000;
+  constexpr std::uint64_t command_ram = 0x1'0050'0000ULL;
+  constexpr std::uint64_t read_second = command_ram + 0x30000;
+  constexpr std::uint64_t target = 0x1900010000ULL, scratch = target + RWGPU_PAGE_BYTES;
+  constexpr unsigned half = RWGPU_PAGE_BYTES / 2;
+  auto& cpu = pc.cpu;
+  install_gpu_msi_handler(pc);
   const auto store = [&](std::uint64_t address, const auto& value) {
     cpu.memory.write_block(address, reinterpret_cast<const std::uint8_t*>(&value), sizeof(value));
   };
@@ -205,7 +222,7 @@ void verify_scheduled_dma(PcMachine& pc, PcMotherboardC06& board,
   const auto download = transfer(RWGPU_DMA_DOWNLOAD, target);
   store(command_ram + 0x2000, download);
   auto bad = download;
-  bad.range[1].ram = lapic;
+  bad.range[1].ram = PcMachine::kLocalApicAddress;
   store(command_ram + 0x3000, bad);
   const auto copied = transfer(RWGPU_DMA_DOWNLOAD, scratch);
   store(command_ram + 0x4000, copied);
@@ -214,10 +231,7 @@ void verify_scheduled_dma(PcMachine& pc, PcMotherboardC06& board,
   driver.cfg_read(4, receipt + 24);
   driver.cfg_read(0x34, receipt + 28);
   driver.cfg_read(RWGPU_PCI_MSI_CAP, receipt + 32);
-  driver.cfg_write(RWGPU_PCI_MSI_CAP + 4, 0xfee00000);
-  driver.cfg_write(RWGPU_PCI_MSI_CAP + 8, vector);
-  driver.cfg_write(RWGPU_PCI_MSI_CAP, 1u << 16);
-  driver.write(lapic + 0xf0, 0x1ff);
+  enable_gpu_msi(driver);
   const auto submit = [&](unsigned ticket, unsigned offset, unsigned fence, unsigned bytes) {
     driver.direct_command(RWGPU_SUBMIT_DMA, ticket, command_ram + offset, fence, bytes);
     driver.emit({0xfb,0xf4,0xfa}); // STI; HLT until the MSI; CLI.
@@ -248,6 +262,24 @@ void verify_scheduled_dma(PcMachine& pc, PcMotherboardC06& board,
           "VidMm DMA data, MSI fences, fault, or preemption diverged");
   std::cout << "PRIME_C08_SCHEDULED_DMA_PASS msi=6 fence=104 fault=105 preempt=205 pixels=4096"
                " pin=system-ram vbe_stores=0 high_dma=1\n";
+}
+#else
+void verify_preempt_msi(PcMachine& pc, PcMotherboardC06& board) {
+  constexpr unsigned preempt_fence = 205, preempt_ticket = 11;
+  install_gpu_msi_handler(pc);
+  Guest32 driver;
+  enable_gpu_msi(driver);
+  driver.direct_command(RWGPU_PREEMPT, preempt_ticket, 0, preempt_fence, 0);
+  driver.emit({0xfb,0xf4,0xfa}); // STI; HLT until the MSI; CLI.
+  driver.read(moved_bar + RWGPU_REG_COMPLETED, msi_receipt + 24);
+  driver.run(pc);
+  require(pc.cpu.read32(msi_receipt) == RWGPU_IRQ_PREEMPT &&
+          pc.cpu.read32(msi_receipt + 12) == preempt_fence &&
+          pc.cpu.read32(msi_receipt + 20) == 1 &&
+          pc.cpu.read32(msi_receipt + 24) == preempt_ticket &&
+          board.interrupt_state().in_service == 0,
+          "PrimeVGC preempt MSI did not reach the guest handler");
+  std::cout << "PRIME_C08_PREEMPT_MSI_PASS fence=" << preempt_fence << " fadt_msi=1\n";
 }
 #endif
 
@@ -481,6 +513,7 @@ void verify(const std::filesystem::path& volume) {
 #else
     require(pc.cpu.read32(0xe024) == RWGPU_UNAVAILABLE && pc.cpu.read32(0xe028) == 10,
             "Headless build must disclose its absent renderer");
+    verify_preempt_msi(pc, board);
     std::cout << "PRIME_C08_RENDER_UNAVAILABLE no_egl=1\n";
 #endif
     pc.reset();

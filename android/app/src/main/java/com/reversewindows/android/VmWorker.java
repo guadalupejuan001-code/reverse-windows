@@ -11,6 +11,7 @@ import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.os.PowerManager;
+import android.os.Process;
 import android.os.SystemClock;
 import android.provider.OpenableColumns;
 import android.util.AtomicFile;
@@ -70,6 +71,7 @@ final class VmWorker {
     private static final long ANDROID_SAMPLE_INTERVAL_MS = 10_000;
     // Newer Android versions no longer send the running-low trim levels.
     private static final long RAM_SAMPLE_INTERVAL_MS = 10_000;
+    private static final long RAM_RECLAIM_SAMPLE_INTERVAL_MS = 1_000;
     private static final long RAM_RECLAIM_INTERVAL_MS = 16;
     private static final String DIAGNOSTIC_FILE = "ultimo-diagnostico.json";
 
@@ -96,6 +98,7 @@ final class VmWorker {
     private long lastDiagnosticSave;
     private long sessionStarted;
     private long sessionWorkerCpuStartNs = -1;
+    private long sessionProcessCpuStartMs;
     private long nextAndroidSample;
     private long androidPssKiB;
     private int androidThermalStatus = -1;
@@ -105,6 +108,9 @@ final class VmWorker {
     private long lastSliceCompleted;
     private long frameNanos;
     private long statusNanos;
+    private long statusSnapshots;
+    private long diagnosticWrites;
+    private long diagnosticWriteNanos;
     private boolean frameRequested; // Worker owns the capture until the UI applies or discards it.
     private boolean videoDirty;
     private String lastLoggedStatus = "";
@@ -242,7 +248,7 @@ final class VmWorker {
 
     void start(int source, Uri iso, boolean debug, boolean primeRam) {
         worker.post(() -> {
-            if (handle != 0) return;
+            if (released || handle != 0) return;
             try {
                 debugSelfTest = debug;
                 lastLoggedStatus = "";
@@ -267,8 +273,10 @@ final class VmWorker {
                 lastDiagnosticSave = 0;
                 sessionStarted = SystemClock.elapsedRealtime();
                 sessionWorkerCpuStartNs = Debug.threadCpuTimeNanos();
+                sessionProcessCpuStartMs = Process.getElapsedCpuTime();
                 nextAndroidSample = sessionStarted;
                 stepNanos = frameNanos = statusNanos = 0;
+                statusSnapshots = diagnosticWrites = diagnosticWriteNanos = 0;
                 lastSliceNanos = 0;
                 lastSliceSteps = 0;
                 lastSliceCompleted = 0;
@@ -280,7 +288,7 @@ final class VmWorker {
                 if (foreground) scheduleRam(RAM_SAMPLE_INTERVAL_MS);
                 requestFrame();
                 schedule(0);
-            } catch (IOException | RuntimeException | LinkageError error) {
+            } catch (IOException | RuntimeException | LinkageError | OutOfMemoryError error) {
                 report(error);
             }
         });
@@ -352,12 +360,20 @@ final class VmWorker {
 
     void stop() {
         worker.post(() -> {
+            String snapshot = lastDiagnostic;
+            if (handle != 0 && outcome != NativeMachine.FAULT) {
+                try {
+                    snapshot = currentDiagnostic(true);
+                } catch (RuntimeException | LinkageError | OutOfMemoryError error) {
+                    Log.w(TAG, "No se pudo actualizar el diagnóstico al apagar", error);
+                }
+            }
             try {
-                String diagnostic = handle == 0 ? "" : currentDiagnostic(true);
-                saveDiagnostic(diagnostic);
                 closeMachine();
+                final String diagnostic = snapshot;
+                saveDiagnostic(diagnostic);
                 send(() -> listener.onState(diagnostic, false, false, false, true));
-            } catch (RuntimeException | LinkageError error) {
+            } catch (RuntimeException | LinkageError | OutOfMemoryError error) {
                 report(error);
             }
         });
@@ -368,7 +384,7 @@ final class VmWorker {
         worker.post(() -> {
             try {
                 closeMachine();
-            } catch (RuntimeException | LinkageError error) {
+            } catch (RuntimeException | LinkageError | OutOfMemoryError error) {
                 Log.w(TAG, "No se pudo cerrar el volumen QSSD", error);
             } finally {
                 thread.quitSafely();
@@ -403,8 +419,13 @@ final class VmWorker {
             } else {
                 more = NativeMachine.maintainRamBudget(handle);
             }
-            if (more) scheduleRam(RAM_RECLAIM_INTERVAL_MS);
-            else if (foreground) scheduleRam(Math.max(0, nextRamSample - SystemClock.uptimeMillis()));
+            if (more) {
+                if (foreground)
+                    nextRamSample = Math.min(nextRamSample, now + RAM_RECLAIM_SAMPLE_INTERVAL_MS);
+                scheduleRam(RAM_RECLAIM_INTERVAL_MS);
+            } else if (foreground) {
+                scheduleRam(Math.max(0, nextRamSample - SystemClock.uptimeMillis()));
+            }
         } catch (RuntimeException | LinkageError error) {
             Log.w(TAG, "No se pudo ajustar el respaldo de RAM", error);
             if (foreground) scheduleRam(RAM_SAMPLE_INTERVAL_MS);
@@ -425,25 +446,24 @@ final class VmWorker {
             long elapsed = Math.max(1, SystemClock.elapsedRealtimeNanos() - started);
             lastSliceNanos = elapsed;
             stepNanos += elapsed;
-            if (outcome == NativeMachine.FAULT) {
-                running = false;
-                String snapshot = currentDiagnostic(false);
-                send(() -> listener.onState(snapshot, false, true, false, true));
-                publishState(true);
-                return;
-            }
-            if (outcome == NativeMachine.RUNNING) {
+            // Devices can advance during a slice without retiring a guest instruction.
+            if (outcome == NativeMachine.RUNNING && lastSliceCompleted != 0) {
                 long estimate = lastSliceCompleted * TARGET_SLICE_NS / elapsed;
                 sliceSteps = (int) Math.max(MIN_SLICE_STEPS,
                         Math.min(MAX_SLICE_STEPS, (sliceSteps + estimate) / 2));
             }
             long now = SystemClock.uptimeMillis();
             requestFrame();
+            if (isTerminal()) {
+                running = false;
+                worker.removeCallbacks(ramMaintenance);
+                publishState(true);
+                return;
+            }
             if (now - lastStatus >= STATUS_INTERVAL_MS || outcome != previous)
-                publishState(isTerminal() || outcome == NativeMachine.WAITING_KEY);
-            if (isTerminal()) running = false;
+                publishState(outcome == NativeMachine.WAITING_KEY);
             schedule(outcome == NativeMachine.HALTED ? HALTED_POLL_DELAY_MS : 0);
-        } catch (RuntimeException | LinkageError error) {
+        } catch (RuntimeException | LinkageError | OutOfMemoryError error) {
             report(error);
         }
     }
@@ -526,6 +546,8 @@ final class VmWorker {
         long workerCpuNs = Debug.threadCpuTimeNanos();
         String workerCpuUs = sessionWorkerCpuStartNs >= 0 && workerCpuNs >= sessionWorkerCpuStartNs
                 ? Long.toString((workerCpuNs - sessionWorkerCpuStartNs) / 1000) : "null";
+        long processCpuMs = Process.getElapsedCpuTime() - sessionProcessCpuStartMs;
+        ++statusSnapshots;
         return withBuildMetadata(NativeMachine.diagnostic(handle, detailed),
                 ",\"elapsed_ms\":" + (now - sessionStarted)
                 + ",\"android_pss_kib\":" + androidPssKiB
@@ -533,8 +555,12 @@ final class VmWorker {
                         ? Integer.toString(androidThermalStatus) : "null")
                 + ",\"worker_timing\":{\"step_us\":" + stepNanos / 1000
                 + ",\"host_thread_cpu_us\":" + workerCpuUs
+                + ",\"host_process_cpu_ms\":" + processCpuMs
                 + ",\"frame_us\":" + frameNanos / 1000
                 + ",\"diagnostic_us\":" + statusNanos / 1000
+                + ",\"diagnostic_snapshots\":" + statusSnapshots
+                + ",\"diagnostic_writes\":" + diagnosticWrites
+                + ",\"diagnostic_write_us\":" + diagnosticWriteNanos / 1000
                 + ",\"last_slice_steps_requested\":" + lastSliceSteps
                 + ",\"last_slice_steps_completed\":" + lastSliceCompleted
                 + ",\"last_slice_us\":" + lastSliceNanos / 1000
@@ -552,9 +578,6 @@ final class VmWorker {
         if (detailed) {
             lastDiagnostic = json;
         }
-        if (saveNow || lastStatus - lastDiagnosticSave >= DIAGNOSTIC_INTERVAL_MS)
-            saveDiagnostic(json);
-        statusNanos += SystemClock.elapsedRealtimeNanos() - started;
         boolean stopped = outcome == NativeMachine.STOPPED;
         boolean active = running && foreground && !isTerminal();
         if (debugSelfTest) {
@@ -565,6 +588,9 @@ final class VmWorker {
             }
         }
         send(() -> listener.onState(json, active, true, stopped, detailed));
+        if (saveNow || lastStatus - lastDiagnosticSave >= DIAGNOSTIC_INTERVAL_MS)
+            saveDiagnostic(json);
+        statusNanos += SystemClock.elapsedRealtimeNanos() - started;
     }
 
     private static String withBuildMetadata(String json) {
@@ -582,15 +608,19 @@ final class VmWorker {
     private void saveDiagnostic(String json) {
         if (json.isEmpty() || json.equals(persistedDiagnostic)) return;
         lastDiagnosticSave = SystemClock.uptimeMillis();
+        long started = SystemClock.elapsedRealtimeNanos();
         FileOutputStream stream = null;
         try {
             stream = diagnosticFile.startWrite();
             stream.write(json.getBytes(StandardCharsets.UTF_8));
             diagnosticFile.finishWrite(stream);
+            ++diagnosticWrites;
             persistedDiagnostic = json;
         } catch (IOException error) {
             if (stream != null) diagnosticFile.failWrite(stream);
             Log.w(TAG, "No se pudo conservar el último diagnóstico", error);
+        } finally {
+            diagnosticWriteNanos += SystemClock.elapsedRealtimeNanos() - started;
         }
     }
 
@@ -616,6 +646,7 @@ final class VmWorker {
 
     private void report(Throwable error) {
         worker.removeCallbacks(slice);
+        worker.removeCallbacks(ramMaintenance);
         running = false;
         String detail = error.getMessage();
         String message = detail == null || detail.isEmpty() ? error.getClass().getSimpleName() : detail;
@@ -623,8 +654,8 @@ final class VmWorker {
         if (hasSession) outcome = NativeMachine.FAULT;
         String snapshot = hasSession ? lastDiagnostic : "";
         try {
-            if (hasSession) snapshot = currentDiagnostic(true);
-        } catch (RuntimeException | LinkageError ignored) {
+            if (hasSession && !(error instanceof OutOfMemoryError)) snapshot = currentDiagnostic(true);
+        } catch (RuntimeException | LinkageError | OutOfMemoryError ignored) {
             // Retain the most recent successful native snapshot.
         }
         lastDiagnostic = withBuildMetadata("{\"schema\":\"reverse-windows-android-error-v1\","

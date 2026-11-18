@@ -13,6 +13,7 @@ namespace reverse_windows {
 
 inline void write_ether_arm64(std::ostream& out, const cosmic_pc::Cpu& cpu) {
   const auto& stats = cpu.ether_arm64_stats();
+  const auto space = cpu.ether_arm64_virtual_stats();
   out << "{\"host_supported\":" << (cpu.ether_arm64_host() ? "true" : "false")
       << ",\"enabled\":" << (cpu.ether_arm64_blocks_enabled() ? "true" : "false")
       << ",\"translated\":" << stats.translated << ",\"cache_hits\":" << stats.hits
@@ -27,10 +28,19 @@ inline void write_ether_arm64(std::ostream& out, const cosmic_pc::Cpu& cpu) {
       << ",\"staged_ram_blocks\":" << stats.staged_ram_blocks
       << ",\"staged_ram_steps\":" << stats.staged_ram_steps
       << ",\"coalesced_ram_writes\":" << stats.coalesced_ram_writes
+      << ",\"resident_read_hits\":" << stats.resident_read_hits
+      << ",\"ram_read_callbacks\":" << stats.ram_read_callbacks
       << ",\"repeated_loop_dispatches\":" << stats.repeated_loop_dispatches
       << ",\"repeated_loop_steps\":" << stats.repeated_loop_steps
+      << ",\"state_vector_dispatches\":" << stats.state_vector_dispatches
+      << ",\"state_vector_steps\":" << stats.state_vector_steps
+      << ",\"protected32_state_vector_steps\":" << stats.protected32_state_vector_steps
       << ",\"rotate_guest_steps\":" << stats.rotate_steps
       << ",\"variable_rotate_guest_steps\":" << stats.variable_rotate_steps
+      << ",\"x86_virtual_space\":{\"logical_bytes\":" << space.logical_bytes
+      << ",\"cache_metadata_bytes\":" << space.cache_metadata_bytes
+      << ",\"allocated_sets\":" << space.allocated_sets
+      << ",\"translated_block_capacity\":" << space.translated_block_capacity << '}'
 #if defined(REVERSE_MUNDO_X_SOURCE_SHA)
       << ",\"mundo_x_source_sha\":\"" REVERSE_MUNDO_X_SOURCE_SHA "\""
 #endif
@@ -139,7 +149,8 @@ class BootProfile {
     out.spill_reads = memory.backing_reads;
     out.spill_writes = memory.backing_writes;
     out.batched = work.rep_elements + work.shift_loop_steps + work.zero_loop_steps +
-        work.scan_loop_steps + work.arm64_block_steps + work.counter_loop_steps + work.affine_ram_rotate_steps;
+        work.scan_loop_steps + work.arm64_block_steps + work.counter_loop_steps +
+        work.affine_ram_rotate_steps + work.movntdq_store_steps;
     out.mode_changes = pc.boot_mode_progress().changes;
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     out.neon_steps = cpu.ether_next_stats().native_instructions;

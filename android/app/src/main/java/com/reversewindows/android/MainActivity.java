@@ -110,9 +110,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private boolean primeRam;
     private String lastJson = "";
     private String diagnosticToExport = "";
-    private long previousStepUs = -1;
-    private long previousSteps;
-    private long stepsPerSecond = -1;
+    private final VmStepRate executionRate = new VmStepRate();
 
     @Override
     public void onCreate(Bundle savedState) {
@@ -454,8 +452,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         fault = false;
         terminal = false;
         blankTextFrame = false;
-        previousStepUs = -1;
-        stepsPerSecond = -1;
+        executionRate.reset();
         monitor.reset();
         showTrace(false);
         monitor.requestFocus();
@@ -508,6 +505,24 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             StringBuilder result = new StringBuilder(ready
                     ? "Requisitos comprobados para Windows 10"
                     : "Requisitos pendientes para Windows 10");
+            JSONObject ether = preflight.optJSONObject("ether_x86_sessions");
+            if (ether != null) {
+                result.append("\n\nSesiones Éter x86 · prueba");
+                if (!ether.optBoolean("passed")) result.append(" incompleta");
+                result.append(String.format(Locale.getDefault(), "\n%d/%d trabajos completos · %d vCPU",
+                        ether.optInt("completed_jobs"), ether.optInt("requested_jobs"), ether.optInt("owners")));
+                long elapsedNs = ether.optLong("elapsed_ns");
+                if (elapsedNs > 0) {
+                    result.append(String.format(Locale.getDefault(), " · %.3f ms", elapsedNs / 1_000_000.0));
+                }
+                long projected = ether.optLong("projected_steps");
+                if (projected > 0) {
+                    result.append(String.format(Locale.getDefault(), "\n%,d pasos x86 proyectados", projected));
+                }
+                String detail = ether.optString("error");
+                if (!detail.isEmpty()) result.append('\n').append(detail);
+                result.append('\n');
+            }
             JSONObject ram = preflight.optJSONObject("ram_profile");
             if (ram != null) {
                 result.append("\nRAM utilizable por el invitado: ")
@@ -569,12 +584,17 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     public void onState(String json, boolean active, boolean hasSession, boolean stopped, boolean detailed) {
         boolean wasFault = fault;
         boolean wasSession = session;
+        boolean wasRunning = running;
+        boolean wasTerminal = terminal;
+        boolean wasPending = pending;
+        boolean wasEvidenceEmpty = lastJson.isEmpty();
         pending = false;
         session = hasSession;
         running = active;
         terminal = stopped;
         if (detailed && !json.isEmpty()) lastJson = json;
         if (!session) {
+            executionRate.reset();
             status.setTextColor(TEXT);
             status.setText("Máquina apagada");
             source.setText(BuildConfig.VERSION_NAME + " · Invitado x86-64");
@@ -613,7 +633,10 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         } else if (!session) {
             stats.setText("");
         }
-        updateControls();
+        if (wasPending || session != wasSession || running != wasRunning || terminal != wasTerminal ||
+                fault != wasFault || wasEvidenceEmpty != lastJson.isEmpty()) {
+            updateControls();
+        }
         if (fault && !wasFault) showTrace(true);
         if (session && !wasSession) restoreGuestFocus();
         if ((session && !wasSession) || (fault && !wasFault)) showBootStatus();
@@ -639,18 +662,12 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         JSONObject volume = diagnostic.optJSONObject("disk");
         JSONObject ether = diagnostic.optJSONObject("ether_next");
         JSONObject ram = diagnostic.optJSONObject("ram_profile");
-        long steps = machine.optLong("instructions");
+        long steps = machine.optLong("instructions", -1);
         long sessionSteps = boot == null ? steps : boot.optLong("session_steps", steps);
         JSONObject workerTiming = diagnostic.optJSONObject("worker_timing");
         long stepUs = workerTiming == null ? -1 : workerTiming.optLong("step_us", -1);
-        if (!running || previousStepUs < 0 || sessionSteps < previousSteps) {
-            stepsPerSecond = -1;
-        } else if (stepUs > previousStepUs) {
-            stepsPerSecond = Math.round((sessionSteps - previousSteps) * 1_000_000.0 /
-                    (stepUs - previousStepUs));
-        }
-        previousStepUs = running ? stepUs : -1;
-        previousSteps = sessionSteps;
+        long stepsPerSecond = executionRate.sample(session && running &&
+                "running".equals(diagnostic.optString("status")), sessionSteps, stepUs);
         if (session) {
             telemetry.update(diagnostic, machine, modeName(machine.optString("cpu_mode")),
                     sessionSteps, stepsPerSecond);
@@ -687,14 +704,27 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         JSONObject topology = diagnostic.optJSONObject("cpu_topology");
         if (topology != null) {
             progress.append(String.format(Locale.getDefault(),
-                    "\nCPU · %d núcleos · %d/%d hilos iniciados · %d trabajadores Android",
+                    "\nCPU · %d núcleos virtuales · %d/%d vCPU iniciadas · %d trabajadores asignados",
                     topology.optInt("cores"), topology.optInt("started"),
                     topology.optInt("logical_processors"), topology.optInt("host_workers")));
+            if (topology.has("phase_projected_steps")) {
+                progress.append(String.format(Locale.getDefault(),
+                        "\nVectores · %,d pasos proyectados · %d vCPU · %,d bloques encadenados",
+                        topology.optLong("phase_projected_steps"), topology.optInt("vcpus_with_projected_steps"),
+                        topology.optLong("parallel_register_continuations")));
+            }
+        }
+        JSONObject coverage = diagnostic.optJSONObject("ether_coverage");
+        if (coverage != null && coverage.optLong("interpreted_steps", -1) >= 0) {
+            progress.append(String.format(Locale.getDefault(),
+                    "\nPasos de la fase · %,d traducidos · %,d en bloque · %,d instrucción a instrucción",
+                    coverage.optLong("translated_steps"), coverage.optLong("batched_steps"),
+                    coverage.optLong("interpreted_steps")));
         }
         if (ram != null) {
             progress.append(String.format(Locale.getDefault(), "\nRAM del invitado · %,d MiB",
                     ram.optLong("usable_bytes") / MIB));
-            progress.append(String.format(Locale.getDefault(), "\nRAM residente: %,d / %,d MiB",
+            progress.append(String.format(Locale.getDefault(), "\nDatos de RAM residentes · %,d / %,d MiB",
                     ram.optLong("resident_bytes") / MIB, ram.optLong("backing_budget_bytes") / MIB));
             if ("file".equals(ram.optString("spill_mode"))) {
                 progress.append(String.format(Locale.getDefault(), " · Temporal: %,d MiB",
@@ -726,7 +756,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         long restarts = boot == null ? 0 : boot.optLong("restarts");
         if (restarts > 0) {
             progress.append(String.format(Locale.getDefault(),
-                    "\nReinicios automáticos: %,d · %,d pasos desde el último", restarts, steps));
+                    "\nReinicios automáticos · %,d · %,d pasos x86 desde el último", restarts,
+                    topology == null ? steps : topology.optLong("phase_x86_steps", steps)));
         }
         if ("iso".equals(diagnostic.optString("source"))) {
             progress.append(String.format(Locale.getDefault(), "\nLecturas de la ISO por BIOS: %,d", reads));

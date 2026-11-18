@@ -1,12 +1,12 @@
 {
   "schema": "reverse-windows-dependency-lock-v1",
-  "recorded_at": "2026-11-16",
+  "recorded_at": "2026-11-17",
   "policy": "exact-commit-only-no-silent-fallback-no-automatic-merge",
   "components": [
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "b50ac8d41114830a59cf35bf4965b5c7ff641325",
+      "commit": "9a71dac41b2029bfc91301a4447f9c37a13586d7",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
       "status": "candidate-windows-x64-shared-guest-ram",
@@ -26,6 +26,7 @@
         "pc-android/native/memory_fabric.hpp",
         "native/include/mundo_x/infinite_session.hpp",
         "native/include/mundo_x/ether_core.hpp",
+        "native/include/mundo_x/ether_virtual/space.hpp",
         "native/tests/ether_rules.cpp",
         "pc-android/native/x86_wide_integer.hpp",
         "pc-android/native/x86_ether_arm64.hpp",
@@ -111,7 +112,7 @@
     {
       "key": "qssd",
       "repository": "guadalupejuan001-code/Virtual-qSSD-",
-      "commit": "333915b23896ceb38eb989185e51e617d48cc114",
+      "commit": "709a5ca4d0116d7335debb2abdc60842cc4cf687",
       "checkout": "deps/Virtual-qSSD-",
       "role": "complete-revisioned-state-and-graphics-work-PR8",
       "status": "candidate-qssd-transient-ram",

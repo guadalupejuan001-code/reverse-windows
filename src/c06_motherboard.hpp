@@ -6,6 +6,7 @@
 #include "c08_guest_gpu.hpp"
 #include "c07_ata.hpp"
 #include "atapi_cdrom.hpp"
+#include "ether_x86_sessions.hpp"
 #include "pc_machine.hpp"
 #include "ps2_keyboard.hpp"
 #include "smp_workers.hpp"
@@ -17,7 +18,6 @@
 #include <ctime>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -26,6 +26,8 @@
 namespace reverse_windows {
 class PcMotherboardC06 {
  public:
+  using Clock = cosmic_pc::PcMachine::RunClock;
+  using ClockSource = std::function<Clock::time_point()>;
   static constexpr std::uint64_t kLocalApic=cosmic_pc::PcMachine::kLocalApicAddress,
       kIoApic=cosmic_pc::PcMachine::kIoApicAddress;
   struct Evidence {
@@ -38,6 +40,15 @@ class PcMotherboardC06 {
     unsigned pending, in_service, priority;
     std::uint32_t timer_count;
     std::uint32_t ioapic_select, ioapic_id;
+  };
+  struct StartupIpis {
+    std::uint64_t init_icr_writes = 0, sipi_icr_writes = 0;
+    std::uint64_t init_targets_queued = 0, sipi_targets_queued = 0, sipi_targets_applied = 0;
+  };
+  struct RtcEvidence {
+    unsigned selected_register, register_a, register_b, register_c;
+    bool nmi_masked;
+    std::uint64_t irq8_assertions, data_writes;
   };
 
  private:
@@ -120,6 +131,16 @@ class PcMotherboardC06 {
       else counter=reload;
       return true;
     }
+    void advance_without_irq(std::uint64_t clocks){
+      if(clocks<counter){
+        counter-=static_cast<std::uint32_t>(clocks);
+      }else if(mode==0){
+        counter=0;
+        enabled=false;
+      }else{
+        counter=reload-static_cast<std::uint32_t>((clocks-counter)%reload);
+      }
+    }
   };
 
   cosmic_pc::PcMachine& pc_;
@@ -139,6 +160,13 @@ class PcMotherboardC06 {
   std::function<void(unsigned)> prior_batch_advance_;
   std::function<unsigned(unsigned)> prior_idle_advance_;
   std::function<void()> prior_reset_;
+  std::function<void()> prior_timestamp_read_;
+  ClockSource clock_source_;
+  Clock::time_point clock_sample_;
+  std::uint64_t active_clock_ns_=0,active_clock_ticks_=0,clock_tick_remainder_=0;
+  unsigned clock_polls_=0;
+  bool active_clock_enabled_=false,active_clock_running_=false,clock_attached_=false;
+  bool timestamp_hook_attached_=false;
   Pic master_{},slave_{};
   std::unique_ptr<AtaC07> ata_;
   std::unique_ptr<AtaC07> data_ata_;
@@ -151,7 +179,13 @@ class PcMotherboardC06 {
   unsigned pit_phase_=0;
   std::uint8_t speaker_control_=0;
   std::uint32_t pci_selector_=0;
-  std::uint8_t cmos_index_=0,rtc_b_=2;
+  static constexpr std::uint8_t kRtcPeriodic=0x40, kRtcIrq=0x80, kRtcSet=0x80;
+  static constexpr std::array<std::uint8_t,8> kRtcCalendar{{0,2,4,6,7,8,9,0x32}};
+  std::array<std::uint8_t,128> cmos_ram_{};
+  std::uint8_t cmos_index_=0,rtc_a_=0x26,rtc_b_=0x02,rtc_c_=0;
+  std::time_t rtc_utc_offset_=0;
+  std::uint64_t rtc_period_ticks_=0,rtc_next_periodic_tick_=UINT64_MAX;
+  std::uint64_t rtc_irq8_assertions_=0,rtc_data_writes_=0;
   std::array<std::uint8_t,256> host_cfg_{},isa_cfg_{};
   std::uint16_t pm_control_=0x0001; // SCI_EN: firmware starts in ACPI mode.
   std::uint16_t pm_status_=0,pm_enable_=0;
@@ -213,14 +247,26 @@ class PcMotherboardC06 {
     PendingWrite mmio_pending;
   };
   static constexpr auto kMaxProcessors = cosmic_pc::CpuTopology::kMaxLogical;
+  static constexpr unsigned kMinParallelLoopSteps = 128;
+  static constexpr unsigned kMixedParallelLoopSteps = 1024;
+  static constexpr auto kParallelLoopAccess = cosmic_pc::Cpu::EtherLoopAccess::ReadOnlyRam;
   std::array<std::unique_ptr<cosmic_pc::Cpu>, kMaxProcessors> secondary_cpus_{};
   std::array<LocalApic, kMaxProcessors> apics_;
   std::array<std::uint64_t, kMaxProcessors> retired_before_init_{};
+  std::array<std::uint64_t, kMaxProcessors> ether_steps_before_init_{};
+  std::array<std::uint64_t, kMaxProcessors> state_vector_steps_before_init_{};
+  StartupIpis startup_ipis_{};
   unsigned processor_count_ = 1;
+  const bool experimental_mixed_smp_;
   unsigned next_cpu_ = 0;
   std::optional<unsigned> faulted_processor_;
-  std::mutex bus_;
   std::unique_ptr<SmpWorkers> workers_;
+  std::unique_ptr<EtherX86Sessions> ether_x86_sessions_;
+  std::uint64_t parallel_register_batches_ = 0, parallel_register_steps_ = 0;
+  std::uint64_t parallel_register_continuations_ = 0;
+  std::uint64_t parallel_ram_batches_ = 0, parallel_ram_steps_ = 0;
+  std::uint64_t parallel_mixed_batches_ = 0;
+  unsigned longest_parallel_register_slice_ = 0;
   bool prior_local_apic_=false;
   const std::uint64_t* prior_clock_ = nullptr;
   cosmic_pc::CpuTopology prior_topology_;
@@ -251,10 +297,15 @@ class PcMotherboardC06 {
     if(keyboard_) keyboard_->reset();
     master_=Pic{};slave_=Pic{};slave_.vector=0x70;
     pit_=Pit{};pit2_=Pit{};pit_phase_=0;speaker_control_=0;pci_selector_=0;
-    cmos_index_=0;rtc_b_=2;pm_control_=0x0001;powered_off_=false;
+    cmos_index_=rtc_c_=0;rtc_a_=0x26;rtc_b_=0x02;pm_control_=0x0001;powered_off_=false;
     pm_status_=pm_enable_=0;sci_active_=false;
     ferr_was_asserted_=false;pc_.cpu.set_x87_ignne(false);
     ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=sci_irqs_=0;
+    active_clock_enabled_=false;
+    active_clock_ns_=active_clock_ticks_=clock_tick_remainder_=0;
+    clock_polls_=0;
+    rtc_irq8_assertions_=rtc_data_writes_=0;
+    rtc_schedule_periodic();
     if(ata_)ata_->reset();
     if(data_ata_)data_ata_->reset();
     if(optical_)optical_->reset();
@@ -267,8 +318,16 @@ class PcMotherboardC06 {
       apics_[id] = LocalApic{secondary_cpus_[id].get()};
     }
     retired_before_init_.fill(0);
+    ether_steps_before_init_.fill(0);
+    state_vector_steps_before_init_.fill(0);
+    startup_ipis_ = {};
     faulted_processor_.reset();
     next_cpu_ = 0;
+    parallel_register_batches_ = parallel_register_steps_ = 0;
+    parallel_register_continuations_ = 0;
+    parallel_ram_batches_ = parallel_ram_steps_ = 0;
+    parallel_mixed_batches_ = 0;
+    longest_parallel_register_slice_ = 0;
     ioapic_select_=0;
     ioapic_id_=std::uint8_t(AcpiC06::ioapic_id(processor_count_));
     io_redir_low_.fill(0x10000U);io_redir_high_.fill(0);
@@ -356,16 +415,43 @@ class PcMotherboardC06 {
     }
     return false;
   }
-  std::uint8_t cmos() const {
-    std::time_t now=std::time(nullptr);
-    std::tm current{};
-#if defined(_WIN32)
-    gmtime_s(&current,&now);
-#else
-    gmtime_r(&now,&current);
-#endif
+  void rtc_schedule_periodic() {
+    unsigned rate=rtc_a_&0x0fU;
+    // This PC uses a 32.768 kHz crystal. Rates 1 and 2 alias rates 8 and 9.
+    if(rate && rate<3)rate+=7;
+    rtc_period_ticks_=0;
+    rtc_next_periodic_tick_=UINT64_MAX;
+    if((rtc_a_&0x70U)!=0x20 || !rate)return;
+    const auto hz=32768U>>(rate-1);
+    rtc_period_ticks_=(cosmic_pc::PcMachine::kVirtualCyclesPerSecond+hz-1)/hz;
+    rtc_next_periodic_tick_=ticks_+rtc_period_ticks_;
+  }
+  void rtc_update_irq() {
+    if(!(rtc_c_&rtc_b_&kRtcPeriodic)){
+      rtc_c_&=~kRtcIrq;
+      return;
+    }
+    if(rtc_c_&kRtcIrq)return;
+    rtc_c_|=kRtcIrq;
+    ++rtc_irq8_assertions_;
+    signal_isa_irq(8);
+  }
+  void rtc_update_periodic() {
+    if(!rtc_period_ticks_||ticks_<rtc_next_periodic_tick_)return;
+    rtc_next_periodic_tick_+=((ticks_-rtc_next_periodic_tick_)/rtc_period_ticks_+1)*rtc_period_ticks_;
+    rtc_c_|=kRtcPeriodic;
+    rtc_update_irq();
+  }
+  static bool rtc_calendar_index(unsigned index) {
+    return std::find(kRtcCalendar.begin(),kRtcCalendar.end(),index)!=kRtcCalendar.end();
+  }
+  std::uint8_t rtc_calendar_byte(unsigned index,const std::tm& current) const {
+    if(index==4 && !(rtc_b_&2U)){
+      const unsigned hour=current.tm_hour%12 ? current.tm_hour%12 : 12;
+      return ((rtc_b_&4U)?std::uint8_t(hour):bcd(hour)) | (current.tm_hour>=12 ? 0x80U : 0);
+    }
     unsigned raw=0;
-    switch(cmos_index_&0x7fU){
+    switch(index){
       case 0x00:raw=current.tm_sec;break;
       case 0x02:raw=current.tm_min;break;
       case 0x04:raw=current.tm_hour;break;
@@ -374,15 +460,93 @@ class PcMotherboardC06 {
       case 0x08:raw=current.tm_mon+1;break;
       case 0x09:raw=(current.tm_year+1900)%100;break;
       case 0x32:raw=(current.tm_year+1900)/100;break;
-      case 0x0a:return 0x26; // rate selector; UIP remains zero
-      case 0x0b:return rtc_b_; // 24h, BCD by default
-      case 0x0c:return 0; // no RTC IRQ pending in C06
-      case 0x0d:return 0x80; // valid CMOS battery status
-      default:return 0; // unmodeled CMOS storage not advertised as device
     }
-    return (rtc_b_&4)?std::uint8_t(raw):bcd(raw);
+    return (rtc_b_&4U)?std::uint8_t(raw):bcd(raw);
+  }
+  std::tm rtc_calendar_now() const {
+    const auto now=std::time(nullptr)+rtc_utc_offset_;
+    std::tm current{};
+#if defined(_WIN32)
+    gmtime_s(&current,&now);
+#else
+    gmtime_r(&now,&current);
+#endif
+    return current;
+  }
+  void rtc_latch_calendar() {
+    const auto current=rtc_calendar_now();
+    for(auto index:kRtcCalendar)cmos_ram_[index]=rtc_calendar_byte(index,current);
+  }
+  void rtc_apply_calendar() {
+    const auto decode=[&](unsigned index,std::uint8_t mask=0xff) {
+      const int value=cmos_ram_[index]&mask;
+      return (rtc_b_&4U)?value:10*(value>>4)+(value&15);
+    };
+    std::tm current{};
+    current.tm_sec=decode(0,0x7f);
+    current.tm_min=decode(2);
+    current.tm_hour=decode(4,0x7f);
+    if(!(rtc_b_&2U))current.tm_hour=current.tm_hour%12+((cmos_ram_[4]&0x80)?12:0);
+    current.tm_mday=decode(7);
+    current.tm_mon=decode(8)-1;
+    current.tm_year=100*decode(0x32)+decode(9)-1900;
+#if defined(_WIN32)
+    const auto target=_mkgmtime(&current);
+#else
+    const auto target=timegm(&current);
+#endif
+    if(target!=std::time_t(-1))rtc_utc_offset_=target-std::time(nullptr);
+  }
+  std::uint8_t cmos_read() {
+    const unsigned index=cmos_index_&0x7fU;
+    switch(index){
+      case 0x0a:{
+        if((rtc_b_&kRtcSet)||(rtc_a_&0x70U)!=0x20)return rtc_a_;
+        using namespace std::chrono;
+        const auto now=system_clock::now();
+        const bool updating=now-floor<seconds>(now)>=microseconds(999756);
+        return rtc_a_|(updating?0x80U:0);
+      }
+      case 0x0b:return rtc_b_;
+      case 0x0c:{
+        rtc_update_periodic();
+        return std::exchange(rtc_c_,0);
+      }
+      case 0x0d:return 0x80;
+    }
+    if((rtc_b_&kRtcSet)||!rtc_calendar_index(index))return cmos_ram_[index];
+    return rtc_calendar_byte(index,rtc_calendar_now());
+  }
+  void cmos_write(std::uint8_t value) {
+    ++rtc_data_writes_;
+    const unsigned index=cmos_index_&0x7fU;
+    switch(index){
+      case 0x0a:
+        rtc_update_periodic();
+        value&=0x7fU;
+        if(rtc_a_!=value){
+          rtc_a_=value;
+          rtc_schedule_periodic();
+        }
+        return;
+      case 0x0b:{
+        rtc_update_periodic();
+        const bool was_set=(rtc_b_&kRtcSet)!=0;
+        if(was_set && !(value&kRtcSet))rtc_apply_calendar();
+        rtc_b_=value;
+        if(!was_set && (rtc_b_&kRtcSet))rtc_latch_calendar();
+        rtc_update_irq();
+        return;
+      }
+      case 0x0c:case 0x0d:return; // Status-only registers.
+    }
+    const bool running_calendar=rtc_calendar_index(index)&&!(rtc_b_&kRtcSet);
+    if(running_calendar)rtc_latch_calendar();
+    cmos_ram_[index]=index==0 ? value&0x7fU : value;
+    if(running_calendar)rtc_apply_calendar();
   }
   std::optional<std::uint32_t> io_read(std::uint16_t p,unsigned width){
+    if(active_clock_running_&&timer_port(p))sync_active_clock();
     if(keyboard_&&width==1&&(p==0x60||p==0x64)){
       const auto status=prior_in_(0x64,1).value_or(0);
       if(p==0x64)return status|(keyboard_->has_data()?1U:0U);
@@ -417,11 +581,12 @@ class PcMotherboardC06 {
         return speaker_control_|(out?0x20U:0U)|(((ticks_/54U)&1U)?0x10U:0U);
       }
       case 0x70:return cmos_index_;
-      case 0x71:return cmos();
+      case 0x71:return cmos_read();
       default:return std::nullopt;
     }
   }
   bool io_write(std::uint16_t p,unsigned width,std::uint32_t value){
+    if(active_clock_running_&&timer_port(p))sync_active_clock();
     if(keyboard_&&width==1&&(p==0x60||p==0x64)){
       const auto data=std::uint8_t(value);
       if(p==0x60&&!keyboard_->controller_expects_data())return keyboard_->command(data);
@@ -486,11 +651,7 @@ class PcMotherboardC06 {
         speaker_control_=b&3U;
         return true;
       case 0x70:cmos_index_=b;return true;
-      case 0x71:
-        if((cmos_index_&0x7fU)==0x0b && (b&~std::uint8_t{0x06})==0) {
-          rtc_b_=b;return true;
-        }
-        return false; // no fake CMOS/RTC IRQ support
+      case 0x71:cmos_write(b);return true;
       default:return false;
     }
   }
@@ -692,6 +853,8 @@ class PcMotherboardC06 {
     }
     source.icr_low=value&0x000ccfffU;
     if (mode == 5 || mode == 6) {
+      if (mode == 5) ++startup_ipis_.init_icr_writes;
+      else ++startup_ipis_.sipi_icr_writes;
       // INIT level deassert has no effect on xAPIC startup state. Queue INIT
       // and SIPI so only the target's executor can reset its CPU or JIT cache.
       if (mode == 5 && (value & 0xc000U) == 0x8000U) return true;
@@ -701,8 +864,10 @@ class PcMotherboardC06 {
         if (mode == 5) {
           target.init_pending = true;
           target.startup_vector.reset();
+          ++startup_ipis_.init_targets_queued;
         } else if ((!target.started || target.init_pending) && !target.startup_vector) {
           target.startup_vector = std::uint8_t(vector);
+          ++startup_ipis_.sipi_targets_queued;
           if (sender == 0) pc_.yield_after_instruction();
         }
       }
@@ -823,14 +988,86 @@ class PcMotherboardC06 {
     }
     return true;
   }
+  Clock::time_point active_now() const {
+    return clock_source_ ? clock_source_() : Clock::now();
+  }
+  void sync_active_clock() {
+    if(!active_clock_running_)return;
+    const auto now=active_now();
+    if(now<=clock_sample_)return;
+    const auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(now-clock_sample_).count();
+    if(!ns)return;
+    clock_sample_=now;
+    active_clock_ns_+=ns;
+    constexpr std::uint64_t second=1000000000U;
+    constexpr std::uint64_t frequency=cosmic_pc::PcMachine::kVirtualCyclesPerSecond;
+    const auto fraction=std::uint64_t(ns)%second*frequency+clock_tick_remainder_;
+    clock_tick_remainder_=fraction%second;
+    const auto elapsed=std::uint64_t(ns)/second*frequency+fraction/second;
+    if(!elapsed)return;
+
+    // Virtual interrupts latch while the guest is between instruction
+    // boundaries. Count PIT expirations, but queue a single pending edge.
+    const auto previous=ticks_;
+    ticks_+=elapsed;
+    active_clock_ticks_+=elapsed;
+    const auto pit_elapsed=pit_phase_+elapsed;
+    const auto clocks=pit_elapsed/kPitClockDivider;
+    pit_phase_=pit_elapsed%kPitClockDivider;
+    if(pit_.enabled){
+      if(clocks>=pit_.counter){
+        pit_irqs_+=pit_.mode==0 ? 1 : 1+(clocks-pit_.counter)/pit_.reload;
+        signal_isa_irq(0);
+      }
+      pit_.advance_without_irq(clocks);
+    }
+    if((speaker_control_&1)&&pit2_.enabled)pit2_.advance_without_irq(clocks);
+    if(previous/AcpiC06::pm_timer_half_period!=ticks_/AcpiC06::pm_timer_half_period){
+      pm_status_|=1U;
+      update_sci();
+    }
+    if((rtc_b_&kRtcPeriodic)&&!(rtc_c_&kRtcIrq))rtc_update_periodic();
+    advance_apic_timer(bsp(),elapsed);
+  }
+  struct ActiveClockRun {
+    PcMotherboardC06& board;
+    explicit ActiveClockRun(PcMotherboardC06& target):board(target){
+      if(!board.active_clock_enabled_)return;
+      board.clock_sample_=board.active_now();
+      board.active_clock_running_=true;
+    }
+    ~ActiveClockRun(){
+      board.sync_active_clock();
+      board.active_clock_running_=false;
+    }
+  };
+  void update_secondary_timer(LocalApic& apic) {
+    advance_apic_timer(apic,ticks_-apic.last_tick);
+    apic.last_tick=ticks_;
+  }
+  void sync_apic_clock(LocalApic& apic) {
+    if(!active_clock_running_)return;
+    sync_active_clock();
+    if(&apic!=&bsp())update_secondary_timer(apic);
+  }
+  static bool timer_port(std::uint16_t port) {
+    return (port>=0x40&&port<=0x43)||port==0x61||(port>=0x70&&port<=0x71)||
+        (port>=AcpiC06::pm_event_port&&port<AcpiC06::pm_timer_port+4);
+  }
   void poll(){
-    ++ticks_;
+    if(active_clock_running_){
+      if((++clock_polls_&15U)==0)sync_active_clock();
+    }else{
+      ++ticks_;
+      if((rtc_b_&kRtcPeriodic)&&!(rtc_c_&kRtcIrq)&&ticks_>=rtc_next_periodic_tick_)
+        rtc_update_periodic();
+    }
     auto& cpu=pc_.cpu;
     const bool ferr=cpu.x87_ferr_asserted();
     if(ferr&&!ferr_was_asserted_)signal_isa_irq(13);
     if(!ferr&&ferr_was_asserted_)cpu.set_x87_ignne(false);
     ferr_was_asserted_=ferr;
-    if(++pit_phase_==kPitClockDivider){
+    if(!active_clock_running_&&++pit_phase_==kPitClockDivider){
       pit_phase_=0;
       if(pit_.enabled&&pit_.tick()){
         ++pit_irqs_;
@@ -838,7 +1075,7 @@ class PcMotherboardC06 {
       }
       if((speaker_control_&1)&&pit2_.enabled)pit2_.tick();
     }
-    if((ticks_&(AcpiC06::pm_timer_half_period-1))==0){
+    if(!active_clock_running_&&(ticks_&(AcpiC06::pm_timer_half_period-1))==0){
       pm_status_|=1U;
       update_sci();
     }
@@ -849,7 +1086,7 @@ class PcMotherboardC06 {
       signal_isa_irq(1);
       keyboard_->mark_irq();
     }
-    advance_apic_timer(bsp(),1);
+    if(!active_clock_running_)advance_apic_timer(bsp(),1);
     // The slave's INT output reaches the master independently of CPU IF or
     // LAPIC acceptance. The guest can read both IRRs with interrupts disabled.
     const auto slave_irq=slave_.pending();
@@ -882,23 +1119,30 @@ class PcMotherboardC06 {
        (keyboard_&&keyboard_->needs_irq()) ||
        (pc_.cpu.flag(cosmic_pc::Cpu::IF)&&interrupt_pending())) return 1;
     if(pit_.enabled)steps=std::min(steps,pit_.counter*kPitClockDivider-pit_phase_);
-    if((speaker_control_&1)&&pit2_.enabled)
-      steps=std::min(steps,pit2_.counter*kPitClockDivider-pit_phase_);
     steps=std::min(steps,pm_timer_edge_in());
-    if(pc_.cpu.apic_global_enabled()&&bsp().timer_cycles&&bsp().timer_cycles<steps)
+    if((rtc_b_&kRtcPeriodic)&&!(rtc_c_&kRtcIrq)&&rtc_next_periodic_tick_-ticks_<steps)
+      steps=unsigned(rtc_next_periodic_tick_-ticks_);
+    if(bsp().timer_cycles&&bsp().timer_cycles<steps&&!(bsp().lvt[kTimer]&kLvtMasked)&&lapic_on(bsp()))
       steps=unsigned(bsp().timer_cycles);
     return steps;
   }
   void advance_batch(unsigned extra_steps) {
+    if(active_clock_running_){
+      if(extra_steps>=128)sync_active_clock();
+      return;
+    }
     ticks_+=extra_steps;
     const auto pit_elapsed=pit_phase_+extra_steps;
     if(pit_.enabled)pit_.counter-=pit_elapsed/kPitClockDivider;
-    if((speaker_control_&1)&&pit2_.enabled)pit2_.counter-=pit_elapsed/kPitClockDivider;
+    // Channel 2 only drives the speaker output. It can cross expirations
+    // within a batch while leaving the guest-visible counter exact.
+    if((speaker_control_&1)&&pit2_.enabled)pit2_.advance_without_irq(pit_elapsed/kPitClockDivider);
     pit_phase_=pit_elapsed%kPitClockDivider;
-    if(pc_.cpu.apic_global_enabled()&&bsp().timer_cycles)bsp().timer_cycles-=extra_steps;
+    advance_apic_timer(bsp(),extra_steps);
   }
   unsigned advance_idle(unsigned max_extra) {
     if(!pc_.cpu.halted||!pc_.cpu.flag(cosmic_pc::Cpu::IF))return 0;
+    sync_active_clock();
     const auto extra=batch_limit(max_extra+1)-1;
     advance_batch(extra);
     return extra;
@@ -913,23 +1157,33 @@ class PcMotherboardC06 {
       return mmio_range_claim(start, length);
     };
     cpu.mmio_read_hook = [this, &apic](std::uint64_t address) {
-      if (mmio_claim(address)) return mmio_byte(apic, address);
+      if (mmio_claim(address)) {
+        sync_apic_clock(apic);
+        return mmio_byte(apic, address);
+      }
       if (gpu_ && gpu_->claims(address)) return std::optional<std::uint8_t>(gpu_->read(address));
       return prior_mmio_read_ ? prior_mmio_read_(address) : std::nullopt;
     };
     cpu.mmio_write_hook = [this, &apic](std::uint64_t address, std::uint8_t value) {
-      if (mmio_claim(address)) return mmio_write(apic, address, value);
+      if (mmio_claim(address)) {
+        sync_apic_clock(apic);
+        return mmio_write(apic, address, value);
+      }
       if (gpu_ && gpu_->claims(address)) return gpu_->write(address, value);
       return prior_mmio_write_ && prior_mmio_write_(address, value);
     };
     cpu.mmio_read32_hook = [this, &apic](std::uint64_t address) {
-      if (mmio_claim(address)) return mmio_register(apic, address);
+      if (mmio_claim(address)) {
+        sync_apic_clock(apic);
+        return mmio_register(apic, address);
+      }
       if (gpu_ && gpu_->claims(address)) return std::optional<std::uint32_t>(gpu_->read32(address));
       return prior_mmio_read32_ ? prior_mmio_read32_(address) : std::nullopt;
     };
     cpu.mmio_write32_hook = [this, &apic](std::uint64_t address, std::uint32_t value)
         -> std::optional<bool> {
       if (mmio_claim(address)) {
+        sync_apic_clock(apic);
         apic.mmio_pending = {};
         return mmio_commit(apic, address, value);
       }
@@ -951,6 +1205,8 @@ class PcMotherboardC06 {
       const auto id = cpu.apic_id();
       const auto sipi = apic.startup_vector;
       retired_before_init_[id] += cpu.instructions;
+      ether_steps_before_init_[id] += cpu.ether_arm64_stats().steps;
+      state_vector_steps_before_init_[id] += cpu.ether_arm64_stats().state_vector_steps;
       cpu.reset(0, 0);
       apic = LocalApic{&cpu};
       apic.startup_vector = sipi;
@@ -965,30 +1221,51 @@ class PcMotherboardC06 {
       apic.started = true;
       apic.startup_vector.reset();
       apic.last_tick = ticks_;
+      ++startup_ipis_.sipi_targets_applied;
     }
   }
-  void run_secondary(unsigned id, unsigned budget) {
+  static constexpr unsigned kSmpQuantum = 32;
+  static constexpr unsigned kExtendedSmpQuantum = 4096;
+
+  unsigned smp_quantum(const std::array<unsigned, kMaxProcessors>& runnable, unsigned count) const {
+    for (unsigned slot = 0; slot < count; ++slot) {
+      const auto& apic = apics_[runnable[slot]];
+      const auto& cpu = *apic.cpu;
+      if (!apic.started || apic.init_pending || apic.startup_vector || apic.timer_cycles ||
+          apic.pending.highest() || cpu.halted || cpu.flag(cosmic_pc::Cpu::IF | cosmic_pc::Cpu::TF) ||
+          !cpu.is_long_mode() || !cpu.ether_arm64_block_candidate()) return kSmpQuantum;
+    }
+    return std::max(kSmpQuantum, batch_limit(kExtendedSmpQuantum));
+  }
+
+  void run_secondary(unsigned id, unsigned budget, cosmic_pc::PcMachine::RunClock::time_point deadline,
+                     bool preserve_ether_loop_entry) {
+    using Clock = cosmic_pc::PcMachine::RunClock;
+    const bool timed = deadline != Clock::time_point::max();
     auto& apic = apics_[id];
     auto& cpu = *apic.cpu;
+    unsigned dispatches = 0;
     for (unsigned used = 0; used < budget;) {
-      // Keep the entire scalar instruction and its undo journal atomic with
-      // respect to the other vCPUs and devices. Éter releases this lock during
-      // native blocks that operate solely on this CPU's private registers.
-      std::unique_lock<std::mutex> lock(bus_);
+      // The workers have joined before shared RAM or devices can change.
+      if ((dispatches++ & 7U) == 0) {
+        if (timed && Clock::now() >= deadline) return;
+        sync_active_clock();
+      }
       if (faulted_processor_ || powered_off_ ||
           pc_.guest_restart() != cosmic_pc::PcMachine::GuestRestart::None) return;
+      if (preserve_ether_loop_entry && used && budget - used < cosmic_pc::ether_arm64::Block::kMaxInstructions &&
+          budget - used < cpu.ether_arm64_loop_length(kParallelLoopAccess)) return;
       apply_startup(apic);
       if (!apic.started) return;
       cpu.a20_enabled = pc_.cpu.a20_enabled;
-      advance_apic_timer(apic, ticks_ - apic.last_tick);
-      apic.last_tick = ticks_;
+      update_secondary_timer(apic);
       deliver_lapic_irq(apic);
       if (cpu.fault) {
         faulted_processor_ = id;
         return;
       }
       if (cpu.halted) return;
-      const auto native_steps = cpu.try_ether_arm64_block(budget - used, &lock);
+      const auto native_steps = cpu.try_ether_arm64_block(budget - used);
       if (native_steps) {
         used += native_steps;
         continue;
@@ -1000,12 +1277,161 @@ class PcMotherboardC06 {
     }
   }
 
+  unsigned run_parallel_ether_loops(const std::array<unsigned, kMaxProcessors>& runnable,
+                                    unsigned count, unsigned budget,
+                                    cosmic_pc::PcMachine::RunClock::time_point deadline) {
+    if (budget < 2 * kMinParallelLoopSteps || !cosmic_pc::Cpu::ether_arm64_host() ||
+        !pc_.boot_acceleration_enabled() || !pc_.guest_execution_available() ||
+        (pc_.cpu.flag(cosmic_pc::Cpu::IF) && slave_.pending()) ||
+        (sci_active_ && (io_redir_low_[AcpiC06::sci_irq] & 0x8000U))) return 0;
+
+    auto limit = budget;
+    std::array<unsigned, kMaxProcessors> candidates{};
+    unsigned candidate_count = 0, active_count = 1;
+    const auto consider = [&](unsigned id) {
+      if (!apics_[id].cpu->ether_arm64_loop_length(kParallelLoopAccess)) return false;
+      candidates[candidate_count++] = id;
+      return true;
+    };
+    if (!consider(0) && !experimental_mixed_smp_) return 0;
+    for (unsigned i = 1; i < count; ++i) {
+      const auto& apic = apics_[runnable[i]];
+      const auto& cpu = *apic.cpu;
+      if (apic.init_pending || apic.startup_vector ||
+          (cpu.flag(cosmic_pc::Cpu::IF) && deliverable_lapic_vector(apic))) return 0;
+      if (cpu.apic_global_enabled() && apic.timer_cycles) {
+        const auto elapsed = ticks_ - apic.last_tick;
+        if (elapsed >= apic.timer_cycles) return 0;
+        limit = static_cast<unsigned>(std::min<std::uint64_t>(limit, apic.timer_cycles - elapsed - 1));
+      }
+      if (cpu.halted) continue;
+      ++active_count;
+      if (!consider(runnable[i]) && !experimental_mixed_smp_) return 0;
+    }
+    if (candidate_count < 2) return 0;
+    // Bound one independent execution by the earliest device edge and the
+    // aggregate budget, including the processors that need serial service.
+    limit = batch_limit(std::min(limit, budget / active_count) + 1) - 1;
+    if (limit < kMinParallelLoopSteps) return 0;
+
+    std::array<unsigned, kMaxProcessors> jobs{};
+    std::array<cosmic_pc::Cpu::EtherLoopWork, kMaxProcessors> work{};
+    const auto prepare = [&](bool ram_only) {
+      unsigned ready = 0;
+      for (unsigned i = 0; i < candidate_count; ++i) {
+        const auto id = candidates[i];
+        const auto accepted = id
+            ? apics_[id].cpu->prepare_ether_arm64_loop(limit, work[ready], kParallelLoopAccess)
+            : pc_.prepare_ether_loop(limit, work[ready], kParallelLoopAccess);
+        if (accepted && (!ram_only || work[ready].reads_ram())) jobs[ready++] = id;
+        else if (!experimental_mixed_smp_) return 0U;
+      }
+      return ready;
+    };
+    bool mixed = false;
+    const auto prepare_mixed = [&] {
+      // Projected register rounds can be cheaper than starting workers.
+      // Give distinct RAM readers a full grant before paying for a mixed batch.
+      if (!experimental_mixed_smp_ || limit < kMixedParallelLoopSteps) return 0U;
+      mixed = true;
+      limit = kMixedParallelLoopSteps;
+      return prepare(true);
+    };
+    auto job_count = candidate_count == active_count ? prepare(false) : 0U;
+    if (job_count < active_count) job_count = prepare_mixed();
+    if (job_count < 2) return 0;
+    if (!workers_) workers_ = std::make_unique<SmpWorkers>(processor_count_);
+    const auto worker_count = workers_->prepare(job_count);
+    if (worker_count < 2) return 0;
+    job_count = worker_count < job_count && !mixed ? std::min(worker_count, prepare_mixed()) : worker_count;
+    if (job_count < 2) return 0;
+
+    // A worker publishes register state to its own vCPU and can use the
+    // rest of its grant on cached register blocks. Shared writes and device
+    // callbacks run at the boundary after all workers return.
+    using Clock = cosmic_pc::PcMachine::RunClock;
+    const bool profile_bsp = pc_.boot_hotspots() || pc_.boot_timing();
+    struct Progress {
+      unsigned steps = 0, ram_steps = 0, continuations = 0;
+    };
+    std::array<Progress, kMaxProcessors> progress{};
+    workers_->run(job_count, [&](unsigned job) {
+      const auto id = jobs[job];
+      auto& cpu = *apics_[id].cpu;
+      auto& block = work[job];
+      Progress result;
+      const bool measure = id == 0 && profile_bsp;
+      bool continued = false;
+      do {
+        const auto start = measure ? Clock::now() : Clock::time_point{};
+        block.run(deadline);
+        const auto elapsed = measure ? Clock::now() - start : Clock::duration{};
+        const auto completed = id == 0 ? pc_.retire_ether_loop(block, elapsed, true)
+                                       : cpu.retire_ether_arm64_loop(block);
+        if (!completed) break;
+        result.steps += completed;
+        if (block.reads_ram()) result.ram_steps += completed;
+        result.continuations += continued;
+        continued = result.steps < limit &&
+                    cpu.prepare_parallel_ether_arm64_register_block(limit - result.steps, block);
+      } while (continued);
+      progress[job] = result;
+    });
+    unsigned total = 0, processors = 0, longest = 0, ram_steps = 0, bsp_steps = 0;
+    std::array<bool, kMaxProcessors> serviced{};
+    for (unsigned job = 0; job < job_count; ++job) {
+      const auto& result = progress[job];
+      serviced[jobs[job]] = result.steps != 0;
+      if (jobs[job] == 0) bsp_steps = result.steps;
+      total += result.steps;
+      processors += result.steps != 0;
+      longest = std::max(longest, result.steps);
+      ram_steps += result.ram_steps;
+      parallel_register_continuations_ += result.continuations;
+    }
+    if (bsp_steps) {
+      pc_.finish_parallel_ether_work();
+      advance_batch(bsp_steps);
+    }
+    if (processors > 1) {
+      parallel_mixed_batches_ += experimental_mixed_smp_ && processors < active_count;
+      if (ram_steps) {
+        ++parallel_ram_batches_;
+        parallel_ram_steps_ += ram_steps;
+      } else {
+        ++parallel_register_batches_;
+        parallel_register_steps_ += total;
+        longest_parallel_register_slice_ = std::max(longest_parallel_register_slice_, longest);
+      }
+    }
+
+    // Only now can the other processors execute memory writes and device I/O.
+    if (!experimental_mixed_smp_ || !total || processors == active_count) return total;
+    const auto serial_limit = std::min(limit, kMixedParallelLoopSteps);
+    for (unsigned i = 0; i < count && !faulted_processor_ && pc_.guest_execution_available(); ++i) {
+      const auto id = runnable[i];
+      if (serviced[id] || (id && apics_[id].cpu->halted)) continue;
+      if (id) run_secondary(id, serial_limit, deadline, true);
+      else run_bsp(serial_limit, deadline, true);
+      total += serial_limit;
+    }
+    return total;
+  }
+
+  void run_bsp(unsigned budget, cosmic_pc::PcMachine::RunClock::time_point deadline,
+               bool preserve_ether_loop_entry = false) {
+    const cosmic_pc::MemoryFabric::ExclusiveRamReads exclusive(pc_.cpu.memory);
+    pc_.run(budget, deadline, preserve_ether_loop_entry);
+  }
+
  public:
   explicit PcMotherboardC06(cosmic_pc::PcMachine& machine, BlockDisk* disk=nullptr,
                             AtapiCdrom::Reader optical={}, std::uint64_t optical_bytes=0,
                             const std::filesystem::path& graphics_vram={},
-                            BlockDisk* data_disk=nullptr, cosmic_pc::CpuTopology topology={})
-      :pc_(machine), processor_count_(topology.logical_processors()) {
+                            BlockDisk* data_disk=nullptr, cosmic_pc::CpuTopology topology={},
+                            bool experimental_mixed_smp=false)
+      :pc_(machine), processor_count_(topology.logical_processors()),
+       experimental_mixed_smp_(experimental_mixed_smp) {
     if (!topology.valid()) throw std::invalid_argument("Invalid virtual processor topology");
     prior_topology_ = pc_.cpu.topology();
     prior_apic_id_ = pc_.cpu.apic_id();
@@ -1094,13 +1520,17 @@ class PcMotherboardC06 {
     };
     prior_local_apic_=pc_.cpu.local_apic_present();
     pc_.cpu.set_local_apic_present(true);
-    if (processor_count_ > 1) prior_clock_ = pc_.cpu.set_shared_clock(&ticks_);
+    if (processor_count_ > 1) {
+      prior_clock_ = pc_.cpu.set_shared_clock(&ticks_);
+      clock_attached_=true;
+    }
   }
   ~PcMotherboardC06(){
     // Never leave a hook pointing at a destroyed motherboard instance.
     pc_.cpu.set_local_apic_present(prior_local_apic_);
     pc_.cpu.configure_topology(prior_topology_, prior_apic_id_);
-    if (processor_count_ > 1) pc_.cpu.set_shared_clock(prior_clock_);
+    if (clock_attached_) pc_.cpu.set_shared_clock(prior_clock_);
+    if (timestamp_hook_attached_) pc_.cpu.before_timestamp_read_hook=std::move(prior_timestamp_read_);
     pc_.reserve_pci_mmio(prior_pci_reservation_);
     pc_.cpu.set_x87_ignne(false);
     pc_.cpu.in_hook=std::move(prior_in_);
@@ -1138,12 +1568,83 @@ class PcMotherboardC06 {
     return static_cast<unsigned>(std::count_if(apics_.begin(), apics_.begin() + processor_count_,
         [](const LocalApic& apic) { return apic.started; }));
   }
+  StartupIpis startup_ipis() const noexcept { return startup_ipis_; }
+  RtcEvidence rtc_evidence() const noexcept {
+    return {cmos_index_&0x7fU,rtc_a_,rtc_b_,rtc_c_,bool(cmos_index_&0x80U),
+            rtc_irq8_assertions_,rtc_data_writes_};
+  }
   unsigned worker_count() const noexcept { return workers_ ? workers_->size() : 1; }
+  void configure_ether_x86_sessions(unsigned workers, unsigned max_sessions_per_vcpu) {
+    if (!workers || !max_sessions_per_vcpu || ether_x86_sessions_) return;
+    const auto slots = std::min<std::uint64_t>(workers, std::uint64_t(processor_count_) * max_sessions_per_vcpu);
+    ether_x86_sessions_ = std::make_unique<EtherX86Sessions>(
+        processor_count_, static_cast<unsigned>(slots), max_sessions_per_vcpu);
+  }
+  std::optional<EtherX86Sessions::Ticket> submit_ether_x86_session(unsigned vcpu, EtherX86Sessions::Job job) {
+    if (!ether_x86_sessions_) return std::nullopt;
+    return ether_x86_sessions_->submit(vcpu, std::move(job));
+  }
+  EtherX86Sessions::Stats ether_x86_session_stats(unsigned vcpu) const {
+    return ether_x86_sessions_ ? ether_x86_sessions_->stats(vcpu) : EtherX86Sessions::Stats{};
+  }
+  unsigned ether_x86_session_workers() const noexcept {
+    return ether_x86_sessions_ ? ether_x86_sessions_->worker_count() : 0;
+  }
+  std::uint64_t parallel_register_batches() const noexcept { return parallel_register_batches_; }
+  std::uint64_t parallel_register_steps() const noexcept { return parallel_register_steps_; }
+  std::uint64_t parallel_register_continuations() const noexcept { return parallel_register_continuations_; }
+  std::uint64_t parallel_ram_batches() const noexcept { return parallel_ram_batches_; }
+  std::uint64_t parallel_ram_steps() const noexcept { return parallel_ram_steps_; }
+  std::uint64_t parallel_mixed_batches() const noexcept { return parallel_mixed_batches_; }
+  unsigned longest_parallel_register_slice() const noexcept { return longest_parallel_register_slice_; }
   const cosmic_pc::Cpu* faulted_cpu() const noexcept {
     return faulted_processor_ ? apics_[*faulted_processor_].cpu : nullptr;
   }
+  void enable_active_clock(ClockSource source={}) {
+    if(active_clock_enabled_)return;
+    if(!clock_attached_){
+      prior_clock_=pc_.cpu.set_shared_clock(&ticks_);
+      clock_attached_=true;
+    }
+    if(!timestamp_hook_attached_){
+      prior_timestamp_read_=std::move(pc_.cpu.before_timestamp_read_hook);
+      pc_.cpu.before_timestamp_read_hook=[this](){
+        if(prior_timestamp_read_)prior_timestamp_read_();
+        sync_active_clock();
+      };
+      for(unsigned id=1;id<processor_count_;++id)
+        apics_[id].cpu->before_timestamp_read_hook=[this](){sync_active_clock();};
+      timestamp_hook_attached_=true;
+    }
+    clock_source_=std::move(source);
+    active_clock_enabled_=true;
+  }
+  bool active_clock_enabled() const noexcept {return active_clock_enabled_;}
+  std::uint64_t active_clock_elapsed_ns() const noexcept {return active_clock_ns_;}
+  std::uint64_t active_clock_ticks() const noexcept {return active_clock_ticks_;}
   std::uint64_t processor_steps(unsigned id) const noexcept {
     return apics_[id].cpu->instructions + retired_before_init_[id];
+  }
+  std::uint64_t processor_ether_arm64_steps(unsigned id) const noexcept {
+    return apics_[id].cpu->ether_arm64_stats().steps + ether_steps_before_init_[id];
+  }
+  std::uint64_t processor_state_vector_steps(unsigned id) const noexcept {
+    return apics_[id].cpu->ether_arm64_stats().state_vector_steps + state_vector_steps_before_init_[id];
+  }
+  struct CpuExecutionTotals {
+    std::uint64_t guest_steps = 0, ether_steps = 0, projected_steps = 0;
+    unsigned processors_with_projected_steps = 0;
+  };
+  CpuExecutionTotals cpu_execution_totals() const noexcept {
+    CpuExecutionTotals totals;
+    for (unsigned id = 0; id < processor_count_; ++id) {
+      const auto projected = processor_state_vector_steps(id);
+      totals.guest_steps += processor_steps(id);
+      totals.ether_steps += processor_ether_arm64_steps(id);
+      totals.projected_steps += projected;
+      totals.processors_with_projected_steps += projected != 0;
+    }
+    return totals;
   }
   std::uint64_t total_processor_steps() const noexcept {
     std::uint64_t steps = 0;
@@ -1152,16 +1653,16 @@ class PcMotherboardC06 {
   }
   void run(unsigned budget, cosmic_pc::PcMachine::RunClock::time_point deadline=
            cosmic_pc::PcMachine::RunClock::time_point::max()) {
+    const ActiveClockRun elapsed(*this);
     using Clock=cosmic_pc::PcMachine::RunClock;
     const bool timed=deadline!=Clock::time_point::max();
     if(!timed)budget=std::min(budget,cosmic_pc::PcMachine::kDefaultRunSteps);
     if (!secondary_can_run()) {
-      pc_.run(budget,deadline);
+      run_bsp(budget, deadline);
       return;
     }
     // The budget counts work across the whole VM. Small calls keep a rotating
     // position so that every runnable processor gets a turn.
-    constexpr unsigned quantum = 32;
     while (budget && !faulted_processor_ && !pc_.cpu.fault && !powered_off_ &&
            pc_.guest_restart() == cosmic_pc::PcMachine::GuestRestart::None) {
       if(timed&&Clock::now()>=deadline)return;
@@ -1170,29 +1671,25 @@ class PcMotherboardC06 {
       for (unsigned id = 1; id < processor_count_; ++id)
         if (needs_service(apics_[id])) runnable[count++] = id;
       if (count == 1) {
-        pc_.run(budget,deadline);
+        run_bsp(budget, deadline);
         return;
       }
-      const auto chunk = std::min(budget, count * quantum);
+      if (const auto completed = run_parallel_ether_loops(runnable, count, budget, deadline)) {
+        budget -= completed;
+        continue;
+      }
+      const auto chunk = std::min(budget, count * smp_quantum(runnable, count));
       std::array<unsigned, kMaxProcessors> work{};
       for (unsigned i = 0; i < count; ++i)
         work[(next_cpu_ + i) % count] = chunk / count + (i < chunk % count);
       next_cpu_ = (next_cpu_ + chunk % count) % count;
-      if (work[0]) pc_.run(work[0]);
+      const bool preserve_ether_loop_entry = cosmic_pc::Cpu::ether_arm64_host() &&
+          pc_.boot_acceleration_enabled() && budget >= count * kMinParallelLoopSteps;
+      if (work[0]) run_bsp(work[0], deadline, preserve_ether_loop_entry);
       if (pc_.cpu.fault || pc_.waiting_key || powered_off_ ||
           pc_.guest_restart() != cosmic_pc::PcMachine::GuestRestart::None) return;
-      std::array<unsigned, kMaxProcessors> jobs{};
-      unsigned job_count = 0;
       for (unsigned i = 1; i < count; ++i)
-        if (work[i]) jobs[job_count++] = i;
-      if (job_count == 1) run_secondary(runnable[jobs[0]], work[jobs[0]]);
-      if (job_count > 1) {
-        if (!workers_) workers_ = std::make_unique<SmpWorkers>(pc_.cpu.topology().cores);
-        workers_->run(job_count, [&](unsigned job) {
-          const auto slot = jobs[job];
-          run_secondary(runnable[slot], work[slot]);
-        });
-      }
+        if (work[i]) run_secondary(runnable[i], work[i], deadline, preserve_ether_loop_entry);
       budget -= chunk;
     }
   }
