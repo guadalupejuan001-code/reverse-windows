@@ -59,7 +59,7 @@ jobs:
             -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" \
             -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
           cmake --build build --target reverse_windows_android_boot_session_test \
-            reverse_windows_ether_core_rules_test reverse_windows_sparse_ram_test \
+            reverse_windows_ether_core_rules_test reverse_windows_prime_ether_arm64_test reverse_windows_sparse_ram_test \
             reverse_windows_atapi_cdrom_guest_test reverse_windows_c06_motherboard_guest_test \
             reverse_windows_smp_guest_test reverse_windows_c04_guest_idt \
             reverse_windows_protected_entry_test reverse_windows_protected_real_transition_test \
@@ -73,7 +73,7 @@ jobs:
             reverse_windows_x86_x87_state_test reverse_windows_c09r1_fxstate_test \
             reverse_windows_x86_ether_counter_loop_test --parallel 2
           ctest --test-dir build --output-on-failure \
-            -R '^(reverse_windows_android_|reverse_windows_ether_core_rules$|reverse_windows_sparse_ram$|reverse_windows_pc_video$|reverse_windows_c04_real_guest_idt$|reverse_windows_c06_real_motherboard$|reverse_windows_smp_guest$|reverse_windows_protected_entry_stack$|reverse_windows_protected_real_transition$|reverse_windows_cpu_profile$|reverse_windows_lock_rmw$|reverse_windows_x64_optical_qssd$|reverse_windows_x86_(far_transfer64|system64|long_mode|long_null_ss|sse|mmx|x87|ether_counter_loop$)|reverse_windows_x86_c09r1_stage5_cvt_fxsr$|reverse_windows_c09r1_x87_fxsave_context$)'
+            -R '^(reverse_windows_android_|reverse_windows_ether_core_rules$|reverse_windows_prime_ether_arm64$|reverse_windows_sparse_ram$|reverse_windows_pc_video$|reverse_windows_c04_real_guest_idt$|reverse_windows_c06_real_motherboard$|reverse_windows_smp_guest$|reverse_windows_protected_entry_stack$|reverse_windows_protected_real_transition$|reverse_windows_cpu_profile$|reverse_windows_lock_rmw$|reverse_windows_x64_optical_qssd$|reverse_windows_x86_(far_transfer64|system64|long_mode|long_null_ss|sse|mmx|x87|ether_counter_loop$)|reverse_windows_x86_c09r1_stage5_cvt_fxsr$|reverse_windows_c09r1_x87_fxsave_context$)'
       - name: Install Android command-line tools and pinned packages
         uses: android-actions/setup-android@v3
         with:
@@ -153,6 +153,7 @@ jobs:
           grep -aFq 'sampled_profile_ns' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'pattern_delta_pages' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'spill_deferred_staged_pages' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'state_vector_interpreter_steps_by_logical_processor' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'boot_rep_direct_page_copy_bytes' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'wbinvd_retired' "$RUNNER_TEMP/reverse-windows-android.so"
           readelf -h -lW "$RUNNER_TEMP/reverse-windows-android.so" > "$out/native-elf.txt"
