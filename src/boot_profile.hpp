@@ -150,7 +150,7 @@ class BootProfile {
     out.spill_writes = memory.backing_writes;
     out.batched = work.rep_elements + work.shift_loop_steps + work.zero_loop_steps +
         work.scan_loop_steps + work.arm64_block_steps + work.counter_loop_steps +
-        work.affine_ram_rotate_steps + work.movntdq_store_steps;
+        work.affine_ram_rotate_steps + work.movntdq_store_steps + cpu.state_vector_interpreter_stats().steps;
     out.mode_changes = pc.boot_mode_progress().changes;
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     out.neon_steps = cpu.ether_next_stats().native_instructions;

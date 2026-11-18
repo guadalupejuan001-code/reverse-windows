@@ -7,6 +7,7 @@
 #include "c06_motherboard.hpp"
 #include "c09_guest_trace.hpp"
 #include "c09r_guest_vga_fabric.hpp"
+#include "riso_reader.hpp"
 #include "virtual_disk.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -21,8 +22,8 @@
 
 namespace {
 struct Options {
-    enum class Source { None, DemoX86, DemoX64, Iso, Disk, QssdCheckpoint, QssdCompact } source = Source::None;
-    std::string iso_path;
+    enum class Source { None, DemoX86, DemoX64, Iso, Riso, Disk, QssdCheckpoint, QssdCompact } source = Source::None;
+    std::string optical_path;
     std::string disk_path;
     std::string qssd_path;
     std::uint64_t create_qssd_gib = 0;
@@ -38,6 +39,7 @@ struct Options {
     std::uint64_t profile_every = 0, profile_from = 0, profile_until = 0;
     bool profile_timing = true;
     bool ether_arm64 = false;
+    bool verify_riso = false;
 };
 
 std::uint64_t positive(const std::string& raw, std::uint64_t upper, const char* name) {
@@ -58,17 +60,22 @@ Options parse(int argc, char** argv) {
             if (i + 1 >= argc) throw std::invalid_argument("Missing argument after " + arg);
             return argv[++i];
         };
-        if (arg == "--demo-x86" || arg == "--demo-x64" || arg == "--iso" || arg == "--boot-hdd") {
+        if (arg == "--demo-x86" || arg == "--demo-x64" || arg == "--iso" || arg == "--riso" ||
+            arg == "--boot-hdd") {
             if (out.source != Options::Source::None) throw std::invalid_argument("One boot source only");
             if (arg == "--demo-x86") out.source = Options::Source::DemoX86;
             else if (arg == "--demo-x64") out.source = Options::Source::DemoX64;
             else if (arg == "--boot-hdd") out.source = Options::Source::Disk;
-            else { out.source = Options::Source::Iso; out.iso_path = next(); }
+            else {
+                out.source = arg == "--riso" ? Options::Source::Riso : Options::Source::Iso;
+                out.optical_path = next();
+            }
         } else if (arg == "--qssd-checkpoint" || arg == "--qssd-compact") {
             if (out.source != Options::Source::None) throw std::invalid_argument("One action/boot source only");
             out.source = arg == "--qssd-checkpoint" ? Options::Source::QssdCheckpoint :
                                                         Options::Source::QssdCompact;
-        } else if (arg == "--disk") out.disk_path = next();
+        } else if (arg == "--verify-riso") out.verify_riso = true;
+        else if (arg == "--disk") out.disk_path = next();
         else if (arg == "--qssd-disk") out.qssd_path = next();
         else if (arg == "--create-qssd-gib") {
             using reverse_windows::QssdDisk;
@@ -93,6 +100,8 @@ Options parse(int argc, char** argv) {
         else throw std::invalid_argument("Unknown option: " + arg);
     }
     if (out.source == Options::Source::None) throw std::invalid_argument("Select a boot source or --qssd-checkpoint/--qssd-compact");
+    if (out.verify_riso && out.source != Options::Source::Riso)
+        throw std::invalid_argument("--verify-riso requires --riso FILE");
     if (out.ether_arm64 && !out.profile_every)
         throw std::invalid_argument("--ether-arm64 requires --profile-every");
     out.profile_timing = !unprofiled;
@@ -124,7 +133,8 @@ Options parse(int argc, char** argv) {
             throw std::invalid_argument("--trace needs a boot source, not offline QSSD maintenance");
         // Refuse to clobber an existing trace, especially an ISO or disk image.
         const auto trace = std::filesystem::weakly_canonical(out.trace_path);
-        if (std::filesystem::exists(trace) || trace==std::filesystem::weakly_canonical(out.iso_path) ||
+        if (std::filesystem::exists(trace) ||
+            (!out.optical_path.empty() && trace==std::filesystem::weakly_canonical(out.optical_path)) ||
             (!out.disk_path.empty() && trace==std::filesystem::weakly_canonical(out.disk_path)) ||
             (!out.qssd_path.empty() && trace==std::filesystem::weakly_canonical(out.qssd_path)))
             throw std::invalid_argument("Trace path exists or aliases a guest ISO/disk; refuse overwrite");
@@ -133,9 +143,19 @@ Options parse(int argc, char** argv) {
     if (out.create_qssd_gib && out.qssd_path.empty()) throw std::invalid_argument("--create-qssd-gib requires --qssd-disk PATH.rqvd");
     if (!out.disk_path.empty() && !out.qssd_path.empty()) throw std::invalid_argument("Select one writable disk backend");
     if (out.source == Options::Source::Disk && out.disk_path.empty() && out.qssd_path.empty()) throw std::invalid_argument("--boot-hdd requires --disk or --qssd-disk");
+    if (!out.optical_path.empty()) {
+        const auto optical = std::filesystem::weakly_canonical(out.optical_path);
+        for (const auto* path : {&out.disk_path, &out.qssd_path}) {
+            if (path->empty()) continue;
+            const auto disk = std::filesystem::weakly_canonical(*path);
+            if (disk == optical || (std::filesystem::exists(disk) && std::filesystem::exists(optical) &&
+                                    std::filesystem::equivalent(disk, optical)))
+                throw std::invalid_argument("Writable disk aliases the read-only optical medium");
+        }
+    }
     if (!out.vram_path.empty()) {
         const auto vram = std::filesystem::weakly_canonical(out.vram_path);
-        for (const auto* path : {&out.iso_path, &out.disk_path, &out.qssd_path,
+        for (const auto* path : {&out.optical_path, &out.disk_path, &out.qssd_path,
                                  &out.trace_path, &out.evidence_path}) {
             if (path->empty()) continue;
             if (vram == std::filesystem::weakly_canonical(*path) ||
@@ -146,7 +166,7 @@ Options parse(int argc, char** argv) {
     }
     if (!out.evidence_path.empty()) {
         const auto evidence = std::filesystem::weakly_canonical(out.evidence_path);
-        for (const auto* input : {&out.iso_path, &out.disk_path, &out.qssd_path, &out.trace_path}) {
+        for (const auto* input : {&out.optical_path, &out.disk_path, &out.qssd_path, &out.trace_path}) {
             if (input->empty()) continue;
             if (evidence == std::filesystem::weakly_canonical(*input) ||
                 (std::filesystem::exists(evidence) && std::filesystem::exists(*input) &&
@@ -226,23 +246,41 @@ int main(int argc, char** argv) {
                 return disk->read_bytes(offset, target, count);
             }, disk->bytes(), "raw");
         } else {
-            kind = "user-ISO";
-            const auto medium = std::make_shared<std::ifstream>(opts.iso_path, std::ios::binary);
-            if (!*medium) throw std::runtime_error("ISO is not readable");
-            medium->seekg(0, std::ios::end);
-            const auto end = medium->tellg();
-            if (end <= 0) throw std::runtime_error("Invalid ISO size");
-            optical_bytes=static_cast<std::uint64_t>(end);
-            read_iso=[medium,&iso_read_time,&profile_active](std::uint64_t offset, std::uint8_t* data, std::size_t size) {
-                const auto start = profile_active ? cosmic_pc::BootTiming::Clock::now() : cosmic_pc::BootTiming::Clock::time_point{};
-                medium->clear();
-                medium->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-                medium->read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(size));
-                if (profile_active) iso_read_time += cosmic_pc::BootTiming::Clock::now() - start;
-                return static_cast<std::size_t>(medium->gcount()) == size;
+            const auto profile_reader = [&](auto read) {
+                return [read,&iso_read_time,&profile_active](std::uint64_t offset, std::uint8_t* data, std::size_t size) {
+                    if (!profile_active) return read(offset, data, size);
+                    const auto start = cosmic_pc::BootTiming::Clock::now();
+                    const bool ok = read(offset, data, size);
+                    iso_read_time += cosmic_pc::BootTiming::Clock::now() - start;
+                    return ok;
+                };
             };
+            if (opts.source == Options::Source::Riso) {
+                kind = "user-ISO-from-REISO01";
+                const auto medium = std::make_shared<reverse_windows::RisoReader>(opts.optical_path);
+                if (opts.verify_riso && !medium->verify_all())
+                    throw std::runtime_error("RISO complete SHA-256 mismatch");
+                optical_bytes = medium->size();
+                read_iso = profile_reader([medium](std::uint64_t offset, std::uint8_t* data, std::size_t size) {
+                    return medium->read(offset, data, size);
+                });
+            } else {
+                kind = "user-ISO";
+                const auto medium = std::make_shared<std::ifstream>(opts.optical_path, std::ios::binary);
+                if (!*medium) throw std::runtime_error("ISO is not readable");
+                medium->seekg(0, std::ios::end);
+                const auto end = medium->tellg();
+                if (end <= 0) throw std::runtime_error("Invalid ISO size");
+                optical_bytes = static_cast<std::uint64_t>(end);
+                read_iso = profile_reader([medium](std::uint64_t offset, std::uint8_t* data, std::size_t size) {
+                    medium->clear();
+                    medium->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+                    medium->read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(size));
+                    return static_cast<std::size_t>(medium->gcount()) == size;
+                });
+            }
             // Independently audit El Torito metadata only when tracing.
-            // Both passes read the same immutable local ISO; no rewrite/RISO.
+            // Both passes use the same read-only optical medium.
             if (!opts.trace_path.empty())
                 optical_plan=cosmic_pc::BootMedia(optical_bytes,read_iso).plan("iso");
             pc.mount(read_iso,optical_bytes,"iso");
@@ -257,7 +295,7 @@ int main(int argc, char** argv) {
         if (opts.profile_every) {
             motherboard.enable_ps2_keyboard();
             pc.enable_boot_acceleration();
-            if (opts.source == Options::Source::Iso) pc.enable_boot_hotspots(true, false);
+            if (optical_bytes) pc.enable_boot_hotspots(true, false);
             pc.cpu.enable_page_translation_cache();
             pc.cpu.enable_ether_arm64_blocks(opts.ether_arm64);
 #if defined(MUNDO_X_PC_ETHER_NEXT)
@@ -379,6 +417,7 @@ int main(int argc, char** argv) {
         const std::string evidence = std::string("{\"schema\":\"reverse-windows-boot-evidence-v1\",") +
             "\"guest_kind\":" + cosmic_pc::PcMachine::quote(kind) +
             ",\"source\":\"original-Mundo-X-PcMachine\"" +
+            ",\"compressed_media_mounted\":" + (opts.source == Options::Source::Riso ? "true" : "false") +
             ",\"windows10_boot_verified\":false" + graphics.str() +
             ",\"c09r_gpu_vga_work\":{\"owner\":\"GPU-VIRTUAL-plus-qSSD-StateBus\",\"source\":\"real-guest-VGA\",\"frames\":" +
                std::to_string(vga_captures) + ",\"full_frame_bytes_baseline\":" +

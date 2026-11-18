@@ -255,6 +255,7 @@ class PcMotherboardC06 {
   std::array<std::uint64_t, kMaxProcessors> retired_before_init_{};
   std::array<std::uint64_t, kMaxProcessors> ether_steps_before_init_{};
   std::array<std::uint64_t, kMaxProcessors> state_vector_steps_before_init_{};
+  std::array<std::uint64_t, kMaxProcessors> interpreter_vector_steps_before_init_{};
   StartupIpis startup_ipis_{};
   unsigned processor_count_ = 1;
   const bool experimental_mixed_smp_;
@@ -320,6 +321,7 @@ class PcMotherboardC06 {
     retired_before_init_.fill(0);
     ether_steps_before_init_.fill(0);
     state_vector_steps_before_init_.fill(0);
+    interpreter_vector_steps_before_init_.fill(0);
     startup_ipis_ = {};
     faulted_processor_.reset();
     next_cpu_ = 0;
@@ -1206,7 +1208,10 @@ class PcMotherboardC06 {
       const auto sipi = apic.startup_vector;
       retired_before_init_[id] += cpu.instructions;
       ether_steps_before_init_[id] += cpu.ether_arm64_stats().steps;
-      state_vector_steps_before_init_[id] += cpu.ether_arm64_stats().state_vector_steps;
+      const auto& interpreter = cpu.state_vector_interpreter_stats();
+      state_vector_steps_before_init_[id] += cpu.ether_arm64_stats().state_vector_steps +
+                                              interpreter.projected_steps;
+      interpreter_vector_steps_before_init_[id] += interpreter.steps;
       cpu.reset(0, 0);
       apic = LocalApic{&cpu};
       apic.startup_vector = sipi;
@@ -1265,10 +1270,22 @@ class PcMotherboardC06 {
         return;
       }
       if (cpu.halted) return;
-      const auto native_steps = cpu.try_ether_arm64_block(budget - used);
+      const auto remaining = budget - used;
+      const auto native_steps = cpu.try_ether_arm64_block(remaining);
       if (native_steps) {
         used += native_steps;
         continue;
+      }
+      const bool interrupts_enabled = cpu.flag(cosmic_pc::Cpu::IF);
+      if (pc_.boot_acceleration_enabled() && cpu.state_vector_batch_candidate() &&
+          !(interrupts_enabled && apic.pending.highest())) {
+        auto limit = batch_limit(remaining);
+        if (interrupts_enabled && apic.timer_cycles && !(apic.lvt[kTimer] & kLvtMasked) && lapic_on(apic))
+          limit = unsigned(std::min<std::uint64_t>(limit, apic.timer_cycles));
+        if (const auto vector_steps = cpu.try_state_vector_batch(limit)) {
+          used += vector_steps;
+          continue;
+        }
       }
       const auto result = cpu.step();
       if (result == cosmic_pc::StepResult::Faulted) faulted_processor_ = id;
@@ -1629,10 +1646,16 @@ class PcMotherboardC06 {
     return apics_[id].cpu->ether_arm64_stats().steps + ether_steps_before_init_[id];
   }
   std::uint64_t processor_state_vector_steps(unsigned id) const noexcept {
-    return apics_[id].cpu->ether_arm64_stats().state_vector_steps + state_vector_steps_before_init_[id];
+    const auto& cpu = *apics_[id].cpu;
+    return cpu.ether_arm64_stats().state_vector_steps + cpu.state_vector_interpreter_stats().projected_steps +
+        state_vector_steps_before_init_[id];
+  }
+  std::uint64_t processor_state_vector_interpreter_steps(unsigned id) const noexcept {
+    return apics_[id].cpu->state_vector_interpreter_stats().steps + interpreter_vector_steps_before_init_[id];
   }
   struct CpuExecutionTotals {
     std::uint64_t guest_steps = 0, ether_steps = 0, projected_steps = 0;
+    std::uint64_t state_vector_interpreter_steps = 0;
     unsigned processors_with_projected_steps = 0;
   };
   CpuExecutionTotals cpu_execution_totals() const noexcept {
@@ -1642,6 +1665,7 @@ class PcMotherboardC06 {
       totals.guest_steps += processor_steps(id);
       totals.ether_steps += processor_ether_arm64_steps(id);
       totals.projected_steps += projected;
+      totals.state_vector_interpreter_steps += processor_state_vector_interpreter_steps(id);
       totals.processors_with_projected_steps += projected != 0;
     }
     return totals;

@@ -410,6 +410,40 @@ void test_signed_projection_with_smp_quantum() {
     std::cout << "SMP_SIGNED_PROJECTION_PASS quantum=" << quantum << " projected=" << projected << '\n';
 }
 
+void test_secondary_interpreter_projection() {
+    if (Cpu::ether_arm64_host()) return;
+    constexpr std::uint8_t guest[] = {
+        0xb8,0x3f,0x15,0,0, 0xba,7,0,0,0,                  // MOV EAX,5439; MOV EDX,7.
+        0x48,0x2b,0xc2, 0x48,0xff,0xc2, 0x48,0x3b,0xc2, 0x7f,0xf5, // SUB; INC; CMP; JG.
+        0x89,0x04,0x25,0x00,0x44,0,0, 0xf4                  // Store the result at kStartFlag; HLT.
+    };
+    const auto run = [&](bool accelerate) {
+        PcMachine pc(4U << 20);
+        pc.boot_long_mode_demo();
+        pc.run(4000);
+        auto& cpu = pc.cpu;
+        require(cpu.is_long_mode() && cpu.halted && !cpu.fault, "AP must start with the BSP's long-mode tables");
+        PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {2, 1});
+        pc.enable_boot_acceleration(accelerate);
+        install_long_mode_smp_guest(cpu, guest, sizeof(guest));
+        start_long_mode_smp_guest(cpu);
+        cpu.eip = 0x7000;
+        cpu.write16(0x7000, 0xfeeb); // Keep the BSP runnable without modifying the AP result.
+        board.run(2048);
+        const auto projected = board.processor_state_vector_steps(1);
+        const auto vector_steps = board.processor_state_vector_interpreter_steps(1);
+        require(board.processors_started() == 2 && !board.faulted_cpu() &&
+                    cpu.read32(kStartFlag) == 104 &&
+                    (projected != 0) == accelerate && (vector_steps != 0) == accelerate &&
+                    board.cpu_execution_totals().state_vector_interpreter_steps == vector_steps &&
+                    !board.processor_ether_arm64_steps(1),
+                "the secondary vector interpreter changed the result or attribution");
+        return board.processor_steps(1);
+    };
+    require(run(true) == run(false), "projected AP should retire the same guest instructions");
+    std::cout << "SMP_STATE_VECTOR_INTERPRETER_PASS projected_ap=1 exact_steps=1\n";
+}
+
 void test_mixed_parallel_and_shared_writes(unsigned writer, bool read_ram, bool opt_in) {
     if (!Cpu::ether_arm64_host()) return;
     const std::uint8_t readers[] = {
@@ -659,6 +693,7 @@ int main() {
         test_secondary_interrupts();
         test_ether_worker_block();
         test_signed_projection_with_smp_quantum();
+        test_secondary_interpreter_projection();
         test_mixed_parallel_and_shared_writes(2, true, true);
         test_mixed_parallel_and_shared_writes(0, true, true);
         test_mixed_parallel_and_shared_writes(2, false, true);

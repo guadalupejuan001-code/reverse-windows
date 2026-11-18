@@ -533,6 +533,9 @@ class AndroidBootSession final {
       out << "],\"state_vector_steps_by_logical_processor\":[";
       for (unsigned id = 0; id < topology.logical_processors(); ++id)
         out << (id ? "," : "") << board_->processor_state_vector_steps(id);
+      out << "],\"state_vector_interpreter_steps_by_logical_processor\":[";
+      for (unsigned id = 0; id < topology.logical_processors(); ++id)
+        out << (id ? "," : "") << board_->processor_state_vector_interpreter_steps(id);
       out << ']';
     }
     out << '}';
@@ -566,11 +569,12 @@ class AndroidBootSession final {
     const auto& boot_work = pc_.boot_acceleration();
     const auto batched_steps = boot_work.rep_elements + boot_work.shift_loop_steps +
         boot_work.zero_loop_steps + boot_work.scan_loop_steps + boot_work.counter_loop_steps +
-        boot_work.affine_ram_rotate_steps + boot_work.movntdq_store_steps;
+        boot_work.affine_ram_rotate_steps + boot_work.movntdq_store_steps + execution.state_vector_interpreter_steps;
     const auto accelerated_steps = execution.ether_steps + batched_steps;
     out << ",\"ether_coverage\":{\"phase_steps\":" << execution.guest_steps
         << ",\"translated_steps\":" << execution.ether_steps
         << ",\"batched_steps\":" << batched_steps
+        << ",\"state_vector_interpreter_steps\":" << execution.state_vector_interpreter_steps
         << ",\"projected_steps\":" << execution.projected_steps
         << ",\"interpreted_steps\":";
     if (accelerated_steps <= execution.guest_steps) out << execution.guest_steps - accelerated_steps;

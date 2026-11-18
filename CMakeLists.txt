@@ -76,6 +76,37 @@ endif()
 include(CTest)
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  find_package(Java 11 QUIET COMPONENTS Development)
+  if(Java_FOUND)
+    set(riso_classes "${CMAKE_CURRENT_BINARY_DIR}/riso-host")
+    set(riso_iso "${riso_classes}/interop.iso")
+    set(riso_archive "${riso_classes}/interop.riso")
+    set(riso_codec "${CMAKE_CURRENT_SOURCE_DIR}/iso-lab-android/app/src/main/java/com/reversewindows/isolab/IsoArchive.java")
+    set(riso_host_test "${CMAKE_CURRENT_SOURCE_DIR}/iso-lab-android/host-tests/com/reversewindows/isolab/IsoArchiveTest.java")
+    set(riso_fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/RisoInteropFixture.java")
+    add_custom_command(OUTPUT "${riso_iso}" "${riso_archive}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory "${riso_classes}"
+      COMMAND "${Java_JAVAC_EXECUTABLE}" -encoding UTF-8 -d "${riso_classes}"
+        "${riso_codec}" "${riso_host_test}" "${riso_fixture}"
+      COMMAND "${Java_JAVA_EXECUTABLE}" -cp "${riso_classes}"
+        com.reversewindows.isolab.RisoInteropFixture "${riso_iso}" "${riso_archive}"
+      DEPENDS "${riso_codec}" "${riso_host_test}" "${riso_fixture}"
+      VERBATIM)
+    add_custom_target(reverse_windows_riso_fixture DEPENDS "${riso_iso}" "${riso_archive}")
+    add_executable(reverse_windows_riso_native_test tests/riso_native_test.cpp)
+    add_dependencies(reverse_windows_riso_native_test reverse_windows_riso_fixture)
+    target_link_libraries(reverse_windows_riso_native_test PRIVATE reverse_windows_component_headers)
+    add_test(NAME reverse_windows_riso_codec COMMAND "${Java_JAVA_EXECUTABLE}" -Xmx256m
+      -cp "${riso_classes}" com.reversewindows.isolab.IsoArchiveTest)
+    add_test(NAME reverse_windows_riso_real_iso_boot
+      COMMAND reverse_windows_riso_native_test "${riso_iso}" "${riso_archive}")
+    add_test(NAME reverse_windows_riso_probe
+      COMMAND reverse_windows_boot_probe --riso "${riso_archive}" --verify-riso --steps 40)
+    set_tests_properties(reverse_windows_riso_codec reverse_windows_riso_real_iso_boot
+      reverse_windows_riso_probe PROPERTIES TIMEOUT 120)
+    set_tests_properties(reverse_windows_riso_probe PROPERTIES
+      PASS_REGULAR_EXPRESSION "\"compressed_media_mounted\":true")
+  endif()
   add_executable(reverse_windows_android_boot_session_test tests/android_boot_session_test.cpp)
   target_link_libraries(reverse_windows_android_boot_session_test PRIVATE reverse_windows_component_headers)
   set(android_boot_fixture "${CMAKE_CURRENT_BINARY_DIR}/android-c03-boot.iso")

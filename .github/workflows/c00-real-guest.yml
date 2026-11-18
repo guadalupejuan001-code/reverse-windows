@@ -31,6 +31,10 @@ jobs:
           test "$(uname -m)" = "${{ matrix.architecture }}"
           git rev-parse HEAD
           python3 scripts/verify_deps.py --checkout
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
       - name: Measure exact x86 loops and individually executed instructions
         shell: bash
         run: |
