@@ -185,6 +185,9 @@ class GuestGpuC08 {
         << ",\"stage_bytes\":" << stage_.size()
         << ",\"resident_vram_bytes\":" << memory_.resident_bytes()
         << ",\"resident_download_bytes\":" << resident_download_bytes_
+        << ",\"c13_geometry_cache_bytes\":" << memory_.draw_resident_bytes()
+        << ",\"c13_geometry_page_uploads\":" << memory_.draw_page_uploads()
+        << ",\"c13_geometry_page_reuses\":" << memory_.draw_page_reuses()
         << ",\"uploads\":" << commands_[RWGPU_UPLOAD] << ",\"downloads\":" << commands_[RWGPU_DOWNLOAD]
         << ",\"vram_copies\":" << commands_[RWGPU_COPY] << ",\"index_sums\":" << commands_[RWGPU_SUM_INDICES]
         << ",\"status\":" << status_ << ",\"ticket\":" << completed_
@@ -619,6 +622,8 @@ class GuestGpuC08 {
 #ifdef REVERSE_WINDOWS_GLES_GUEST
     static_assert(sizeof(RwGpuVertex) == sizeof(xgpu::GuestVertex) &&
                   RWGPU_MAX_VERTICES == xgpu::GuestTriangleWork::max_vertices);
+    static_assert(RWGPU_MAX_VERTICES * sizeof(RwGpuVertex) + GpuVram::kPageBytes - 1 <=
+                  GpuVram::kDrawResidentBytes);
     const auto display = pc_.video_info();
     const auto width = params_[3], height = params_[4], clear = params_[5];
     const auto present = flags == RWGPU_DRAW_PRESENT_VBE;
@@ -639,7 +644,7 @@ class GuestGpuC08 {
     if (op == RWGPU_DRAW_RAM) {
       pc_.cpu.memory.read_block(offset, vertex_data, bytes);
     } else if (op == RWGPU_DRAW_VRAM) {
-      const auto read = memory_.read(offset, vertex_data, bytes);
+      const auto read = memory_.read_draw(offset, vertex_data, bytes);
       if (read != GpuVram::Result::Complete) return result_status(read);
     } else if (bytes) {
       std::memcpy(vertices_.data(), stage_.data(), bytes);

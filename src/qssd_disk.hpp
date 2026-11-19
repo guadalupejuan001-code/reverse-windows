@@ -1004,6 +1004,19 @@ class QssdDisk final : public BlockDisk {
     return save_checkpoint_locked();
   }
 
+  // Record offsets name immutable block contents for this open volume.
+  // The index is read from one epoch and compaction replaces files offline.
+  bool block_versions(std::uint64_t first,std::size_t count,std::uint64_t* versions) const {
+    const auto blocks=capacity_/kBlockSize;
+    if((!versions&&count)||first>blocks||count>blocks-first)return false;
+    const auto view=states_.snapshot();
+    for(std::size_t i=0;i<count;++i){
+      const auto ref=locate(view->value->root,first+i);
+      versions[i]=ref.kind==Zero?0:ref.offset;
+    }
+    return true;
+  }
+
   bool read_bytes(std::uint64_t offset,std::uint8_t* target,std::size_t size) override {
     if((!target&&size)||offset>capacity_||size>capacity_-offset)return false;
     try{

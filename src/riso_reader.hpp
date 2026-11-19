@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -95,13 +96,27 @@ class Sha256 {
 class RisoReader {
  public:
   static constexpr std::size_t kBlock = 65536;
+  static constexpr std::array<std::uint8_t,8> kSignature{'R','E','I','S','O','0','1','\n'};
+  using ReadAt = std::function<bool(std::uint64_t,std::uint8_t*,std::size_t)>;
+
   explicit RisoReader(const std::string& path) : file_(path,std::ios::binary) {
     if (!file_)throw std::runtime_error("Cannot open compact ISO container");
     file_.seekg(0,std::ios::end);
     const auto end=file_.tellg();
     if (end < 0)throw std::runtime_error("Cannot determine RISO length");
     physical_size_=static_cast<std::uint64_t>(end);
-    seek(0);parse();
+    read_at_ = [this](std::uint64_t offset, std::uint8_t* target, std::size_t count) {
+      file_.clear();
+      file_.seekg(static_cast<std::streamoff>(offset));
+      file_.read(reinterpret_cast<char*>(target),static_cast<std::streamsize>(count));
+      return file_.gcount()==static_cast<std::streamsize>(count);
+    };
+    parse();
+  }
+  RisoReader(std::uint64_t physical_size, ReadAt read_at)
+      : read_at_(std::move(read_at)), physical_size_(physical_size) {
+    if (!read_at_) throw std::invalid_argument("RISO needs a random-access reader");
+    parse();
   }
   RisoReader(const RisoReader&)=delete;
   RisoReader& operator=(const RisoReader&)=delete;
@@ -159,29 +174,33 @@ class RisoReader {
   };
 
   void seek(std::uint64_t where) {
-    if (where>physical_size_ ||
-        where>static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))
-      throw std::runtime_error("RISO file seek outside bounds");
-    file_.clear();file_.seekg(static_cast<std::streamoff>(where),std::ios::beg);
-    if (!file_)throw std::runtime_error("RISO file seek failed");
+    if (where>physical_size_)throw std::runtime_error("RISO file seek outside bounds");
+    position_ = where;
   }
-  std::uint64_t where() {
-    const auto p=file_.tellg();
-    if (p < 0)throw std::runtime_error("RISO stream position invalid");
-    return static_cast<std::uint64_t>(p);
-  }
+  std::uint64_t where() const noexcept { return position_; }
   std::uint8_t byte() {
-    const int value=file_.get();
-    if (value<0)throw std::runtime_error("RISO truncated record");
-    return static_cast<std::uint8_t>(value);
+    std::uint8_t value = 0;
+    exact(&value,1);
+    return value;
   }
   void exact(std::uint8_t* target,std::size_t size) {
-    if (size && (!target || size>physical_size_-where()))
+    if (!size) return;
+    if (!target || size>physical_size_-position_)
       throw std::runtime_error("RISO record exceeds file size");
-    if (!size)return;
-    file_.read(reinterpret_cast<char*>(target),static_cast<std::streamsize>(size));
-    if (file_.gcount()!=static_cast<std::streamsize>(size))
+    if (size <= read_ahead_.size()) {
+      if (position_ < buffered_offset_ || position_+size > buffered_offset_+buffered_size_) {
+        const auto count = std::min<std::uint64_t>(read_ahead_.size(),physical_size_-position_);
+        buffered_size_ = 0;
+        if (!read_at_(position_,read_ahead_.data(),count))
+          throw std::runtime_error("RISO truncated data");
+        buffered_offset_ = position_;
+        buffered_size_ = count;
+      }
+      std::memcpy(target,read_ahead_.data()+(position_-buffered_offset_),size);
+    } else if (!read_at_(position_,target,size)) {
       throw std::runtime_error("RISO truncated data");
+    }
+    position_ += size;
   }
   std::uint32_t u32() {
     std::uint32_t result=0;
@@ -194,10 +213,9 @@ class RisoReader {
     return result;
   }
   void parse() {
-    static constexpr std::uint8_t magic[8]={'R','E','I','S','O','0','1','\n'};
-    std::array<std::uint8_t,8> signature{};
+    std::array<std::uint8_t,kSignature.size()> signature{};
     exact(signature.data(),signature.size());
-    if (!std::equal(signature.begin(),signature.end(),magic))
+    if (signature!=kSignature)
       throw std::runtime_error("REISO01 signature invalid");
     if (u32()!=kBlock)throw std::runtime_error("Unsupported RISO block size/version");
     bool last_partial=false;
@@ -283,7 +301,11 @@ class RisoReader {
   }
 
   std::ifstream file_;
+  ReadAt read_at_;
   std::uint64_t physical_size_=0,logical_size_=0;
+  std::uint64_t position_=0,buffered_offset_=0;
+  std::size_t buffered_size_=0;
+  std::array<std::uint8_t,512> read_ahead_{};
   std::vector<Block> blocks_;
   std::vector<Unique> uniques_;
   std::array<std::uint8_t,32> full_digest_{};

@@ -532,6 +532,35 @@ void verify(const std::filesystem::path& volume) {
             << " e820=1 acpi=1 restart=1 exact=1\n";
 }
 
+void verify_c13_residency(const std::filesystem::path& path) {
+  using Vram = reverse_windows::GpuVram;
+  constexpr auto page = Vram::kPageBytes;
+  constexpr auto offset = page - 13;
+  Vram vram(path);
+  std::array<std::uint8_t, 3 * page> original{};
+  for (std::size_t i = 0; i < original.size(); ++i)
+    original[i] = static_cast<std::uint8_t>((i / 128 + i) % 251);
+  std::array<std::uint8_t, page + 47> output{};
+  require(vram.write(0, original.data(), original.size()) == Vram::Result::Complete,
+          "Could not populate the geometry pages");
+  const auto exact_read = [&] {
+    return vram.read_draw(offset, output.data(), output.size()) == Vram::Result::Complete &&
+        std::equal(output.begin(), output.end(), original.begin() + offset);
+  };
+  require(exact_read() && vram.draw_page_uploads() == 3 && vram.draw_page_reuses() == 0,
+          "C13 failed to resolve the first unaligned geometry read");
+  require(exact_read() && vram.draw_page_uploads() == 3 && vram.draw_page_reuses() == 3,
+          "C13 did not reuse unchanged geometry pages");
+  original[page + 17] ^= 0xff;
+  require(vram.write(page + 17, &original[page + 17], 1) == Vram::Result::Complete &&
+              exact_read() && vram.draw_page_uploads() == 4 && vram.draw_page_reuses() == 5,
+          "C13 did not replace only the page whose QSSD version changed");
+  vram.set_cache_enabled(false);
+  require(vram.resident_bytes() == 0 && exact_read() && vram.draw_page_uploads() == 4 &&
+              vram.draw_resident_bytes() == 0, "C13 must release its pages under memory pressure");
+  std::cout << "PRIME_C13_GEOMETRY_PASS uploads=4 reused_pages=5 pressure_release=1 exact=1\n";
+}
+
 void measure_vram(const std::filesystem::path& path) {
   constexpr unsigned batch_bytes = RWGPU_VRAM_BATCH_BYTES;
   constexpr unsigned batches = 128;
@@ -582,6 +611,7 @@ int main() {
       ~RemoveDirectory() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
     } remove{name};
     verify(remove.path / "gpu.rqvd");
+    verify_c13_residency(remove.path / "c13.rqvd");
     measure_vram(remove.path / "large-vram.rqvd");
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

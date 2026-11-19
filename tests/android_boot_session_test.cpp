@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -1046,10 +1047,39 @@ std::string bytes(const std::filesystem::path& path) {
   require(input.is_open(), "Cannot read ISO fixture");
   return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
+
+void verify_riso_boot(const std::filesystem::path& original, const std::filesystem::path& archive) {
+  const TestDiskDirectory dir;
+  const auto archive_size = std::filesystem::file_size(archive);
+  const auto original_size = std::filesystem::file_size(original);
+  std::unique_ptr<Session> session;
+  {
+    const FileDescriptor fd(archive,O_RDONLY);
+    const auto hardware = Session::check_hardware({},fd.value,archive_size);
+    require(hardware.find("\"iso_boot\":true") != std::string::npos,
+            "Android hardware check must accept the REISO01 boot catalog");
+    session = std::make_unique<Session>(dir.path / "riso.rqvd",1,Session::BootSource::Iso,
+                                        fd.value,archive_size);
+  }
+  require(session->step(40) != Session::Step::Fault, "Android failed to boot the REISO01 fixture");
+  const auto report = session->diagnostic();
+  require(report.find("\"iso_container\":\"REISO01\"") != std::string::npos &&
+              counter(report,"iso_bytes") == original_size &&
+              counter(report,"iso_file_bytes") == archive_size &&
+              report.find("\"atapi_cdrom\":true") != std::string::npos &&
+              report.find("\"regs_hex\":[\"0000000000001234\"") != std::string::npos,
+          "Android must mount the expanded CD-ROM geometry and execute the original x86 boot code");
+  std::cout << "REVERSE_WINDOWS_ANDROID_REISO_BOOT_PASS original_bytes=" << original_size
+            << " archive_bytes=" << archive_size << '\n';
+}
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 4 && std::string(argv[1]) == "--riso") {
+      verify_riso_boot(argv[2],argv[3]);
+      return 0;
+    }
     verify_ram_profile();
     require(argc == 2 || argc == 3, "Pass the synthetic BIOS fixture and optional evidence path");
     const TestDiskDirectory dir;
@@ -1119,6 +1149,8 @@ int main(int argc, char** argv) {
               "ISO startup did not select the Windows x64 processor profile");
       require(progress.find("\"cores\":8,\"threads_per_core\":2,\"logical_processors\":16,\"started\":1") !=
                   std::string::npos, "Prime Android ISO boot uses the requested CPU topology");
+      require(counter(progress, "host_workers_capacity") == 8,
+              "Prime Android must retain a separate eight-worker host limit");
       const auto live = session.diagnostic(false);
       require(live.size() < progress.size() && live.find("\"boot_profile\":") == std::string::npos &&
                   live.find("\"status\":\"waiting_key\"") != std::string::npos &&

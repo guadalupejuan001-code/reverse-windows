@@ -1,6 +1,6 @@
 {
   "schema": "reverse-windows-dependency-lock-v1",
-  "recorded_at": "2026-11-17",
+  "recorded_at": "2026-11-18",
   "policy": "exact-commit-only-no-silent-fallback-no-automatic-merge",
   "components": [
     {
@@ -95,15 +95,16 @@
     {
       "key": "gpu_virtual",
       "repository": "guadalupejuan001-code/GPU-VIRTUAL",
-      "commit": "933bbd7ea7679f661de7188fd4235691ab885567",
+      "commit": "d97b64a838113480898bde75b423c0e7ff3916c4",
       "checkout": "deps/GPU-VIRTUAL",
-      "role": "C12.3-physical-framebuffer-guest-triangles-and-PrimeVGC-compute",
+      "role": "C13-versioned-geometry-residency-and-PrimeVGC-compute",
       "status": "candidate-prime-c08-primevgc",
       "required_paths": [
         "include/ejecucion_gpu.hpp",
         "VERSION",
         "include/trabajo_fisico.hpp",
         "include/guest_triangle_work.hpp",
+        "include/graphics_page_residency.hpp",
         "include/relaciones_gpu.hpp",
         "include/transformacion_reversible.hpp",
         "tests/physical_work_authority.cpp"

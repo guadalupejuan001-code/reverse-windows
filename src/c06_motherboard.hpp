@@ -265,6 +265,7 @@ class PcMotherboardC06 {
   unsigned processor_count_ = 1;
   const bool experimental_mixed_smp_;
   bool threaded_smp_enabled_ = false;
+  unsigned worker_limit_ = kMaxProcessors;
   unsigned next_cpu_ = 0;
   std::optional<unsigned> faulted_processor_;
   std::unique_ptr<SmpWorkers> workers_;
@@ -1365,7 +1366,7 @@ class PcMotherboardC06 {
     auto job_count = candidate_count == active_count ? prepare(false) : 0U;
     if (job_count < active_count) job_count = prepare_mixed();
     if (job_count < 2) return 0;
-    if (!workers_) workers_ = std::make_unique<SmpWorkers>(processor_count_);
+    if (!workers_) workers_ = std::make_unique<SmpWorkers>(host_workers_capacity());
     const auto worker_count = workers_->prepare(job_count);
     if (worker_count < 2) return 0;
     job_count = worker_count < job_count && !mixed ? std::min(worker_count, prepare_mixed()) : worker_count;
@@ -1477,7 +1478,7 @@ class PcMotherboardC06 {
     const auto grant = std::min(budget / jobs, active_clock_running_ ? timed_grant : kSmpQuantum);
     if (jobs < 2 || grant < kSmpQuantum) return 0;
 
-    if (!workers_) workers_ = std::make_unique<SmpWorkers>(processor_count_);
+    if (!workers_) workers_ = std::make_unique<SmpWorkers>(host_workers_capacity());
     const auto workers = workers_->prepare(jobs);
     if (workers < 2) return 0;
 
@@ -1665,7 +1666,11 @@ class PcMotherboardC06 {
             rtc_irq8_assertions_,rtc_data_writes_};
   }
   unsigned worker_count() const noexcept { return workers_ ? workers_->size() : 1; }
-  void enable_threaded_smp() noexcept { threaded_smp_enabled_ = true; }
+  unsigned host_workers_capacity() const noexcept { return std::min(worker_limit_, processor_count_); }
+  void enable_threaded_smp(unsigned worker_limit = kMaxProcessors) noexcept {
+    if (!workers_) worker_limit_ = std::clamp(worker_limit, 1U, kMaxProcessors);
+    threaded_smp_enabled_ = true;
+  }
   bool threaded_smp_enabled() const noexcept { return threaded_smp_enabled_; }
   const ThreadedSmpStats& threaded_smp_stats() const noexcept { return threaded_smp_stats_; }
   void configure_ether_x86_sessions(unsigned workers, unsigned max_sessions_per_vcpu) {

@@ -258,7 +258,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         add(setup, media, 10);
         LinearLayout mediaRow = row(setup);
         ((LinearLayout.LayoutParams) mediaRow.getLayoutParams()).topMargin = dp(5);
-        selectIso = action("Elegir ISO", false, this::pickIso);
+        selectIso = action("Elegir ISO o RISO", false, this::pickIso);
         selectIso.setId(R.id.vm_select_iso);
         ejectIso = action("Expulsar ISO", false, this::clearIso);
         pair(mediaRow, selectIso, ejectIso);
@@ -273,7 +273,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         });
         add(setup, ramProfile, 6);
 
-        bootIso = action("Arrancar desde ISO", true, () -> start(NativeMachine.BOOT_ISO, false));
+        bootIso = action("Arrancar desde CD/DVD", true, () -> start(NativeMachine.BOOT_ISO, false));
         bootIso.setId(R.id.vm_boot_iso);
         add(setup, bootIso, 12);
         LinearLayout bootRow = row(setup);
@@ -872,7 +872,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         boolean diskReady = disk.isFile();
         boolean dataDiskReady = dataDisk.isFile();
-        media.setText(iso == null ? "Selecciona tu ISO local de Windows" : "CD/DVD · " + isoName);
+        media.setText(iso == null ? "Selecciona tu ISO o RISO local" : "CD/DVD · " + isoName);
         String bootStorage = diskReady ? "QSSD de arranque · 64 GiB lógicos"
                 : "QSSD · se crea al arrancar la ISO";
         storage.setText(dataDiskReady ? bootStorage + "\nQSSD de datos · 8 PiB lógicos" : bootStorage);

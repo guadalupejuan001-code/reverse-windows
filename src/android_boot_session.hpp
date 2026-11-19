@@ -8,6 +8,7 @@
 #include "ether_x86_check.hpp"
 #include "guest_vbe_fabric.hpp"
 #include "qssd_disk.hpp"
+#include "riso_reader.hpp"
 #include "storage_profile.hpp"
 #include <algorithm>
 #include <array>
@@ -43,6 +44,7 @@ class AndroidBootSession final {
   static constexpr unsigned kMaxVideoWidth = 960, kMaxVideoHeight = 720;
   static constexpr RamProfile kDefaultRamProfile{2048ULL * 1024 * 1024, 256ULL * 1024 * 1024};
   static constexpr cosmic_pc::CpuTopology kPrimeCpuTopology{8, 2};
+  static constexpr unsigned kPrimeHostWorkers = 8;
   static constexpr std::uint64_t kPrimeRamBytes = 64ULL << 30;
   static constexpr std::uint64_t kMaxResidentBytes = 1024ULL * 1024 * 1024;
   static constexpr std::uint64_t kMinResidentBytes = 16ULL * 1024 * 1024;
@@ -239,7 +241,7 @@ class AndroidBootSession final {
           pc_, disk_.get(), AtapiCdrom::Reader{}, 0, graphics_vram, data_disk_.get(), topology);
     }
     board_->enable_ps2_keyboard();
-    board_->enable_threaded_smp();
+    board_->enable_threaded_smp(kPrimeHostWorkers);
     if (source != BootSource::SelfTest) pc_.enable_guest_restart();
     pc_.enable_boot_acceleration();
     pc_.cpu.enable_page_translation_cache();
@@ -524,6 +526,8 @@ class AndroidBootSession final {
     out << "{\"schema\":\"reverse-windows-android-session-v1\",\"source\":\""
         << source_name() << "\",\"status\":\"" << status << "\",\"iso_bytes\":"
         << (iso_ ? iso_->size() : 0)
+        << ",\"iso_file_bytes\":" << (iso_ ? iso_->file_size() : 0)
+        << ",\"iso_container\":\"" << (iso_ ? iso_->container() : "") << '"'
         << ",\"iso_read_us\":" << (iso_ ? iso_->read_us() : 0)
         << ",\"input\":\"bios-int16+ps2-irq1\",\"disk\":";
     if (disk_) {
@@ -555,6 +559,7 @@ class AndroidBootSession final {
         << ",\"logical_processors\":" << topology.logical_processors()
         << ",\"started\":" << board_->processors_started()
         << ",\"host_workers\":" << board_->worker_count()
+        << ",\"host_workers_capacity\":" << board_->host_workers_capacity()
         << ",\"threaded_execution\":" << (board_->threaded_smp_enabled() ? "true" : "false")
         << ",\"host_workers_last_dispatch\":" << threaded.last_workers
         << ",\"host_workers_peak_dispatch\":" << threaded.peak_workers
@@ -1052,13 +1057,17 @@ class AndroidBootSession final {
         struct stat info {};
         if (::fstat(fd_, &info) != 0)
           throw std::system_error(errno, std::generic_category(), "Consultar ISO");
-        if (info.st_size > 0) size_ = static_cast<std::uint64_t>(info.st_size);
-        else size_ = expected_size;
-        std::uint8_t first = 0;
-        if (!size_ || size_ > std::uint64_t(std::numeric_limits<off_t>::max()) ||
-            (info.st_size > 0 && expected_size && expected_size != size_) ||
-            !read(0, &first, 1))
+        file_size_ = info.st_size > 0 ? static_cast<std::uint64_t>(info.st_size) : expected_size;
+        std::array<std::uint8_t,RisoReader::kSignature.size()> signature{};
+        if (!file_size_ || file_size_ > std::uint64_t(std::numeric_limits<off_t>::max()) ||
+            (info.st_size > 0 && expected_size && expected_size != file_size_) ||
+            !read(0, signature.data(), std::min<std::uint64_t>(file_size_,signature.size())))
           throw std::invalid_argument("La ISO necesita un archivo local con tamaño y lectura aleatoria.");
+        if (signature == RisoReader::kSignature) {
+          riso_ = std::make_unique<RisoReader>(file_size_, [this](auto offset, auto* target, auto count) {
+            return read_file(offset, target, count);
+          });
+        }
       } catch (...) {
         ::close(fd_);
         throw;
@@ -1067,13 +1076,21 @@ class AndroidBootSession final {
     OpticalReader(const OpticalReader&) = delete;
     OpticalReader& operator=(const OpticalReader&) = delete;
     ~OpticalReader() { ::close(fd_); }
-    std::uint64_t size() const noexcept { return size_; }
+    std::uint64_t size() const noexcept { return riso_ ? riso_->size() : file_size_; }
+    std::uint64_t file_size() const noexcept { return file_size_; }
+    const char* container() const noexcept { return riso_ ? "REISO01" : "raw"; }
     std::uint64_t read_us() const noexcept {
       return std::chrono::duration_cast<std::chrono::microseconds>(read_time_).count();
     }
     bool read(std::uint64_t offset, std::uint8_t* target, std::size_t count) const {
-      if (offset > size_ || count > size_ - offset) return false;
+      if (offset > size() || count > size() - offset) return false;
       const auto started = std::chrono::steady_clock::now();
+      const bool read_ok = riso_ ? riso_->read(offset, target, count) : read_file(offset, target, count);
+      if (read_ok) read_time_ += std::chrono::steady_clock::now() - started;
+      return read_ok;
+    }
+   private:
+    bool read_file(std::uint64_t offset, std::uint8_t* target, std::size_t count) const {
       while (count) {
         const auto n = ::pread(fd_, target, count, static_cast<off_t>(offset));
         if (n < 0 && errno == EINTR) continue;
@@ -1083,12 +1100,11 @@ class AndroidBootSession final {
         count -= got;
         offset += got;
       }
-      read_time_ += std::chrono::steady_clock::now() - started;
       return true;
     }
-   private:
     int fd_ = -1;
-    std::uint64_t size_ = 0;
+    std::uint64_t file_size_ = 0;
+    std::unique_ptr<RisoReader> riso_;
     mutable std::chrono::steady_clock::duration read_time_{};
   };
 

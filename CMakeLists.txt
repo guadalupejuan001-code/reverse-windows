@@ -109,6 +109,12 @@ if(BUILD_TESTING)
   endif()
   add_executable(reverse_windows_android_boot_session_test tests/android_boot_session_test.cpp)
   target_link_libraries(reverse_windows_android_boot_session_test PRIVATE reverse_windows_component_headers)
+  if(TARGET reverse_windows_riso_fixture)
+    add_dependencies(reverse_windows_android_boot_session_test reverse_windows_riso_fixture)
+    add_test(NAME reverse_windows_android_riso_boot
+      COMMAND reverse_windows_android_boot_session_test --riso "${riso_iso}" "${riso_archive}")
+    set_tests_properties(reverse_windows_android_riso_boot PROPERTIES TIMEOUT 60)
+  endif()
   set(android_boot_fixture "${CMAKE_CURRENT_BINARY_DIR}/android-c03-boot.iso")
   add_test(NAME reverse_windows_android_synthetic_iso
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/c10_android_boot_iso.py"
