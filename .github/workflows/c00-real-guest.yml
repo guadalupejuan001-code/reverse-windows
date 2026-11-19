@@ -142,6 +142,33 @@ jobs:
         with:
           name: prime-vector-stream-${{ matrix.architecture }}
           path: build/prime-vector-stream.log
+      - name: Compare full and partial VBE frames with identical guest writes
+        shell: bash
+        run: |
+          set -euo pipefail
+          old_app="$RUNNER_TEMP/prime-r097"
+          reference=67f385fa63a1cb56f8f19c7d61d19273075f841e
+          git fetch --no-tags --depth=1 origin "$reference"
+          git worktree add --detach "$old_app" "$reference"
+          compile_display() {
+            c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread -I"$1/src" \
+              -I"$2/pc-android/native" -I"$2/native/include" \
+              -Ideps/Virtual-qSSD-/include -Ideps/GPU-VIRTUAL/include \
+              tests/prime_vbe_guest_test.cpp -lz -o "$3"
+          }
+          compile_display "$old_app" "$RUNNER_TEMP/mundo-prime-r097" build/vbe-r097
+          compile_display . deps/mundo-X build/vbe-r098
+          for trial in 1 2 3 4 5; do
+            order=(r097 r098)
+            if (( trial % 2 == 0 )); then order=(r098 r097); fi
+            for version in "${order[@]}"; do
+              "build/vbe-$version" --measure | sed "s/^/$version /"
+            done
+          done | tee build/prime-vbe-compare.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prime-vbe-compare-${{ matrix.architecture }}
+          path: build/prime-vbe-compare.log
       - name: Compile native boot probe against actual x86/x64 CPU
         run: |
           sudo apt-get update -qq

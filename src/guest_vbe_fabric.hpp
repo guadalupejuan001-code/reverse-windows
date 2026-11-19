@@ -5,6 +5,7 @@
 #include "trabajo_fisico.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <ostream>
 #include <stdexcept>
 #include <vector>
@@ -140,17 +141,32 @@ class GuestVbeFabric {
                                      source_.data(), read_bytes);
       stats_.read_bytes += read_bytes;
       stats_.examined_pixels += last_x - first_x;
-      auto& changed = rows_[y];
       auto* output = pixels_.data() + std::size_t(y) * width_;
-      for (unsigned x = first_x; x < last_x; ++x) {
+      const auto sample = [&](unsigned x) {
         const auto* bgrx = source_.data() + std::size_t(sample_columns_[x] - source_x) * 4;
-        const auto argb = 0xff000000U | (std::uint32_t(bgrx[2]) << 16) |
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        std::uint32_t pixel;
+        std::memcpy(&pixel, bgrx, sizeof(pixel));
+        return pixel | 0xff000000U;
+#else
+        return 0xff000000U | (std::uint32_t(bgrx[2]) << 16) |
             (std::uint32_t(bgrx[1]) << 8) | bgrx[0];
-        if (!full && output[x] == argb) continue;
+#endif
+      };
+      if (full) {
+        for (unsigned x = first_x; x < last_x; ++x) output[x] = sample(x);
+        rows_[y] = {first_x, last_x};
+        continue;
+      }
+      auto changed = rows_[y];
+      for (unsigned x = first_x; x < last_x; ++x) {
+        const auto argb = sample(x);
+        if (output[x] == argb) continue;
         output[x] = argb;
         changed.left = std::min(changed.left, x);
         changed.right = std::max(changed.right, x + 1);
       }
+      rows_[y] = changed;
     }
   }
 

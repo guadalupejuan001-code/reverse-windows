@@ -271,7 +271,7 @@ void measure() {
   run_demo(pc, 1280, 720);
   Pixels full, previous, actual;
   std::vector<std::uint8_t> row;
-  Clock::duration baseline{}, update{};
+  Clock::duration baseline{}, first_capture{}, later_captures{};
   std::uint64_t total_legacy_bytes = 0, total_legacy_reads = 0;
   unsigned legacy_frames = 0;
   for (unsigned tick = 0; tick < slots; ++tick) {
@@ -292,7 +292,9 @@ void measure() {
     const auto start = Clock::now();
     if (pc.cpu.memory.write_watch()->pending())
       apply(video.capture(width, height), width, height, actual);
-    update += Clock::now() - start;
+    const auto elapsed = Clock::now() - start;
+    if (tick == 0) first_capture += elapsed;
+    else later_captures += elapsed;
     require(actual == previous, "C06 and C07 must present equal pixels at each display opportunity");
   }
   const auto data = metrics(video);
@@ -307,12 +309,18 @@ void measure() {
             << " frames=" << frames << " legacy_bytes=" << total_legacy_bytes
             << " packet_bytes=" << packet_bytes << " legacy_read_bytes=" << total_legacy_reads
             << " read_bytes=" << read_bytes << " legacy_ns=" << nanoseconds(baseline)
-            << " delta_ns=" << nanoseconds(update) << " pixels=exact\n";
+            << " first_ns=" << nanoseconds(first_capture) << " partial_ns=" << nanoseconds(later_captures)
+            << " delta_ns=" << nanoseconds(first_capture + later_captures) << " pixels=exact\n";
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string_view(argv[1]) == "--measure") {
+      measure();
+      return 0;
+    }
+    require(argc == 1, "Use --measure to benchmark identical display work separately");
     correctness();
     android_session();
     measure();
