@@ -182,6 +182,7 @@ class PcMotherboardC06 {
   std::uint64_t active_clock_ns_=0,active_clock_ticks_=0,clock_tick_remainder_=0;
   unsigned clock_polls_=0;
   bool active_clock_enabled_=false,active_clock_running_=false,clock_attached_=false;
+  bool target_projection_hook_ = false;
   bool timestamp_hook_attached_=false;
   ClockStart clock_start_ = ClockStart::Immediate;
   bool waiting_for_guest_mode_ = false;
@@ -1700,6 +1701,8 @@ class PcMotherboardC06 {
     pc_.device_step_hook=[this](){
       if(prior_tick_)prior_tick_();
       poll();
+      if (target_projection_hook_ && pc_.cpu.halted && !pc_.cpu.flag(cosmic_pc::Cpu::IF) &&
+          !secondary_can_run()) pc_.yield_after_instruction();
       // A guest can enter and leave protected mode inside a single Android slice.
       observe_guest_clock_mode(pc_.cpu);
     };
@@ -1736,6 +1739,7 @@ class PcMotherboardC06 {
     pc_.cpu.mmio_read32_hook=std::move(prior_mmio_read32_);
     pc_.cpu.mmio_write32_hook=std::move(prior_mmio_write32_);
     pc_.device_step_hook=std::move(prior_tick_);
+    if (target_projection_hook_) pc_.register_projection_limit_hook = {};
     pc_.device_batch_limit_hook=std::move(prior_batch_limit_);
     pc_.device_batch_advance_hook=std::move(prior_batch_advance_);
     pc_.device_idle_advance_hook=std::move(prior_idle_advance_);
@@ -1816,6 +1820,17 @@ class PcMotherboardC06 {
     if (start == ClockStart::Immediate) activate_clock();
   }
   bool active_clock_enabled() const noexcept {return active_clock_enabled_;}
+  void enable_execution_target() {
+    if (pc_.register_projection_limit_hook || prior_tick_ || prior_batch_limit_ || prior_batch_advance_) return;
+    pc_.register_projection_limit_hook = [this](unsigned requested) {
+      if (!active_clock_running_ || powered_off_ || (keyboard_ && keyboard_->needs_irq()) ||
+          pc_.cpu.x87_ferr_asserted() != ferr_was_asserted_) return 0U;
+      // The proven loop has neither I/O nor RAM operands. With IF clear
+      // device time can be sampled after applying its atomic register state.
+      return pc_.cpu.flag(cosmic_pc::Cpu::IF) ? batch_limit(requested) : requested;
+    };
+    target_projection_hook_ = true;
+  }
   // Android serializes this with run(). Preserve the counter, including per-vCPU
   // IA32_TSC offsets. Only subsequent elapsed time accrues at the chosen rate.
   void set_experimental_tsc(bool enabled) {

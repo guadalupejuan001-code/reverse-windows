@@ -155,22 +155,19 @@ JNIEXPORT void JNICALL Java_com_reversewindows_android_NativeMachine_createDisk(
     });
 }
 
+JNIEXPORT jlong JNICALL Java_com_reversewindows_android_NativeMachine_engineTargetHz(JNIEnv*, jclass) {
+    return Session::kEngineTargetHz;
+}
+
 JNIEXPORT jlong JNICALL Java_com_reversewindows_android_NativeMachine_step(
-        JNIEnv* env, jclass, jlong handle, jint budget, jlong hostBudgetNs) {
+        JNIEnv* env, jclass, jlong handle, jlong hostBudgetNs) {
     return call<jlong>(env, 3, [&] {
-        if (budget <= 0 || hostBudgetNs <= 0) throw std::invalid_argument("Presupuesto de ejecución inválido.");
-        return session(handle, [budget, hostBudgetNs](Session& machine) {
-            using Clock = cosmic_pc::PcMachine::RunClock;
-            const auto now = Clock::now();
-            const auto duration = std::chrono::duration_cast<Clock::duration>(std::chrono::nanoseconds(hostBudgetNs));
-            const auto deadline = now + std::min(duration, Clock::time_point::max() - now);
-            const auto before = machine.session_steps();
-            const auto result = machine.step(static_cast<unsigned>(budget), deadline);
+        return session(handle, [hostBudgetNs](Session& machine) {
+            const auto result = machine.step_engine_window(std::chrono::nanoseconds(hostBudgetNs));
             const auto outcome = result == Session::Step::Halted && machine.is_stopped()
                 ? jint{4} : static_cast<jint>(result);
             const auto flags = outcome | (machine.video_pending() ? kVideoDirty : 0);
-            const auto completed = machine.session_steps() - before;
-            return static_cast<jlong>((completed << 32) | static_cast<std::uint32_t>(flags));
+            return static_cast<jlong>((machine.last_engine_retired() << 9) | static_cast<unsigned>(flags));
         });
     });
 }

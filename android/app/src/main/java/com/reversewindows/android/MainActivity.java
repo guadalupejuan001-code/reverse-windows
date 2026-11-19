@@ -674,9 +674,9 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         long steps = machine.optLong("instructions", -1);
         long sessionSteps = boot == null ? steps : boot.optLong("session_steps", steps);
         JSONObject workerTiming = diagnostic.optJSONObject("worker_timing");
-        long stepUs = workerTiming == null ? -1 : workerTiming.optLong("step_us", -1);
+        long sampleUs = workerTiming == null ? -1 : workerTiming.optLong("sample_elapsed_us", -1);
         long stepsPerSecond = executionRate.sample(session && running &&
-                "running".equals(diagnostic.optString("status")), sessionSteps, stepUs);
+                "running".equals(diagnostic.optString("status")), sessionSteps, sampleUs);
         if (session) {
             telemetry.update(diagnostic, machine, modeName(machine.optString("cpu_mode")),
                     sessionSteps, stepsPerSecond);
@@ -696,13 +696,17 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
                 : "BIOS preparando el arranque");
         progress.append("\nModo ").append(modeName(machine.optString("cpu_mode")));
         progress.append(String.format(Locale.getDefault(), "\n%,d pasos x86 en esta sesión", sessionSteps));
-        if (stepsPerSecond >= 0) {
-            progress.append(String.format(Locale.getDefault(), " · %,d pasos/s de ejecución", stepsPerSecond));
+        JSONObject engine = diagnostic.optJSONObject("ether_execution");
+        if (engine != null) {
+            progress.append(String.format(Locale.getDefault(), "\nÉter · objetivo %.1f THz virtuales",
+                    engine.optLong("target_virtual_cycles_per_second") / 1e12));
         }
-        if (workerTiming != null && workerTiming.optInt("max_steps_per_slice") > 0) {
+        if (stepsPerSecond >= 0) progress.append(String.format(Locale.getDefault(),
+                " · %,d pasos x86/s medidos", stepsPerSecond));
+        if (workerTiming != null && workerTiming.optLong("max_steps_per_slice") > 0) {
             progress.append(String.format(Locale.getDefault(),
                     "\nTanda de hasta %,d pasos · Guardado cada %d s",
-                    workerTiming.optInt("max_steps_per_slice"),
+                    workerTiming.optLong("max_steps_per_slice"),
                     workerTiming.optLong("diagnostic_save_interval_ms") / 1000));
         }
         if (boot != null && boot.optLong("checkpoint_interval_steps") > 0) {

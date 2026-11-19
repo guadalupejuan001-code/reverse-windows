@@ -45,6 +45,9 @@ class AndroidBootSession final {
   static constexpr RamProfile kDefaultRamProfile{2048ULL * 1024 * 1024, 256ULL * 1024 * 1024};
   static constexpr cosmic_pc::CpuTopology kPrimeCpuTopology{8, 2};
   static constexpr auto kPrimeCpuClock = PcMotherboardC06::CpuClock::Experimental4_5THz;
+  static constexpr auto kEngineTargetHz = cosmic_pc::ether_arm64::kExecutionTargetHz;
+  static constexpr auto kMaxEngineWindow = std::chrono::milliseconds(8);
+  static_assert(kEngineTargetHz % 1'000'000'000 == 0);
   static constexpr unsigned kPrimeHostWorkers = 8;
   static constexpr std::uint64_t kPrimeRamBytes = 64ULL << 30;
   static constexpr std::uint64_t kMaxResidentBytes = 1024ULL * 1024 * 1024;
@@ -397,6 +400,34 @@ class AndroidBootSession final {
 
   std::uint64_t session_steps() const noexcept { return previous_boot_steps_+board_->total_processor_steps(); }
 
+  // A grant is shared by all vCPUs. Only work actually retired by the board
+  // counts. Each guest checkpoint and every sub-grant shares one host deadline.
+  Step step_engine_window(std::chrono::nanoseconds duration) {
+    using Clock = cosmic_pc::PcMachine::RunClock;
+    if (duration.count() <= 0 || duration > kMaxEngineWindow)
+      throw std::invalid_argument("Ventana de ejecución fuera del intervalo admitido.");
+    board_->enable_execution_target();
+    const auto start = Clock::now();
+    const auto deadline = start + duration;
+    const auto before = session_steps();
+    engine_requested_ = std::uint64_t(duration.count()) * (kEngineTargetHz / 1'000'000'000);
+    engine_retired_ = 0;
+    auto status = Step::Running;
+    do {
+      const auto remaining = engine_requested_ - engine_retired_;
+      const auto chunk = static_cast<unsigned>(std::min<std::uint64_t>(remaining, 0x7fffffff));
+      status = step(chunk, deadline);
+      const auto retired = session_steps() - before;
+      const bool progressed = retired > engine_retired_;
+      engine_retired_ = retired;
+      if (status != Step::Running || !progressed || retired >= engine_requested_) break;
+    } while (Clock::now() < deadline);
+    engine_elapsed_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+    return status;
+  }
+
+  std::uint64_t last_engine_retired() const noexcept { return engine_retired_; }
+
   void set_experimental_tsc(bool enabled) { board_->set_experimental_tsc(enabled); }
 
   void configure_ether_x86_sessions(unsigned workers, unsigned max_sessions_per_vcpu) {
@@ -536,6 +567,9 @@ class AndroidBootSession final {
         << ",\"iso_file_bytes\":" << (iso_ ? iso_->file_size() : 0)
         << ",\"iso_container\":\"" << (iso_ ? iso_->container() : "") << '"'
         << ",\"iso_read_us\":" << (iso_ ? iso_->read_us() : 0)
+        << ",\"ether_execution\":{\"target_virtual_cycles_per_second\":" << kEngineTargetHz
+        << ",\"last_requested_steps\":" << engine_requested_ << ",\"last_retired_steps\":" << engine_retired_
+        << ",\"last_active_ns\":" << engine_elapsed_ns_ << '}'
         << ",\"input\":\"bios-int16+ps2-irq1\",\"disk\":";
     if (disk_) {
       const auto stats = disk_->stats();
@@ -1150,6 +1184,7 @@ class AndroidBootSession final {
   std::uint64_t initial_disk_commits_ = 0;
   std::uint64_t restarts_ = 0;
   std::uint64_t previous_boot_steps_ = 0;
+  std::uint64_t engine_requested_ = 0, engine_retired_ = 0, engine_elapsed_ns_ = 0;
   unsigned rapid_restarts_ = 0;
   const char* last_restart_ = "";
 };

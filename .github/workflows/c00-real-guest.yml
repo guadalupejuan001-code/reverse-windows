@@ -37,25 +37,60 @@ jobs:
           set -euo pipefail
           previous=73146f88beb8c2bcdeca157b1939bffa4a6da546
           baseline="$RUNNER_TEMP/prime-previous-engine"
+          previous_prime=a08f47ce18e170a5d6fb3e3ff515924e8ce422c9
+          git fetch --no-tags --depth=1 origin "$previous_prime"
+          git worktree add --detach "$RUNNER_TEMP/prime-0.3.66" "$previous_prime"
           if ! git -C deps/mundo-X cat-file -e "$previous^{commit}" 2>/dev/null; then
             git -C deps/mundo-X fetch --no-tags --depth=1 https://github.com/guadalupejuan001-code/mundo-X.git "$previous"
           fi
           git -C deps/mundo-X worktree add --detach "$baseline" "$previous"
           mkdir -p build
           compile_engine() {
-            c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread -Isrc \
+            c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread -I"$3/src" \
               -I"$1/pc-android/native" -I"$1/native/include" \
               -Ideps/Virtual-qSSD-/include -Ideps/GPU-VIRTUAL/include \
               tests/prime_execution_bench.cpp -lz -o "$2"
           }
-          compile_engine "$baseline" build/engine-before
-          compile_engine deps/mundo-X build/engine-after
+          compile_engine "$baseline" build/engine-before "$RUNNER_TEMP/prime-0.3.66"
+          compile_engine deps/mundo-X build/engine-after .
           for trial in 1 2 3 4 5 6 7; do
             order=(before after)
             if (( trial % 2 == 0 )); then order=(after before); fi
             for version in "${order[@]}"; do "./build/engine-$version" "$version"; done
           done | tee build/prime-execution.log
           python3 tests/compare_execution.py build/prime-execution.log | tee -a build/prime-execution.log
+      - name: Measure the execution target with the production Android session
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_engine=18f2c012c9dee2cedb3c18089c4d8ae05f2917e1
+          git -C deps/mundo-X fetch --no-tags --depth=1 https://github.com/guadalupejuan001-code/mundo-X.git "$previous_engine"
+          git -C deps/mundo-X worktree add --detach "$RUNNER_TEMP/ether-0.3.66" "$previous_engine"
+          compile_window() {
+            local app="$1" engine="$2" output="$3"
+            shift 3
+            c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread "$@" -I"$app/src" \
+              -I"$engine/pc-android/native" -I"$engine/native/include" \
+              -Ideps/Virtual-qSSD-/include -Ideps/GPU-VIRTUAL/include tests/android_boot_session_test.cpp -lz -o "$output"
+          }
+          compile_window "$RUNNER_TEMP/prime-0.3.66" "$RUNNER_TEMP/ether-0.3.66" build/window-before -DPRIME_PREVIOUS_ENGINE_WINDOW=1
+          compile_window . deps/mundo-X build/window-after
+          for trial in 1 2 3 4 5; do
+            order=(before after)
+            if (( trial % 2 == 0 )); then order=(after before); fi
+            for version in "${order[@]}"; do
+              for argument in --measure-engine-window --measure-engine-mix; do
+                ./build/window-"$version" "$argument" | sed "s/^/$version /"
+              done
+            done
+            ./build/window-after --sustain-engine-window | sed 's/^/after /'
+          done | tee build/prime-engine-window.log
+          python3 tests/compare_execution.py --windows build/prime-engine-window.log
+      - name: Save paired execution window measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: prime-engine-window-${{ matrix.architecture }}
+          path: build/prime-engine-window.log
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

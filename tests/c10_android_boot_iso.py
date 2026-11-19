@@ -175,10 +175,10 @@ def image(profile: bool = False, engine_check: bool = False) -> bytearray:
         0x0F, 0x31, 0x29, 0xF0, 0x19, 0xFA,  # RDTSC; SUB EAX,ESI; SBB EDX,EDI
     )) + expect_condition(0x73)  # JAE: second RDTSC >= MSR.
     if engine_check:
-        count = 4096
+        count = 2_000_000_000
         read_tsc += b"\xb9" + struct.pack("<I", count) + b"\x31\xc0"  # ECX=count, EAX=0.
         read_tsc += b"\x01\xc8\x49\x75\xfb"  # ADD EAX,ECX; DEC ECX; JNZ ADD.
-        read_tsc += b"\x3d" + struct.pack("<I", count * (count + 1) // 2) + expect_equal()
+        read_tsc += b"\x3d" + struct.pack("<I", (count * (count + 1) // 2) & 0xffffffff) + expect_equal()
     next_code = 0x500
     if profile:
         next_code = 0x1400

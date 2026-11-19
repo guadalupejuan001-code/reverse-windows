@@ -59,10 +59,8 @@ final class VmWorker {
             ",\"mundo_x_sha\":" + JSONObject.quote(BuildConfig.MUNDO_X_SHA);
     private static final int DISK_GIB = 64;
     private static final int DATA_DISK_GIB = 8 * 1024 * 1024;
-    private static final int INITIAL_SLICE_STEPS = 4096;
-    private static final int MIN_SLICE_STEPS = 64;
-    private static final int MAX_SLICE_STEPS = Integer.MAX_VALUE;
     private static final long TARGET_SLICE_NS = 8_000_000L;
+    private static final long MAX_SLICE_STEPS = NativeMachine.engineTargetHz() / 1_000_000_000L * TARGET_SLICE_NS;
     // Aim to finish an eight-ms VM workload in six ms to leave room for controls.
     private static final long CPU_TARGET_NS = 6_000_000L;
     private static final long HALTED_POLL_DELAY_MS = 35;
@@ -92,7 +90,6 @@ final class VmWorker {
     private volatile boolean foreground = true;
     private volatile long handle;
     private int outcome;
-    private int sliceSteps = INITIAL_SLICE_STEPS;
     private boolean running;
     private boolean debugSelfTest;
     private long lastStatus;
@@ -104,8 +101,9 @@ final class VmWorker {
     private long androidPssKiB;
     private long stepNanos;
     private long lastSliceNanos;
-    private int lastSliceSteps;
+    private long lastSliceSteps;
     private long lastSliceCompleted;
+    private long peakSliceCompleted;
     private long frameNanos;
     private long statusNanos;
     private long statusSnapshots;
@@ -269,7 +267,6 @@ final class VmWorker {
                 }
                 if (handle == 0) throw new IllegalStateException("La máquina no se pudo iniciar.");
                 outcome = NativeMachine.RUNNING;
-                sliceSteps = INITIAL_SLICE_STEPS;
                 lastStatus = 0;
                 lastDiagnosticSave = 0;
                 sessionStarted = SystemClock.elapsedRealtime();
@@ -281,6 +278,7 @@ final class VmWorker {
                 lastSliceNanos = 0;
                 lastSliceSteps = 0;
                 lastSliceCompleted = 0;
+                peakSliceCompleted = 0;
                 videoDirty = true;
                 running = true;
                 publishState(true);
@@ -458,10 +456,11 @@ final class VmWorker {
             int previous = outcome;
             if (outcome == NativeMachine.RUNNING) cpuPerformance.beforeWork(handle);
             long started = SystemClock.elapsedRealtimeNanos();
-            lastSliceSteps = sliceSteps;
-            long step = NativeMachine.step(handle, lastSliceSteps, TARGET_SLICE_NS);
-            int updated = (int) step;
-            lastSliceCompleted = step >>> 32;
+            lastSliceSteps = MAX_SLICE_STEPS;
+            long step = NativeMachine.step(handle, TARGET_SLICE_NS);
+            int updated = (int) (step & 0x1ff);
+            lastSliceCompleted = step >>> 9;
+            peakSliceCompleted = Math.max(peakSliceCompleted, lastSliceCompleted);
             outcome = updated & ~NativeMachine.STEP_VIDEO_DIRTY;
             videoDirty = (updated & NativeMachine.STEP_VIDEO_DIRTY) != 0;
             long elapsed = Math.max(1, SystemClock.elapsedRealtimeNanos() - started);
@@ -469,12 +468,6 @@ final class VmWorker {
             stepNanos += elapsed;
             if (outcome != NativeMachine.RUNNING) cpuPerformance.pause();
             else if (lastSliceCompleted > 0) cpuPerformance.report(elapsed);
-            // Devices can advance during a slice without retiring a guest instruction.
-            if (outcome == NativeMachine.RUNNING && lastSliceCompleted != 0) {
-                long estimate = lastSliceCompleted * TARGET_SLICE_NS / elapsed;
-                sliceSteps = (int) Math.max(MIN_SLICE_STEPS,
-                        Math.min(MAX_SLICE_STEPS, (sliceSteps + estimate) / 2));
-            }
             long now = SystemClock.uptimeMillis();
             requestFrame();
             if (isTerminal()) {
@@ -485,7 +478,11 @@ final class VmWorker {
             }
             if (now - lastStatus >= STATUS_INTERVAL_MS || outcome != previous)
                 publishState(outcome == NativeMachine.WAITING_KEY);
-            schedule(outcome == NativeMachine.HALTED ? HALTED_POLL_DELAY_MS : 0);
+            // Yield the remainder only when the engine really earned the full grant.
+            long remainingNs = TARGET_SLICE_NS - (SystemClock.elapsedRealtimeNanos() - started);
+            long delayMs = lastSliceCompleted == lastSliceSteps && remainingNs > 0
+                    ? (remainingNs + 999_999L) / 1_000_000L : 0;
+            schedule(outcome == NativeMachine.HALTED ? HALTED_POLL_DELAY_MS : delayMs);
         } catch (RuntimeException | LinkageError | OutOfMemoryError error) {
             report(error);
         }
@@ -575,6 +572,7 @@ final class VmWorker {
                 + ",\"android_pss_kib\":" + androidPssKiB
                 + cpuPerformance.diagnosticFields()
                 + ",\"worker_timing\":{\"step_us\":" + stepNanos / 1000
+                + ",\"sample_elapsed_us\":" + SystemClock.elapsedRealtimeNanos() / 1000
                 + ",\"host_thread_cpu_us\":" + workerCpuUs
                 + ",\"host_process_cpu_ms\":" + processCpuMs
                 + ",\"frame_us\":" + frameNanos / 1000
@@ -584,8 +582,9 @@ final class VmWorker {
                 + ",\"diagnostic_write_us\":" + diagnosticWriteNanos / 1000
                 + ",\"last_slice_steps_requested\":" + lastSliceSteps
                 + ",\"last_slice_steps_completed\":" + lastSliceCompleted
+                + ",\"peak_slice_steps_completed\":" + peakSliceCompleted
                 + ",\"last_slice_us\":" + lastSliceNanos / 1000
-                + ",\"next_slice_steps_requested\":" + sliceSteps
+                + ",\"next_slice_steps_requested\":" + MAX_SLICE_STEPS
                 + ",\"max_steps_per_slice\":" + MAX_SLICE_STEPS
                 + ",\"target_slice_us\":" + TARGET_SLICE_NS / 1000
                 + ",\"diagnostic_save_interval_ms\":" + DIAGNOSTIC_INTERVAL_MS + "}");

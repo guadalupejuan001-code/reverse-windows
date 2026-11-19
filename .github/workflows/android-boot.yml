@@ -405,7 +405,11 @@ jobs:
           assert report["boot_progress"]["handed_off"] and report["boot_profile"]["checkpoint_interval_steps"] == 50_000_000
           assert report["boot_progress"]["checkpoint_interval_steps"] == 50_000_000
           timing = report["worker_timing"]
-          assert timing["max_steps_per_slice"] == (1 << 31) - 1 and timing["target_slice_us"] == 8_000, timing
+          assert timing["max_steps_per_slice"] == 36_000_000_000 and timing["target_slice_us"] == 8_000, timing
+          window = report["ether_execution"]
+          assert window["target_virtual_cycles_per_second"] == 4_500_000_000_000
+          assert window["last_requested_steps"] == timing["max_steps_per_slice"]
+          assert window["last_retired_steps"] == timing["last_slice_steps_completed"]
           assert 0 <= timing["last_slice_steps_completed"] <= timing["last_slice_steps_requested"] <= timing["max_steps_per_slice"], timing
           assert 0 < timing["next_slice_steps_requested"] <= timing["max_steps_per_slice"], timing
           assert timing["diagnostic_save_interval_ms"] == 5_000
@@ -420,7 +424,10 @@ jobs:
           assert ether["code_version_hits"] == ether["code_byte_checks"] == ether["code_bytes_read"] == 0
           projected = report["ether_coverage"]["state_vector_interpreter_steps"]
           assert projected > 0, report["ether_coverage"]
-          print(f"PRIME_ANDROID_ENGINE_PASS sum_1_to_4096=8390656 projected_steps={projected}")
+          assert report["boot_progress"]["session_steps"] >= 6_000_000_000
+          assert report["boot_hotspots"]["register_batch_steps"] > (1 << 32)
+          print(f"PRIME_ANDROID_ENGINE_PASS counted_steps=6000000000 projected_steps={projected} "
+                f"max_retired_in_one_window={timing['peak_slice_steps_completed']}")
           print("PRIME_ANDROID_ISO_PICKER_PASS boot=el-torito ram_gib=64 qssd_boot_gib=64 qssd_data_pib=8",
                 f"protected32_tsc_hz={topology['guest_tsc_hz']}")
           PY
@@ -439,6 +446,7 @@ jobs:
           from pathlib import Path
           before, after = [json.loads(Path(path).read_text()) for path in sys.argv[1:3]]
           assert after["cpu_topology"]["guest_tsc_hz"] == int(sys.argv[3])
+          assert after["ether_execution"]["target_virtual_cycles_per_second"] == 4_500_000_000_000
           assert after["source"] == "iso" and after["status"] == "waiting_key"
           assert after["boot_progress"]["session_steps"] == before["boot_progress"]["session_steps"] > 0
           assert after["irq"]["active_clock_elapsed_ns"] == before["irq"]["active_clock_elapsed_ns"]

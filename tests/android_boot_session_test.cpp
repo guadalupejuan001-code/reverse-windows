@@ -749,8 +749,7 @@ void verify_real_mode_ps2(const std::filesystem::path& path, bool via_irq) {
 
 constexpr unsigned kLongModeTestOffset = 0x160;
 
-template <std::size_t N>
-auto long_mode_test_sector(const std::uint8_t (&guest)[N]) {
+auto long_mode_test_sector(const std::uint8_t* guest, std::size_t size) {
   auto boot = cosmic_pc::long_mode_boot_disk();
   const std::array<std::uint8_t, 6> signature{0x48,0xb8,0x01,0,0,0};
   const auto start = std::search(boot.begin(), boot.end(), signature.begin(), signature.end());
@@ -759,9 +758,99 @@ auto long_mode_test_sector(const std::uint8_t (&guest)[N]) {
   constexpr unsigned destination = 0x7c00 + kLongModeTestOffset;
   const std::uint8_t handoff[] = {0xbb,std::uint8_t(destination),std::uint8_t(destination >> 8),0,0,0xff,0xe3};
   std::copy(std::begin(handoff), std::end(handoff), start);
-  static_assert(kLongModeTestOffset + N <= 510, "Guest must fit before the boot signature");
-  std::copy(std::begin(guest), std::end(guest), boot.begin() + kLongModeTestOffset);
+  require(size <= 510-kLongModeTestOffset, "Guest must fit before the boot signature");
+  std::copy_n(guest, size, boot.begin() + kLongModeTestOffset);
   return boot;
+}
+
+template <std::size_t N>
+auto long_mode_test_sector(const std::uint8_t (&guest)[N]) {
+  static_assert(kLongModeTestOffset + N <= 510, "Guest must fit before the boot signature");
+  return long_mode_test_sector(guest,N);
+}
+
+void measure_engine_window(std::uint64_t rounds, bool paced, bool mixed=false) {
+  using Clock = cosmic_pc::PcMachine::RunClock;
+  using namespace std::chrono;
+  TestDiskDirectory dir;
+  const auto path = dir.path / "engine-window.rqvd";
+  auto checksum = rounds % 2 ? rounds * (rounds / 2 + 1) : (rounds / 2) * (rounds + 1);
+  if (mixed) {
+    checksum = 0;
+    for (auto counter=rounds; counter; --counter) {
+      checksum = (checksum + counter) ^ 0x13579bdf;
+      checksum = (checksum << 5) | (checksum >> 59);
+    }
+  }
+  std::vector<std::uint8_t> guest{0xfa,0x48,0xb9}; // CLI; MOV RCX,rounds.
+  const auto imm64 = [&](std::uint64_t v) {
+    for (unsigned i=0; i<8; ++i) guest.push_back(std::uint8_t(v >> (8*i)));
+  };
+  imm64(rounds);
+  guest.insert(guest.end(),{0x31,0xc0}); // XOR EAX,EAX.
+  const auto loop = guest.size();
+  guest.insert(guest.end(),{0x48,0x01,0xc8}); // ADD RAX,RCX.
+  if (mixed) guest.insert(guest.end(),{0x48,0x35,0xdf,0x9b,0x57,0x13,0x48,0xc1,0xc0,5});
+  guest.insert(guest.end(),{0x48,0xff,0xc9,0x75}); // DEC RCX; JNZ loop.
+  guest.push_back(std::uint8_t(loop-guest.size()-1));
+  guest.insert(guest.end(),{0x48,0xba}); // MOV RDX,checksum.
+  imm64(checksum);
+  guest.insert(guest.end(),{0x48,0x39,0xd0,0x74,2,0x0f,0x0b,0xfa,0xf4}); // CMP; JE; UD2; CLI; HLT.
+  const auto boot = long_mode_test_sector(guest.data(),guest.size());
+  Session::create_disk(path, 1);
+  { reverse_windows::QssdDisk disk(path); require(disk.write(0,1,boot.data()), "Write engine fixture"); }
+  Session session(path,0,Session::BootSource::Disk,-1,0,Session::kDefaultRamProfile,
+                  {},{},{},Session::kPrimeCpuTopology,true,Session::kPrimeCpuClock);
+  for (unsigned i = 0; ; ++i) {
+    const auto d = session.diagnostic(false);
+    if (counter(d.substr(d.find("\"machine\":")), "ip") == 0x7c00 + kLongModeTestOffset + loop) break;
+    require(i < 4000 && session.step(1) == Session::Step::Running, "Cannot enter the measured x64 loop");
+  }
+  const auto before = session.session_steps();
+  std::uint64_t active_ns = 0, full = 0, windows = 0;
+#ifdef PRIME_PREVIOUS_ENGINE_WINDOW
+  std::uint64_t request = 4096;
+#endif
+  const auto begin = Clock::now();
+  auto status = Session::Step::Running;
+  while (status == Session::Step::Running && Clock::now()-begin < seconds(25)) {
+    const auto turn = Clock::now();
+    const auto steps = session.session_steps();
+#ifdef PRIME_PREVIOUS_ENGINE_WINDOW
+    status = session.step(unsigned(request), turn + milliseconds(8));
+#else
+    status = session.step_engine_window(milliseconds(8));
+#endif
+    const auto elapsed = std::max<std::int64_t>(1, duration_cast<nanoseconds>(Clock::now()-turn).count());
+    active_ns += elapsed;
+    const auto done = session.session_steps() - steps;
+    ++windows;
+#ifdef PRIME_PREVIOUS_ENGINE_WINDOW
+    if (done && status == Session::Step::Running)
+      request = std::clamp<std::uint64_t>((request + done * 8'000'000 / elapsed) / 2, 64, INT32_MAX);
+#else
+    require(done == session.last_engine_retired() && done <= 36'000'000'000ULL, "Incorrect 64-bit grant");
+    if (done == 36'000'000'000ULL) {
+      ++full;
+      if (paced && status == Session::Step::Running) std::this_thread::sleep_until(turn + milliseconds(8));
+    }
+#endif
+  }
+  const auto wall_ns = duration_cast<nanoseconds>(Clock::now()-begin).count();
+  const auto retired = session.session_steps()-before;
+  require(status == Session::Step::Halted && session.is_stopped() && retired == (mixed?5:3)*rounds+5,
+          "The guest checksum, halt or exact retired count failed");
+#ifndef PRIME_PREVIOUS_ENGINE_WINDOW
+  const auto report = session.diagnostic();
+  if (!mixed) require(counter(report,"register_batch_steps") > 0 && counter(report,"phase_projected_steps") > 0,
+          "The production session never used register projection");
+  if (cosmic_pc::Cpu::ether_arm64_host()) require(counter(report,"phase_ether_arm64_steps") > 0, "Native engine missing");
+  require(session.step_engine_window(milliseconds(8)) == Session::Step::Halted &&
+              session.last_engine_retired() == 0, "A stopped machine earned execution credit");
+#endif
+  std::cout << "PRIME_ENGINE_WINDOW_SAMPLE kind=" << (mixed ? "mix" : "sum") << " paced=" << paced << " steps=" << retired
+            << " checksum=" << checksum << " windows=" << windows << " full=" << full
+            << " active_ns=" << active_ns << " wall_ns=" << wall_ns << '\n';
 }
 
 void verify_late_prime_pressure(const std::filesystem::path& path) {
@@ -1078,6 +1167,18 @@ void verify_riso_boot(const std::filesystem::path& original, const std::filesyst
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string(argv[1]) == "--measure-engine-window") {
+      measure_engine_window(100'000'000ULL, false);
+      return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--sustain-engine-window") {
+      measure_engine_window(1'500'000'000'000ULL, true);
+      return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--measure-engine-mix") {
+      measure_engine_window(250'000ULL, false, true);
+      return 0;
+    }
     if (argc == 4 && std::string(argv[1]) == "--riso") {
       verify_riso_boot(argv[2],argv[3]);
       return 0;
