@@ -33,6 +33,8 @@ class PcMotherboardC06 {
   enum class CpuClock : unsigned { Standard = 1, Double = 2, Twentyfold = 20, Experimental4_5THz };
   static constexpr std::uint64_t kExperimentalTscHz = 4'500'000'000'000ULL;
   static_assert(kExperimentalTscHz % cosmic_pc::Cpu::kTscTicksPerCycle == 0);
+  static constexpr std::uint64_t kRamClockHz = 4'500'000'000'000ULL;
+  static_assert(kRamClockHz % 1'000'000'000 == 0);
   enum class ClockStart { Immediate, Guest32Or64 };
   static constexpr std::uint64_t kLocalApic=cosmic_pc::PcMachine::kLocalApicAddress,
       kIoApic=cosmic_pc::PcMachine::kIoApicAddress;
@@ -361,6 +363,9 @@ class PcMotherboardC06 {
     io_remote_vector_.fill(0);
     io_remote_targets_.fill(0);
     build_config(host_cfg_,0x0001,0x00);
+    // Read-only, little-endian RAM clock (Hz) in the virtual host bridge.
+    config32(host_cfg_, 0x40, static_cast<std::uint32_t>(kRamClockHz));
+    config32(host_cfg_, 0x44, static_cast<std::uint32_t>(kRamClockHz >> 32));
     build_config(isa_cfg_,0x0002,0x01);
     if(ide_present()){
       ata_cfg_.fill(0);
@@ -605,7 +610,9 @@ class PcMotherboardC06 {
         const bool gate=(speaker_control_&1)!=0;
         const bool out=pit2_.mode==0 ? !pit2_.enabled :
             !gate||!pit2_.enabled||pit2_.counter>pit2_.reload/2;
-        return speaker_control_|(out?0x20U:0U)|(((ticks_/54U)&1U)?0x10U:0U);
+        // The refresh divider changes state every 2^26 RAM cycles (~14.9 us).
+        const bool refresh = (ram_clock_cycles() & (1ULL << 26)) != 0;
+        return speaker_control_|(out?0x20U:0U)|(refresh?0x10U:0U);
       }
       case 0x70:return cmos_index_;
       case 0x71:return cmos_read();
@@ -1841,6 +1848,14 @@ class PcMotherboardC06 {
   }
   std::uint64_t guest_tsc_hz() const noexcept {
     return tsc_cycles_per_second_ * cosmic_pc::Cpu::kTscTicksPerCycle;
+  }
+  std::uint64_t ram_clock_cycles() const noexcept {
+    // Derive the free-running oscillator on demand, once for the entire board.
+    // The firmware phase stops where active VM time takes over, even mid-tick.
+    const auto firmware_steps = (ticks_ - active_clock_ticks_) * cpu_clock_ratio_ + cpu_cycle_phase_;
+    std::uint64_t remainder = 0;
+    const auto firmware = scaled_cycles(firmware_steps, kRamClockHz, firmware_cycles_per_second_, remainder);
+    return firmware + active_clock_ns_ * (kRamClockHz / 1'000'000'000);
   }
   std::uint64_t active_clock_elapsed_ns() const noexcept {return active_clock_ns_;}
   std::uint64_t active_clock_ticks() const noexcept {return active_clock_ticks_;}

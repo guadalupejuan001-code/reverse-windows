@@ -5,7 +5,7 @@ plugins {
 }
 
 def etherPreview = providers.gradleProperty('etherPreview').map { it == 'true' }.getOrElse(false)
-def appVersion = '0.3.67-eter-4.5THz'
+def appVersion = '0.3.68-ram'
 def dependencyLock = rootProject.layout.projectDirectory.file('../config/dependencies.lock.json')
 def dependencies = new JsonSlurper().parseText(providers.fileContents(dependencyLock).asText.get())
 def mundoXSha = dependencies.components.find { it.key == 'mundo_x' }?.commit
@@ -22,7 +22,7 @@ android {
         applicationId(etherPreview ? 'com.reversewindows.android.prime.smp.r092' : 'com.reversewindows.android')
         minSdk 26
         targetSdk 35
-        versionCode 97
+        versionCode 98
         versionName appVersion
         manifestPlaceholders = [appLabel: etherPreview ? 'REVERSE Windows Prime ' + appVersion : 'REVERSE Windows']
         buildConfigField 'String', 'MUNDO_X_SHA', "\"${mundoXSha}\""
