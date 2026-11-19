@@ -18,9 +18,13 @@ class Ps2Keyboard final {
 
   void controller_command(std::uint8_t command) {
     if (command == 0x60 || command == 0xd1) controller_pending_ = command;
+    if (command == 0xa7) config_ |= 0x20;
+    if (command == 0xa8) config_ &= ~0x20;
     if (command == 0xad) config_ |= 0x10;
     if (command == 0xae) config_ &= ~0x10;
   }
+
+  std::uint8_t configuration() const noexcept { return config_; }
 
   bool controller_expects_data() const noexcept { return controller_pending_ != 0; }
 
@@ -50,8 +54,23 @@ class Ps2Keyboard final {
       return false;
     const auto input = static_cast<std::uint8_t>(code);
     const bool extended = (code >> 8) == 0xe0;
-    if (!input || input >= set2_.size()) return false;
     const bool translated = (config_ & 0x40) || scan_set_ == 1;
+    if (code == 0xe037 || code == 0xe045) {
+      if (keys_.size() + 8 > kQueueLimit) return false;
+      const auto append = [&](std::initializer_list<std::uint8_t> bytes) {
+        keys_.insert(keys_.end(), bytes.begin(), bytes.end());
+      };
+      if (code == 0xe045) {
+        if (pressed && translated) append({0xe1,0x1d,0x45,0xe1,0x9d,0xc5});
+        if (pressed && !translated) append({0xe1,0x14,0x77,0xe1,0xf0,0x14,0xf0,0x77});
+      } else if (translated) {
+        if (pressed) append({0xe0,0x2a,0xe0,0x37}); else append({0xe0,0xb7,0xe0,0xaa});
+      } else {
+        if (pressed) append({0xe0,0x12,0xe0,0x7c}); else append({0xe0,0xf0,0x7c,0xe0,0xf0,0x12});
+      }
+      return true;
+    }
+    if (!input || (!extended && input >= set2_.size())) return false;
     const auto output = translated ? input : (extended ? extended_set2(input) : set2_[input]);
     if (!output || keys_.size() + 3 > kQueueLimit) return false;
     if (extended) keys_.push_back(0xe0);
@@ -104,6 +123,7 @@ class Ps2Keyboard final {
       case 0x49: case 0x4b: case 0x4d: case 0x4f: case 0x50: case 0x51:
       case 0x52: case 0x53:
         return set2_[value];
+      case 0x5b: return 0x1f; case 0x5c: return 0x27; case 0x5d: return 0x2f;
       default: return 0; // E0 events outside the current key map.
     }
   }

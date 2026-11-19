@@ -20,6 +20,7 @@ final class GuestMonitor extends View {
     interface Input {
         boolean onKey(KeyEvent event);
         void onText(CharSequence text);
+        void onPresented();
     }
 
     private static final int[] VGA = {
@@ -56,7 +57,21 @@ final class GuestMonitor extends View {
         setFocusableInTouchMode(true);
     }
 
+    private boolean commitPending,drawPending;
+    private int generation;
+    String dimensions(){return hasText?"80 × 25 celdas":videoStripes==null?"Pendiente":videoWidth+" × "+videoHeight+" px";}
     void show(VmWorker.Frame update) {
+        if(isShown()){
+            if(android.os.Build.VERSION.SDK_INT>=29 && isHardwareAccelerated()){
+                if(!commitPending){
+                    commitPending=true;int epoch=generation;
+                    getViewTreeObserver().registerFrameCommitCallback(()->{
+                        if(epoch!=generation)return;commitPending=false;
+                        if(isShown())input.onPresented();
+                    });
+                }
+            }else drawPending=true;
+        }
         if (update.text != null) {
             System.arraycopy(update.text, 0, cells, 0, cells.length);
             hasText = true;
@@ -97,6 +112,7 @@ final class GuestMonitor extends View {
     }
 
     void reset() {
+        generation++;commitPending=drawPending=false;
         hasText = false;
         discardVideo();
         Arrays.fill(cells, (byte) 0);
@@ -110,6 +126,7 @@ final class GuestMonitor extends View {
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
+        if(drawPending){drawPending=false;input.onPresented();}
         canvas.drawColor(0xff080b10);
         if (hasText) {
             drawTextMode(canvas);

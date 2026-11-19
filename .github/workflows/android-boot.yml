@@ -304,20 +304,14 @@ jobs:
           assert snapshot["machine"]["page_translation_hits"] == 0
           assert snapshot["ether_next"]["boot_paged_rep_elements"] == 0
           PY
+          adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity" --ez com.reversewindows.android.SELF_TEST true
+          wait_for_state waiting_key
+          python3 tests/android_rgb_console.py key
+          wait_for_state halted
+          echo "PRIME_RGB_GUEST_KEY_PASS physical=iso-es-n-tilde bios=halted"
+          adb shell am force-stop "$ANDROID_APP_ID"
           adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity"
-          saved=false
-          for attempt in {1..8}; do
-            adb shell uiautomator dump /sdcard/reverse-windows-window.xml >/dev/null
-            adb exec-out cat /sdcard/reverse-windows-window.xml > "$RUNNER_TEMP/reverse-windows-window.xml"
-            if grep -Fq "resource-id=\"$ANDROID_APP_ID:id/vm_copy_diagnostic\"" "$RUNNER_TEMP/reverse-windows-window.xml"; then
-              saved=true
-              break
-            fi
-          done
-          if [[ "$saved" != true ]]; then
-            echo "Saved diagnostic was unavailable after relaunch" >&2
-            exit 1
-          fi
+          python3 tests/android_rgb_console.py console
 
           tap_visible() {
             local field="$1" label="$2" scroll="${3:-}" point
@@ -418,6 +412,7 @@ jobs:
           assert topology["guest_tsc_hz"] == 4_500_000_000_000
           assert report["irq"]["clock_source"] == "host-active-monotonic" and report["irq"]["active_clock_ticks"] > 0
           assert report["ram_profile"]["usable_bytes"] == 64 << 30, report["ram_profile"]
+          assert report["ram_profile"]["ram_clock_hz"] == 4_500_000_000_000
           ether = report["ether_arm64"]
           assert ether["mundo_x_source_sha"] == os.environ["MUNDO_X_SHA"]
           assert ether["protected32_guest_steps"] == 0
@@ -431,6 +426,7 @@ jobs:
           print("PRIME_ANDROID_ISO_PICKER_PASS boot=el-torito ram_gib=64 qssd_boot_gib=64 qssd_data_pib=8",
                 f"protected32_tsc_hz={topology['guest_tsc_hz']}")
           PY
+          python3 tests/android_rgb_console.py settings
           for rate in 4581817600 4500000000000; do
             tap_visible resource-id "$ANDROID_APP_ID:id/vm_experimental_clock" down
             live="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/iso-clock-$rate.json"

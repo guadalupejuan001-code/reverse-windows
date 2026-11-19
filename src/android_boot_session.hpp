@@ -482,6 +482,8 @@ class AndroidBootSession final {
         (pc_.cpu.halted && !pc_.cpu.flag(cosmic_pc::Cpu::IF) && !board_->secondary_can_run());
   }
 
+  void pointer(int dx,int dy,unsigned buttons){board_->pointer(dx,dy,buttons);}
+
   bool key(unsigned ascii, unsigned scancode, bool pressed) {
     if (ascii > 255 || (scancode > 255 && (scancode & ~255U) != 0xe000U))
       throw std::invalid_argument("Código de teclado BIOS inválido.");

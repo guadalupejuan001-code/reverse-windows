@@ -86,6 +86,7 @@ final class NativeMachine {
                                                     boolean lowMemory);
     static native boolean maintainRamBudget(long handle);
     static native boolean prepareRamReclaim(long handle);
+    static native void pointer(long handle, int dx, int dy, int buttons);
     static native boolean key(long handle, int ascii, int scanCode, boolean pressed);
     static native void flush(long handle);
     static native String diagnostic(long handle, boolean detailed);

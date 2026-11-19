@@ -1398,6 +1398,36 @@ void ps2_keyboard_guest(){
        pc.cpu.regs[Cpu::ESP]==0x190000,"PS/2 IRQ1 must resume and return the guest for every byte");
   std::cout<<"C06_PS2_KEYBOARD_IRQ1_PASS bytes=8 protected32=true\n";
 }
+void ps2_pointer_guest() {
+  PcMachine pc(16*1024*1024); boot32(pc);
+  PcMotherboardC06 board(pc); board.enable_ps2_keyboard();
+  pc.cpu.idtr={0x1000,0x15000};
+  pc.cpu.regs[Cpu::ESP]=0x190000; pc.cpu.regs[Cpu::EDI]=0x9500;
+  gate(pc.cpu,0x2c,0x13400);
+  code(pc.cpu,0x13400,{0xe4,0x64,0xaa,0xe4,0x60,0xaa, // Status + byte observed by the guest.
+                       0xb0,0x20,0xe6,0xa0,0xe6,0x20,0xcf});
+  std::vector<std::uint8_t> p;
+  const auto out=[&](std::uint8_t port,std::uint8_t value){emit(p,{0xb0,value,0xe6,port});};
+  out(0x20,0x11);out(0x21,0x20);out(0x21,4);out(0x21,1);
+  out(0xa0,0x11);out(0xa1,0x28);out(0xa1,2);out(0xa1,1);
+  out(0x21,0xfb);out(0xa1,0xef);
+  out(0x64,0xa7);out(0x64,0xa8);out(0x64,0xa9);emit(p,{0xe4,0x60,0xaa});
+  out(0x64,0x60);out(0x60,6); // Auxiliary IRQ enabled.
+  out(0x64,0xd4);out(0x60,0xf4); // Start mouse data reporting.
+  emit(p,{0xfb,0xf4,0xeb,0xfd});
+  code(pc.cpu,0xa000,p); pc.cpu.eip=0xa000;pc.cpu.halted=false;pc.cpu.fault.reset();
+  run(pc,180);
+  board.pointer(12,-7,1); board.pointer(0,0,2); board.pointer(0,0,0);
+  run(pc,400);
+  const std::array<std::uint8_t,10> bytes{{0xfa,0x29,12,0xf9,0x0a,0,0,8,0,0}};
+  need(pc.cpu.read8(0x9500)==0 && pc.cpu.regs[Cpu::EDI]==0x9501+2*bytes.size(),
+       "The guest must receive the second-port test and all ten IRQ12 events");
+  for (unsigned i=0;i<bytes.size();++i) {
+    need((pc.cpu.read8(0x9501+2*i)&0x21)==0x21 && pc.cpu.read8(0x9502+2*i)==bytes[i],
+         "AUX status, movement or button transition differed at the guest port");
+  }
+  std::cout<<"C06_PS2_POINTER_PASS irq12=10 x=12 y=-7 left=1 right=1 released=1\n";
+}
 void queued_lapic_requests_guest(){
   PcMachine pc(16*1024*1024);boot32(pc);
   PcMotherboardC06 board(pc);
@@ -1663,6 +1693,7 @@ int main(){
     prime_bios_clock();
     prime_vga_graphics_ports();
     ps2_keyboard_guest();
+    ps2_pointer_guest();
     queued_lapic_requests_guest();
     cr8_lapic_priority_guest();
     std::cout<<"REVERSE_WINDOWS_C06_MOTHERBOARD_PASS checks="<<checks

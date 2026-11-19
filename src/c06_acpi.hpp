@@ -78,7 +78,7 @@ class AcpiC06 {
     table[at+3]=std::uint8_t(access);
     u64(table,at+4,port);
   }
-  static std::vector<std::uint8_t> dsdt_aml(bool ide, bool pci_mmio, unsigned processors) {
+  static std::vector<std::uint8_t> dsdt_aml(bool ide, bool pci_mmio, unsigned processors, bool ps2) {
     // Name(\_S5, Package(){5, 5}).
     std::vector<std::uint8_t> aml{0x08,0x5c,'_','S','5','_',0x12,0x06,0x02,0x0a,0x05,0x0a,0x05};
     const auto finish_large_package=[&](std::size_t length_offset){
@@ -142,6 +142,22 @@ class AcpiC06 {
       0x79,0x00
     });
     finish_large_package(root_length);
+    if (ps2) {
+      for (bool mouse : {false,true}) {
+        const auto length = aml.size()+2;
+        aml.insert(aml.end(),{0x5b,0x82,0,0});
+        const char* name=mouse ? "MOU0" : "KBD0";
+        aml.insert(aml.end(),name,name+4);
+        aml.insert(aml.end(),{0x08,'_','H','I','D',0x0c,0x41,0xd0,
+                              std::uint8_t(mouse ? 0x0f : 0x03),std::uint8_t(mouse ? 0x13 : 0x03)});
+        const auto size=std::uint8_t(mouse ? 5 : 21);
+        aml.insert(aml.end(),{0x08,'_','C','R','S',0x11,std::uint8_t(size+3),0x0a,size});
+        if(!mouse)for(std::uint8_t port : {0x60,0x64})
+          aml.insert(aml.end(),{0x47,1,port,0,port,0,1,1});
+        aml.insert(aml.end(),{0x22,std::uint8_t(mouse?0:2),std::uint8_t(mouse?16:0),0x79,0});
+        finish_large_package(length);
+      }
+    }
     constexpr char digits[] = "0123456789ABCDEF";
     for (unsigned id = 0; processors > 1 && id < processors; ++id) {
       const auto cpu_length = aml.size() + 2;
@@ -157,7 +173,7 @@ class AcpiC06 {
   }
 
  public:
-  static void install(cosmic_pc::Cpu& cpu,bool ide,bool graphics_device=false) {
+  static void install(cosmic_pc::Cpu& cpu,bool ide,bool graphics_device=false,bool ps2=false) {
     if(cpu.memory.size()<0x100000)throw std::runtime_error("ACPI BIOS RAM unavailable");
     const auto processors = cpu.topology().logical_processors();
     const auto dsdt_pointer = processors > 1 ? smp_dsdt_address : dsdt_address;
@@ -222,7 +238,7 @@ class AcpiC06 {
     u32(madt,entry+4,sci_irq);u16(madt,entry+8,0x0f); // Active-low, level-triggered.
     publish(cpu,madt_address,std::move(madt));
 
-    const auto aml=dsdt_aml(ide,graphics_device,processors);
+    const auto aml=dsdt_aml(ide,graphics_device,processors,ps2);
     auto dsdt=table("DSDT",36+aml.size(),2);
     std::copy(aml.begin(),aml.end(),dsdt.begin()+36);
     publish(cpu,dsdt_pointer,std::move(dsdt));

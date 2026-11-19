@@ -29,6 +29,7 @@ import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -70,14 +71,15 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private GuestMonitor monitor;
     private ScrollView scroll;
     private ScrollView traceScroll;
-    private LinearLayout workbench;
-    private LinearLayout viewer;
+    private FrameLayout pages;
+    private ScrollView metricPage;
+    private ConsoleDeck console;
+    private ConsoleMetrics liveMetrics;
+    private TextView displayValues;
+    private int page;
     private FrameLayout guestSurface;
     private VmTelemetry telemetry;
     private TextView sessionSummary;
-    private Button screenTab;
-    private Button traceTab;
-    private Button expandMonitor;
     private TextView media;
     private TextView storage;
     private TextView status;
@@ -99,7 +101,6 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private TextView hardwareResult;
     private LinearLayout controls;
     private LinearLayout primaryActions;
-    private LinearLayout guestKeys;
     private LinearLayout setupPanel;
     private boolean pending;
     private boolean session;
@@ -141,120 +142,91 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     }
 
     private void buildScreen() {
-        scroll = new ScrollView(this);
-        scroll.setFillViewport(true);
-        scroll.setBackground(new GradientDrawable(GradientDrawable.Orientation.TL_BR,
-                new int[]{0xff2a404a, BG, 0xff204038}));
-        scroll.setClipToPadding(false);
-        scroll.setOnApplyWindowInsetsListener((view, insets) -> {
-            if (Build.VERSION.SDK_INT >= 30) {
-                android.graphics.Insets safe = insets.getInsets(
-                        WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
-                android.graphics.Insets keyboard = insets.getInsets(WindowInsets.Type.ime());
-                view.setPadding(safe.left, safe.top, safe.right, Math.max(safe.bottom, keyboard.bottom));
-            }
-            return insets;
-        });
-        LinearLayout body = column();
-        body.setPadding(dp(12), dp(8), dp(12), dp(12));
-        scroll.addView(body);
-
-        LinearLayout header = row(body);
-        header.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout identity = column();
-        header.addView(identity, new LinearLayout.LayoutParams(0, -2, 1));
-        TextView title = label("REVERSE Windows", 20, TEXT);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        identity.addView(title);
-        source = label(BuildConfig.VERSION_NAME + " · Invitado x86-64", 12, ACCENT);
-        source.setTypeface(Typeface.MONOSPACE);
-        add(identity, source, 2);
-        evidence = action("Diagnóstico", false, this::showDiagnostic);
-        evidence.setId(R.id.vm_copy_diagnostic);
-        LinearLayout.LayoutParams evidenceParams = new LinearLayout.LayoutParams(-2, -2);
-        evidenceParams.leftMargin = dp(8);
-        header.addView(evidence, evidenceParams);
-
-        status = label("Máquina apagada", 14, TEXT);
-        status.setId(R.id.vm_status);
-        status.setTypeface(Typeface.DEFAULT_BOLD);
-        status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
-        add(body, status, 5);
-        setupPanel = card(body, 10);
-        LinearLayout display = card(body, 9);
-        workbench = row(display);
-        viewer = column();
-        workbench.addView(viewer);
-
-        LinearLayout viewTabs = row(viewer);
-        screenTab = action("Pantalla", false, () -> showTrace(false));
-        traceTab = action("Registro", false, () -> showTrace(true));
-        expandMonitor = action("Ampliar", false, this::toggleMonitorSize);
-        weighted(viewTabs, screenTab, 0);
-        weighted(viewTabs, traceTab, 6);
-        weighted(viewTabs, expandMonitor, 6);
-
-        guestSurface = new FrameLayout(this);
-        guestSurface.setBackground(panel(0x9910161a, 8, BORDER));
-        guestSurface.setClipToOutline(true);
-        add(viewer, guestSurface, 6);
-        monitor = new GuestMonitor(this, this);
-        guestSurface.addView(monitor, new FrameLayout.LayoutParams(-1, -1));
-
-        traceScroll = new ScrollView(this);
-        traceScroll.setFillViewport(true);
-        stats = label("", 13, MUTED);
-        stats.setTypeface(Typeface.MONOSPACE);
-        stats.setTextIsSelectable(true);
-        stats.setPadding(dp(10), dp(9), dp(10), dp(9));
-        traceScroll.addView(stats);
-        guestSurface.addView(traceScroll, new FrameLayout.LayoutParams(-1, -1));
-        showTrace(false);
-
-        telemetry = new VmTelemetry(this);
-        workbench.addView(telemetry);
-
-        sessionSummary = label("", 11, MUTED);
-        sessionSummary.setTypeface(Typeface.MONOSPACE);
-        sessionSummary.setVisibility(View.GONE);
-        add(display, sessionSummary, 6);
-
-        controls = column();
-        add(display, controls, 6);
-        experimentalClock = new Switch(this);
-        experimentalClock.setId(R.id.vm_experimental_clock);
-        experimentalClock.setText("Reloj virtual de 4,5 THz");
-        experimentalClock.setTextColor(TEXT);
-        experimentalClock.setOnClickListener(v -> worker.setExperimentalClock(experimentalClock.isChecked()));
-        add(controls, experimentalClock, 0);
-        primaryActions = row(controls);
-        LinearLayout sessionRow = row(primaryActions);
-        pause = action("Pausar", false, () -> worker.setRunning(!running));
-        stop = action("Apagar", false, this::confirmStop);
-        pair(sessionRow, pause, stop);
-        LinearLayout inputRow = row(primaryActions);
-        pair(inputRow, action("Teclado", false, () -> {
-            showTrace(false);
-            monitor.showKeyboard();
-            scroll.postDelayed(() -> scroll.smoothScrollTo(0, 0), 220);
-        }), action("Enter ↵", false, () -> sendGuestKey(13, 0x1c)));
-        guestKeys = row(controls);
-        ((LinearLayout.LayoutParams) guestKeys.getLayoutParams()).topMargin = dp(5);
-        LinearLayout arrows = row(guestKeys);
-        String[] arrowsText = {"←", "↑", "↓", "→"};
-        String[] arrowsDescription = {"Izquierda", "Arriba", "Abajo", "Derecha"};
-        int[] arrowsScan = {0xe04b, 0xe048, 0xe050, 0xe04d};
-        for (int i = 0; i < arrowsText.length; i++) {
-            int scan = arrowsScan[i];
-            Button key = action(arrowsText[i], false, () -> sendGuestKey(0, scan));
-            key.setContentDescription(arrowsDescription[i]);
-            weighted(arrows, key, i == 0 ? 0 : 6);
+        pages=new FrameLayout(this);
+        pages.setBackgroundColor(0xff171c22);
+        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE |
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION |
+                View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+        if(Build.VERSION.SDK_INT>=28){
+            WindowManager.LayoutParams lp=getWindow().getAttributes();
+            lp.layoutInDisplayCutoutMode=WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            getWindow().setAttributes(lp);
         }
-        LinearLayout extraKeys = row(guestKeys);
-        weighted(extraKeys, action("Esc", false, () -> sendGuestKey(27, 0x01)), 0);
-        weighted(extraKeys, action("Tab", false, () -> sendGuestKey(9, 0x0f)), 6);
-        weighted(extraKeys, action("F8", false, () -> sendGuestKey(0, 0x42)), 6);
-        weighted(extraKeys, action("F10", false, () -> sendGuestKey(0, 0x44)), 6);
+        pages.setOnApplyWindowInsetsListener((v,in)->{
+            if(Build.VERSION.SDK_INT>=30){
+                android.graphics.Insets safe=in.getInsets(WindowInsets.Type.displayCutout()|
+                        WindowInsets.Type.systemGestures()|WindowInsets.Type.systemBars()|WindowInsets.Type.ime());
+                v.setPadding(safe.left,safe.top,safe.right,safe.bottom);
+            }else{
+                int left=in.getSystemWindowInsetLeft(),top=in.getSystemWindowInsetTop(),right=in.getSystemWindowInsetRight(),bottom=in.getSystemWindowInsetBottom();
+                if(Build.VERSION.SDK_INT>=28&&in.getDisplayCutout()!=null){
+                    left=Math.max(left,in.getDisplayCutout().getSafeInsetLeft());right=Math.max(right,in.getDisplayCutout().getSafeInsetRight());
+                    top=Math.max(top,in.getDisplayCutout().getSafeInsetTop());bottom=Math.max(bottom,in.getDisplayCutout().getSafeInsetBottom());
+                }
+                v.setPadding(left,top,right,bottom);
+            }
+            return in;
+        });
+        guestSurface=new FrameLayout(this);
+        monitor=new GuestMonitor(this,this);
+        guestSurface.addView(monitor,new FrameLayout.LayoutParams(-1,-1));
+        traceScroll=new ScrollView(this);
+        traceScroll.setBackgroundColor(0xff121a20);
+        stats=label("",12,MUTED);stats.setTypeface(Typeface.MONOSPACE);stats.setTextIsSelectable(true);
+        stats.setPadding(dp(10),dp(48),dp(10),dp(8));traceScroll.addView(stats);
+        guestSurface.addView(traceScroll,new FrameLayout.LayoutParams(-1,-1));traceScroll.setVisibility(View.GONE);
+
+        scroll=new ScrollView(this);
+        LinearLayout body=pageBody(scroll,"Configuración");
+        status=label("Máquina apagada",15,TEXT);status.setId(R.id.vm_status);
+        status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);add(body,status,5);
+        source=label(BuildConfig.VERSION_NAME+" · Motor local Éter · Invitado x86-64",13,ACCENT);add(body,source,3);
+        evidence=action("Diagnóstico",false,this::showDiagnostic);evidence.setId(R.id.vm_copy_diagnostic);add(body,evidence,5);
+        setupPanel=card(body,8);
+        controls=card(body,8);
+        experimentalClock=new Switch(this);experimentalClock.setId(R.id.vm_experimental_clock);
+        experimentalClock.setText("Reloj virtual de 4,5 THz");experimentalClock.setTextColor(TEXT);
+        experimentalClock.setOnClickListener(v->worker.setExperimentalClock(experimentalClock.isChecked()));add(controls,experimentalClock,0);
+        primaryActions=row(controls);
+        pause=action("Pausar",false,()->{console.release();worker.setRunning(!running);});
+        stop=action("Apagar",false,this::confirmStop);pair(primaryActions,pause,stop);
+        LinearLayout diagRow=row(controls);
+        pair(diagRow,action("Registro",false,()->{showPage(0);showTrace(true);}),
+                action("Teclado de Android",false,()->{showPage(0);showTrace(false);monitor.showKeyboard();}));
+        LinearLayout display=card(body,8);display.addView(label("Pantalla y fluidez",16,TEXT));
+        displayValues=label("",13,MUTED);add(display,displayValues,4);
+        int fps=prefs.getInt("presentation_fps",60);
+        Button target=action("Objetivo del presentador · "+fps+" FPS",false,()->{});add(display,target,4);
+        target.setOnClickListener(v->new AlertDialog.Builder(this).setTitle("Objetivo del presentador")
+                .setItems(new String[]{"30 FPS","60 FPS","90 FPS"},(dialog,index)->{
+                    int value=new int[]{30,60,90}[index];prefs.edit().putInt("presentation_fps",value).apply();
+                    worker.setPresentationTarget(value);liveMetrics.cap(value);target.setText("Objetivo del presentador · "+value+" FPS");
+                }).show());
+        worker.setPresentationTarget(fps);
+        LinearLayout inputCard=card(body,8);inputCard.addView(label("Teclado y puntero",16,TEXT));
+        String initial=prefs.getString("rgb_default_mode","Completo");
+        RgbKeyboard.Mode initialMode;
+        try{initialMode=RgbKeyboard.Mode.valueOf(initial);}catch(IllegalArgumentException e){initialMode=RgbKeyboard.Mode.Completo;}
+        Button initialButton=action("Vista inicial · "+initialMode,false,()->{});add(inputCard,initialButton,4);
+        initialButton.setOnClickListener(v->new AlertDialog.Builder(this).setTitle("Vista inicial del teclado")
+                .setItems(new String[]{"Completo · 105 teclas","ABC · Pulgares","Núm · Pulgares","Fn · Pulgares"},(dialog,index)->{
+                    RgbKeyboard.Mode m=RgbKeyboard.Mode.values()[index];prefs.edit().putString("rgb_default_mode",m.name()).apply();
+                    console.keyboard.setMode(m);initialButton.setText("Vista inicial · "+m);
+                }).show());
+        int light=prefs.getInt("rgb_light",70),speed=prefs.getInt("rgb_pointer_speed",10);
+        addSlider(inputCard,"Intensidad RGB",light,100,0," %","rgb_light");
+        addSlider(inputCard,"Sensibilidad del puntero",speed,20,5,"×","rgb_pointer_speed");
+        metricPage=new ScrollView(this);
+        LinearLayout metrics=pageBody(metricPage,"Métricas");
+        liveMetrics=new ConsoleMetrics(this,metrics,fps);
+        telemetry=new VmTelemetry(this);add(metrics,telemetry,10);
+        sessionSummary=label("",12,MUTED);add(metrics,sessionSummary,4);
+        sessionSummary.setVisibility(View.GONE);
+        console=new ConsoleDeck(this,guestSurface,new ConsoleDeck.Input(){
+            public void key(int ascii,int scan,boolean down){if(canQueueGuestInput()){if(down)liveMetrics.input();worker.key(ascii,scan,down);}}
+            public void pointer(int dx,int dy,int buttons){if(canQueueGuestInput()){liveMetrics.input();worker.pointer(dx,dy,buttons);}}
+        },initialMode,light,speed/10f,()->showPage(1),()->showPage(2));
+        pages.addView(console);pages.addView(scroll);pages.addView(metricPage);
 
         LinearLayout setup = setupPanel;
         TextView bootTitle = label("Arranque", 16, TEXT);
@@ -307,61 +279,58 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         hardwareResult.setVisibility(View.GONE);
         hardwareResult.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         add(setup, hardwareResult, 6);
-        layoutWorkbench(getResources().getConfiguration());
-        setContentView(scroll);
+        setContentView(pages);
+        showPage(0);
     }
 
-    @Override
-    public void onConfigurationChanged(Configuration configuration) {
-        super.onConfigurationChanged(configuration);
-        layoutWorkbench(configuration);
+    private LinearLayout pageBody(ScrollView view,String title){
+        view.setFillViewport(true);view.setBackgroundColor(0xff121b22);LinearLayout body=column();
+        body.setPadding(dp(14),dp(8),dp(14),dp(14));view.addView(body);
+        LinearLayout header=row(body);header.setGravity(Gravity.CENTER_VERTICAL);
+        Button back=action("‹  Consola",false,()->showPage(0));header.addView(back);
+        TextView heading=label(title,22,TEXT);heading.setTypeface(Typeface.DEFAULT_BOLD);
+        heading.setPadding(dp(14),0,0,0);header.addView(heading,new LinearLayout.LayoutParams(0,-2,1));
+        boolean settings=title.equals("Configuración");
+        header.addView(action(settings?"Métricas":"Configuración",false,()->showPage(settings?2:1)));
+        return body;
     }
 
-    private void layoutWorkbench(Configuration configuration) {
-        int width = configuration.screenWidthDp;
-        boolean landscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-                && width >= 600;
-        workbench.setOrientation(landscape ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
-        viewer.setLayoutParams(new LinearLayout.LayoutParams(landscape ? 0 : -1, -2, landscape ? 1 : 0));
-        LinearLayout.LayoutParams sidebar = new LinearLayout.LayoutParams(
-                landscape ? dp(Math.max(228, Math.min(320, width * 34 / 100))) : -1, -2);
-        sidebar.leftMargin = landscape ? dp(9) : 0;
-        sidebar.topMargin = landscape ? 0 : dp(9);
-        telemetry.setLayoutParams(sidebar);
-        int height = landscape ? configuration.screenHeightDp - 197 : (width - 48) * 5 / 8;
-        LinearLayout.LayoutParams screen = (LinearLayout.LayoutParams) guestSurface.getLayoutParams();
-        screen.height = dp(Math.max(145, Math.min(380, height)));
-        guestSurface.setLayoutParams(screen);
-        layoutActionBand(primaryActions, landscape);
-        layoutActionBand(guestKeys, landscape);
+    private void addSlider(LinearLayout parent,String title,int value,int max,int min,String unit,String preference){
+        boolean speed=min>0;
+        TextView label=label("",13,MUTED);add(parent,label,8);
+        SeekBar bar=new SeekBar(this);bar.setContentDescription(title);bar.setMax(max-min);add(parent,bar,2);
+        java.util.function.IntConsumer show=n->label.setText(title+" · "+(speed?String.format(Locale.getDefault(),"%.1f",n/10f):Integer.toString(n))+unit);
+        show.accept(value);bar.setProgress(value-min);
+        bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){
+            public void onStartTrackingTouch(SeekBar b){}
+            public void onStopTrackingTouch(SeekBar b){}
+            public void onProgressChanged(SeekBar b,int n,boolean user){
+                if(!user)return;int level=n+min;show.accept(level);
+                prefs.edit().putInt(preference,level).apply();
+                if(speed)console.sensitivity(level/10f);else console.keyboard.light(level);
+            }
+        });
     }
-
-    private void layoutActionBand(LinearLayout band, boolean landscape) {
-        band.setOrientation(landscape ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
-        for (int i = 0; i < band.getChildCount(); i++) {
-            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-                    landscape ? 0 : -1, -2, landscape ? 1 : 0);
-            params.leftMargin = landscape && i > 0 ? dp(7) : 0;
-            params.topMargin = !landscape && i > 0 ? dp(5) : 0;
-            band.getChildAt(i).setLayoutParams(params);
-        }
+    private void showPage(int next){
+        if(page==0&&next!=0)console.release();page=next;
+        console.setVisibility(next==0?View.VISIBLE:View.GONE);
+        scroll.setVisibility(next==1?View.VISIBLE:View.GONE);
+        metricPage.setVisibility(next==2?View.VISIBLE:View.GONE);
+        liveMetrics.visible(next==0);
+        if(next==1){scroll.scrollTo(0,0);updateDisplayValues();}
+        if(next==2){metricPage.scrollTo(0,0);telemetry.render();liveMetrics.render();}
+        if(next==0)restoreGuestFocus();
     }
-
-    private void showTrace(boolean visible) {
-        monitor.setVisibility(visible ? View.GONE : View.VISIBLE);
-        traceScroll.setVisibility(visible ? View.VISIBLE : View.GONE);
-        screenTab.setSelected(!visible);
-        traceTab.setSelected(visible);
-        if (!visible && session) monitor.requestFocus();
+    private void updateDisplayValues(){
+        displayValues.setText("Salida del invitado · "+monitor.dimensions()+"    Pantalla Android · "+
+                getResources().getDisplayMetrics().widthPixels+" × "+getResources().getDisplayMetrics().heightPixels+" px");
     }
-
-    private void toggleMonitorSize() {
-        boolean expanded = !expandMonitor.isSelected();
-        expandMonitor.setSelected(expanded);
-        expandMonitor.setText(expanded ? "Restaurar" : "Ampliar");
-        telemetry.setVisibility(expanded ? View.GONE : View.VISIBLE);
-        if (!expanded) telemetry.render();
+    @Override public void onBackPressed(){if(page!=0){showPage(0);return;}super.onBackPressed();}
+    private void showTrace(boolean visible){
+        monitor.setVisibility(visible?View.GONE:View.VISIBLE);traceScroll.setVisibility(visible?View.VISIBLE:View.GONE);
+        if(!visible&&session)restoreGuestFocus();
     }
+    @Override public void onPresented(){liveMetrics.presented();}
 
     private void pickIso() {
         Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -462,6 +431,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         terminal = false;
         blankTextFrame = false;
         executionRate.reset();
+        liveMetrics.clear();
+        showPage(0);
         monitor.reset();
         showTrace(false);
         monitor.requestFocus();
@@ -678,6 +649,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         long stepsPerSecond = executionRate.sample(session && running &&
                 "running".equals(diagnostic.optString("status")), sessionSteps, sampleUs);
         if (session) {
+            liveMetrics.signal(diagnostic);
             telemetry.update(diagnostic, machine, modeName(machine.optString("cpu_mode")),
                     sessionSteps, stepsPerSecond);
             sessionSummary.setText(VmTelemetry.summary(diagnostic, machine, sessionSteps));
@@ -820,6 +792,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     }
 
     private void showBootStatus() {
+        if(!scroll.isShown())return;
         status.post(() -> status.requestRectangleOnScreen(
                 new Rect(0, 0, status.getWidth(), status.getHeight())));
     }
@@ -839,6 +812,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         }
         blankTextFrame = blank;
         monitor.show(frame);
+        if(page==1)updateDisplayValues();
     }
 
     @Override
@@ -883,6 +857,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         else
             getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        liveMetrics.running(session&&running&&!fault&&!terminal);
+        console.state(session||pending||fault,status.getText());
         boolean diskReady = disk.isFile();
         boolean dataDiskReady = dataDisk.isFile();
         media.setText(iso == null ? "Selecciona tu ISO o RISO local" : "CD/DVD · " + isoName);
@@ -1002,6 +978,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     @Override
     public boolean onKey(KeyEvent event) {
         if (!canQueueGuestInput()) return false;
+        if(event.getAction()==KeyEvent.ACTION_DOWN)liveMetrics.input();
         int ascii = GuestKeys.ascii(event);
         int scan = GuestKeys.scan(event.getKeyCode(), ascii);
         if (ascii == 0 && scan == 0) return false;
@@ -1015,6 +992,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     @Override
     public void onText(CharSequence text) {
         if (!canQueueGuestInput()) return;
+        liveMetrics.input();
         for (int index = 0; index < Math.min(text.length(), 256); index++) {
             char key = text.charAt(index);
             int scan = GuestKeys.scanAscii(key);
@@ -1046,10 +1024,13 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     protected void onStart() {
         super.onStart();
         worker.setForeground(true);
+        liveMetrics.start();
     }
 
     @Override
     protected void onStop() {
+        console.release();
+        liveMetrics.stop();
         worker.setForeground(false);
         super.onStop();
     }

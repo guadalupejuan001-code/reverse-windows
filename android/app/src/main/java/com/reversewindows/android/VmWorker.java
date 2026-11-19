@@ -357,6 +357,14 @@ final class VmWorker {
         });
     }
 
+    void pointer(int dx, int dy, int buttons) {
+        worker.post(() -> {
+            if (handle == 0 || !running || !foreground || isTerminal()) return;
+            try { NativeMachine.pointer(handle, dx, dy, buttons); }
+            catch (RuntimeException | LinkageError error) { report(error); }
+        });
+    }
+
     void key(int ascii, int scan, boolean pressed) {
         worker.post(() -> {
             if (handle == 0 || !running || !foreground || isTerminal()) return;
@@ -487,6 +495,19 @@ final class VmWorker {
         }
     }
 
+    private volatile int presentationTarget=60;
+    // Main thread only. Keep phase on displays whose refresh is not a multiple of the cap.
+    private long nextPresentation;
+    void setPresentationTarget(int fps){presentationTarget=fps;nextPresentation=0;}
+    private void awaitPresentation(long session,long frameTime) {
+        if(released || !foreground || handle!=session){worker.post(()->finishFrame(session,false));return;}
+        long period=1_000_000_000L/presentationTarget;
+        if(frameTime+500_000 < nextPresentation){
+            Choreographer.getInstance().postFrameCallback(t->awaitPresentation(session,t));return;
+        }
+        nextPresentation=(frameTime-nextPresentation>=period?frameTime:nextPresentation)+period;
+        worker.post(()->captureFrame(session));
+    }
     private void requestFrame() {
         if (released || !foreground || handle == 0 || frameRequested || !videoDirty) return;
         long session = handle;
@@ -497,7 +518,7 @@ final class VmWorker {
                 return;
             }
             Choreographer.getInstance().postFrameCallback(
-                    frameTime -> worker.post(() -> captureFrame(session)));
+                    frameTime -> awaitPresentation(session,frameTime));
         })) frameRequested = false;
     }
 

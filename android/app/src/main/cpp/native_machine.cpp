@@ -201,6 +201,16 @@ JNIEXPORT jintArray JNICALL Java_com_reversewindows_android_NativeMachine_cpuThr
     });
 }
 
+JNIEXPORT void JNICALL Java_com_reversewindows_android_NativeMachine_pointer(
+        JNIEnv* env, jclass, jlong handle, jint dx, jint dy, jint buttons) {
+    call<int>(env, 0, [&] {
+        return session(handle, [=](Session& machine) {
+            machine.pointer(dx, dy, static_cast<unsigned>(buttons) & 3U);
+            return 0;
+        });
+    });
+}
+
 JNIEXPORT jboolean JNICALL Java_com_reversewindows_android_NativeMachine_key(
         JNIEnv* env, jclass, jlong handle, jint ascii, jint scancode, jboolean pressed) {
     return call<jboolean>(env, JNI_FALSE, [&] {

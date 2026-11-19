@@ -9,6 +9,7 @@
 #include "ether_x86_sessions.hpp"
 #include "pc_machine.hpp"
 #include "ps2_keyboard.hpp"
+#include "ps2_mouse.hpp"
 #include "smp_workers.hpp"
 #include <algorithm>
 #include <array>
@@ -163,6 +164,15 @@ class PcMotherboardC06 {
   std::uint64_t cpu_cycles_ = 0;
   std::uint64_t firmware_tsc_remainder_ = 0, active_tsc_remainder_ = 0;
   std::optional<Ps2Keyboard> keyboard_;
+  Ps2Mouse mouse_;
+  bool aux_command_ = false, aux_test_reply_ = false;
+  bool aux_ready() const {
+    return keyboard_ && !(keyboard_->configuration() & 0x20) && mouse_.ready();
+  }
+  bool aux_irq() const {
+    return aux_ready() && !keyboard_->has_data() && !aux_test_reply_ &&
+           (keyboard_->configuration() & 2) && mouse_.needs_irq();
+  }
   std::function<std::optional<std::uint32_t>(std::uint16_t,unsigned)> prior_in_;
   std::function<bool(std::uint16_t,unsigned,std::uint32_t)> prior_out_;
   decltype(cosmic_pc::Cpu::pio_batch_limit_hook) prior_pio_batch_limit_;
@@ -320,6 +330,7 @@ class PcMotherboardC06 {
   }
   void reset_devices(){
     if(keyboard_) keyboard_->reset();
+    mouse_ = {}; aux_command_ = aux_test_reply_ = false;
     master_=Pic{};slave_=Pic{};slave_.vector=0x70;
     pit_=Pit{};pit2_=Pit{};pit_phase_=0;speaker_control_=0;pci_selector_=0;
     cmos_index_=rtc_c_=0;rtc_a_=0x26;rtc_b_=0x02;pm_control_=0x0001;powered_off_=false;
@@ -379,7 +390,7 @@ class PcMotherboardC06 {
     }
     // After a real PcMachine::reset, firmware RAM is new; republish the
     // same discovered tables and keep their E820-reserved addresses.
-    AcpiC06::install(pc_.cpu,ide_present(),bool(gpu_));
+    install_firmware_input();
   }
   bool ide_present()const noexcept{return bool(ata_)||bool(optical_);}
   AtaC07* selected_ata() const noexcept {
@@ -581,9 +592,15 @@ class PcMotherboardC06 {
     if(active_clock_running_&&timer_port(p))sync_active_clock();
     if(keyboard_&&width==1&&(p==0x60||p==0x64)){
       const auto status=prior_in_(0x64,1).value_or(0);
-      if(p==0x64)return status|(keyboard_->has_data()?1U:0U);
+      if(p==0x64) {
+        if (status & 1U) return status;
+        if (aux_test_reply_ || keyboard_->has_data()) return status | 1U;
+        return aux_ready() ? status | 0x21U : status;
+      }
       if(status&1U)return prior_in_(p,width);
-      return keyboard_->read_data();
+      if(aux_test_reply_){aux_test_reply_=false;return 0;}
+      if(keyboard_->has_data())return keyboard_->read_data();
+      return aux_ready() ? mouse_.read() : 0xffU;
     }
     if(ide_port(p)){
       if(ata_cfg_[4]&1U){
@@ -623,6 +640,20 @@ class PcMotherboardC06 {
     if(active_clock_running_&&timer_port(p))sync_active_clock();
     if(keyboard_&&width==1&&(p==0x60||p==0x64)){
       const auto data=std::uint8_t(value);
+      if(aux_command_){
+        if(p!=0x60)return false;
+        aux_command_=false;
+        return mouse_.command(data);
+      }
+      if(p==0x64 && !keyboard_->controller_expects_data()){
+        if(data==0xd4){aux_command_=true;return true;}
+        if(data==0xa9){aux_test_reply_=true;return true;}
+        if(data==0xa8){
+          const auto config=keyboard_->configuration() & ~0x20U;
+          if(!prior_out_(0x64,1,0x60)||!prior_out_(0x60,1,config))return false;
+          keyboard_->controller_command(data);return true;
+        }
+      }
       if(p==0x60&&!keyboard_->controller_expects_data())return keyboard_->command(data);
       if(!prior_out_(p,width,value))return false;
       if(p==0x64)keyboard_->controller_command(data);
@@ -1165,6 +1196,10 @@ class PcMotherboardC06 {
       signal_isa_irq(1);
       keyboard_->mark_irq();
     }
+    if(aux_irq() && !(prior_in_(0x64,1).value_or(0)&1U)){
+      signal_isa_irq(12);
+      mouse_.mark_irq();
+    }
     if(device_tick)advance_apic_timer(bsp(),1);
     // The slave's INT output reaches the master independently of CPU IF or
     // LAPIC acceptance. The guest can read both IRRs with interrupts disabled.
@@ -1195,7 +1230,7 @@ class PcMotherboardC06 {
   // another tick could change the interrupt or timer state visible to the CPU.
   unsigned batch_limit(unsigned steps) const {
     if(prior_tick_ || powered_off_ || pc_.cpu.x87_ferr_asserted()!=ferr_was_asserted_ ||
-       (keyboard_&&keyboard_->needs_irq()) ||
+       ((keyboard_&&keyboard_->needs_irq()) || aux_irq()) ||
        (pc_.cpu.flag(cosmic_pc::Cpu::IF)&&interrupt_pending())) return 1;
     std::uint64_t edge = pm_timer_edge_in();
     if (pit_.enabled) edge = std::min<std::uint64_t>(edge, pit_.counter*kPitClockDivider-pit_phase_);
@@ -1830,7 +1865,7 @@ class PcMotherboardC06 {
   void enable_execution_target() {
     if (pc_.register_projection_limit_hook || prior_tick_ || prior_batch_limit_ || prior_batch_advance_) return;
     pc_.register_projection_limit_hook = [this](unsigned requested) {
-      if (!active_clock_running_ || powered_off_ || (keyboard_ && keyboard_->needs_irq()) ||
+      if (!active_clock_running_ || powered_off_ || ((keyboard_ && keyboard_->needs_irq()) || aux_irq()) ||
           pc_.cpu.x87_ferr_asserted() != ferr_was_asserted_) return 0U;
       // The proven loop has neither I/O nor RAM operands. With IF clear
       // device time can be sampled after applying its atomic register state.
@@ -1944,7 +1979,9 @@ class PcMotherboardC06 {
   // Deterministic single guest-cycle advance; no host sleeper or background
   // worker. PC's canonical run loop calls this once per guest step.
   void advance_one(){poll();}
-  void enable_ps2_keyboard(){keyboard_.emplace();}
+  void enable_ps2_keyboard(){keyboard_.emplace();install_firmware_input();}
+  void install_firmware_input(){AcpiC06::install(pc_.cpu,ide_present(),bool(gpu_),bool(keyboard_));}
+  void pointer(int dx,int dy,unsigned buttons){if(keyboard_)mouse_.input(dx,dy,buttons);}
   bool guest_uses_ps2_scancodes()const noexcept {
     return keyboard_&&keyboard_->guest_uses_scancodes();
   }
