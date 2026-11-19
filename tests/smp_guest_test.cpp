@@ -591,7 +591,7 @@ void test_parallel_register_continuations() {
     auto& cpu = pc.cpu;
     require(cpu.is_long_mode() && cpu.halted && !cpu.fault && cpu.cr3 == 0x1000,
             "BSP must provide the APs' long-mode page tables");
-    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {8, 2}, worker_limit < kProcessors);
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {8, 2});
     pc.enable_boot_acceleration();
     pc.enable_boot_hotspots(true, false);
     cpu.enable_page_translation_cache();
@@ -669,7 +669,7 @@ void test_parallel_ram_vectors(bool shared, unsigned worker_limit = kProcessors)
     auto& cpu = pc.cpu;
     require(cpu.is_long_mode() && cpu.halted && !cpu.fault && cpu.cr3 == 0x1000,
             "BSP must provide the APs' long-mode page tables");
-    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {8, 2});
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {8, 2}, worker_limit < kProcessors);
     if (worker_limit < kProcessors) board.enable_threaded_smp(worker_limit);
     pc.enable_boot_acceleration();
     cpu.enable_page_translation_cache();
