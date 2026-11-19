@@ -6,6 +6,10 @@ GPU Virtual C12.3 valida y agrupa los triángulos en orden de dibujo. Descarta l
 
 ## Capacidad y mediciones
 
+Durante el arranque, el invitado puede escribir en el framebuffer VBE de Mundo X. GPU-VIRTUAL planifica los rectángulos modificados y qSSD publica cada revisión. En Android 10 o superior, el monitor con aceleración gráfica reutiliza una lista de dibujo por franja y actualiza las franjas cuyos píxeles cambiaron. El diagnóstico `host_vbe` indica el último camino de dibujo, las pasadas por Canvas acelerado o por software y las listas de franja grabadas. Los FPS presentados se miden en el monitor. El reloj virtual de C08 es de 4,5 THz.
+
+`machine.video_bytes` mide el framebuffer del invitado. `guest_gpu.resident_vram_bytes` mide la memoria de las cachés de transferencia y geometría de C08. Una sesión puede producir cuadros VBE con ambas cachés vacías. Las órdenes, los dibujos completados y el nombre del renderizador de C08 permiten seguir el trabajo 3D que envía el invitado.
+
 El dispositivo publica **120.000.000.000 bytes lógicos** respaldados por páginas dispersas de 4 KiB en QSSD. Los volúmenes nuevos usan la capacidad exacta. Los volúmenes anteriores de 112 GiB se abren con el mismo límite visible para el invitado. Android abre el respaldo C08 existente y reutiliza el respaldo junto al disco de PrimeVGC cuando es el único disponible. El tamaño real del respaldo, los bytes de vértices, el tiempo de preparación y lectura, el temporizador del renderizador y su identificación de hardware se registran en `guest_gpu`. En hardware, `gpu_query_ns` depende de una consulta válida de `GL_EXT_disjoint_timer_query`.
 
 La prueba del invitado x86 verifica descubrimiento PCI, tamaño y reasignación del BAR, el límite de VRAM y el dibujo de geometría subida directamente a VRAM. Comprueba píxeles, profundidad y recorte. Repite el mismo dibujo desde RAM y compara el framebuffer completo. Las órdenes de transferencia por ventana intermedia conservan su límite de 15 páginas y su prueba de 7,5 MiB.

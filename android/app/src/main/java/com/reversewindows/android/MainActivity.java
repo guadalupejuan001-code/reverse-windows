@@ -166,7 +166,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             }
             return in;
         });
-        monitor=new GuestMonitor(this,this);
+        monitor=new GuestMonitor(this,this,worker.vbePresentation);
 
         ScrollView scroll=new ScrollView(this);
         settingsWindow=new ConsolePage(this,scroll,"Configuración",()->showPage(0),"Métricas",()->showPage(2));

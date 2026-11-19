@@ -229,7 +229,9 @@ void android_session() {
     reverse_windows::QssdDisk disk(volume);
     require(disk.write(0, 1, boot.data()) && disk.flush(), "Could not write VBE boot sector");
   }
-  AndroidBootSession session(volume, 0, AndroidBootSession::BootSource::Disk);
+  const auto vram = cleanup.path / "video.rqvd";
+  AndroidBootSession session(volume, 0, AndroidBootSession::BootSource::Disk, -1, 0,
+                             AndroidBootSession::kDefaultRamProfile, {}, vram);
   std::array<std::uint8_t, 4000> text;
   const auto vga = session.capture_video(text.data(), text.size());
   require(vga.text_bytes == text.size() && !vga.graphics && !session.video_pending(),
@@ -256,7 +258,14 @@ void android_session() {
   require(vbe != std::string::npos && metric(diagnostic.substr(vbe), "frames") == frames &&
           metric(diagnostic.substr(vbe), "qssd_graphics_serial") == frames + 1,
           "Native Android statistics must account for every delivered revision");
-  std::cout << "PRIME_C07_ANDROID_VBE_PASS frames=" << frames << " qssd=1 pixels=exact\n";
+  const auto gpu = diagnostic.find("\"guest_gpu\":{");
+  require(gpu != std::string::npos, "The VBE fixture must run with the C08 adapter attached");
+  const auto c08 = diagnostic.substr(gpu);
+  require(metric(c08, "virtual_clock_hz") == 4500000000000ULL &&
+          metric(c08, "resident_vram_bytes") == 0 && metric(c08, "draws") == 0 &&
+          metric(c08, "scheduler_submissions") == 0 && !std::filesystem::exists(vram),
+          "Showing a VBE image must not synthesize C08 commands or allocate its VRAM");
+  std::cout << "PRIME_C07_ANDROID_VBE_PASS frames=" << frames << " qssd=1 pixels=exact c08_resident=0\n";
 }
 
 std::uint64_t nanoseconds(Clock::duration elapsed) {

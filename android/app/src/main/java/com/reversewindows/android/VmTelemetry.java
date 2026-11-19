@@ -260,13 +260,27 @@ final class VmTelemetry extends LinearLayout {
     private void renderVideo() {
         JSONObject gpu = snapshot.optJSONObject("guest_gpu");
         JSONObject vbe = snapshot.optJSONObject("vbe");
+        JSONObject host = snapshot.optJSONObject("host_vbe");
+        String backend = host == null ? "" : host.optString("last_backend");
+        String renderer = gpu == null ? "" : gpu.optString("renderer");
         heading("Resolución del invitado", resolution(machine), machine.optString("video_kind"));
         metric(0, "Cuadros VBE", count(number(vbe, "frames")));
-        metric(1, "VRAM lógica", units(number(gpu, "logical_vram_bytes"), 1_000_000_000, "GB", 1));
-        metric(2, "VRAM residente", storage(number(gpu, "resident_vram_bytes")));
-        metric(3, "Aceleración 3D", machine.has("graphics_3d_ready")
-                ? (machine.optBoolean("graphics_3d_ready") ? "Lista" : "Pendiente") : UNKNOWN);
-        showRows(4);
+        metric(1, "Framebuffer VBE del invitado", "vbe32".equals(machine.optString("video_kind"))
+                ? storage(number(machine, "video_bytes")) : UNKNOWN);
+        metric(2, "Último dibujo VBE en Android", switch (backend) {
+            case "render_nodes" -> "HWUI por franjas";
+            case "hardware_canvas" -> "Canvas acelerado";
+            case "software_canvas" -> "Canvas por software";
+            default -> UNKNOWN;
+        });
+        metric(3, "Reloj virtual de la GPU C08", frequency(number(gpu, "virtual_clock_hz")));
+        metric(4, "VRAM lógica C08", units(number(gpu, "logical_vram_bytes"), 1_000_000_000, "GB", 1));
+        metric(5, "Caché VRAM residente C08", storage(number(gpu, "resident_vram_bytes")));
+        metric(6, "Dibujos 3D completados por C08", count(number(gpu, "draws")));
+        if (renderer.isEmpty() && number(gpu, "draw_requests") == 0 &&
+                number(gpu, "scheduler_submissions") == 0) renderer = "Sin solicitudes";
+        metric(7, "Renderizador 3D C08", renderer.isEmpty() ? UNKNOWN : renderer);
+        showRows(8);
     }
 
     private void heading(String title, String value, String hint) {
