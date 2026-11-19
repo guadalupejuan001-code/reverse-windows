@@ -194,8 +194,7 @@ class AndroidBootSession final {
                      const std::filesystem::path& data_disk={},
                      cosmic_pc::CpuTopology topology={}, bool active_guest_clock=false,
                      PcMotherboardC06::CpuClock cpu_clock=PcMotherboardC06::CpuClock::Standard)
-      : source_(source), use_active_guest_clock_(active_guest_clock && source != BootSource::SelfTest),
-        pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_), vbe_(pc_) {
+      : source_(source), pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_), vbe_(pc_) {
     if (disk.empty() && (create_gib || source != BootSource::SelfTest))
       throw std::invalid_argument("Selecciona o crea un disco QSSD para iniciar.");
     pc_.cpu.use_windows_x64_profile(source != BootSource::SelfTest);
@@ -243,6 +242,8 @@ class AndroidBootSession final {
       board_ = std::make_unique<PcMotherboardC06>(
           pc_, disk_.get(), AtapiCdrom::Reader{}, 0, graphics_vram, data_disk_.get(), topology, true, workers_, cpu_clock);
     }
+    if (active_guest_clock && source != BootSource::SelfTest)
+      board_->enable_active_clock({}, PcMotherboardC06::ClockStart::Guest32Or64);
     board_->enable_ps2_keyboard();
     board_->enable_threaded_smp(kPrimeHostWorkers);
     if (source != BootSource::SelfTest) pc_.enable_guest_restart();
@@ -411,8 +412,6 @@ class AndroidBootSession final {
             cosmic_pc::PcMachine::RunClock::time_point::max()) {
     if (board_->faulted_cpu()) return Step::Fault;
     if (!is_stopped()) {
-      if (use_active_guest_clock_ && pc_.cpu.is_long_mode() && !board_->active_clock_enabled())
-        board_->enable_active_clock();
       const auto slice = boot_profile_ ? boot_profile_->budget(budget, pc_) : budget;
       board_->run(slice,deadline);
       if (boot_profile_) boot_profile_->after_run(pc_, *board_);
@@ -1128,7 +1127,6 @@ class AndroidBootSession final {
 
   enum class KeyRoute : std::uint8_t { None, Bios, Ps2 };
   BootSource source_;
-  const bool use_active_guest_clock_;
   std::array<KeyRoute, 512> key_routes_{};
   std::optional<BootProfile> boot_profile_;
   std::optional<std::string> previous_boot_profile_;

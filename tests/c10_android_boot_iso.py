@@ -167,9 +167,13 @@ def image(profile: bool = False) -> bytearray:
         0x89, 0xC6,                       # MOV ESI,EAX
         0x89, 0xD7,                       # MOV EDI,EDX
         0x0F, 0x32,                       # RDMSR at protected32 CPL0
-        0x39, 0xFA,                       # CMP EDX,EDI: same upper half.
-    )) + expect_equal() + b"\x29\xf0" + expect_condition(0x77)  # SUB EAX,ESI; JA.
-    read_tsc += b"\x3d\x00\x10\x00\x00" + expect_condition(0x76)  # CMP EAX,4096; JBE.
+        # The MSR sample must fall between two full-width RDTSC samples.
+        0x39, 0xF0, 0x89, 0xD6, 0x19, 0xFE,  # CMP EAX,ESI; MOV ESI,EDX; SBB ESI,EDI
+    )) + expect_condition(0x73)  # JAE: MSR >= first RDTSC, including a low-word wrap.
+    read_tsc += bytes((
+        0x89, 0xC6, 0x89, 0xD7,           # Save the MSR in EDI:ESI.
+        0x0F, 0x31, 0x29, 0xF0, 0x19, 0xFA,  # RDTSC; SUB EAX,ESI; SBB EDX,EDI
+    )) + expect_condition(0x73)  # JAE: second RDTSC >= MSR.
     next_code = 0x500
     if profile:
         next_code = 0x1400

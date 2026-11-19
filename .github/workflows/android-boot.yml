@@ -411,12 +411,15 @@ jobs:
           assert timing["diagnostic_save_interval_ms"] == 5_000
           topology = report["cpu_topology"]
           assert (topology["cores"], topology["threads_per_core"], topology["logical_processors"]) == (8, 2, 16)
+          assert topology["guest_tsc_hz"] == 4_581_817_600
+          assert report["irq"]["clock_source"] == "host-active-monotonic" and report["irq"]["active_clock_ticks"] > 0
           assert report["ram_profile"]["usable_bytes"] == 64 << 30, report["ram_profile"]
           ether = report["ether_arm64"]
           assert ether["mundo_x_source_sha"] == os.environ["MUNDO_X_SHA"]
           assert ether["protected32_guest_steps"] == 0
           assert ether["code_version_hits"] == ether["code_byte_checks"] == ether["code_bytes_read"] == 0
-          print("PRIME_ANDROID_ISO_PICKER_PASS boot=el-torito ram_gib=64 qssd_boot_gib=64 qssd_data_pib=8")
+          print("PRIME_ANDROID_ISO_PICKER_PASS boot=el-torito ram_gib=64 qssd_boot_gib=64 qssd_data_pib=8",
+                f"protected32_tsc_hz={topology['guest_tsc_hz']}")
           PY
           BASH
       - name: Run BIOS, keyboard and synthetic ISO from Downloads on Android

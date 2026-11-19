@@ -1141,12 +1141,15 @@ int main(int argc, char** argv) {
       auto session = [&] {
         FileDescriptor iso(fixture, O_RDONLY);
         return Session(disk, 64, Session::BootSource::Iso, iso.value, original.size(),
-                       prime, dir.path, vram, data_disk, Session::kPrimeCpuTopology);
+                       prime, dir.path, vram, data_disk, Session::kPrimeCpuTopology, true, Session::kPrimeCpuClock);
       }();
       run_until(session, Session::Step::WaitingKey,
                 "El Torito guest did not detect QSSD and return to the real-mode BIOS prompt", 1);
       frame = capture_cells(session);
       progress = session.diagnostic();
+      require(progress.find("\"clock_source\":\"host-active-monotonic\"") != std::string::npos &&
+                  counter(progress, "active_clock_ticks") > 0 && counter(progress, "guest_tsc_hz") == 4'581'817'600ULL,
+              "A protected32 ISO must activate the Prime clock without entering long mode");
       require(progress.find("\"cpuid_vendor\":\"GenuineIntel\"") != std::string::npos,
               "ISO startup did not select the Windows x64 processor profile");
       require(progress.find("\"cores\":8,\"threads_per_core\":2,\"logical_processors\":16,\"started\":1") !=
@@ -1215,6 +1218,9 @@ int main(int argc, char** argv) {
       require(screen(capture_cells(session)).find("QSSD REBOOT OK") != std::string::npos,
               "Guest-requested restart did not execute QSSD boot code");
       restarted = session.diagnostic();
+      require(restarted.find("\"clock_source\":\"guest-cycles\"") != std::string::npos &&
+                  counter(restarted, "active_clock_elapsed_ns") == 0,
+              "A reboot to a real-mode disk must resume deterministic firmware timing");
       require(counter(restarted, "session_steps") >=
                   counter(progress, "session_steps") + counter(restarted, "instructions"),
               "Guest reboot must preserve the accumulated session steps");

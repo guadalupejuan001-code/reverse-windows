@@ -22,6 +22,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace reverse_windows {
@@ -30,6 +31,7 @@ class PcMotherboardC06 {
   using Clock = cosmic_pc::PcMachine::RunClock;
   using ClockSource = std::function<Clock::time_point()>;
   enum class CpuClock : unsigned { Standard = 1, Double = 2, Twentyfold = 20 };
+  enum class ClockStart { Immediate, Guest32Or64 };
   static constexpr std::uint64_t kLocalApic=cosmic_pc::PcMachine::kLocalApicAddress,
       kIoApic=cosmic_pc::PcMachine::kIoApicAddress;
   struct Evidence {
@@ -176,6 +178,8 @@ class PcMotherboardC06 {
   unsigned clock_polls_=0;
   bool active_clock_enabled_=false,active_clock_running_=false,clock_attached_=false;
   bool timestamp_hook_attached_=false;
+  ClockStart clock_start_ = ClockStart::Immediate;
+  bool waiting_for_guest_mode_ = false;
   Pic master_{},slave_{};
   std::unique_ptr<AtaC07> ata_;
   std::unique_ptr<AtaC07> data_ata_;
@@ -315,7 +319,7 @@ class PcMotherboardC06 {
     ferr_was_asserted_=false;pc_.cpu.set_x87_ignne(false);
     cpu_cycles_=ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=sci_irqs_=0;
     cpu_cycle_phase_ = 0;
-    active_clock_enabled_=false;
+    active_clock_enabled_=active_clock_running_=waiting_for_guest_mode_=false;
     active_clock_ns_=active_clock_ticks_=clock_tick_remainder_=0;
     clock_polls_=0;
     rtc_irq8_assertions_=rtc_data_writes_=0;
@@ -1046,16 +1050,35 @@ class PcMotherboardC06 {
     if((rtc_b_&kRtcPeriodic)&&!(rtc_c_&kRtcIrq))rtc_update_periodic();
     advance_apic_timer(bsp(),elapsed);
   }
+  void activate_clock() {
+    if (!clock_attached_) {
+      prior_clock_ = pc_.cpu.set_shared_clock(&cpu_cycles_);
+      clock_attached_ = true;
+    }
+    active_clock_enabled_ = true;
+  }
+  void start_clock_sample() {
+    clock_sample_ = active_now();
+    active_clock_running_ = true;
+  }
+  void observe_guest_clock_mode(const cosmic_pc::Cpu& cpu) {
+    if (!waiting_for_guest_mode_ || cpu.is_real_mode()) return;
+    const std::string_view mode = cpu.mode_name();
+    if (mode != "protected32" && mode != "compat32" && mode != "long64") return;
+    waiting_for_guest_mode_ = false;
+    activate_clock();
+    start_clock_sample();
+  }
   struct ActiveClockRun {
     PcMotherboardC06& board;
     explicit ActiveClockRun(PcMotherboardC06& target):board(target){
-      if(!board.active_clock_enabled_)return;
-      board.clock_sample_=board.active_now();
-      board.active_clock_running_=true;
+      if (board.active_clock_enabled_) board.start_clock_sample();
+      else board.waiting_for_guest_mode_ = board.clock_start_ == ClockStart::Guest32Or64;
     }
     ~ActiveClockRun(){
       board.sync_active_clock();
       board.active_clock_running_=false;
+      board.waiting_for_guest_mode_ = false;
     }
   };
   void update_secondary_timer(LocalApic& apic) {
@@ -1298,6 +1321,7 @@ class PcMotherboardC06 {
         return;
       }
       if (cpu.halted) return;
+      observe_guest_clock_mode(cpu);
       const auto remaining = budget - used;
       const auto native_steps = cpu.try_ether_arm64_block(remaining, bus);
       if (native_steps) {
@@ -1646,6 +1670,8 @@ class PcMotherboardC06 {
     pc_.device_step_hook=[this](){
       if(prior_tick_)prior_tick_();
       poll();
+      // A guest can enter and leave protected mode inside a single Android slice.
+      observe_guest_clock_mode(pc_.cpu);
     };
     pc_.device_batch_limit_hook=[this](unsigned steps){return batch_limit(steps);};
     pc_.device_batch_advance_hook=[this](unsigned steps){advance_batch(steps);};
@@ -1743,12 +1769,8 @@ class PcMotherboardC06 {
   const cosmic_pc::Cpu* faulted_cpu() const noexcept {
     return faulted_processor_ ? apics_[*faulted_processor_].cpu : nullptr;
   }
-  void enable_active_clock(ClockSource source={}) {
+  void enable_active_clock(ClockSource source={}, ClockStart start=ClockStart::Immediate) {
     if(active_clock_enabled_)return;
-    if(!clock_attached_){
-      prior_clock_=pc_.cpu.set_shared_clock(&cpu_cycles_);
-      clock_attached_=true;
-    }
     if(!timestamp_hook_attached_){
       prior_timestamp_read_=std::move(pc_.cpu.before_timestamp_read_hook);
       pc_.cpu.before_timestamp_read_hook=[this](){
@@ -1760,7 +1782,8 @@ class PcMotherboardC06 {
       timestamp_hook_attached_=true;
     }
     clock_source_=std::move(source);
-    active_clock_enabled_=true;
+    clock_start_ = start;
+    if (start == ClockStart::Immediate) activate_clock();
   }
   bool active_clock_enabled() const noexcept {return active_clock_enabled_;}
   std::uint64_t guest_tsc_hz() const noexcept {

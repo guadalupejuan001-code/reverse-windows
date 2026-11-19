@@ -192,6 +192,19 @@ void test_eight_cores_sixteen_threads(bool threaded, unsigned worker_limit = kPr
             "a machine reset clears per-phase thread evidence");
     check_acpi(pc.cpu);
 }
+// Enter the flat 32-bit code segment at 0008:9020 from a real-mode startup page.
+void install_protected32_entry(Cpu& cpu, unsigned address) {
+    cpu.write16(0x2800,23);
+    cpu.write32(0x2802,0x2810);
+    cpu.write64(0x2818,0x00cf9a000000ffffULL);
+    cpu.write64(0x2820,0x00cf92000000ffffULL);
+    constexpr std::uint8_t startup[] = {
+        0xfa, 0x0f,0x01,0x16,0x00,0x28,               // CLI; LGDT [2800h]
+        0x0f,0x20,0xc0, 0x0c,0x01, 0x0f,0x22,0xc0,   // Set CR0.PE.
+        0x66,0xea,0x20,0x90,0x00,0x00,0x08,0x00};    // Far jump into code32.
+    cpu.memory.write_block(address,startup,sizeof(startup));
+}
+
 void test_secondary_interrupts(bool threaded) {
     PcMachine pc(4U << 20);
     pc.boot_demo();
@@ -202,21 +215,13 @@ void test_secondary_interrupts(bool threaded) {
     cpu.a20_enabled = true;
     cpu.write16(0x7200,0xfeeb);
 
-    // Flat GDT and protected-mode IDT used by the application processor.
-    cpu.write16(0x2800,23);
-    cpu.write32(0x2802,0x2810);
+    install_protected32_entry(cpu, 0x9000);
     cpu.write16(0x2806,0x07ff);
     cpu.write32(0x2808,0x1000);
-    cpu.write64(0x2818,0x00cf9a000000ffffULL);
-    cpu.write64(0x2820,0x00cf92000000ffffULL);
     cpu.write64(0x1208,0x00008e0000089200ULL); // Fixed interprocessor IRQ.
     cpu.write64(0x1210,0x00008e0000089230ULL); // LAPIC timer IRQ.
     // Switch the AP to 32-bit mode, read its own LAPIC ID, configure its
     // timer and wait with IF set, then acknowledge IRQs and return via IRET.
-    constexpr std::uint8_t startup[] = {
-        0xfa,0x0f,0x01,0x16,0x00,0x28,0x0f,0x20,0xc0,0x0c,0x01,0x0f,
-        0x22,0xc0,0x66,0xea,0x20,0x90,0x00,0x00,0x08,0x00
-    };
     constexpr std::uint8_t protected_init[] = {
         0x66,0xb8,0x10,0x00,0x8e,0xd8,0x8e,0xd0,0xbc,0x00,0x62,0x00,
         0x00,0x0f,0x01,0x1d,0x06,0x28,0x00,0x00,0xa1,0x20,0x00,0xe0,
@@ -234,7 +239,6 @@ void test_secondary_interrupts(bool threaded) {
         0xff,0x05,0x08,0x34,0x00,0x00,0xc7,0x05,0xb0,0x00,0xe0,0xfe,
         0x00,0x00,0x00,0x00,0xcf
     };
-    cpu.memory.write_block(0x9000,startup,sizeof(startup));
     cpu.memory.write_block(0x9020,protected_init,sizeof(protected_init));
     cpu.memory.write_block(0x9200,ipi_handler,sizeof(ipi_handler));
     cpu.memory.write_block(0x9230,timer_handler,sizeof(timer_handler));
@@ -814,6 +818,61 @@ void check_all_smp_timestamps() {
     std::cout << "PRIME_SMP_TSC_PASS vcpus=" << kProcessors << " guest_hz=" << board.guest_tsc_hz() << '\n';
 }
 
+void check_protected32_timestamps(PcMotherboardC06::CpuClock profile, std::uint64_t expected_hz) {
+    PcMachine pc(4U << 20);
+    pc.boot_demo();
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {8,2}, true, {}, profile);
+    board.enable_threaded_smp(8);
+    auto& cpu = pc.cpu;
+    cpu.reset(0,0x7200);
+    cpu.a20_enabled = true;
+    constexpr std::uint8_t wait_for_aps[]{0x80,0x3e,0x01,0x44,0, 0x74,0xf9};
+    cpu.memory.write_block(0x7200,wait_for_aps,sizeof(wait_for_aps));
+    install_protected32_entry(cpu, 0x7200 + sizeof(wait_for_aps));
+    install_protected32_entry(cpu, kStartupVector << 12);
+    constexpr std::uint8_t guest[]{
+        0x66,0xb8,0x10,0, 0x8e,0xd8,                      // Load flat DS.
+        0xb8,0x0b,0,0,0, 0x31,0xc9, 0x0f,0xa2,            // CPUID.0B.0: EDX = APIC ID.
+        0x89,0xd7, 0xc1,0xe7,4,                          // EDI = APIC ID * 16.
+        0x0f,0x31, 0x89,0x87,0,0x36,0,0, 0x89,0x97,4,0x36,0,0,
+        0x80,0x3d,0,0x44,0,0,0, 0x74,0xf7,               // Wait for the second sample.
+        0x0f,0x31, 0x89,0x87,8,0x36,0,0, 0x89,0x97,12,0x36,0,0,
+        0xeb,0xfe};
+    cpu.memory.write_block(0x9020,guest,sizeof(guest));
+
+    PcMachine::RunClock::time_point now{};
+    bool measure = false;
+    unsigned samples = 0;
+    board.enable_active_clock([&] {
+        if (measure && ++samples == 2) now += std::chrono::seconds(1);
+        return now;
+    }, PcMotherboardC06::ClockStart::Guest32Or64);
+    cpu.write32(kLapic + 0x300,0x000cc500);
+    cpu.write32(kLapic + 0x300,0x000c8500);
+    cpu.write32(kLapic + 0x300,0x000c0600 | kStartupVector);
+    board.run(8192);
+    require(board.processors_started() == kProcessors && cpu.is_real_mode() && board.active_clock_enabled(),
+            "A 32-bit AP must start the clock while the BSP is still in real mode");
+    cpu.write8(kStartFlag + 1,1);
+    board.run(8192);
+    require(std::string(cpu.mode_name()) == "protected32", "BSP must join the 32-bit guest");
+
+    now += std::chrono::seconds(10);  // Time between run calls is excluded.
+    cpu.write8(kStartFlag,1);
+    measure = true;
+    board.run(8192);
+    const auto initial = cpu.read64(0x3600);
+    for (unsigned id = 0; id < kProcessors; ++id) {
+        const auto record = 0x3600 + id * 16;
+        require(cpu.read64(record) == initial && cpu.read64(record + 8) - initial == expected_hz,
+                "Protected32 RDTSC delta on vCPU " + std::to_string(id));
+    }
+    require(board.active_clock_elapsed_ns() == 1'000'000'000 && board.guest_tsc_hz() == expected_hz &&
+            board.active_clock_ticks() == PcMachine::kVirtualCyclesPerSecond, "Shared active second");
+    std::cout << "PRIME_PROTECTED32_TSC_PASS vcpus=" << kProcessors << " active_ns=" << board.active_clock_elapsed_ns()
+              << " rdtsc_delta=" << cpu.read64(0x3608) - initial << '\n';
+}
+
 // Complete identical arithmetic on all 16 vCPUs. Count only the loop body,
 // excluding setup, BSP polling and virtual timer ticks from the reported rate.
 void measure_smp_clock(PcMotherboardC06::CpuClock profile) {
@@ -865,6 +924,8 @@ int main(int argc, char** argv) {
         check_cpu_clock(Profile::Double, 2);
         check_cpu_clock(Profile::Twentyfold, 20);
         check_all_smp_timestamps();
+        check_protected32_timestamps(Profile::Double, 458'181'760ULL);
+        check_protected32_timestamps(Profile::Twentyfold, 4'581'817'600ULL);
         if (argc == 2 && std::string(argv[1]) == "--measure-cpu-clock") {
             for (unsigned trial = 0; trial < 4; ++trial) {
                 measure_smp_clock(trial % 2 ? Profile::Twentyfold : Profile::Double);
