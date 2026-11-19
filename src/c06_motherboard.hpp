@@ -1488,6 +1488,8 @@ class PcMotherboardC06 {
     constexpr unsigned bus_steps = 64, timed_grant = 512;
     const auto grant = std::min(budget / jobs, active_clock_running_ ? timed_grant : kSmpQuantum);
     if (jobs < 2 || grant < kSmpQuantum) return 0;
+    const bool preserve_loop_entries = cosmic_pc::Cpu::ether_arm64_host() &&
+        pc_.boot_acceleration_enabled() && budget >= jobs * kMinParallelLoopSteps;
 
     if (!workers_) workers_ = std::make_shared<SmpWorkers>(host_workers_capacity());
 
@@ -1508,8 +1510,11 @@ class PcMotherboardC06 {
               (deadline != Clock::time_point::max() && Clock::now() >= deadline)) return;
           const auto before = processor_steps(id);
           const auto steps = std::min(bus_steps, grant - used);
-          if (id) run_secondary(id, steps, deadline, false, &lock);
-          else pc_.run(steps, deadline, false, &lock);
+          // The next dispatch can admit a complete cached loop when a
+          // short remainder would otherwise leave its vCPU inside it.
+          const bool preserve = preserve_loop_entries && used + steps == grant;
+          if (id) run_secondary(id, steps, deadline, preserve, &lock);
+          else pc_.run(steps, deadline, preserve, &lock);
           const auto retired = processor_steps(id) - before;
           progress[worker] += retired;
           if (retired < steps) break;
@@ -1526,7 +1531,8 @@ class PcMotherboardC06 {
       active += steps != 0;
     }
     record_threaded_dispatch(active, retired);
-    return jobs * grant;
+    const auto scheduled = jobs * grant;
+    return preserve_loop_entries && retired ? std::min<std::uint64_t>(scheduled, retired) : scheduled;
   }
 
  public:

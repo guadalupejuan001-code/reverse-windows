@@ -170,7 +170,8 @@ class EtherX86Sessions {
     else if (pc.waiting_key) result.fault = "Private x86 job requested BIOS keyboard input";
     result.registers = cpu.regs;
     result.steps = cpu.instructions - first_step;
-    result.projected_steps = cpu.ether_arm64_stats().state_vector_steps;
+    result.projected_steps = cpu.ether_arm64_stats().state_vector_steps +
+        cpu.state_vector_interpreter_stats().projected_steps;
     result.rip = cpu.eip;
     result.flags = cpu.eflags;
     result.halted = cpu.halted;

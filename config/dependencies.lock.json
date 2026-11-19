@@ -1,12 +1,12 @@
 {
   "schema": "reverse-windows-dependency-lock-v1",
-  "recorded_at": "2026-11-18",
+  "recorded_at": "2026-11-19",
   "policy": "exact-commit-only-no-silent-fallback-no-automatic-merge",
   "components": [
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "96ca59072a350eaf1e263e3c6438876fc67e51eb",
+      "commit": "51b608734f42d4fd23f882c45419bf2d662e3cea",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
       "status": "candidate-windows-x64-shared-guest-ram",
