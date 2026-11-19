@@ -239,14 +239,18 @@ final class VmTelemetry extends LinearLayout {
                 iso ? units(capacity, GIB, "GiB", 1) : count(number(machine, "disk_reads")));
         metric(1, "Archivo QSSD en el teléfono", storage(number(disk, "physical_bytes")));
         metric(2, "Operaciones guardadas", count(number(disk, "commits")));
+        int rows = 3;
+        if (disk != null && disk.has("clock_hz")) {
+            metric(rows++, "Reloj del QSSD virtual", frequency(number(disk, "clock_hz")));
+        }
         JSONObject dataDisk = snapshot.optJSONObject("data_disk");
         if (dataDisk != null) {
-            metric(3, "QSSD de datos", storage(number(dataDisk, "logical_bytes")) + " · "
+            metric(rows++, "QSSD de datos", storage(number(dataDisk, "logical_bytes")) + " · "
                     + storage(number(dataDisk, "physical_bytes")) + " en Android");
         } else if (iso) {
-            metric(3, "Tamaño de la ISO", units(number(snapshot, "iso_bytes"), GIB, "GiB", 2));
+            metric(rows++, "Tamaño de la ISO", units(number(snapshot, "iso_bytes"), GIB, "GiB", 2));
         }
-        showRows(iso || dataDisk != null ? 4 : 3);
+        showRows(rows);
     }
 
     private void renderVideo() {

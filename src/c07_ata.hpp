@@ -22,6 +22,7 @@ class AtaC07 {
   static constexpr std::uint16_t kControl=0x3f6;
   static constexpr unsigned kMaxMultipleSectors=16;
   enum class Unit { Master, Slave };
+  using ClockReader = std::function<std::uint64_t(std::uint64_t frequency_hz)>;
   struct Counters {
     std::uint64_t commands=0,read_sectors=0,write_sectors=0,identifies=0;
     std::uint64_t flushes=0,aborts=0,irqs_signaled=0;
@@ -38,6 +39,7 @@ class AtaC07 {
   BlockDisk& disk_;
   const Unit unit_;
   std::function<void()> irq14_;
+  ClockReader read_clock_;
   std::array<std::uint8_t,kMaxMultipleSectors*512> buffer_{};
   enum class Transfer {Idle,Identify,Read,Write} transfer_=Transfer::Idle;
   std::uint8_t error_=1,features_=0,sector_count_=1,sector_number_=1;
@@ -99,6 +101,16 @@ class AtaC07 {
     word(identify_data,86,commands);word(identify_data,87,0x4000);
     for(unsigned i=0;i<4;++i)word(identify_data,100+i,std::uint16_t(capacity>>(i*16)));
     word(identify_data,106,0x4000); // Valid 512-byte logical and physical geometry.
+    // Vendor words 129–136 hold two little-endian uint64 values. Latch the
+    // clock at command issue so one IDENTIFY response is a coherent sample.
+    const auto hz = disk_.clock_hz();
+    if (hz) {
+      const auto cycles = read_clock_ ? read_clock_(hz) : 0;
+      for (unsigned i = 0; i < 4; ++i) {
+        word(identify_data, 129 + i, std::uint16_t(hz >> (16 * i)));
+        word(identify_data, 133 + i, std::uint16_t(cycles >> (16 * i)));
+      }
+    }
     identify_data[510]=0xa5; // ATA integrity word signature in the low byte.
     std::uint8_t sum=0;
     for(const auto byte:identify_data)sum=std::uint8_t(sum+byte);
@@ -253,8 +265,9 @@ class AtaC07 {
   }
 
  public:
-  explicit AtaC07(BlockDisk& disk,std::function<void()> signal_irq14,Unit unit=Unit::Master)
-    :disk_(disk),unit_(unit),irq14_(std::move(signal_irq14)) {
+  explicit AtaC07(BlockDisk& disk,std::function<void()> signal_irq14,Unit unit=Unit::Master,
+                  ClockReader read_clock={})
+    :disk_(disk),unit_(unit),irq14_(std::move(signal_irq14)),read_clock_(std::move(read_clock)) {
     if(disk_.sectors()==0||disk_.bytes()!=disk_.sectors()*512ULL ||
        disk_.sectors() >= (1ULL<<48))
       throw std::invalid_argument("C07 ATA requires 512-byte sector BlockDisk within LBA48");

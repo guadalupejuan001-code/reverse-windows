@@ -23,6 +23,8 @@ QssdDisk .rqvd (journal, commit, fsync, Estado QSSD)
 
 ## Funcionalidad probada
 
+En Prime, el reloj virtual del QSSD avanza a 4,5 THz durante el arranque y el tiempo activo del invitado. Cada disco QSSD devuelve dos enteros de 64 bits en las palabras de fabricante de `IDENTIFY DEVICE`, con la palabra menos significativa primero. Las palabras 129–132 contienen la frecuencia en Hz y las 133–136 contienen los ciclos al recibir el comando. Android muestra la frecuencia en la pestaña Disco. Las duraciones de lectura, escritura y sincronización del archivo se siguen midiendo con el reloj del anfitrión.
+
 1. `PcMotherboardC06` publica el dispositivo PCI IDE sólo si se conectó un `BlockDisk`. ID PCI sintético `1b36:c071`, clase `0x0101`, modo legacy, IRQ14, I/O habilitado; sin afirmar DMA ni SATA AHCI.
 2. `AtaC07` implementa task file de 8 registros, alt status/registro de control, selección de master, ATA status DRDY/DSC/DRQ/ERR, identificador del fabricante y la geometría/capacidad desde el BlockDisk real. El slave está ausente.
 3. **IDENTIFY DEVICE (0xEC):** 256 palabras con modelo, serial, 512 B por sector, LBA28 y LBA48; no anuncia UDMA inexistente.

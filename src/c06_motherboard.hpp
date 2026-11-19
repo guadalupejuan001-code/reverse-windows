@@ -1683,9 +1683,13 @@ class PcMotherboardC06 {
     }
     pc_.cpu.configure_topology(topology,0);
     if(data_disk&&!disk)throw std::invalid_argument("ATA data disk requires a primary disk");
-    if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_isa_irq(14);});
+    const auto disk_clock = [this](std::uint64_t hz) {
+      sync_active_clock();
+      return device_clock_cycles(hz);
+    };
+    if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_isa_irq(14);},AtaC07::Unit::Master,disk_clock);
     if(data_disk)data_ata_=std::make_unique<AtaC07>(
-        *data_disk,[this](){signal_isa_irq(14);},AtaC07::Unit::Slave);
+        *data_disk,[this](){signal_isa_irq(14);},AtaC07::Unit::Slave,disk_clock);
     if(optical)optical_=std::make_unique<AtapiCdrom>(
         std::move(optical),optical_bytes,[this](){signal_isa_irq(15);});
     if(!graphics_vram.empty())gpu_=std::make_unique<GuestGpuC08>(
@@ -1884,13 +1888,16 @@ class PcMotherboardC06 {
   std::uint64_t guest_tsc_hz() const noexcept {
     return tsc_cycles_per_second_ * cosmic_pc::Cpu::kTscTicksPerCycle;
   }
-  std::uint64_t ram_clock_cycles() const noexcept {
+  std::uint64_t device_clock_cycles(std::uint64_t hz) const noexcept {
     // Derive the free-running oscillator on demand, once for the entire board.
     // The firmware phase stops where active VM time takes over, even mid-tick.
     const auto firmware_steps = (ticks_ - active_clock_ticks_) * cpu_clock_ratio_ + cpu_cycle_phase_;
-    std::uint64_t remainder = 0;
-    const auto firmware = scaled_cycles(firmware_steps, kRamClockHz, firmware_cycles_per_second_, remainder);
-    return firmware + active_clock_ns_ * (kRamClockHz / 1'000'000'000);
+    std::uint64_t firmware_remainder = 0, active_remainder = 0;
+    const auto firmware = scaled_cycles(firmware_steps, hz, firmware_cycles_per_second_, firmware_remainder);
+    return firmware + scaled_cycles(active_clock_ns_, hz, 1'000'000'000, active_remainder);
+  }
+  std::uint64_t ram_clock_cycles() const noexcept {
+    return device_clock_cycles(kRamClockHz);
   }
   std::uint64_t active_clock_elapsed_ns() const noexcept {return active_clock_ns_;}
   std::uint64_t active_clock_ticks() const noexcept {return active_clock_ticks_;}

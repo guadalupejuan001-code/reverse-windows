@@ -593,7 +593,9 @@ class AndroidBootSession final {
       out << "{\"logical_bytes\":" << stats.logical_bytes
           << ",\"physical_bytes\":" << stats.physical_bytes
           << ",\"commits\":" << stats.commits << ",\"initial_commits\":" << initial_disk_commits_
-          << ",\"generation\":" << disk_->generation() << '}';
+          << ",\"generation\":" << disk_->generation()
+          << ",\"clock_hz\":" << disk_->clock_hz()
+          << ",\"clock_cycles\":" << board_->device_clock_cycles(disk_->clock_hz()) << '}';
     } else {
       out << "null";
     }
@@ -602,6 +604,8 @@ class AndroidBootSession final {
       const auto activity = board_->attached_data_ata()->counters();
       out << ",\"data_disk\":{\"logical_bytes\":" << stats.logical_bytes
           << ",\"physical_bytes\":" << stats.physical_bytes << ",\"commits\":" << stats.commits
+          << ",\"clock_hz\":" << data_disk_->clock_hz()
+          << ",\"clock_cycles\":" << board_->device_clock_cycles(data_disk_->clock_hz())
           << ",\"ata_identify_data_transfers\":" << activity.identify_data_transfers
           << ",\"ata_read_sectors\":" << activity.read_sectors
           << ",\"ata_write_sectors\":" << activity.write_sectors << ",\"qssd_parallel_io\":";

@@ -428,6 +428,12 @@ void test_max_data_disk(const std::string& boot_path,const std::string& data_pat
          "Guest IDENTIFY truncated the 8 PiB sector count");
     need(pc.cpu.read64(0xa400+100*2)==boot.sectors(),
          "Guest device selection reported the data capacity on the boot drive");
+    constexpr std::uint64_t qssd_hz = 4'500'000'000'000ULL;
+    need(pc.cpu.read64(0xa000 + 129*2) == qssd_hz && pc.cpu.read64(0xa400 + 129*2) == qssd_hz,
+         "Both QSSD devices must report the full 64-bit clock in ATA IDENTIFY");
+    const auto data_ticks = pc.cpu.read64(0xa000 + 133*2);
+    need(data_ticks > 0 && pc.cpu.read64(0xa400 + 133*2) > data_ticks,
+         "The QSSD clock must already advance between firmware commands");
     need(pc.cpu.read16(0xa000+19*2)!=pc.cpu.read16(0xa400+19*2),
          "Boot and data disks must have distinct ATA serial numbers");
     need(pc.cpu.memory[0x9600]==0x50&&pc.cpu.memory[0x9601]==0x50&&
@@ -440,6 +446,34 @@ void test_max_data_disk(const std::string& boot_path,const std::string& data_pat
     need(board.attached_data_ata()->counters().write_sectors==1&&
          board.attached_ata()->counters().write_sectors==0,
          "ATA wrote through the wrong device");
+
+    PcMachine::RunClock::time_point now{};
+    std::chrono::nanoseconds interval{};
+    board.enable_active_clock([&] {
+      const auto sample = now;
+      now += interval;
+      interval = {};
+      return sample;
+    });
+    std::vector<std::uint8_t> probe{0xfa};  // CLI before polling the primary drive.
+    out8(probe,0x1f6,0xe0); out8(probe,0x1f7,0xec); rep_words(probe,true,0xa400);
+    ins(probe,{0xf4});
+    pc.cpu.memory.write_block(0xd000,probe.data(),probe.size());
+    const auto read_ticks = [&](std::chrono::nanoseconds elapsed) {
+      interval = elapsed;
+      pc.cpu.eip = 0xd000;
+      pc.cpu.halted = false;
+      board.run(1024);
+      need(pc.cpu.halted && !pc.cpu.fault, "Guest QSSD clock read must complete");
+      return pc.cpu.read64(0xa400 + 133*2);
+    };
+    const auto first = read_ticks(std::chrono::nanoseconds::zero());
+    const auto second = read_ticks(std::chrono::seconds(1));
+    need(second - first == qssd_hz, "One active guest second must advance 4.5 trillion QSSD cycles");
+    now += std::chrono::hours(1);  // VM paused between runs.
+    board.set_experimental_tsc(true);
+    need(read_ticks(std::chrono::nanoseconds(1)) - second == 4500,
+         "QSSD time must exclude the pause and keep its rate across a CPU clock change");
   }
   QssdDisk reopened(data_path,QssdDisk::Access::ReadOnly);
   need(reopened.read(last_sector,1,read.data())&&read==payload,

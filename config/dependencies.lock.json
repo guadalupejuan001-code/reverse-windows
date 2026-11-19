@@ -113,11 +113,12 @@
     {
       "key": "qssd",
       "repository": "guadalupejuan001-code/Virtual-qSSD-",
-      "commit": "709a5ca4d0116d7335debb2abdc60842cc4cf687",
+      "commit": "de67569bf1cbb37bff3eb283a417c09f61e1a854",
       "checkout": "deps/Virtual-qSSD-",
       "role": "complete-revisioned-state-and-graphics-work-PR8",
       "status": "candidate-qssd-transient-ram",
       "required_paths": [
+        "include/qssd/device_clock.hpp",
         "include/qssd/state_bus.hpp",
         "include/qssd/transient_pages.hpp",
         "include/qssd/packed_transient_pages.hpp",

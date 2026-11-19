@@ -5,6 +5,7 @@
 // No simulated quantum hardware or arbitrary compression promises.
 #include "block_disk.hpp"
 #include "smp_workers.hpp"
+#include "qssd/device_clock.hpp"
 #include "qssd/state_bus.hpp"
 #include <algorithm>
 #include <array>
@@ -999,6 +1000,7 @@ class QssdDisk final : public BlockDisk {
   QssdDisk& operator=(const QssdDisk&)=delete;
   std::uint64_t bytes() const noexcept override {return capacity_;}
   std::uint64_t sectors() const noexcept override {return capacity_/kSectorSize;}
+  std::uint64_t clock_hz() const noexcept override {return qssd::device_clock_hz;}
   Stats stats() const {
     const auto v=states_.snapshot();
     return {capacity_,v->value->end,v->value->commits,v->value->raw,
