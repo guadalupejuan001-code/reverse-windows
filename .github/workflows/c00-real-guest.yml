@@ -142,6 +142,29 @@ jobs:
         with:
           name: prime-vector-stream-${{ matrix.architecture }}
           path: build/prime-vector-stream.log
+      - name: Compare disp32 vector stores with Prime 0.3.74
+        shell: bash
+        run: |
+          set -euo pipefail
+          reference=43cc1adef7921a8dbd82c2c539ac9a4297145916
+          old="$RUNNER_TEMP/mundo-prime-r099"
+          git -C deps/mundo-X fetch --no-tags --depth=1 https://github.com/guadalupejuan001-code/mundo-X.git "$reference"
+          git -C deps/mundo-X worktree add --detach "$old" "$reference"
+          driver=pc-android/native/tests/x86_ether_counter_loop_test.cpp
+          cp "deps/mundo-X/$driver" "$old/$driver"
+          c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread \
+            -I"$old/pc-android/native" -I"$old/native/include" "$old/$driver" -o build/prime-x86-r099
+          for trial in 1 2 3 4 5; do
+            order=(prime-x86-r099 prime-x86-measure)
+            if (( trial % 2 == 0 )); then order=(prime-x86-measure prime-x86-r099); fi
+            for binary in "${order[@]}"; do
+              "build/$binary" --measure-disp32-movntdq | sed "s/^/$binary /"
+            done
+          done | tee build/prime-disp32.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prime-disp32-${{ matrix.architecture }}
+          path: build/prime-disp32.log
       - name: Compare full and partial VBE frames with identical guest writes
         shell: bash
         run: |

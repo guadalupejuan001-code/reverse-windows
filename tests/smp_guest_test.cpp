@@ -393,6 +393,61 @@ void start_long_mode_smp_guest(Cpu& cpu) {
     cpu.write32(kLapic + 0x300, 0x000c0600 | kStartupVector);
 }
 
+void test_secondary_streaming_stores(bool threaded) {
+    constexpr unsigned source = 0xa000, destination = 0xb000, rounds = 16;
+    // Enable OSFXSR, load two distinct XMM values, then write eight consecutive
+    // 16-byte values per iteration. Only the secondary CPU runs this code.
+    constexpr std::uint8_t guest[] = {
+        0x0f,0x20,0xe0, 0x0d,0x00,0x02,0,0, 0x0f,0x22,0xe0,
+        0xbe,0,0xa0,0,0, 0xbf,0,0xb0,0,0, 0xb9,rounds,0,0,0,
+        0xf3,0x0f,0x6f,0x06, 0xf3,0x0f,0x6f,0x4e,0x10,
+        0x66,0x0f,0xe7,0x07,      0x66,0x0f,0xe7,0x4f,0x10,
+        0x66,0x0f,0xe7,0x47,0x20, 0x66,0x0f,0xe7,0x4f,0x30,
+        0x66,0x0f,0xe7,0x47,0x40, 0x66,0x0f,0xe7,0x4f,0x50,
+        0x66,0x0f,0xe7,0x47,0x60, 0x66,0x0f,0xe7,0x4f,0x70,
+        0x81,0xc7,0x80,0,0,0, 0xff,0xc9, 0x75,0xcf, 0xf4,
+    };
+    std::uint64_t scalar_steps = 0;
+    for (bool accelerated : {false, true}) {
+        PcMachine pc(4U << 20);
+        pc.boot_long_mode_demo();
+        pc.run(4000);
+        auto& cpu = pc.cpu;
+        PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {2,1});
+        if (threaded) board.enable_threaded_smp(2);
+        if (accelerated) pc.enable_boot_acceleration();
+        install_long_mode_smp_guest(cpu, guest, sizeof(guest));
+        for (unsigned i = 0; i < 32; ++i) cpu.write8(source + i, std::uint8_t(0xa0 + i));
+        cpu.write8(destination - 1, 0x71);
+        cpu.write8(destination + 128 * rounds, 0x72);
+        start_long_mode_smp_guest(cpu);
+        cpu.write16(0x7000, 0xfeeb); // Park the BSP in a JMP to itself.
+        cpu.eip = 0x7000;
+        for (unsigned turn = 0; turn < 64 && board.secondary_can_run(); ++turn) {
+            const unsigned budget = turn % 3 ? 128 : 7;
+            const auto previous = board.total_processor_steps();
+            board.run(budget);
+            require(board.total_processor_steps() - previous <= budget, "AP streaming stores exceeded the grant");
+        }
+        require(board.processors_started() == 2 && !board.secondary_can_run() &&
+                !board.faulted_cpu() && !cpu.fault, "secondary XMM stream must halt successfully");
+        for (unsigned i = 0; i < 128 * rounds; ++i)
+            require(cpu.read8(destination + i) == 0xa0 + i % 32, "AP XMM bytes diverged");
+        require(cpu.read8(destination - 1) == 0x71 && cpu.read8(destination + 128 * rounds) == 0x72,
+                "secondary XMM stream overwrote its boundaries");
+        const auto batches = board.secondary_store_batches(), steps = board.secondary_store_steps();
+        if (accelerated) {
+            require(steps > 0 && steps >= 2 * batches && steps <= 8 * batches &&
+                    board.processor_steps(1) == scalar_steps, "secondary stores must coalesce with exact retirement");
+            std::cout << "SMP_MOVNTDQ_PASS threaded=" << threaded << " stores=" << steps
+                      << " batches=" << batches << " guest_steps=" << scalar_steps << '\n';
+        } else {
+            require(!batches && !steps, "scalar secondary must skip XMM batches");
+            scalar_steps = board.processor_steps(1);
+        }
+    }
+}
+
 void test_signed_projection_with_smp_quantum(bool threaded) {
     if (!Cpu::ether_arm64_host()) return;
     constexpr unsigned loop = 0x7000;
@@ -1006,6 +1061,8 @@ int main(int argc, char** argv) {
         test_secondary_interrupts(false);
         test_secondary_interrupts(true);
         test_ether_worker_block();
+        test_secondary_streaming_stores(false);
+        test_secondary_streaming_stores(true);
         test_signed_projection_with_smp_quantum(false);
         test_signed_projection_with_smp_quantum(true);
         test_secondary_interpreter_projection();

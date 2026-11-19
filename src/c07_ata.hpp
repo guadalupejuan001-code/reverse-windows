@@ -1,6 +1,7 @@
 #pragma once
 // C07: legacy-compatible PCI IDE primary channel, ATA PIO and exact BlockDisk.
 #include "block_disk.hpp"
+#include "prime_pci_clock.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -21,7 +22,7 @@ class AtaC07 {
   static constexpr std::uint16_t kDrive=0x1f6;
   static constexpr std::uint16_t kControl=0x3f6;
   static constexpr unsigned kMaxMultipleSectors=16;
-  static constexpr std::uint64_t kControllerClockHz = 4'500'000'000'000ULL;
+  static constexpr std::uint64_t kControllerClockHz = RW_PRIME_COMPONENT_HZ;
   enum class Unit { Master, Slave };
   using ClockReader = std::function<std::uint64_t(std::uint64_t frequency_hz)>;
   struct Counters {

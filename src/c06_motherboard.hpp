@@ -10,6 +10,7 @@
 #include "pc_machine.hpp"
 #include "ps2_keyboard.hpp"
 #include "ps2_mouse.hpp"
+#include "prime_pci_clock.h"
 #include "smp_workers.hpp"
 #include <algorithm>
 #include <array>
@@ -32,10 +33,12 @@ class PcMotherboardC06 {
   using Clock = cosmic_pc::PcMachine::RunClock;
   using ClockSource = std::function<Clock::time_point()>;
   enum class CpuClock : unsigned { Standard = 1, Double = 2, Twentyfold = 20, Experimental4_5THz };
-  static constexpr std::uint64_t kExperimentalTscHz = 4'500'000'000'000ULL;
+  static constexpr std::uint64_t kExperimentalTscHz = RW_PRIME_COMPONENT_HZ;
   static_assert(kExperimentalTscHz % cosmic_pc::Cpu::kTscTicksPerCycle == 0);
-  static constexpr std::uint64_t kRamClockHz = 4'500'000'000'000ULL;
+  static constexpr std::uint64_t kRamClockHz = RW_PRIME_COMPONENT_HZ;
   static_assert(kRamClockHz % 1'000'000'000 == 0);
+  static_assert(cosmic_pc::ether_arm64::kExecutionTargetHz == RW_PRIME_COMPONENT_HZ);
+  static_assert(qssd::device_clock_hz == RW_PRIME_COMPONENT_HZ);
   enum class ClockStart { Immediate, Guest32Or64 };
   static constexpr std::uint64_t kLocalApic=cosmic_pc::PcMachine::kLocalApicAddress,
       kIoApic=cosmic_pc::PcMachine::kIoApicAddress;
@@ -208,7 +211,7 @@ class PcMotherboardC06 {
   std::unique_ptr<GuestGpuC08> gpu_;
   bool prior_pci_reservation_=false;
   std::array<std::uint8_t,256> ata_cfg_{};
-  static constexpr unsigned kAtaClockSample = 0x48;
+  std::array<std::uint64_t, GuestGpuC08::pci_device + 1> pci_clock_samples_{};
   std::uint64_t ata_irq_delivered_=0;
   Pit pit_{},pit2_{};
   unsigned pit_phase_=0;
@@ -310,6 +313,7 @@ class PcMotherboardC06 {
   std::uint64_t parallel_register_continuations_ = 0;
   std::uint64_t parallel_ram_batches_ = 0, parallel_ram_steps_ = 0;
   std::uint64_t parallel_mixed_batches_ = 0;
+  std::uint64_t secondary_store_batches_ = 0, secondary_store_steps_ = 0;
   unsigned longest_parallel_register_slice_ = 0;
   bool prior_local_apic_=false;
   const std::uint64_t* prior_clock_ = nullptr;
@@ -329,10 +333,6 @@ class PcMotherboardC06 {
   static std::uint8_t bcd(unsigned n){return std::uint8_t((n/10)*16+(n%10));}
   static void config32(std::array<std::uint8_t,256>& bytes,unsigned at,std::uint32_t v){
     for(unsigned i=0;i<4;++i)bytes[at+i]=std::uint8_t(v>>(8*i));
-  }
-  static void config64(std::array<std::uint8_t,256>& bytes,unsigned at,std::uint64_t value){
-    config32(bytes, at, static_cast<std::uint32_t>(value));
-    config32(bytes, at + 4, static_cast<std::uint32_t>(value >> 32));
   }
   static void build_config(std::array<std::uint8_t,256>& b,std::uint16_t device,
                            std::uint8_t type){
@@ -380,6 +380,7 @@ class PcMotherboardC06 {
     parallel_register_continuations_ = 0;
     parallel_ram_batches_ = parallel_ram_steps_ = 0;
     parallel_mixed_batches_ = 0;
+    secondary_store_batches_ = secondary_store_steps_ = 0;
     longest_parallel_register_slice_ = 0;
     ioapic_select_=0;
     ioapic_id_=std::uint8_t(AcpiC06::ioapic_id(processor_count_));
@@ -387,8 +388,7 @@ class PcMotherboardC06 {
     io_remote_vector_.fill(0);
     io_remote_targets_.fill(0);
     build_config(host_cfg_,0x0001,0x00);
-    // Read-only, little-endian RAM clock (Hz) in the virtual host bridge.
-    config64(host_cfg_, 0x40, kRamClockHz);
+    pci_clock_samples_.fill(0);
     build_config(isa_cfg_,0x0002,0x01);
     if(ide_present()){
       ata_cfg_.fill(0);
@@ -399,7 +399,6 @@ class PcMotherboardC06 {
       ata_cfg_[10]=0x01;ata_cfg_[11]=0x01; // PCI 0x0101 IDE controller
       // Legacy IDE decodes fixed ports and IRQ14/15, without PCI BARs or INTx.
       ata_cfg_[0x3c]=0xff;
-      config64(ata_cfg_, 0x40, AtaC07::kControllerClockHz);
     }
     // After a real PcMachine::reset, firmware RAM is new; republish the
     // same discovered tables and keep their E820-reserved addresses.
@@ -437,16 +436,20 @@ class PcMotherboardC06 {
       const unsigned offset=(pci_selector_&0xfcU)+(p-0xcfc);
       if(offset+width>256)return part_mask(width);
       const auto dev=selected_pci_device();
+      if (offset >= RW_PRIME_PCI_CLOCK_HZ && offset < RW_PRIME_PCI_CLOCK_CYCLES + 8 &&
+          (dev == 0 || (dev == 2 && ide_present()) || (dev == GuestGpuC08::pci_device && gpu_))) {
+        if (offset == RW_PRIME_PCI_CLOCK_CYCLES) {
+          sync_active_clock();
+          pci_clock_samples_[dev] = device_clock_cycles(RW_PRIME_COMPONENT_HZ);
+        }
+        const auto value = offset < RW_PRIME_PCI_CLOCK_CYCLES ? RW_PRIME_COMPONENT_HZ : pci_clock_samples_[dev];
+        return std::uint32_t(value >> ((offset & 7U) * 8)) & part_mask(width);
+      }
       if (gpu_ && dev==GuestGpuC08::pci_device) {
         const auto value=gpu_->config_word(offset&~3U);
         return (value>>((offset&3U)*8))&part_mask(width);
       }
       const auto config=selected_pci(dev);
-      if (config == &ata_cfg_ && offset == kAtaClockSample) {
-        // Reading the low byte latches all 64 bits for subsequent PCI reads.
-        sync_active_clock();
-        config64(ata_cfg_, kAtaClockSample, device_clock_cycles(AtaC07::kControllerClockHz));
-      }
       std::uint32_t value=0;
       for(unsigned i=0;i<width;++i)
         value|=std::uint32_t(config?(*config)[offset+i]:0xff)<<(i*8);
@@ -1395,6 +1398,15 @@ class PcMotherboardC06 {
     return std::max(kSmpQuantum, batch_limit(kExtendedSmpQuantum));
   }
 
+  unsigned secondary_batch_limit(const LocalApic& apic, unsigned remaining) const {
+    const bool accepts_irq = apic.cpu->flag(cosmic_pc::Cpu::IF);
+    if (accepts_irq && apic.pending.highest()) return 1;
+    auto limit = batch_limit(remaining);
+    if (accepts_irq && apic.timer_cycles && !(apic.lvt[kTimer] & kLvtMasked) && lapic_on(apic))
+      limit = unsigned(std::min<std::uint64_t>(limit, apic.timer_cycles));
+    return limit;
+  }
+
   void run_secondary(unsigned id, unsigned budget, Clock::time_point deadline,
                      bool preserve_ether_loop_entry, std::unique_lock<std::mutex>* bus = nullptr) {
     using Clock = cosmic_pc::PcMachine::RunClock;
@@ -1424,18 +1436,27 @@ class PcMotherboardC06 {
       if (cpu.halted) return;
       observe_guest_clock_mode(cpu);
       const auto remaining = budget - used;
-      const auto native_steps = cpu.try_ether_arm64_block(remaining, bus);
-      if (native_steps) {
-        used += native_steps;
-        continue;
+      // Apply the same one-page XMM store coalescer as the boot CPU. Shared
+      // writes stay inside the scheduler's bus grant in threaded mode.
+      if (pc_.boot_acceleration_enabled() && cpu.movntdq_store_batch_candidate()) {
+        if (const auto stores = cpu.try_movntdq_store_batch(secondary_batch_limit(apic, remaining))) {
+          ++secondary_store_batches_;
+          secondary_store_steps_ += stores;
+          used += stores;
+          continue;
+        }
       }
-      const bool interrupts_enabled = cpu.flag(cosmic_pc::Cpu::IF);
-      if (pc_.boot_acceleration_enabled() && cpu.state_vector_batch_candidate() &&
-          !(interrupts_enabled && apic.pending.highest())) {
-        auto limit = batch_limit(remaining);
-        if (interrupts_enabled && apic.timer_cycles && !(apic.lvt[kTimer] & kLvtMasked) && lapic_on(apic))
-          limit = unsigned(std::min<std::uint64_t>(limit, apic.timer_cycles));
-        if (const auto vector_steps = cpu.try_state_vector_batch(limit)) {
+      if (remaining > 1 && cpu.ether_arm64_block_candidate()) {
+        // A scheduler turn can span a local timer edge. Native blocks do not
+        // poll the APIC internally, so bound their grant when IF is set.
+        const auto limit = cpu.flag(cosmic_pc::Cpu::IF) ? secondary_batch_limit(apic, remaining) : remaining;
+        if (const auto native_steps = cpu.try_ether_arm64_block(limit, bus)) {
+          used += native_steps;
+          continue;
+        }
+      }
+      if (pc_.boot_acceleration_enabled() && cpu.state_vector_batch_candidate()) {
+        if (const auto vector_steps = cpu.try_state_vector_batch(secondary_batch_limit(apic, remaining))) {
           used += vector_steps;
           continue;
         }
@@ -1879,6 +1900,8 @@ class PcMotherboardC06 {
   std::uint64_t parallel_register_continuations() const noexcept { return parallel_register_continuations_; }
   std::uint64_t parallel_ram_batches() const noexcept { return parallel_ram_batches_; }
   std::uint64_t parallel_ram_steps() const noexcept { return parallel_ram_steps_; }
+  std::uint64_t secondary_store_batches() const noexcept { return secondary_store_batches_; }
+  std::uint64_t secondary_store_steps() const noexcept { return secondary_store_steps_; }
   std::uint64_t parallel_mixed_batches() const noexcept { return parallel_mixed_batches_; }
   unsigned longest_parallel_register_slice() const noexcept { return longest_parallel_register_slice_; }
   const cosmic_pc::Cpu* faulted_cpu() const noexcept {

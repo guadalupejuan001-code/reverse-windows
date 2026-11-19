@@ -4,6 +4,7 @@
 #include "graphics_memory.hpp"
 #include "guest_triangle_work.hpp"
 #include "pc_machine.hpp"
+#include "prime_pci_clock.h"
 #include "qssd/graphics_work_state.hpp"
 #include "relaciones_gpu.hpp"
 #ifdef REVERSE_WINDOWS_GLES_GUEST
@@ -183,6 +184,7 @@ class GuestGpuC08 {
   void write_json(std::ostream& out) const {
     const auto parallel = parallel_io_stats();
     out << "{\"logical_vram_bytes\":" << GpuVram::kBytes
+        << ",\"virtual_clock_hz\":" << RW_PRIME_COMPONENT_HZ
         << ",\"qssd_backing_bytes\":" << memory_.journal_bytes()
         << ",\"qssd_vram_commits\":" << memory_.commits()
         << ",\"stage_bytes\":" << stage_.size()

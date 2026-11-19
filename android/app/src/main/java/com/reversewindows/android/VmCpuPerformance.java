@@ -71,6 +71,13 @@ final class VmCpuPerformance {
         return thermal >= 0 && thermal < PowerManager.THERMAL_STATUS_MODERATE;
     }
 
+    VmHostPacing pacing() {
+        if (thermal >= PowerManager.THERMAL_STATUS_CRITICAL) return VmHostPacing.CRITICAL;
+        if (thermal >= PowerManager.THERMAL_STATUS_SEVERE) return VmHostPacing.SEVERE;
+        if (thermal >= PowerManager.THERMAL_STATUS_MODERATE) return VmHostPacing.MODERATE;
+        return VmHostPacing.NORMAL;
+    }
+
     void beforeWork(long handle) {
         long now = SystemClock.elapsedRealtime();
         sample(now);
