@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
@@ -66,13 +67,15 @@ class AndroidBootSession final {
   }
 
   void sample_ram_pressure(std::uint64_t available, std::uint64_t threshold, bool low_memory) {
+    const auto sampled_at = cosmic_pc::SparseRam::ReclaimClock::now();
     const auto& memory = pc_.cpu.memory;
     const auto headroom = available > threshold ? available - threshold : 0;
     const auto limit = resident_limit(memory.size());
     const bool prime_ram = high_ram_profile(memory.size());
     const bool background_trim = low_memory && available == 0 && threshold == 0;
     const auto floor = std::min(limit, kMinResidentBytes);
-    const auto old_target = pressure_.target ? pressure_.target : memory.budget_bytes();
+    const auto previous_target = pressure_.target;
+    const auto old_target = previous_target ? previous_target : memory.budget_bytes();
     auto target = floor;
     pressure_.reserve = 0;
     if (prime_ram && !background_trim) {
@@ -104,6 +107,10 @@ class AndroidBootSession final {
       pressure_.target = target;
     else
       pressure_.target = old_target;
+    if (pressure_.target != previous_target) {
+      pressure_.latency = {};
+      pressure_.latency.sampled_at = sampled_at;
+    }
   }
 
   bool maintain_ram_budget() {
@@ -124,7 +131,8 @@ class AndroidBootSession final {
       pressure_.status = Adjustment::Blocked;
       pressure_.error = error.what();
     }
-    const auto elapsed = Clock::now() - started;
+    const auto finished = Clock::now();
+    const auto elapsed = finished - started;
     if (spill_.file) pressure_.encode_ns += spill_.file->codec_stats().encode.wall_ns - encode_before;
     const auto after = memory.allocated_bytes();
     const auto cache_after = memory.backing_cache_bytes();
@@ -138,6 +146,13 @@ class AndroidBootSession final {
     pressure_.last_released_bytes = resident_before - std::min(resident_before, resident_after);
     pressure_.released_bytes += pressure_.last_released_bytes;
     if (elapsed <= kRamReclaimWindow) pressure_.released_within_window += pressure_.last_released_bytes;
+    auto& latency = pressure_.latency;
+    if (pressure_.last_released_bytes && !latency.first_release_batch) {
+      latency.first_release_batch = finished - latency.sampled_at;
+      latency.first_released_bytes = pressure_.last_released_bytes;
+    }
+    if (pressure_.status == Adjustment::Applied && !latency.target_applied)
+      latency.target_applied = finished - latency.sampled_at;
     return pressure_.status == Adjustment::Reclaiming;
   }
 
@@ -759,6 +774,11 @@ class AndroidBootSession final {
   }
 
   struct RamPressure {
+    struct Latency {
+      std::chrono::steady_clock::time_point sampled_at{};
+      std::optional<std::chrono::steady_clock::duration> first_release_batch, target_applied;
+      std::uint64_t first_released_bytes = 0;
+    } latency;
     struct Preparation {
       std::uint64_t batches = 0, backed_pages = 0, failures = 0, overruns = 0;
       std::uint64_t compact_up_to_2k = 0, compact_up_to_3k = 0, dense_pages = 0, released_bytes = 0;
@@ -865,7 +885,16 @@ class AndroidBootSession final {
           << ",\"pressure_last_released_resident_bytes\":" << pressure->last_released_bytes
           << ",\"pressure_released_resident_bytes\":" << pressure->released_bytes
           << ",\"pressure_within_window_released_bytes\":" << pressure->released_within_window
-          << ",\"reclaim_preparation\":{\"batches\":" << pressure->preparation.batches
+          << ",\"pressure_first_released_bytes\":" << pressure->latency.first_released_bytes
+          << ",\"pressure_first_release_batch_us\":";
+      if (const auto time = pressure->latency.first_release_batch)
+        out << std::chrono::duration_cast<std::chrono::microseconds>(*time).count();
+      else out << "null";
+      out << ",\"pressure_target_applied_us\":";
+      if (const auto time = pressure->latency.target_applied)
+        out << std::chrono::duration_cast<std::chrono::microseconds>(*time).count();
+      else out << "null";
+      out << ",\"reclaim_preparation\":{\"batches\":" << pressure->preparation.batches
           << ",\"backed_pages\":" << pressure->preparation.backed_pages
           << ",\"released_bytes\":" << pressure->preparation.released_bytes
           << ",\"compact_up_to_2k\":" << pressure->preparation.compact_up_to_2k

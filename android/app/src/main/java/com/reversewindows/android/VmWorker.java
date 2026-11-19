@@ -326,7 +326,8 @@ final class VmWorker {
             if ((background && foreground) || released || handle == 0 || isTerminal()) return;
             reclaimRam = background;
             nextRamSample = 0;
-            scheduleRam(0);
+            worker.removeCallbacks(ramMaintenance);
+            maintainRam();
         });
     }
 

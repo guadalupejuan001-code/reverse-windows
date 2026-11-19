@@ -815,6 +815,9 @@ void verify_late_prime_pressure(const std::filesystem::path& path) {
               counter(partial, "pressure_last_released_resident_bytes") > 0 &&
               counter(partial, "pressure_last_released_resident_bytes") <=
                   counter(partial, "pressure_released_resident_bytes") &&
+              counter(partial, "pressure_first_released_bytes") > 0 &&
+              partial.find("\"pressure_first_release_batch_us\":null") == std::string::npos &&
+              partial.find("\"pressure_target_applied_us\":null") != std::string::npos &&
               counter(partial, "raw_backing_capacity_bytes") <= Session::kPrimeRamBytes &&
               partial.find("\"pressure_background_trim\":false") != std::string::npos,
           "Foreground pressure must reserve host headroom without targeting the 16 MiB floor");
@@ -826,6 +829,9 @@ void verify_late_prime_pressure(const std::filesystem::path& path) {
   const auto recovered = live.diagnostic(false);
   require(counter(recovered, "spill_writes") == spills &&
               counter(recovered, "pressure_target_bytes") >= 380 * mib &&
+              counter(recovered, "pressure_first_released_bytes") == 0 &&
+              recovered.find("\"pressure_first_release_batch_us\":null") != std::string::npos &&
+              recovered.find("\"pressure_target_applied_us\":null") == std::string::npos &&
               counter(recovered, "usable_bytes") == Session::kPrimeRamBytes,
           "Recovering headroom must keep remaining guest pages and the original E820 map");
 
