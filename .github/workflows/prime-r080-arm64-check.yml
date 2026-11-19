@@ -1,0 +1,33 @@
+name: Compare Prime r080 ARM64 projection tests
+on:
+  push:
+    branches: ["codex/prime-0.3.58-smp-arm64-check"]
+permissions:
+  contents: read
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "077c4631bec7d00e3d598eed47fed1ef88fbbcbd"
+          persist-credentials: false
+      - name: Check out the pinned r080 components
+        run: python3 scripts/verify_deps.py --checkout
+      - name: Compile the two ARM64 projection tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          inc=(-I src -I deps/mundo-X/pc-android/native -I deps/mundo-X/native/include -I deps/Virtual-qSSD-/include -I deps/GPU-VIRTUAL/include)
+          c++ -std=c++17 -O2 -frounding-math -pthread "${inc[@]}" deps/mundo-X/pc-android/native/tests/x86_ether_arm64_test.cpp -o "$RUNNER_TEMP/prime-ether-arm64" -lz
+          c++ -std=c++17 -O2 -frounding-math -pthread "${inc[@]}" tests/ether_x86_sessions_test.cpp -o "$RUNNER_TEMP/prime-x86-sessions" -lz
+      - name: Measure the original r080 behavior
+        shell: bash
+        run: |
+          status=0
+          "$RUNNER_TEMP/prime-ether-arm64" || status=$?
+          echo "R080_ETHER_ARM64_EXIT=$status"
+          status=0
+          "$RUNNER_TEMP/prime-x86-sessions" || status=$?
+          echo "R080_X86_SESSIONS_EXIT=$status"

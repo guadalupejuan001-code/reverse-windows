@@ -1,0 +1,41 @@
+name: Prime r044 ARM64 optimized motherboard measurement
+
+on:
+  push:
+    branches: ["codex/prime-r044-arm64-measurement"]
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: d888f8a218b07d2569e49cbe12a1037f4a2d1a6b
+          persist-credentials: false
+      - name: Check out the same revisions compiled in the APK
+        run: |
+          test "$(uname -m)" = aarch64
+          test "$(git rev-parse HEAD)" = 'd888f8a218b07d2569e49cbe12a1037f4a2d1a6b'
+          python3 scripts/verify_deps.py --checkout
+          test "$(git -C deps/mundo-X rev-parse HEAD)" = '2c802655dc82a52017068e9e0c99c0fba104917b'
+      - name: Exercise the C06 guest and time the verified rotate-XOR loop at -O2
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          clang++ --version
+          clang++ -std=c++17 -O2 -frounding-math -pthread \
+            -DMUNDO_X_PC_ETHER_NEXT=1 '-DREVERSE_MUNDO_X_SOURCE_SHA="2c802655dc82a52017068e9e0c99c0fba104917b"' \
+            -Isrc -Ideps/mundo-X/pc-android/native -Ideps/mundo-X/native/include \
+            -Ideps/Virtual-qSSD-/include -Ideps/GPU-VIRTUAL/include \
+            tests/c06_motherboard_guest_test.cpp deps/mundo-X/native/src/ether_transform.cpp \
+            deps/mundo-X/native/src/ether_neon.cpp -o build/c06-prime-r044
+          for sample in 1 2 3; do
+            ./build/c06-prime-r044
+          done | tee build/c06-prime-r044.log
+          grep '^C06_TIMED_ROTATE_XOR_PASS steps=32000028 ' build/c06-prime-r044.log | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$(grep -c '^C06_TIMED_ROTATE_XOR_PASS steps=32000028 ' build/c06-prime-r044.log)" = 3
