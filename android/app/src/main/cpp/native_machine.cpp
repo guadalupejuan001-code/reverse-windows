@@ -118,7 +118,7 @@ JNIEXPORT jlong JNICALL Java_com_reversewindows_android_NativeMachine_openWithRa
             static_cast<Session::BootSource>(source), iso_fd,
             static_cast<std::uint64_t>(iso_bytes), ram_profile(available, threshold, low_memory, prime_ram),
             string_from(env, ram_cache), string_from(env, graphics_vram), string_from(env, data_disk),
-            Session::kPrimeCpuTopology, true, reverse_windows::PcMotherboardC06::CpuClock::Double);
+            Session::kPrimeCpuTopology, true, Session::kPrimeCpuClock);
         auto instance = std::make_shared<Instance>(std::move(machine));
         std::lock_guard<std::mutex> lock(registry_mutex);
         if (next_handle == std::numeric_limits<jlong>::max())

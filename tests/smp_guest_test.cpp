@@ -749,8 +749,18 @@ void check_cpu_clock(PcMotherboardC06::CpuClock profile, unsigned ratio) {
         require(cpu.step() == cosmic_pc::StepResult::Executed, "Guest RDTSC");
         return (cpu.regs[Cpu::EDX] << 32) | cpu.regs[Cpu::EAX];
     };
+    require(read_tsc() == std::uint64_t(work) * Cpu::kTscTicksPerCycle, "Firmware timestamp");
+    // Mix the batch and scalar paths across a device edge, then switch clock
+    // sources with a partial device tick still pending.
+    const auto ticks = board.evidence().ticks;
+    pc.device_batch_advance_hook(3 * ratio - 1);
+    require(board.evidence().ticks == ticks + 2, "A partial device tick must not fire early");
+    board.advance_one();
+    require(board.evidence().ticks == ticks + 3, "The scalar step must consume the batch remainder");
+    if (ratio > 1) board.advance_one();
     const auto before = read_tsc();
-    require(before == std::uint64_t(work) * Cpu::kTscTicksPerCycle, "Firmware timestamp");
+    const auto cycles = std::uint64_t(work) + 3 * ratio + (ratio > 1 ? 1 : 0);
+    require(before == cycles * Cpu::kTscTicksPerCycle, "Batched firmware timestamp");
     const auto origin = PcMachine::RunClock::time_point{};
     unsigned samples = 0;
     board.enable_active_clock([&] {
@@ -763,6 +773,45 @@ void check_cpu_clock(PcMotherboardC06::CpuClock profile, unsigned ratio) {
             read_tsc() - before == hz && board.guest_tsc_hz() == hz,
             "A guest second must preserve the ACPI oscillator and the requested TSC rate");
     std::cout << "PRIME_CPU_CLOCK_PASS guest_tsc_hz=" << hz << " peripheral_ticks=512 retired=" << work << '\n';
+}
+
+void check_all_smp_timestamps() {
+    PcMachine pc(4U << 20);
+    pc.boot_demo();
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {8,2}, true, {},
+                           PcMotherboardC06::CpuClock::Twentyfold);
+    board.enable_threaded_smp(8);
+    auto& cpu = pc.cpu;
+    cpu.reset(0,0x7200);
+    cpu.a20_enabled = true;
+    const std::uint8_t guest[]{
+        0x66,0xb8,0x0b,0,0,0, 0x66,0x31,0xc9, 0x0f,0xa2, // CPUID: EDX = APIC ID
+        0x89,0xd7,0xc1,0xe7,3,                         // DI = APIC ID * 8
+        0x80,0x3e,0,0x44,0, 0x74,0xf9,                  // wait for the common sample gate
+        0x0f,0x31,                                     // RDTSC
+        0x66,0x89,0x85,0,0x36, 0x66,0x89,0x95,4,0x36, // store both halves
+        0xeb,0xfe};
+    cpu.memory.write_block(0x7200, guest, sizeof(guest));
+    cpu.memory.write_block(kStartupVector << 12, guest, sizeof(guest));
+    bool sampling = false;
+    unsigned samples = 0;
+    board.enable_active_clock([&] {
+        const bool advanced = sampling && ++samples >= 2;
+        return PcMachine::RunClock::time_point{} + std::chrono::seconds(advanced ? 1 : 0);
+    });
+    cpu.write32(kLapic + 0x300, 0x000cc500);
+    cpu.write32(kLapic + 0x300, 0x000c8500);
+    cpu.write32(kLapic + 0x300, 0x000c0600 | kStartupVector);
+    board.run(8192);
+    require(board.processors_started() == kProcessors, "All vCPUs must start");
+    cpu.write8(kStartFlag, 1);
+    sampling = true;
+    board.run(8192);
+    for (unsigned id = 0; id < kProcessors; ++id)
+        require(cpu.read64(0x3600 + id * 8) == 4'581'817'600ULL,
+                "64-bit timestamp on vCPU " + std::to_string(id));
+    require(board.active_clock_ticks() == PcMachine::kVirtualCyclesPerSecond, "Peripheral oscillator rate");
+    std::cout << "PRIME_SMP_TSC_PASS vcpus=" << kProcessors << " guest_hz=" << board.guest_tsc_hz() << '\n';
 }
 
 // Complete identical arithmetic on all 16 vCPUs. Count only the loop body,
@@ -814,10 +863,12 @@ int main(int argc, char** argv) {
         using Profile = PcMotherboardC06::CpuClock;
         check_cpu_clock(Profile::Standard, 1);
         check_cpu_clock(Profile::Double, 2);
+        check_cpu_clock(Profile::Twentyfold, 20);
+        check_all_smp_timestamps();
         if (argc == 2 && std::string(argv[1]) == "--measure-cpu-clock") {
             for (unsigned trial = 0; trial < 4; ++trial) {
-                measure_smp_clock(trial % 2 ? Profile::Double : Profile::Standard);
-                measure_smp_clock(trial % 2 ? Profile::Standard : Profile::Double);
+                measure_smp_clock(trial % 2 ? Profile::Twentyfold : Profile::Double);
+                measure_smp_clock(trial % 2 ? Profile::Double : Profile::Twentyfold);
             }
             return 0;
         }

@@ -292,7 +292,7 @@ jobs:
           assert cpu_us is None or cpu_us > 0
           thermal = snapshot["android_thermal_status"]
           assert thermal is None or 0 <= thermal <= 6
-          assert snapshot["cpu_topology"]["guest_tsc_hz"] == 458181760
+          assert snapshot["cpu_topology"]["guest_tsc_hz"] == 4_581_817_600
           host = snapshot["host_cpu"]
           assert host["hint_threads"] == 0, "Android hints must close when the guest stops"
           if host["readable_policies"]:

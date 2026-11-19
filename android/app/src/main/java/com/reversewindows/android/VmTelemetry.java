@@ -203,7 +203,9 @@ final class VmTelemetry extends LinearLayout {
         metric(3, "Bloques encadenados en paralelo", count(number(topology, "parallel_register_continuations")));
         metric(4, "vCPU iniciadas / configuradas", count(number(topology, "started")) + " / "
                 + count(number(topology, "logical_processors")));
-        metric(5, "Reloj virtual (TSC)", units(number(topology, "guest_tsc_hz"), 1_000_000, "MHz", 2));
+        long tscHz = number(topology, "guest_tsc_hz");
+        metric(5, "Reloj virtual (TSC)", tscHz >= 1_000_000_000L
+                ? units(tscHz, 1_000_000_000L, "GHz", 3) : units(tscHz, 1_000_000, "MHz", 2));
         JSONObject host = snapshot.optJSONObject("host_cpu");
         long low = number(host, "min_reported_khz");
         long high = number(host, "max_reported_khz");

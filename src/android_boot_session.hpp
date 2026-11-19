@@ -44,6 +44,7 @@ class AndroidBootSession final {
   static constexpr unsigned kMaxVideoWidth = 960, kMaxVideoHeight = 720;
   static constexpr RamProfile kDefaultRamProfile{2048ULL * 1024 * 1024, 256ULL * 1024 * 1024};
   static constexpr cosmic_pc::CpuTopology kPrimeCpuTopology{8, 2};
+  static constexpr auto kPrimeCpuClock = PcMotherboardC06::CpuClock::Twentyfold;
   static constexpr unsigned kPrimeHostWorkers = 8;
   static constexpr std::uint64_t kPrimeRamBytes = 64ULL << 30;
   static constexpr std::uint64_t kMaxResidentBytes = 1024ULL * 1024 * 1024;

@@ -905,7 +905,7 @@ void verify_active_guest_clock(const std::filesystem::path& path) {
     require(disk.write(0, 1, boot.data()), "Could not write the clock fixture");
   }
   Session session(path, 0, Session::BootSource::Disk, -1, 0, Session::kDefaultRamProfile,
-                  {}, {}, {}, Session::kPrimeCpuTopology, true, reverse_windows::PcMotherboardC06::CpuClock::Double);
+                  {}, {}, {}, Session::kPrimeCpuTopology, true, Session::kPrimeCpuClock);
   require(session.diagnostic(false).find("\"clock_source\":\"guest-cycles\"") != std::string::npos,
           "Firmware must start with the deterministic clock");
   for (unsigned slice = 0; slice < 1024 && !session.is_stopped(); ++slice) {
@@ -920,8 +920,8 @@ void verify_active_guest_clock(const std::filesystem::path& path) {
   constexpr std::uint64_t second = 1'000'000'000, hz = cosmic_pc::PcMachine::kVirtualCyclesPerSecond;
   const auto elapsed = counter(result, "active_clock_elapsed_ns");
   const auto ticks = counter(result, "active_clock_ticks");
-  require(counter(result, "guest_tsc_hz") == 2 * hz * cosmic_pc::Cpu::kTscTicksPerCycle,
-          "The Android profile must publish the doubled TSC rate");
+  require(counter(result, "guest_tsc_hz") == 4'581'817'600ULL,
+          "The Android TSC must run at ten times the 0.3.62 rate");
   require(ticks > 0 && ticks == elapsed / second * hz + elapsed % second * hz / second,
           "Active clock ticks must follow the declared oscillator rate");
   std::cout << "PRIME_ANDROID_ACTIVE_CLOCK_PASS deterministic_firmware=1 long64=1 ticks=" << ticks << '\n';
