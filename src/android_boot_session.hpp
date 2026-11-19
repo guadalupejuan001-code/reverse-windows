@@ -787,6 +787,8 @@ class AndroidBootSession final {
         << ",\"register_b\":" << rtc.register_b
         << ",\"register_c\":" << rtc.register_c
         << ",\"irq8_assertions\":" << rtc.irq8_assertions
+        << ",\"irq8_acknowledgements\":" << rtc.irq8_acknowledgements
+        << ",\"irq8_redirection_low\":" << rtc.irq8_redirection_low
         << ",\"data_writes\":" << rtc.data_writes
         << "},\"ata\":{\"commands\":" << counts.commands
         << ",\"identify_data_transfers\":" << counts.identify_data_transfers
@@ -807,6 +809,8 @@ class AndroidBootSession final {
         << ",\"lapic_software_enabled\":" << (interrupts.software_enabled ? "true" : "false")
         << ",\"lapic_pending_vector\":" << interrupts.pending
         << ",\"lapic_in_service_vector\":" << interrupts.in_service
+        << ",\"lapic_in_service_delivery_id\":" << interrupts.in_service_delivery_id
+        << ",\"lapic_in_service_since_tick\":" << interrupts.in_service_since_tick
         << ",\"lapic_priority\":" << interrupts.priority
         << ",\"lapic_timer_count\":" << interrupts.timer_count
         << ",\"ioapic_select\":" << interrupts.ioapic_select

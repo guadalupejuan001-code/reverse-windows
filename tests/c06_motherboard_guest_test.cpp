@@ -748,6 +748,78 @@ void prime_rtc_cmos_guest() {
   std::cout << "PRIME_RTC_CMOS_X64_PASS rate_hz=2048 pic_irq8=2 ioapic_irq8=2 status_c_read_clear=1\n";
 }
 
+void rtc_irq8_during_service() {
+  constexpr auto lapic = PcMotherboardC06::kLocalApic, ioapic = PcMotherboardC06::kIoApic;
+  constexpr unsigned vector = 0xd1, handler = 0x13000, stack = 0x190000;
+  constexpr unsigned period = (PcMachine::kVirtualCyclesPerSecond + 2047) / 2048;
+  for (bool level : {false, true}) {
+    PcMachine pc(16U << 20);
+    boot32(pc);
+    PcMotherboardC06 board(pc);
+    auto& cpu = pc.cpu;
+    cpu.idtr = {0x1000, 0x15000};
+    cpu.regs[Cpu::ESP] = stack;
+    gate(cpu, vector, handler);
+    code(cpu, handler, {
+        0xe4,0x71,                              // IN AL,71h: acknowledge RTC register C.
+        0xc7,0x05,0xb0,0,0xe0,0xfe,0,0,0,0,    // MOV DWORD [LAPIC EOI],0
+        0xcf                                    // IRETD
+    });
+    const auto step = [&] {
+      need(cpu.step() == cosmic_pc::StepResult::Executed, "IRQ8 handler instruction failed");
+    };
+    const auto next_period = [&] {
+      for (unsigned i = 0; i < period; ++i) board.advance_one();
+    };
+    cpu.write32(lapic + 0xf0, 0x1ff);
+    cpu.write32(ioapic, 0x20);                  // GSI8 redirection, physical destination 0.
+    const auto route = vector | (level ? 1U << 15 : 0);
+    cpu.write32(ioapic + 0x10, route | (1U << 16));
+    cpu.out_hook(0x70, 1, 0x0a); cpu.out_hook(0x71, 1, 0x25);
+    cpu.out_hook(0x70, 1, 0x0b); cpu.out_hook(0x71, 1, 0x42);
+    cpu.out_hook(0x70, 1, 0x0c);
+    cpu.eip = 0xa000;
+    code(cpu, 0xa000, {0xfb,0x90,0xf4});        // STI; NOP clears the interrupt shadow.
+    step();
+    step();
+    next_period();
+    need(board.rtc_evidence().register_c == 0xc0 && board.evidence().apic_irqs == 0,
+         "masked RTC input was not held at the device");
+    cpu.write32(ioapic + 0x10, route);
+    board.advance_one();
+    if (!level) {
+      need(board.evidence().apic_irqs == 0, "unmasking an edge input invented an RTC edge");
+      need(cpu.in_hook(0x71, 1) == 0xc0, "RTC did not acknowledge the masked edge");
+      next_period();
+    }
+    const auto first = board.interrupt_state();
+    need(cpu.eip == handler && first.in_service == vector && first.in_service_delivery_id == 1,
+         level ? "held level IRQ8 was lost on unmask" : "new RTC edge was lost after unmask");
+    step();
+    need(board.rtc_evidence().register_c == 0, "guest IN did not clear the first RTC request");
+    next_period();                              // Another RTC pulse before the first LAPIC EOI.
+    need(board.rtc_evidence().register_c == 0xc0 && board.evidence().apic_irqs == 1,
+         "a second request must wait while the first handler is in service");
+    step();                                     // EOI for the first interrupt.
+    step();                                     // IRETD restores IF.
+    board.advance_one();
+    const auto second = board.interrupt_state();
+    need(cpu.eip == handler && second.in_service == vector && second.in_service_delivery_id == 2 &&
+         second.in_service_since_tick > first.in_service_since_tick && board.evidence().apic_irqs == 2,
+         "RTC request asserted between register C read and EOI was lost");
+    step(); step(); step();
+    board.advance_one();
+    const auto idle = board.interrupt_state();
+    const auto rtc = board.rtc_evidence();
+    need(board.evidence().apic_irqs == 2 && idle.pending == 0 && idle.in_service == 0 &&
+         idle.in_service_delivery_id == 0 && idle.in_service_since_tick == 0 &&
+         cpu.regs[Cpu::ESP] == stack && rtc.irq8_acknowledgements == rtc.irq8_assertions &&
+         rtc.irq8_redirection_low == route && cpu.read32(ioapic + 0x10) == route,
+         "acknowledged RTC request repeated or remained in service");
+  }
+  std::cout << "PRIME_RTC_IRQ8_DURING_SERVICE_PASS vector=0xd1 edge=1 level=1\n";
+}
+
 void prime_pci_inventory() {
   struct Disk final : reverse_windows::BlockDisk {
     std::uint64_t bytes()const noexcept override{return 512;}
@@ -1679,6 +1751,7 @@ int main(){
     pci_acpi_cmos_guest();
     ram_refresh_guest();
     prime_rtc_cmos_guest();
+    rtc_irq8_during_service();
     prime_pci_inventory();
     ioapic_lapic_guest();
     ioapic_id_x64_guest();

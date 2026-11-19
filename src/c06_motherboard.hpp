@@ -49,6 +49,7 @@ class PcMotherboardC06 {
     unsigned pending, in_service, priority;
     std::uint32_t timer_count;
     std::uint32_t ioapic_select, ioapic_id;
+    std::uint64_t in_service_delivery_id, in_service_since_tick;
   };
   struct StartupIpis {
     std::uint64_t init_icr_writes = 0, sipi_icr_writes = 0;
@@ -58,6 +59,8 @@ class PcMotherboardC06 {
     unsigned selected_register, register_a, register_b, register_c;
     bool nmi_masked;
     std::uint64_t irq8_assertions, data_writes;
+    std::uint64_t irq8_acknowledgements;
+    std::uint32_t irq8_redirection_low;
   };
   struct ThreadedSmpStats {
     std::uint64_t dispatches = 0, guest_steps = 0;
@@ -211,6 +214,7 @@ class PcMotherboardC06 {
   unsigned pit_phase_=0;
   std::uint8_t speaker_control_=0;
   std::uint32_t pci_selector_=0;
+  static constexpr unsigned kRtcLine = 8;
   static constexpr std::uint8_t kRtcPeriodic=0x40, kRtcIrq=0x80, kRtcSet=0x80;
   static constexpr std::array<std::uint8_t,8> kRtcCalendar{{0,2,4,6,7,8,9,0x32}};
   std::array<std::uint8_t,128> cmos_ram_{};
@@ -218,6 +222,7 @@ class PcMotherboardC06 {
   std::time_t rtc_utc_offset_=0;
   std::uint64_t rtc_period_ticks_=0,rtc_next_periodic_tick_=UINT64_MAX;
   std::uint64_t rtc_irq8_assertions_=0,rtc_data_writes_=0;
+  std::uint64_t rtc_irq8_acknowledgements_=0;
   std::array<std::uint8_t,256> host_cfg_{},isa_cfg_{};
   std::uint16_t pm_control_=0x0001; // SCI_EN: firmware starts in ACPI mode.
   std::uint16_t pm_status_=0,pm_enable_=0;
@@ -275,6 +280,9 @@ class PcMotherboardC06 {
     std::uint32_t timer_reload = 0, divider = 0;
     std::uint64_t timer_cycles = 0, last_tick = 0;
     ApicPriorityVectors pending, in_service;
+    // A nested interrupt must have a higher priority class than the interrupted one.
+    struct Delivery { std::uint64_t id=0, tick=0; };
+    std::array<Delivery,16> delivery_by_priority{};
     std::bitset<256> pending_level, in_service_level, pending_ata, pending_sci;
     PendingWrite mmio_pending;
   };
@@ -347,7 +355,7 @@ class PcMotherboardC06 {
     active_clock_enabled_=active_clock_running_=waiting_for_guest_mode_=false;
     active_clock_ns_=active_clock_ticks_=clock_tick_remainder_=0;
     clock_polls_=0;
-    rtc_irq8_assertions_=rtc_data_writes_=0;
+    rtc_irq8_assertions_=rtc_irq8_acknowledgements_=rtc_data_writes_=0;
     rtc_schedule_periodic();
     if(ata_)ata_->reset();
     if(data_ata_)data_ata_->reset();
@@ -487,7 +495,14 @@ class PcMotherboardC06 {
     if(rtc_c_&kRtcIrq)return;
     rtc_c_|=kRtcIrq;
     ++rtc_irq8_assertions_;
-    signal_isa_irq(8);
+    signal_isa_irq(kRtcLine);
+  }
+  void resample_rtc_level() {
+    constexpr std::uint32_t level = 1U << 15, masked = 1U << 16;
+    const auto route = io_redir_low_[kRtcLine];
+    if ((rtc_c_ & kRtcIrq) && !io_remote_vector_[kRtcLine] &&
+        (route & (level | masked)) == level && (route & 0xffU) >= 16)
+      route_ioapic(kRtcLine);
   }
   void rtc_update_periodic() {
     if(!rtc_period_ticks_||ticks_<rtc_next_periodic_tick_)return;
@@ -563,6 +578,7 @@ class PcMotherboardC06 {
       case 0x0b:return rtc_b_;
       case 0x0c:{
         rtc_update_periodic();
+        if (rtc_c_ & kRtcIrq) ++rtc_irq8_acknowledgements_;
         return std::exchange(rtc_c_,0);
       }
       case 0x0d:return 0x80;
@@ -767,6 +783,9 @@ class PcMotherboardC06 {
       return (offset-0x320)/16;
     return std::nullopt;
   }
+  std::uint32_t ioapic_redirection_low(unsigned line) const {
+    return io_redir_low_[line] | (io_remote_vector_[line] ? 1U << 14 : 0);
+  }
   std::optional<std::uint32_t> mmio_register(const LocalApic& apic, std::uint64_t base) const {
     if(base>=kLocalApic&&base<kLocalApic+4096) {
       if(!apic.cpu->apic_global_enabled())return std::nullopt;
@@ -802,8 +821,7 @@ class PcMotherboardC06 {
       if(ioapic_select_==1)return 0x00170011U; // version and max RTE 23
       if(ioapic_select_>=0x10&&ioapic_select_<0x40) {
         const unsigned pin=(ioapic_select_-0x10)/2;
-        return (ioapic_select_&1)?io_redir_high_[pin]:
-            io_redir_low_[pin]|(io_remote_vector_[pin]?1U<<14:0);
+        return (ioapic_select_&1)?io_redir_high_[pin]:ioapic_redirection_low(pin);
       }
     }
     return std::nullopt;
@@ -858,6 +876,7 @@ class PcMotherboardC06 {
         const unsigned pin=(ioapic_select_-0x10)/2;
         if(ioapic_select_&1)io_redir_high_[pin]=v&0xff000000U;
         else io_redir_low_[pin]=v&0x1afffU;
+        if(pin==kRtcLine)resample_rtc_level();
         if(pin==AcpiC06::sci_irq&&sci_active_)deliver_sci();
         return true;
       }
@@ -984,7 +1003,10 @@ class PcMotherboardC06 {
     for (unsigned line = 0; line < io_remote_vector_.size(); ++line) {
       if (io_remote_vector_[line] != vector) continue;
       io_remote_targets_[line] &= ~(1U << apic.cpu->apic_id());
-      if (!io_remote_targets_[line]) io_remote_vector_[line] = 0;
+      if (!io_remote_targets_[line]) {
+        io_remote_vector_[line] = 0;
+        if (line == kRtcLine) resample_rtc_level();
+      }
     }
     if(sci_active_)deliver_sci();
   }
@@ -1060,6 +1082,7 @@ class PcMotherboardC06 {
       apic.pending_ata.reset(vector);
       apic.pending_sci.reset(vector);
       ++apic_irqs_; ++irq_delivered_;
+      apic.delivery_by_priority[vector >> 4] = {apic_irqs_, ticks_};
     }
     return true;
   }
@@ -1199,8 +1222,8 @@ class PcMotherboardC06 {
       pm_status_|=1U;
       update_sci();
     }
-    // A level interrupt stays asserted if the guest enables its LAPIC
-    // after the PM event arose.
+    // A held input can gain a destination after the guest enables or retargets its LAPIC.
+    resample_rtc_level();
     if(sci_active_&&(io_redir_low_[AcpiC06::sci_irq]&0x8000U))deliver_sci();
     if(keyboard_&&keyboard_->needs_irq()&&!(prior_in_(0x64,1).value_or(0)&1U)){
       signal_isa_irq(1);
@@ -1807,9 +1830,11 @@ class PcMotherboardC06 {
     return {ticks_,irq_delivered_,pit_irqs_,apic_irqs_,true,true,powered_off_,ata_irq_delivered_,sci_irqs_};
   }
   InterruptState interrupt_state()const{
+    const auto vector = bsp().in_service.highest();
+    const auto delivery = bsp().delivery_by_priority[vector >> 4]; // Class zero is never delivered.
     return {pc_.cpu.apic_global_enabled(),lapic_on(bsp()),bsp().pending.highest(),
-            bsp().in_service.highest(),processor_priority(bsp()),timer_count(bsp()),
-            ioapic_select_,ioapic_id_};
+            vector,processor_priority(bsp()),timer_count(bsp()),ioapic_select_,ioapic_id_,
+            delivery.id,delivery.tick};
   }
   bool secondary_can_run() const noexcept {
     for (unsigned id = 1; id < processor_count_; ++id)
@@ -1823,7 +1848,7 @@ class PcMotherboardC06 {
   StartupIpis startup_ipis() const noexcept { return startup_ipis_; }
   RtcEvidence rtc_evidence() const noexcept {
     return {cmos_index_&0x7fU,rtc_a_,rtc_b_,rtc_c_,bool(cmos_index_&0x80U),
-            rtc_irq8_assertions_,rtc_data_writes_};
+            rtc_irq8_assertions_,rtc_data_writes_,rtc_irq8_acknowledgements_,ioapic_redirection_low(kRtcLine)};
   }
   unsigned worker_count() const noexcept { return workers_ ? workers_->size() : 1; }
   unsigned host_workers_capacity() const noexcept { return std::min(worker_limit_, processor_count_); }
