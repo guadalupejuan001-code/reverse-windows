@@ -19,7 +19,7 @@ android {
     ndkVersion '27.2.12479018'
 
     defaultConfig {
-        applicationId(etherPreview ? 'com.reversewindows.android.prime.ram.r083' : 'com.reversewindows.android')
+        applicationId(etherPreview ? 'com.reversewindows.android.prime.smp.r083' : 'com.reversewindows.android')
         minSdk 26
         targetSdk 35
         versionCode 88
