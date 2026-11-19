@@ -73,6 +73,7 @@ final class VmWorker {
     private static final long RAM_SAMPLE_INTERVAL_MS = 10_000;
     private static final long RAM_RECLAIM_SAMPLE_INTERVAL_MS = 1_000;
     private static final long RAM_RECLAIM_INTERVAL_MS = 16;
+    private static final long RAM_PREPARE_INTERVAL_MS = 50;
     private static final String DIAGNOSTIC_FILE = "ultimo-diagnostico.json";
 
     private final Context context;
@@ -119,6 +120,7 @@ final class VmWorker {
     private final Runnable slice = this::runSlice;
     private final Runnable ramMaintenance = this::maintainRam;
     private boolean reclaimRam;
+    private boolean reclaimPending;
     private long nextRamSample;
 
     VmWorker(Context context, File disk, File dataDisk, Listener listener) {
@@ -284,6 +286,7 @@ final class VmWorker {
                 running = true;
                 publishState(true);
                 reclaimRam = false;
+                reclaimPending = false;
                 nextRamSample = 0;
                 if (foreground) scheduleRam(RAM_SAMPLE_INTERVAL_MS);
                 requestFrame();
@@ -417,14 +420,17 @@ final class VmWorker {
                 more = NativeMachine.refreshRamPressure(context, handle, reclaimRam);
                 nextRamSample = now + RAM_SAMPLE_INTERVAL_MS;
             } else {
-                more = NativeMachine.maintainRamBudget(handle);
+                more = reclaimPending && NativeMachine.maintainRamBudget(handle);
             }
+            reclaimPending = more;
             if (more) {
                 if (foreground)
                     nextRamSample = Math.min(nextRamSample, now + RAM_RECLAIM_SAMPLE_INTERVAL_MS);
                 scheduleRam(RAM_RECLAIM_INTERVAL_MS);
             } else if (foreground) {
-                scheduleRam(Math.max(0, nextRamSample - SystemClock.uptimeMillis()));
+                final boolean preparing = running && NativeMachine.prepareRamReclaim(handle);
+                final long untilSample = Math.max(0, nextRamSample - SystemClock.uptimeMillis());
+                scheduleRam(preparing ? Math.min(RAM_PREPARE_INTERVAL_MS, untilSample) : untilSample);
             }
         } catch (RuntimeException | LinkageError error) {
             Log.w(TAG, "No se pudo ajustar el respaldo de RAM", error);

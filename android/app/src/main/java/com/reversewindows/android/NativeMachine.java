@@ -81,6 +81,7 @@ final class NativeMachine {
     private static native boolean sampleRamPressure(long handle, long available, long threshold,
                                                     boolean lowMemory);
     static native boolean maintainRamBudget(long handle);
+    static native boolean prepareRamReclaim(long handle);
     static native boolean key(long handle, int ascii, int scanCode, boolean pressed);
     static native void flush(long handle);
     static native String diagnostic(long handle, boolean detailed);

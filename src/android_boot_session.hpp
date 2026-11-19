@@ -116,7 +116,9 @@ class AndroidBootSession final {
     const auto encode_before = spill_.file ? spill_.file->codec_stats().encode.wall_ns : 0;
     const auto started = Clock::now();
     try {
-      pressure_.status = memory.adjust_payload_budget(pressure_.target, 128, started + kRamReclaimWindow);
+      const auto clean_pages = spill_.file && high_ram_profile(memory.size()) ? kPrimeCleanReservePages : 0;
+      pressure_.status = memory.adjust_payload_budget(pressure_.target, 128, started + kRamReclaimWindow,
+                                                     clean_pages);
       pressure_.error.clear();
     } catch (const std::exception& error) {
       pressure_.status = Adjustment::Blocked;
@@ -135,7 +137,35 @@ class AndroidBootSession final {
     const auto resident_after = after + cache_after;
     pressure_.last_released_bytes = resident_before - std::min(resident_before, resident_after);
     pressure_.released_bytes += pressure_.last_released_bytes;
+    if (elapsed <= kRamReclaimWindow) pressure_.released_within_window += pressure_.last_released_bytes;
     return pressure_.status == Adjustment::Reclaiming;
+  }
+
+  bool prepare_ram_reclaim() {
+    using Clock = cosmic_pc::SparseRam::ReclaimClock;
+    using Adjustment = cosmic_pc::SparseRam::BudgetAdjustment;
+    auto& memory = pc_.cpu.memory;
+    const auto budget = memory.budget_bytes();
+    if (!spill_.file || !high_ram_profile(memory.size()) || !pressure_.target ||
+        pressure_.low_memory || pressure_.status != Adjustment::Applied ||
+        memory.allocated_bytes() < budget - budget / 4) return false;
+    const auto goal = std::min(kPrimeCleanReservePages, memory.allocated_pages() / 16);
+    if (memory.clean_backing_pages() >= goal) return false;
+
+    const auto start = Clock::now();
+    const auto progress = memory.prepare_reclaim(goal, start + kRamPrepareWindow);
+    const auto elapsed = Clock::now() - start;
+    auto& prep = pressure_.preparation;
+    ++prep.batches;
+    prep.backed_pages += progress.backed_pages;
+    prep.compact_up_to_2k += progress.compact_up_to_2k;
+    prep.compact_up_to_3k += progress.compact_up_to_3k;
+    prep.dense_pages += progress.dense_pages;
+    prep.released_bytes += progress.released_bytes;
+    prep.failures += progress.backing_failed;
+    prep.max_time = std::max(prep.max_time, elapsed);
+    if (elapsed > kRamPrepareWindow) ++prep.overruns;
+    return !progress.backing_failed && elapsed <= kRamPrepareWindow && memory.clean_backing_pages() < goal;
   }
 
   AndroidBootSession(std::filesystem::path disk, unsigned create_gib,
@@ -705,6 +735,8 @@ class AndroidBootSession final {
 
  private:
   static constexpr auto kRamReclaimWindow = std::chrono::milliseconds(3);
+  static constexpr auto kRamPrepareWindow = std::chrono::microseconds(750);
+  static constexpr std::size_t kPrimeCleanReservePages = (32 * 1024 * 1024) / cosmic_pc::SparseRam::kPageSize;
 
   static bool high_ram_profile(std::uint64_t physical) noexcept {
     return physical > cosmic_pc::PcMachine::kLegacyPhysicalLimit;
@@ -727,6 +759,11 @@ class AndroidBootSession final {
   }
 
   struct RamPressure {
+    struct Preparation {
+      std::uint64_t batches = 0, backed_pages = 0, failures = 0, overruns = 0;
+      std::uint64_t compact_up_to_2k = 0, compact_up_to_3k = 0, dense_pages = 0, released_bytes = 0;
+      std::chrono::steady_clock::duration max_time{};
+    } preparation;
     std::uint64_t target = 0;
     std::uint64_t available = 0, threshold = 0, reserve = 0;
     bool low_memory = false;
@@ -735,7 +772,7 @@ class AndroidBootSession final {
     std::string error;
     std::chrono::steady_clock::duration maintenance_time{}, last_maintenance{}, max_maintenance{};
     std::uint64_t maintenance_batches = 0, reclaimed_bytes = 0, encode_ns = 0;
-    std::uint64_t last_released_bytes = 0, released_bytes = 0;
+    std::uint64_t last_released_bytes = 0, released_bytes = 0, released_within_window = 0;
   };
 
   struct SpillInfo {
@@ -763,7 +800,8 @@ class AndroidBootSession final {
                                                       defer_pressure_packing);
       auto* file_stats = file.get();
       using CachePolicy = cosmic_pc::SparseRam::BackingCachePolicy;
-      memory.attach_page_backing(std::move(file), packed ? CachePolicy::Adaptive : CachePolicy::Fixed);
+      if (packed) memory.attach_page_backing(std::move(file), CachePolicy::Adaptive, kPrimeCleanReservePages);
+      else memory.attach_page_backing(std::move(file), CachePolicy::Fixed);
       info.file = file_stats;
       info.state = "file";
     } catch (const std::exception& error) {
@@ -825,7 +863,21 @@ class AndroidBootSession final {
           << ",\"pressure_spill_encode_ns\":" << pressure->encode_ns
           << ",\"pressure_reclaimed_bytes\":" << pressure->reclaimed_bytes
           << ",\"pressure_last_released_resident_bytes\":" << pressure->last_released_bytes
-          << ",\"pressure_released_resident_bytes\":" << pressure->released_bytes;
+          << ",\"pressure_released_resident_bytes\":" << pressure->released_bytes
+          << ",\"pressure_within_window_released_bytes\":" << pressure->released_within_window
+          << ",\"reclaim_preparation\":{\"batches\":" << pressure->preparation.batches
+          << ",\"backed_pages\":" << pressure->preparation.backed_pages
+          << ",\"released_bytes\":" << pressure->preparation.released_bytes
+          << ",\"compact_up_to_2k\":" << pressure->preparation.compact_up_to_2k
+          << ",\"compact_2k_to_3k\":" << pressure->preparation.compact_up_to_3k
+          << ",\"dense_pages\":" << pressure->preparation.dense_pages
+          << ",\"failures\":" << pressure->preparation.failures
+          << ",\"overruns\":" << pressure->preparation.overruns
+          << ",\"window_us\":"
+          << std::chrono::duration_cast<std::chrono::microseconds>(kRamPrepareWindow).count()
+          << ",\"max_us\":"
+          << std::chrono::duration_cast<std::chrono::microseconds>(pressure->preparation.max_time).count()
+          << '}';
     }
     out
         << ",\"spill_mode\":" << cosmic_pc::PcMachine::quote(spill.state)

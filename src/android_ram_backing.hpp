@@ -93,10 +93,15 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
       for (std::size_t i = 0; i < count; ++i) pages[i] = {writes[i].page, writes[i].bytes};
       raw_->write_pages(pages.data(), count);
     }
-    if (count > 1) {
-      ++write_batches_;
-      grouped_pages_ += count;
-    }
+    record_group(count);
+    return count;
+  }
+
+  std::size_t prepare_pages(const PageWrite* writes, std::size_t count,
+                            cosmic_pc::SparseRam::ReclaimClock::time_point deadline) override {
+    if (!count || count > kMaxWritePages) throw std::invalid_argument("Tanda de preparación de RAM inválida.");
+    count = packed_ ? packed_->prepare_pages(writes, count, deadline) : 0;
+    record_group(count);
     return count;
   }
 
@@ -272,6 +277,20 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
       if (!acquire_write_lock(lock, paced)) return yield_batch();
       pages.write_pages(prepared.data(), processed);
       return processed;
+    }
+
+    std::size_t prepare_pages(const PageWrite* writes, std::size_t count,
+                              Clock::time_point deadline) {
+      // The copies are optional. Preserve room for a pressure batch and
+      // a relocation, and yield instead of waiting on the encoder.
+      std::unique_lock<std::mutex> lock(io_mutex, std::try_to_lock);
+      if (!lock || Clock::now() >= deadline || !pages.room_for_raw(count + kMaxWritePages + 1))
+        return 0;
+      std::array<qssd::PackedTransientPages::PageWrite, kMaxWritePages> prepared;
+      for (std::size_t i = 0; i < count; ++i)
+        prepared[i] = {writes[i].page, writes[i].bytes, false};
+      pages.write_pages(prepared.data(), count);
+      return count;
     }
 
     bool encode_page(const std::uint8_t* page, Buffer& target) {
@@ -501,6 +520,13 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
   };
 
   std::unique_ptr<qssd::TransientPages> raw_;
+  void record_group(std::size_t count) noexcept {
+    if (count > 1) {
+      ++write_batches_;
+      grouped_pages_ += count;
+    }
+  }
+
   std::unique_ptr<Packed> packed_;
   std::uint64_t write_batches_ = 0, grouped_pages_ = 0;
 };

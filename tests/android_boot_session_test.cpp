@@ -829,6 +829,18 @@ void verify_late_prime_pressure(const std::filesystem::path& path) {
               counter(recovered, "usable_bytes") == Session::kPrimeRamBytes,
           "Recovering headroom must keep remaining guest pages and the original E820 map");
 
+  live.sample_ram_pressure(threshold + 34 * mib, threshold, false);
+  require(!live.maintain_ram_budget(), "Stable RAM budget must allow preparation before pressure");
+  for (unsigned pass = 0; pass < 32; ++pass) {
+    live.prepare_ram_reclaim();
+    if (counter(live.diagnostic(false), "compact_up_to_2k")) break;
+  }
+  const auto prepared = live.diagnostic(false);
+  require(counter(prepared, "compact_up_to_2k") > 0 &&
+              counter(prepared, "resident_bytes") < counter(recovered, "resident_bytes") &&
+              counter(prepared, "usable_bytes") == Session::kPrimeRamBytes,
+          "The live preparation route must compact 40-word pages before pressure");
+
   live.sample_ram_pressure(UINT64_MAX, 0, false);
   require(!live.maintain_ram_budget() &&
               counter(live.diagnostic(false), "backing_budget_bytes") == profile.physical_bytes,
@@ -837,6 +849,41 @@ void verify_late_prime_pressure(const std::filesystem::path& path) {
             << " first_batch_spills=" << spills
             << " maintenance_us=" << counter(partial, "pressure_maintenance_us")
             << " stale_reclaim_stopped=1 logical_gib=64\n";
+}
+
+void verify_prepared_ram_backing(const std::filesystem::path& directory) {
+  using Ram = cosmic_pc::SparseRam;
+  using Clock = Ram::ReclaimClock;
+  constexpr std::size_t count = 256, bytes = count * Ram::kPageSize;
+  Ram ram(2 * bytes, 2 * bytes);
+  auto backing = std::make_unique<reverse_windows::AndroidRamBacking>(directory, ram.size(), 2 * bytes, true);
+  auto* file = backing.get();
+  ram.attach_page_backing(std::move(backing));
+  std::vector<std::uint8_t> data(bytes), recovered(bytes);
+  for (std::uint64_t i = 0; i < data.size() / sizeof(i); ++i)
+    std::memcpy(data.data() + i * sizeof(i), &i, sizeof(i));
+  ram.write_block(0, data.data(), data.size());
+  for (unsigned pass = 0; pass < 32 && ram.clean_backing_pages() < count; ++pass)
+    ram.prepare_reclaim(count, Clock::time_point::max());
+  const auto writes = file->write_calls();
+  require(ram.clean_backing_pages() == count && ram.allocated_bytes() == bytes &&
+              file->codec_stats().encode_attempts == 0 && writes > 0,
+          "Prime must prepare a raw file-backed reserve while keeping exact resident pages");
+
+  const auto start = Clock::now();
+  const auto first = ram.adjust_payload_budget(0, 128, start + std::chrono::milliseconds(3), count);
+  const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count();
+  const auto first_released = bytes - ram.allocated_bytes();
+  auto status = first;
+  for (unsigned pass = 0; status == Ram::BudgetAdjustment::Reclaiming && pass < 16; ++pass)
+    status = ram.adjust_payload_budget(0, 128, Clock::now() + std::chrono::milliseconds(3), count);
+  ram.read_block(0, recovered.data(), recovered.size());
+  require(status == Ram::BudgetAdjustment::Applied && ram.metrics().backing_clean_reclaims == count &&
+              file->write_calls() == writes && recovered == data,
+          "Reclaim must drop the prepared copies without I/O writes and preserve every byte");
+  std::cout << "PRIME_RAM_PREPARED_RECLAIM_PASS ready_pages=" << count
+            << " first_released_bytes=" << first_released << " first_reclaim_us=" << elapsed
+            << " writes_at_reclaim=0 exact=1\n";
 }
 
 void verify_active_guest_clock(const std::filesystem::path& path) {
@@ -1003,6 +1050,7 @@ int main(int argc, char** argv) {
     verify_ram_spill(dir.path);
     verify_packed_ram64(dir.path);
     verify_deferred_ram_reclaim(dir.path);
+    verify_prepared_ram_backing(dir.path);
     verify_shared_ram(dir.path);
     verify_real_mode_ps2(dir.path / "keyboard-irq.rqvd", true);
     verify_real_mode_ps2(dir.path / "keyboard-poll.rqvd", false);

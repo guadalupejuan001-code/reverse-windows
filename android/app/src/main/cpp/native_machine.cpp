@@ -207,6 +207,15 @@ JNIEXPORT jboolean JNICALL Java_com_reversewindows_android_NativeMachine_maintai
     });
 }
 
+JNIEXPORT jboolean JNICALL Java_com_reversewindows_android_NativeMachine_prepareRamReclaim(
+        JNIEnv* env, jclass, jlong handle) {
+    return call<jboolean>(env, JNI_FALSE, [&] {
+        return session(handle, [](Session& machine) -> jboolean {
+            return machine.prepare_ram_reclaim() ? JNI_TRUE : JNI_FALSE;
+        });
+    });
+}
+
 JNIEXPORT void JNICALL Java_com_reversewindows_android_NativeMachine_flush(
         JNIEnv* env, jclass, jlong handle) {
     call(env, false, [&] {
