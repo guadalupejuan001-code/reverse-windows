@@ -4,6 +4,7 @@
         android:enableOnBackInvokedCallback="false"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:label="${appLabel}"
         android:theme="@style/AppTheme">
         <activity
