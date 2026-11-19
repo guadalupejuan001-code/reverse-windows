@@ -409,6 +409,7 @@ int main(int argc, char** argv) {
         const auto final_json = pc.json();
         const auto* ata = motherboard.attached_ata();
         const auto ata_stats = ata ? ata->counters() : reverse_windows::AtaC07::Counters{};
+        const auto ata_hz = motherboard.ata_clock_hz();
         std::ostringstream graphics;
         if (const auto* gpu = motherboard.attached_gpu()) {
             graphics << ",\"guest_gpu\":";
@@ -441,7 +442,9 @@ int main(int argc, char** argv) {
                std::to_string(ata_stats.read_sectors) + ",\"write_sectors\":" +
                std::to_string(ata_stats.write_sectors) + ",\"flushes\":" +
                std::to_string(ata_stats.flushes) + ",\"irq14_delivered\":" +
-               std::to_string(platform.ata_irqs) + "}" +
+               std::to_string(platform.ata_irqs) + ",\"clock_hz\":" + std::to_string(ata_hz) +
+               ",\"clock_cycles\":" + std::to_string(motherboard.device_clock_cycles(ata_hz)) +
+               ",\"last_command_cycle\":" + std::to_string(ata_stats.last_command_cycle) + "}" +
             ",\"motherboard_c06\":{\"pci_config\":true,\"acpi_tables\":true,\"apic_full\":false,\"irq_delivered\":" +
                std::to_string(platform.irq_delivered) + ",\"pit_irqs\":" +
                std::to_string(platform.pit_irqs) + ",\"apic_irqs\":" +

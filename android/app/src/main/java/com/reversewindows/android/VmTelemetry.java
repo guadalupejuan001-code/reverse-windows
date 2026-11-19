@@ -240,6 +240,10 @@ final class VmTelemetry extends LinearLayout {
         metric(1, "Archivo QSSD en el teléfono", storage(number(disk, "physical_bytes")));
         metric(2, "Operaciones guardadas", count(number(disk, "commits")));
         int rows = 3;
+        long ataHz = number(snapshot.optJSONObject("ata"), "clock_hz");
+        if (ataHz > 0) {
+            metric(rows++, "Reloj del controlador ATA virtual", frequency(ataHz));
+        }
         if (disk != null && disk.has("clock_hz")) {
             metric(rows++, "Reloj del QSSD virtual", frequency(number(disk, "clock_hz")));
         }

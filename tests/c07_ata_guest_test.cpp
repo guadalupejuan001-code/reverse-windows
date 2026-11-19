@@ -1,6 +1,7 @@
 #include "c06_motherboard.hpp"
 #include "c07_ata.hpp"
 #include "qssd_disk.hpp"
+#include "virtual_disk.hpp"
 #include "bios_hard_disk.hpp"
 #include "pc_machine.hpp"
 #include <array>
@@ -394,6 +395,54 @@ void test_corrupt_and_torn(const std::string& path){
   std::cout<<"C07_QSSD_CORRUPT_REJECT_TORN_RECOVER_PASS\n";
 }
 
+void read_ide_config(std::vector<std::uint8_t>& code,unsigned offset,std::uint32_t dest) {
+  out32(code,0xcf8,0x80001000U | offset);
+  in32_store(code,0xcfc,dest);
+}
+
+void test_raw_controller_clock(const std::string& path) {
+  using reverse_windows::AtaC07;
+  reverse_windows::DiskImage::create(path,1);
+  reverse_windows::DiskImage disk(path);
+  PcMachine pc(16*1024*1024);boot32(pc);
+  PcMotherboardC06 board(pc,&disk);
+  std::vector<std::uint8_t> code;
+  out8(code,0x3f6,2);
+  out8(code,0x1f7,0xec);rep_words(code,true,0xa000);
+  for (unsigned offset : {0x40U,0x44U}) {
+    out32(code,0xcf8,0x80001000U | offset);
+    out32(code,0xcfc,0);  // The guest cannot overwrite the fixed frequency.
+    in32_store(code,0xcfc,0x9600 + offset - 0x40);
+  }
+  read_ide_config(code,0x48,0x9608);
+  read_ide_config(code,0x4c,0x960c);
+  ins(code,{0xf4});program(pc,code);
+  need(pc.cpu.read64(0xa000 + 129*2) == 0 && pc.cpu.read64(0x9600) == 4'500'000'000'000ULL,
+       "The PCI ATA controller must expose its own 4.5 THz clock with an unclocked raw disk");
+  need(pc.cpu.read64(0x9608) > 0,"The ATA oscillator must advance in firmware");
+  const auto raw_command = board.attached_ata()->counters().last_command_cycle;
+  need(raw_command > 0 && raw_command < pc.cpu.read64(0x9608),
+       "The raw disk command must be timestamped by the controller before the PCI sample");
+  pc.reset();
+  need(board.device_clock_cycles(board.ata_clock_hz()) == 0,"Machine reset must restart the ATA clock");
+
+  // Resolve a single edge, including wrap, below the platform clock's 1 ns resolution.
+  std::uint64_t cycle = UINT64_MAX;
+  AtaC07 ata(disk,{},AtaC07::Unit::Master,[&](std::uint64_t hz) {
+    need(hz == 4'500'000'000'000ULL,"SRST must use the controller oscillator");
+    return cycle;
+  });
+  ata.output(AtaC07::kControl,1,4);
+  ata.output(AtaC07::kControl,1,0);
+  ata.output(AtaC07::kLast,1,0xec);
+  need(ata.input(AtaC07::kControl,1) == 0x80 && !ata.ready() && ata.counters().commands == 0,
+       "The ATA task file must stay busy until the next controller edge");
+  ++cycle;
+  need(ata.input(AtaC07::kLast,1) == 0x50 && ata.ready(),"The first edge must release SRST");
+  ata.output(AtaC07::kLast,1,0xec);
+  need(ata.status() == 0x58 && ata.counters().identifies == 1,"IDENTIFY must resume after SRST");
+}
+
 void test_max_data_disk(const std::string& boot_path,const std::string& data_path){
   constexpr auto capacity=QssdDisk::kMaxLogicalBytes;
   constexpr auto last_sector=capacity/QssdDisk::kSectorSize-1;
@@ -446,6 +495,9 @@ void test_max_data_disk(const std::string& boot_path,const std::string& data_pat
     need(board.attached_data_ata()->counters().write_sectors==1&&
          board.attached_ata()->counters().write_sectors==0,
          "ATA wrote through the wrong device");
+    need(board.attached_data_ata()->counters().last_command_cycle > data_ticks &&
+         board.attached_ata()->counters().last_command_cycle == pc.cpu.read64(0xa400 + 133*2),
+         "Each unit must timestamp its last accepted command on the common ATA clock");
 
     PcMachine::RunClock::time_point now{};
     std::chrono::nanoseconds interval{};
@@ -457,6 +509,9 @@ void test_max_data_disk(const std::string& boot_path,const std::string& data_pat
     });
     std::vector<std::uint8_t> probe{0xfa};  // CLI before polling the primary drive.
     out8(probe,0x1f6,0xe0); out8(probe,0x1f7,0xec); rep_words(probe,true,0xa400);
+    read_ide_config(probe,0x4c,0x9610);  // High half of the previous sample.
+    read_ide_config(probe,0x48,0x9618);
+    read_ide_config(probe,0x4c,0x961c);
     ins(probe,{0xf4});
     pc.cpu.memory.write_block(0xd000,probe.data(),probe.size());
     const auto read_ticks = [&](std::chrono::nanoseconds elapsed) {
@@ -468,12 +523,21 @@ void test_max_data_disk(const std::string& boot_path,const std::string& data_pat
       return pc.cpu.read64(0xa400 + 133*2);
     };
     const auto first = read_ticks(std::chrono::nanoseconds::zero());
+    const auto ata_first = pc.cpu.read64(0x9618);
     const auto second = read_ticks(std::chrono::seconds(1));
+    const auto ata_second = pc.cpu.read64(0x9618);
     need(second - first == qssd_hz, "One active guest second must advance 4.5 trillion QSSD cycles");
+    need(ata_second - ata_first == 4'500'000'000'000ULL && pc.cpu.read32(0x9610) == (ata_first >> 32),
+         "PCI must latch all 64 bits and count exactly 4.5 trillion ATA cycles per active second");
     now += std::chrono::hours(1);  // VM paused between runs.
     board.set_experimental_tsc(true);
     need(read_ticks(std::chrono::nanoseconds(1)) - second == 4500,
          "QSSD time must exclude the pause and keep its rate across a CPU clock change");
+    const auto ata_delta = pc.cpu.read64(0x9618) - ata_second;
+    need(ata_delta == 4500 && pc.cpu.read32(0x9610) == (ata_second >> 32),
+         "The ATA clock must exclude paused time and remain independent of the CPU rate");
+    std::cout << "C07_ATA_CLOCK_PASS active_second_cycles=" << ata_second - ata_first
+              << " active_nanosecond_cycles=" << ata_delta << "\n";
   }
   QssdDisk reopened(data_path,QssdDisk::Access::ReadOnly);
   need(reopened.read(last_sector,1,read.data())&&read==payload,
@@ -488,7 +552,10 @@ int main(){
      ("reverse-ata-c07-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   const auto path=root.string()+".rqvd";
   const auto data_path=root.string()+".data.rqvd";
+  const auto raw_path=root.string()+".rvdisk";
   try{
+    test_raw_controller_clock(raw_path);
+    std::filesystem::remove(raw_path);
     QssdDisk::create(path,256);
     run_device(path);
     test_corrupt_and_torn(path);
@@ -501,6 +568,7 @@ int main(){
   }catch(const std::exception& e){
     std::cerr<<"REVERSE_WINDOWS_C07_REAL_ATA_FAIL "<<e.what()<<"\n";
     std::error_code ignored;std::filesystem::remove(path,ignored);
+    std::filesystem::remove(raw_path,ignored);
     std::filesystem::remove(data_path,ignored);
     return 1;
   }

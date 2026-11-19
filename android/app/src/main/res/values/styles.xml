@@ -22,7 +22,13 @@
     <item name="vm_boot_iso" type="id" />
     <item name="vm_boot_disk" type="id" />
     <item name="vm_bios_test" type="id" />
+    <item name="vm_console" type="id" />
+    <item name="vm_display" type="id" />
     <item name="vm_console_menu" type="id" />
+    <item name="vm_console_fault" type="id" />
+    <item name="vm_keyboard" type="id" />
+    <item name="vm_toggle_keyboard" type="id" />
+    <item name="vm_toggle_pointer" type="id" />
     <item name="vm_left_click" type="id" />
     <item name="vm_right_click" type="id" />
     <item name="vm_touchpad" type="id" />

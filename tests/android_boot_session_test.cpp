@@ -1269,12 +1269,12 @@ int main(int argc, char** argv) {
       require(counter(progress, "host_workers_capacity") == 8,
               "Prime Android must retain a separate eight-worker host limit");
       const auto live = session.diagnostic(false);
-      for (const char* field : {"\"disk\":{", "\"data_disk\":{"}) {
+      for (const char* field : {"\"ata\":{", "\"disk\":{", "\"data_disk\":{"}) {
         const auto begin = live.find(field);
-        require(begin != std::string::npos, "Missing disk in live telemetry");
+        require(begin != std::string::npos, "Missing storage device in live telemetry");
         const auto entry = live.substr(begin, live.find('}', begin) - begin);
         require(counter(entry, "clock_hz") == 4'500'000'000'000ULL && counter(entry, "clock_cycles") > 0,
-                "Boot and data QSSDs must expose their active device clock");
+                "ATA and both QSSDs must expose their active clocks");
       }
       require(live.size() < progress.size() && live.find("\"boot_profile\":") == std::string::npos &&
                   live.find("\"status\":\"waiting_key\"") != std::string::npos &&
