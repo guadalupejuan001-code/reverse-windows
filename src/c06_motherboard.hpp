@@ -1434,6 +1434,7 @@ class PcMotherboardC06 {
     auto& apic = apics_[id];
     auto& cpu = *apic.cpu;
     unsigned dispatches = 0;
+    std::optional<std::uint64_t> rejected_vector_ip;
     for (unsigned used = 0; used < budget;) {
       // The workers have joined before shared RAM or devices can change.
       if ((dispatches++ & 7U) == 0) {
@@ -1483,11 +1484,16 @@ class PcMotherboardC06 {
           continue;
         }
       }
-      if (pc_.boot_acceleration_enabled() && cpu.state_vector_batch_candidate()) {
+      if (pc_.boot_acceleration_enabled() && cpu.state_vector_batch_candidate() &&
+          rejected_vector_ip != cpu.eip) {
+        const auto entry = cpu.eip;
         if (const auto vector_steps = cpu.try_state_vector_batch(secondary_batch_limit(apic, remaining))) {
           used += vector_steps;
           continue;
         }
+        // Do not decode the same rejected loop on every backedge of this grant.
+        // Scalar execution remains exact, and the next grant retries changed code or state.
+        rejected_vector_ip = entry;
       }
       const auto result = cpu.step();
       if (result == cosmic_pc::StepResult::Faulted) faulted_processor_ = id;

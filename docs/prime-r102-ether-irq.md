@@ -10,6 +10,8 @@ La sesión Android habilita la traducción ARM64, el planificador SMP y el reloj
 
 Los procesadores secundarios también llaman a `Cpu::try_rep_batch` con el presupuesto de la placa y la misma exclusión del bus que las operaciones escalares. Éter comprueba instrucciones, permisos, límites de página y solapamientos. El diagnóstico incluye los elementos y bytes procesados en `ether_next.secondary_rep_elements` y `secondary_rep_bytes`.
 
+Si el intérprete de vectores descarta un bucle, la vCPU ejecuta sus instrucciones y vuelve a evaluar esa dirección en su siguiente turno. Así evita decodificar repetidamente un bucle que ya ha rechazado durante el turno actual.
+
 ## Cómo comprobar el resultado
 
 Con los componentes fijados por el proyecto y una copia de r101 en la ruta indicada, ejecutar desde la raíz del proyecto
