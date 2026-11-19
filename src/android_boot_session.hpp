@@ -564,7 +564,6 @@ class AndroidBootSession final {
     out << ",\"cpu_topology\":{\"sockets\":1,\"cores\":" << topology.cores
         << ",\"threads_per_core\":" << topology.threads_per_core
         << ",\"logical_processors\":" << topology.logical_processors()
-        << ",\"guest_tsc_hz\":" << board_->guest_tsc_hz()
         << ",\"started\":" << board_->processors_started()
         << ",\"host_workers\":" << board_->worker_count()
         << ",\"host_workers_capacity\":" << board_->host_workers_capacity()
@@ -604,7 +603,7 @@ class AndroidBootSession final {
         out << (id ? "," : "") << board_->processor_state_vector_interpreter_steps(id);
       out << ']';
     }
-    out << '}';
+    out << ",\"guest_tsc_hz\":" << board_->guest_tsc_hz() << '}';
     if (const auto workers = board_->ether_x86_session_workers()) {
       out << ",\"ether_x86_sessions\":{\"host_workers\":" << workers << ",\"by_vcpu\":[";
       for (unsigned id = 0; id < topology.logical_processors(); ++id) {
