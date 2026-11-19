@@ -693,7 +693,8 @@ class AndroidBootSession final {
     const auto& boot_work = pc_.boot_acceleration();
     const auto batched_steps = boot_work.rep_elements + boot_work.shift_loop_steps +
         boot_work.zero_loop_steps + boot_work.scan_loop_steps + boot_work.counter_loop_steps +
-        boot_work.affine_ram_rotate_steps + boot_work.movntdq_store_steps + execution.state_vector_interpreter_steps;
+        boot_work.affine_ram_rotate_steps + boot_work.movntdq_store_steps + board_->secondary_store_steps() +
+        execution.state_vector_interpreter_steps;
     const auto accelerated_steps = execution.ether_steps + batched_steps;
     out << ",\"ether_coverage\":{\"phase_steps\":" << execution.guest_steps
         << ",\"translated_steps\":" << execution.ether_steps
@@ -727,7 +728,9 @@ class AndroidBootSession final {
         << ",\"boot_affine_ram_rotate_batches\":" << boot_work.affine_ram_rotate_batches
         << ",\"boot_affine_ram_rotate_steps\":" << boot_work.affine_ram_rotate_steps
         << ",\"boot_movntdq_store_batches\":" << boot_work.movntdq_store_batches
-        << ",\"boot_movntdq_store_steps\":" << boot_work.movntdq_store_steps;
+        << ",\"boot_movntdq_store_steps\":" << boot_work.movntdq_store_steps
+        << ",\"secondary_movntdq_store_batches\":" << board_->secondary_store_batches()
+        << ",\"secondary_movntdq_store_steps\":" << board_->secondary_store_steps();
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     const auto ether = pc_.cpu.ether_next_stats();
     out << ",\"neon_requested\":" << (pc_.cpu.ether_next_enabled() ? "true" : "false")

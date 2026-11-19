@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -282,6 +283,58 @@ void verify_preempt_msi(PcMachine& pc, PcMotherboardC06& board) {
   std::cout << "PRIME_C08_PREEMPT_MSI_PASS fence=" << preempt_fence << " fadt_msi=1\n";
 }
 #endif
+
+void verify_pci_clocks(const std::filesystem::path& directory) {
+  using namespace std::chrono_literals;
+  using Disk = reverse_windows::QssdDisk;
+  const auto disk_path = directory / "clock-disk.rqvd";
+  Disk::create(disk_path, 1);
+  Disk disk(disk_path);
+  PcMachine pc(16 * MiB);
+  pc.boot_demo();
+  PcMotherboardC06 board(pc, &disk, {}, 0, directory / "clock-vram.rqvd");
+  auto now = PcMotherboardC06::Clock::time_point{};
+  PcMotherboardC06::Clock::duration advance{};
+  board.enable_active_clock([&] {
+    const auto sampled = now;
+    now += std::exchange(advance, {});
+    return sampled;
+  });
+  const auto read = [&](unsigned dev, unsigned offset, unsigned bytes = 4) {
+    require(pc.cpu.out_hook(0xcf8, 4, 0x80000000U | (dev << 11) | (offset & ~3U)),
+            "Cannot select PCI clock register");
+    return pc.cpu.in_hook(0xcfc + (offset & 3U), bytes).value();
+  };
+  const auto read64 = [&](unsigned dev, unsigned offset) {
+    const auto low = read(dev, offset);
+    return low | (std::uint64_t(read(dev, offset + 4)) << 32);
+  };
+  constexpr std::uint64_t hz = 4'500'000'000'000ULL;
+  constexpr unsigned gpu = GuestGpuC08::pci_device;
+  advance = 1s;
+  board.run(1);
+  for (const unsigned dev : {0U, 2U, gpu}) {
+    require(read64(dev, RW_PRIME_PCI_CLOCK_HZ) == hz &&
+            read64(dev, RW_PRIME_PCI_CLOCK_CYCLES) == hz,
+            "RAM, IDE and GPU must sample the same active second");
+  }
+  require(read(gpu, RW_PRIME_PCI_CLOCK_HZ + 5, 2) == ((hz >> 40) & 0xffff) &&
+          !pc.cpu.in_hook(0xcff, 2) && !pc.cpu.in_hook(0xcff, 4),
+          "PCI clock reads must stay inside the selected four-byte port window");
+  now += 1h;
+  advance = 2s;
+  board.run(1);
+  require(read64(0, RW_PRIME_PCI_CLOCK_CYCLES) == 3 * hz &&
+          read64(2, RW_PRIME_PCI_CLOCK_CYCLES) == 3 * hz &&
+          read(gpu, RW_PRIME_PCI_CLOCK_CYCLES + 4) == hz >> 32 &&
+          read(gpu, RW_PRIME_PCI_CLOCK_CYCLES + 1, 2) == ((hz >> 8) & 0xffff) &&
+          read(gpu, RW_PRIME_PCI_CLOCK_CYCLES, 1) == ((3 * hz) & 0xff) &&
+          read(gpu, RW_PRIME_PCI_CLOCK_CYCLES + 4) == (3 * hz) >> 32 &&
+          read64(gpu, RW_PRIME_PCI_CLOCK_CYCLES) == 3 * hz &&
+          board.active_clock_ticks() == 3ULL * PcMachine::kVirtualCyclesPerSecond,
+          "PCI clock latches, VM pauses or peripheral time diverged");
+  std::cout << "PRIME_PCI_CLOCK_PASS active_seconds=3 guest_hz=" << hz << " devices=3\n";
+}
 
 void verify(const std::filesystem::path& volume) {
   std::array<std::uint8_t, RWGPU_PAGE_BYTES> payload{}, actual{};
@@ -610,6 +663,7 @@ int main() {
       std::filesystem::path path;
       ~RemoveDirectory() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
     } remove{name};
+    verify_pci_clocks(remove.path);
     verify(remove.path / "gpu.rqvd");
     verify_c13_residency(remove.path / "c13.rqvd");
     measure_vram(remove.path / "large-vram.rqvd");

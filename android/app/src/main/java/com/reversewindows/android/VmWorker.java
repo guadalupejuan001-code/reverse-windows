@@ -287,7 +287,7 @@ final class VmWorker {
                 nextRamSample = 0;
                 if (foreground) scheduleRam(RAM_SAMPLE_INTERVAL_MS);
                 requestFrame();
-                schedule(0);
+                enqueueSlice(0);
             } catch (IOException | RuntimeException | LinkageError | OutOfMemoryError error) {
                 report(error);
             }
@@ -297,9 +297,9 @@ final class VmWorker {
     void setForeground(boolean visible) {
         worker.post(() -> {
             foreground = visible;
+            worker.removeCallbacks(slice);
             if (!visible) {
                 cpuPerformance.pause();
-                worker.removeCallbacks(slice);
                 worker.removeCallbacks(ramMaintenance);
             }
             if (running && handle != 0 && !isTerminal()) {
@@ -314,7 +314,7 @@ final class VmWorker {
                 nextRamSample = 0;
                 scheduleRam(0);
                 requestFrame();
-                schedule(0);
+                enqueueSlice(0);
             }
         });
     }
@@ -347,7 +347,7 @@ final class VmWorker {
             running = resume;
             if (!resume) cpuPerformance.pause();
             worker.removeCallbacks(slice);
-            if (running) schedule(0);
+            if (running) enqueueSlice(0);
             try {
                 requestFrame();
                 publishState(true);
@@ -373,7 +373,7 @@ final class VmWorker {
                 requestFrame();
                 if (outcome == NativeMachine.WAITING_KEY && wokeBios) {
                     outcome = NativeMachine.RUNNING;
-                    schedule(0);
+                    enqueueSlice(0);
                 }
             } catch (RuntimeException | LinkageError error) {
                 report(error);
@@ -415,8 +415,7 @@ final class VmWorker {
         });
     }
 
-    private void schedule(long delay) {
-        worker.removeCallbacks(slice);
+    private void enqueueSlice(long delay) {
         if (!released && foreground && running && handle != 0 &&
                 outcome != NativeMachine.WAITING_KEY && !isTerminal()) {
             // Rejoin the ordinary queue after each slice so pending controls can run.
@@ -486,10 +485,14 @@ final class VmWorker {
             }
             if (now - lastStatus >= STATUS_INTERVAL_MS || outcome != previous)
                 publishState(outcome == NativeMachine.WAITING_KEY);
-            // Yield the remainder only when the engine really earned the full grant.
-            long delayMs = lastSliceCompleted == lastSliceSteps && outcome == NativeMachine.RUNNING
-                    ? (NativeMachine.engineDelayNs(handle) + 999_999L) / 1_000_000L : 0;
-            schedule(outcome == NativeMachine.HALTED ? HALTED_POLL_DELAY_MS : delayMs);
+            if (outcome == NativeMachine.RUNNING) {
+                long engineWaitNs = lastSliceCompleted == lastSliceSteps ? NativeMachine.engineDelayNs(handle) : 0;
+                long delayMs = cpuPerformance.pacing().delayMillis(engineWaitNs,
+                        Math.min(elapsed, TARGET_SLICE_NS), lastSliceCompleted > 0);
+                enqueueSlice(delayMs);
+            } else if (outcome == NativeMachine.HALTED) {
+                enqueueSlice(HALTED_POLL_DELAY_MS);
+            }
         } catch (RuntimeException | LinkageError | OutOfMemoryError error) {
             report(error);
         }
