@@ -365,7 +365,7 @@ jobs:
             return 1
           }
           iso=reverse-windows-test.iso
-          python3 tests/c10_android_boot_iso.py "$RUNNER_TEMP/$iso"
+          python3 tests/c10_android_boot_iso.py "$RUNNER_TEMP/$iso" --engine-check
           adb push "$RUNNER_TEMP/$iso" "/sdcard/Download/$iso"
           tap_visible resource-id "$ANDROID_APP_ID:id/vm_select_iso"
           tap_visible text "$iso"
@@ -418,6 +418,9 @@ jobs:
           assert ether["mundo_x_source_sha"] == os.environ["MUNDO_X_SHA"]
           assert ether["protected32_guest_steps"] == 0
           assert ether["code_version_hits"] == ether["code_byte_checks"] == ether["code_bytes_read"] == 0
+          projected = report["ether_coverage"]["state_vector_interpreter_steps"]
+          assert projected > 0, report["ether_coverage"]
+          print(f"PRIME_ANDROID_ENGINE_PASS sum_1_to_4096=8390656 projected_steps={projected}")
           print("PRIME_ANDROID_ISO_PICKER_PASS boot=el-torito ram_gib=64 qssd_boot_gib=64 qssd_data_pib=8",
                 f"protected32_tsc_hz={topology['guest_tsc_hz']}")
           PY

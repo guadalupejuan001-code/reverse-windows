@@ -31,6 +31,31 @@ jobs:
           test "$(uname -m)" = "${{ matrix.architecture }}"
           git rev-parse HEAD
           python3 scripts/verify_deps.py --checkout
+      - name: Compare 0.3.65 and current engines on equal guest work
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous=73146f88beb8c2bcdeca157b1939bffa4a6da546
+          baseline="$RUNNER_TEMP/prime-previous-engine"
+          if ! git -C deps/mundo-X cat-file -e "$previous^{commit}" 2>/dev/null; then
+            git -C deps/mundo-X fetch --no-tags --depth=1 https://github.com/guadalupejuan001-code/mundo-X.git "$previous"
+          fi
+          git -C deps/mundo-X worktree add --detach "$baseline" "$previous"
+          mkdir -p build
+          compile_engine() {
+            c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread -Isrc \
+              -I"$1/pc-android/native" -I"$1/native/include" \
+              -Ideps/Virtual-qSSD-/include -Ideps/GPU-VIRTUAL/include \
+              tests/prime_execution_bench.cpp -lz -o "$2"
+          }
+          compile_engine "$baseline" build/engine-before
+          compile_engine deps/mundo-X build/engine-after
+          for trial in 1 2 3 4 5 6 7; do
+            order=(before after)
+            if (( trial % 2 == 0 )); then order=(after before); fi
+            for version in "${order[@]}"; do "./build/engine-$version" "$version"; done
+          done | tee build/prime-execution.log
+          python3 tests/compare_execution.py build/prime-execution.log | tee -a build/prime-execution.log
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -488,6 +513,7 @@ jobs:
             build/prime-c02-boot-profile.json
             build/prime-x86-measure.log
             build/prime-smp-clock.log
+            build/prime-execution.log
             build/prime-c03-ether-arm64.log
             build/prime-c03-ether-arm64.json
             build/prime-c04-ram.log

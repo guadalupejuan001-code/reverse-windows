@@ -107,7 +107,7 @@ def profiled_workload() -> bytes:
     return code
 
 
-def image(profile: bool = False) -> bytearray:
+def image(profile: bool = False, engine_check: bool = False) -> bytearray:
     iso = generate()
     start = BOOT * SECTOR
     iso[start : start + 4 * SECTOR] = bytes(4 * SECTOR)
@@ -174,6 +174,11 @@ def image(profile: bool = False) -> bytearray:
         0x89, 0xC6, 0x89, 0xD7,           # Save the MSR in EDI:ESI.
         0x0F, 0x31, 0x29, 0xF0, 0x19, 0xFA,  # RDTSC; SUB EAX,ESI; SBB EDX,EDI
     )) + expect_condition(0x73)  # JAE: second RDTSC >= MSR.
+    if engine_check:
+        count = 4096
+        read_tsc += b"\xb9" + struct.pack("<I", count) + b"\x31\xc0"  # ECX=count, EAX=0.
+        read_tsc += b"\x01\xc8\x49\x75\xfb"  # ADD EAX,ECX; DEC ECX; JNZ ADD.
+        read_tsc += b"\x3d" + struct.pack("<I", count * (count + 1) // 2) + expect_equal()
     next_code = 0x500
     if profile:
         next_code = 0x1400
@@ -267,9 +272,9 @@ def image(profile: bool = False) -> bytearray:
 
 if __name__ == "__main__":
     path = pathlib.Path(sys.argv[1])
-    if sys.argv[2:] not in ([], ["--profile"]):
-        raise SystemExit("usage: c10_android_boot_iso.py PATH [--profile]")
-    fixture = image(profile=sys.argv[2:] == ["--profile"])
+    if sys.argv[2:] not in ([], ["--profile"], ["--engine-check"]):
+        raise SystemExit("usage: c10_android_boot_iso.py PATH [--profile | --engine-check]")
+    fixture = image(profile=sys.argv[2:] == ["--profile"], engine_check=sys.argv[2:] == ["--engine-check"])
     try:
         with path.open("xb") as output:
             output.write(fixture)
