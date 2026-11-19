@@ -6,6 +6,7 @@ import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.RectF;
 import android.graphics.Typeface;
+import android.os.Build;
 import android.text.InputType;
 import android.view.KeyEvent;
 import android.view.View;
@@ -15,6 +16,7 @@ import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
 
 import java.util.Arrays;
+import java.util.BitSet;
 
 final class GuestMonitor extends View {
     interface Input {
@@ -38,6 +40,7 @@ final class GuestMonitor extends View {
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF frame = new RectF();
     private final Input input;
+    private final VbePresentationStats vbeStats;
     private final byte[] cells = new byte[4000];
     private final char[] row = new char[80];
     private boolean hasText;
@@ -48,10 +51,13 @@ final class GuestMonitor extends View {
     private int videoHeight;
     private int videoStripeHeight;
     private final RectF stripeFrame = new RectF();
+    private final BitSet changedStripes = new BitSet();
+    private VbeRenderNodes videoNodes;
 
-    GuestMonitor(Context context, Input input) {
+    GuestMonitor(Context context, Input input, VbePresentationStats vbeStats) {
         super(context);
         this.input = input;
+        this.vbeStats = vbeStats;
         setId(R.id.vm_monitor);
         setContentDescription("Pantalla del invitado");
         setFocusableInTouchMode(true);
@@ -80,12 +86,14 @@ final class GuestMonitor extends View {
             int[] video = update.video; // width, height, stripe height, count, then rectangles
             if (videoStripes == null || videoWidth != update.width || videoHeight != update.height ||
                     videoStripeHeight != video[2]) {
+                discardVideo();
                 videoWidth = update.width;
                 videoHeight = update.height;
                 videoStripeHeight = video[2];
                 videoStripes = new Bitmap[(videoHeight + videoStripeHeight - 1) / videoStripeHeight];
             }
             int offset = 4;
+            changedStripes.clear();
             for (int i = 0; i < video[3]; ++i) {
                 int x = video[offset++];
                 int y = video[offset++];
@@ -102,8 +110,14 @@ final class GuestMonitor extends View {
                                 videoWidth, stripeHeight, Bitmap.Config.ARGB_8888);
                     }
                     videoStripes[stripe].setPixels(video, offset, width, x, y - top, width, rows);
+                    changedStripes.set(stripe);
                     offset += width * rows;
                     y += rows;
+                }
+            }
+            if (isShown() && isHardwareAccelerated()) {
+                for (int i = changedStripes.nextSetBit(0); i >= 0; i = changedStripes.nextSetBit(i + 1)) {
+                    videoStripes[i].prepareToDraw();
                 }
             }
             hasText = false;
@@ -113,6 +127,7 @@ final class GuestMonitor extends View {
 
     void reset() {
         generation++;commitPending=drawPending=false;
+        vbeStats.reset();
         hasText = false;
         discardVideo();
         Arrays.fill(cells, (byte) 0);
@@ -120,7 +135,14 @@ final class GuestMonitor extends View {
     }
 
     private void discardVideo() {
+        videoNodes = null;
         videoStripes = null;
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        super.onDetachedFromWindow();
+        videoNodes = null;
     }
 
     @Override
@@ -136,16 +158,24 @@ final class GuestMonitor extends View {
             canvas.clipRect(frame);
             canvas.translate(frame.left, frame.top);
             canvas.scale(frame.width() / videoWidth, frame.height() / videoHeight);
-            paint.setFilterBitmap(false);
-            paint.setAntiAlias(false);
-            for (int i = 0; i < videoStripes.length; ++i) {
-                Bitmap stripe = videoStripes[i];
-                if (stripe == null) continue;
-                int top = i * videoStripeHeight;
-                stripeFrame.set(0, top, videoWidth, top + stripe.getHeight());
-                canvas.drawBitmap(stripe, null, stripeFrame, paint);
+            if (Build.VERSION.SDK_INT >= 29 && canvas.isHardwareAccelerated()) {
+                if (videoNodes == null) videoNodes = new VbeRenderNodes(videoWidth, videoHeight, videoStripeHeight);
+                int recorded = videoNodes.draw(canvas, videoStripes);
+                vbeStats.drawn(VbePresentationStats.Backend.RENDER_NODES, recorded);
+            } else {
+                paint.setFilterBitmap(false);
+                paint.setAntiAlias(false);
+                for (int i = 0; i < videoStripes.length; ++i) {
+                    Bitmap stripe = videoStripes[i];
+                    if (stripe == null) continue;
+                    int top = i * videoStripeHeight;
+                    stripeFrame.set(0, top, videoWidth, top + stripe.getHeight());
+                    canvas.drawBitmap(stripe, null, stripeFrame, paint);
+                }
+                paint.setAntiAlias(true);
+                vbeStats.drawn(canvas.isHardwareAccelerated() ? VbePresentationStats.Backend.HARDWARE_CANVAS
+                        : VbePresentationStats.Backend.SOFTWARE_CANVAS, 0);
             }
-            paint.setAntiAlias(true);
             canvas.restore();
         } else {
             paint.setColor(0xff81909f);

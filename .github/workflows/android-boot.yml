@@ -92,6 +92,7 @@ jobs:
         working-directory: android
         run: |
           args=(--no-daemon --stacktrace "-PandroidAbi=$ANDROID_ABI" -PetherPreview=true :app:assembleDebug)
+          if [[ "$ANDROID_ABI" == x86_64 ]]; then args+=(:app:assembleDebugAndroidTest); fi
           ./gradlew "${args[@]}" || ./gradlew --refresh-dependencies "${args[@]}"
       - name: Read Prime APK identity from Gradle
         id: apk_metadata
@@ -224,6 +225,11 @@ jobs:
           trap 'adb logcat -d > "$log"' EXIT
           adb shell settings put secure immersive_mode_confirmations confirmed
           adb install -r "$apk"
+          adb install -r android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          adb shell am instrument -w "$ANDROID_APP_ID.test/com.reversewindows.android.VbeRenderTest" \
+            | tee "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/vbe-display-test.log"
+          grep -Fxq 'INSTRUMENTATION_CODE: -1' "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/vbe-display-test.log"
+          adb shell am force-stop "$ANDROID_APP_ID"
           adb logcat -c
           adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity" --ez com.reversewindows.android.SELF_TEST true
           build_fields="\"app_version\":\"$ANDROID_VERSION\",\"app_version_code\":$ANDROID_VERSION_CODE,\"application_id\":\"$ANDROID_APP_ID\",\"mundo_x_sha\":\"$MUNDO_X_SHA\""

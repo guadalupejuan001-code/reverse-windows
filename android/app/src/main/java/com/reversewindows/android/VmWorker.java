@@ -85,6 +85,7 @@ final class VmWorker {
     private final Handler worker;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final byte[] textCells = new byte[4000];
+    final VbePresentationStats vbePresentation = new VbePresentationStats();
 
     private volatile boolean released;
     private volatile boolean foreground = true;
@@ -594,6 +595,7 @@ final class VmWorker {
                 ",\"elapsed_ms\":" + (now - sessionStarted)
                 + ",\"android_pss_kib\":" + androidPssKiB
                 + cpuPerformance.diagnosticFields()
+                + ",\"host_vbe\":" + vbePresentation.json()
                 + ",\"worker_timing\":{\"step_us\":" + stepNanos / 1000
                 + ",\"sample_elapsed_us\":" + SystemClock.elapsedRealtimeNanos() / 1000
                 + ",\"host_thread_cpu_us\":" + workerCpuUs
