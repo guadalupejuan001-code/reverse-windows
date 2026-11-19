@@ -108,6 +108,9 @@ class QssdDisk final : public BlockDisk {
 
   static constexpr std::size_t kDedupWindow=4096;
   static constexpr std::size_t kReadCacheBlocks=128; // 512 KiB bounded data
+  static constexpr std::size_t kReadCacheBytes=kReadCacheBlocks*kBlockSize;
+  static constexpr std::size_t kVerifiedRunBlocks=16;
+  static_assert(kVerifiedRunBlocks*kRawRecordBytes + kBlockSize <= kReadCacheBytes);
   int fd_=-1;
   const Access access_;
   std::filesystem::path path_;
@@ -128,6 +131,8 @@ class QssdDisk final : public BlockDisk {
   mutable std::mutex cache_mutex_;
   mutable std::unordered_map<std::uint64_t,std::shared_ptr<const BlockData>> read_cache_;
   mutable std::deque<std::uint64_t> read_fifo_;
+  mutable std::vector<std::uint8_t> verified_raw_;
+  mutable std::uint64_t verified_offset_=0,verified_block_=0;
   mutable std::atomic<std::uint64_t> cache_hits_{0},cache_misses_{0};
   struct IoCounters {
     std::atomic<std::uint64_t> calls{0},bytes{0},ns{0};
@@ -477,12 +482,16 @@ class QssdDisk final : public BlockDisk {
       if(data[0]==data[period]&&std::memcmp(data,data+period,kBlockSize-period)==0)return period;
     return 0;
   }
+  void trim_decoded_cache_locked(std::size_t keep) const {
+    while (read_fifo_.size() > keep) {
+      read_cache_.erase(read_fifo_.front());
+      read_fifo_.pop_front();
+    }
+  }
   void cache_insert_locked(std::uint64_t off,std::shared_ptr<const BlockData> data) const {
     if(read_cache_.find(off)!=read_cache_.end())return;
-    if(read_fifo_.size()>=kReadCacheBlocks) {
-      const auto old=read_fifo_.front();read_fifo_.pop_front();
-      read_cache_.erase(old);
-    }
+    const auto capacity = (kReadCacheBytes - verified_raw_.capacity()) / kBlockSize;
+    trim_decoded_cache_locked(capacity - 1);
     read_fifo_.push_back(off);
     try{read_cache_.emplace(off,std::move(data));}
     catch(...){read_fifo_.pop_back();throw;}
@@ -537,11 +546,18 @@ class QssdDisk final : public BlockDisk {
     const auto size=count*kRawRecordBytes;
     if(offset>limit||size>limit-offset)
       throw std::runtime_error("QSSD truncated contiguous RAW records");
-    if(read_cached_raw_run(offset,count,target))return;
+    if (access_ == Access::ReadWrite && read_cached_raw_run(offset,count,target)) return;
     buffer.resize(size);
     read_all(fd_,offset,buffer.data(),size,&physical_reads_);
 
-    const auto lanes=run_bulk(count,[&](std::size_t first,std::size_t end){
+    bool verified = false;
+    if (cache_request) {
+      std::lock_guard<std::mutex> guard(cache_mutex_);
+      // Compare every header, payload and footer just read. A changed byte
+      // always goes through the original checksum and block address checks.
+      verified = offset == verified_offset_ && block == verified_block_ && buffer == verified_raw_;
+    }
+    const auto lanes=verified ? 1U : run_bulk(count,[&](std::size_t first,std::size_t end){
       for(auto i=first;i<end;){
         std::array<const std::uint8_t*,kDigestLanes> records{};
         const auto batch=std::min(kDigestLanes,end-i);
@@ -558,19 +574,14 @@ class QssdDisk final : public BlockDisk {
     // Copy only after the raw run has passed both checksum checks.
     for(std::size_t i=0;i<count;++i)
       std::memcpy(target+i*kBlockSize,buffer.data()+i*kRawRecordBytes+kRecHeader,kBlockSize);
-    if (cache_request) {
-      // Published offsets are immutable. Large streaming requests bypass admission.
-      try {
-        for (std::size_t i = 0; i < count; ++i) {
-          auto page = std::make_shared<BlockData>();
-          std::memcpy(page->data(), target + i * kBlockSize, kBlockSize);
-          cache_insert(offset + i * kRawRecordBytes, std::move(page));
-        }
-      } catch (const std::bad_alloc&) {
-        // The caller already has every verified byte.
-      }
+    if (!verified && cache_request && buffer.capacity() <= kVerifiedRunBlocks*kRawRecordBytes) {
+      std::lock_guard<std::mutex> guard(cache_mutex_);
+      trim_decoded_cache_locked((kReadCacheBytes - buffer.capacity()) / kBlockSize);
+      verified_raw_.swap(buffer);
+      verified_offset_ = offset;
+      verified_block_ = block;
     }
-    cache_misses_.fetch_add(count,std::memory_order_relaxed);
+    (verified ? cache_hits_ : cache_misses_).fetch_add(count,std::memory_order_relaxed);
     record_parallel(parallel_reads_,lanes,count*kBlockSize);
   }
 
@@ -1042,9 +1053,8 @@ class QssdDisk final : public BlockDisk {
   CacheStats cache_stats() const {
     std::lock_guard<std::mutex> hold(cache_mutex_);
     const auto blocks=std::uint64_t(read_cache_.size());
-    return {cache_hits_.load(std::memory_order_relaxed),
-            cache_misses_.load(std::memory_order_relaxed),blocks,
-            blocks*kBlockSize};
+    return {cache_hits_.load(std::memory_order_relaxed), cache_misses_.load(std::memory_order_relaxed),
+            blocks + verified_raw_.size()/kRawRecordBytes, blocks*kBlockSize + verified_raw_.capacity()};
   }
   bool checkpoint() {
     if(access_==Access::ReadOnly)return false;
@@ -1092,7 +1102,7 @@ class QssdDisk final : public BlockDisk {
             if(next.kind!=Raw||next.offset!=ref.offset+count*kRawRecordBytes)break;
           }
           if(count>=kDigestLanes){
-            read_raw_run(ref.offset,block,count,view->value->end,size<=kReadCacheBlocks*kBlockSize,
+            read_raw_run(ref.offset,block,count,view->value->end,size<=kVerifiedRunBlocks*kBlockSize,
                          raw_buffer,target+done);
             done+=count*kBlockSize;
             continue;
@@ -1275,6 +1285,8 @@ class QssdDisk final : public BlockDisk {
       // and published guest transaction.
       try {
         std::lock_guard<std::mutex> guard(cache_mutex_);
+        // A new committed write gets the full decoded-block cache budget.
+        if (!verified_raw_.empty()) std::vector<std::uint8_t>().swap(verified_raw_);
         const auto keep=std::min(cache_positions.size(),kReadCacheBlocks);
         for(auto i=cache_positions.size()-keep;i<cache_positions.size();++i){
           const auto position=cache_positions[i];

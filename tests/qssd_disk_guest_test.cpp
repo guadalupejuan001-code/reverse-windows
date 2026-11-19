@@ -74,8 +74,8 @@ void verify_parallel_io(const std::filesystem::path& path) {
          std::equal(reread.begin(), reread.end(), payload.begin() + (offset - first)),
          "Cached contiguous RAW read changed bytes");
     const auto warm = volume.io_stats().read_calls - before - cold;
-    need(cold == 1 && warm == 0 && volume.cache_stats().hits - hits == 8 &&
-         volume.cache_stats().resident_bytes <= 512 * 1024, "RAW read cache admission failed");
+    need(cold == 1 && warm == 1 && volume.cache_stats().hits - hits == 8 &&
+         volume.cache_stats().resident_bytes <= 512 * 1024, "RAW reread did not verify the current record");
     std::cout << "PRIME_QSSD_RAW_REREAD_PASS bytes=" << reread.size()
               << " cold_reads=" << cold << " warm_reads=" << warm << '\n';
   }
