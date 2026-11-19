@@ -82,7 +82,9 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Build signed debug APK
         working-directory: android
-        run: ./gradlew --no-daemon --stacktrace -PandroidAbi="$ANDROID_ABI" -PetherPreview=true :app:assembleDebug
+        run: |
+          args=(--no-daemon --stacktrace "-PandroidAbi=$ANDROID_ABI" -PetherPreview=true :app:assembleDebug)
+          ./gradlew "${args[@]}" || ./gradlew --refresh-dependencies "${args[@]}"
       - name: Read Prime APK identity from Gradle
         id: apk_metadata
         run: |
