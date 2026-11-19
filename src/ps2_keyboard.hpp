@@ -70,7 +70,7 @@ class Ps2Keyboard final {
       }
       return true;
     }
-    if (!input || (!extended && input >= set2_.size())) return false;
+    if (!input || (input >= set2_.size() && !(extended && input >= 0x5b && input <= 0x5d))) return false;
     const auto output = translated ? input : (extended ? extended_set2(input) : set2_[input]);
     if (!output || keys_.size() + 3 > kQueueLimit) return false;
     if (extended) keys_.push_back(0xe0);

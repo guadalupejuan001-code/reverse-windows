@@ -212,6 +212,7 @@ jobs:
           apk=android/app/build/outputs/apk/debug/app-debug.apk
           log="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/android-runtime.log"
           trap 'adb logcat -d > "$log"' EXIT
+          adb shell settings put secure immersive_mode_confirmations confirmed
           adb install -r "$apk"
           adb logcat -c
           adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity" --ez com.reversewindows.android.SELF_TEST true
@@ -449,6 +450,18 @@ jobs:
           print("PRIME_ANDROID_LIVE_CLOCK_PASS same_session=1 guest_tsc_hz=" + sys.argv[3])
           PY
           done
+          # A second optical guest reads the actual PS/2 packets from the Android controls.
+          as --32 tests/rgb_pointer_guest.S -o "$RUNNER_TEMP/rgb-pointer.o"
+          objcopy -O binary -j .text "$RUNNER_TEMP/rgb-pointer.o" "$RUNNER_TEMP/rgb-pointer.bin"
+          python3 tests/android_rgb_console.py fixture "$RUNNER_TEMP/rgb-pointer.bin" "$RUNNER_TEMP/rgb-pointer.iso"
+          adb push "$RUNNER_TEMP/rgb-pointer.iso" /sdcard/Download/rgb-pointer.iso
+          adb shell am force-stop "$ANDROID_APP_ID"
+          adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity"
+          python3 tests/android_rgb_console.py settings
+          tap_visible resource-id "$ANDROID_APP_ID:id/vm_select_iso" down
+          tap_visible text rgb-pointer.iso
+          tap_visible resource-id "$ANDROID_APP_ID:id/vm_boot_iso" down
+          python3 tests/android_rgb_console.py pointer
           BASH
       - name: Run BIOS, keyboard and synthetic ISO from Downloads on Android
         if: matrix.abi == 'x86_64' && steps.kvm.outputs.available == 'true'

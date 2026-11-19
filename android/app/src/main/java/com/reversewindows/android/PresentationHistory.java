@@ -25,16 +25,16 @@ final class PresentationHistory {
     final ArrayDeque<Sample> samples=new ArrayDeque<>();
     final ArrayDeque<Episode> episodes=new ArrayDeque<>();
     private final ArrayList<Double> gaps=new ArrayList<>();
-    private long lastFrame,begin,expectThrough,lastInput;private int frames,lows,highs,target;
+    private long lastFrame,begin,expectThrough;private int frames,lows,highs,target;
     private double firstWorst;
     private long firstLow,firstHigh;
     private Episode active;
     void clear(){samples.clear();episodes.clear();reset(0);}
     void reset(long wall){
         if(active!=null){active.end=wall;active.interrupted=true;active=null;}
-        lows=highs=frames=0;lastFrame=begin=expectThrough=lastInput=0;gaps.clear();
+        lows=highs=frames=0;lastFrame=begin=expectThrough=0;gaps.clear();
     }
-    void input(long ns){lastInput=ns;expectThrough=Math.max(expectThrough,ns+3_500_000_000L);}
+    void input(long ns){expectThrough=Math.max(expectThrough,ns+3_500_000_000L);}
     void presented(long ns){
         if(begin==0)return;
         if(lastFrame!=0 && ns>lastFrame && ns-lastFrame<2_000_000_000L){

@@ -135,7 +135,7 @@ final class VmTelemetry extends LinearLayout {
         mode = modeName;
         steps = instructions;
         stepRate = instructionsPerSecond;
-        if (getVisibility() == View.VISIBLE) render();
+        if (isShown()) render();
     }
 
     void clear() {

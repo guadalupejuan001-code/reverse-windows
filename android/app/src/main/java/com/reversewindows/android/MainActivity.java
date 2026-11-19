@@ -74,6 +74,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private FrameLayout pages;
     private ScrollView metricPage;
     private ConsoleDeck console;
+    private ConsolePage settingsWindow,metricsWindow;
     private ConsoleMetrics liveMetrics;
     private TextView displayValues;
     private int page;
@@ -177,7 +178,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         guestSurface.addView(traceScroll,new FrameLayout.LayoutParams(-1,-1));traceScroll.setVisibility(View.GONE);
 
         scroll=new ScrollView(this);
-        LinearLayout body=pageBody(scroll,"Configuración");
+        settingsWindow=new ConsolePage(this,scroll,"Configuración",()->showPage(0),"Métricas",()->showPage(2));
+        LinearLayout body=settingsWindow.tab("Sesión","Configuración");
         status=label("Máquina apagada",15,TEXT);status.setId(R.id.vm_status);
         status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);add(body,status,5);
         source=label(BuildConfig.VERSION_NAME+" · Motor local Éter · Invitado x86-64",13,ACCENT);add(body,source,3);
@@ -193,7 +195,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         LinearLayout diagRow=row(controls);
         pair(diagRow,action("Registro",false,()->{showPage(0);showTrace(true);}),
                 action("Teclado de Android",false,()->{showPage(0);showTrace(false);monitor.showKeyboard();}));
-        LinearLayout display=card(body,8);display.addView(label("Pantalla y fluidez",16,TEXT));
+        LinearLayout display=card(settingsWindow.tab("Pantalla","Pantalla y fluidez"),8);display.addView(label("Señal de vídeo",16,TEXT));
         displayValues=label("",13,MUTED);add(display,displayValues,4);
         int fps=prefs.getInt("presentation_fps",60);
         Button target=action("Objetivo del presentador · "+fps+" FPS",false,()->{});add(display,target,4);
@@ -203,7 +205,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
                     worker.setPresentationTarget(value);liveMetrics.cap(value);target.setText("Objetivo del presentador · "+value+" FPS");
                 }).show());
         worker.setPresentationTarget(fps);
-        LinearLayout inputCard=card(body,8);inputCard.addView(label("Teclado y puntero",16,TEXT));
+        LinearLayout inputCard=card(settingsWindow.tab("Controles","Teclado y puntero"),8);
+        inputCard.addView(label("Distribución española · ISO de 105 teclas",16,TEXT));
         String initial=prefs.getString("rgb_default_mode","Completo");
         RgbKeyboard.Mode initialMode;
         try{initialMode=RgbKeyboard.Mode.valueOf(initial);}catch(IllegalArgumentException e){initialMode=RgbKeyboard.Mode.Completo;}
@@ -217,8 +220,9 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         addSlider(inputCard,"Intensidad RGB",light,100,0," %","rgb_light");
         addSlider(inputCard,"Sensibilidad del puntero",speed,20,5,"×","rgb_pointer_speed");
         metricPage=new ScrollView(this);
-        LinearLayout metrics=pageBody(metricPage,"Métricas");
-        liveMetrics=new ConsoleMetrics(this,metrics,fps);
+        metricsWindow=new ConsolePage(this,metricPage,"Métricas",()->showPage(0),"Configuración",()->showPage(1));
+        liveMetrics=new ConsoleMetrics(this,metricsWindow,fps);
+        LinearLayout metrics=liveMetrics.motor;
         telemetry=new VmTelemetry(this);add(metrics,telemetry,10);
         sessionSummary=label("",12,MUTED);add(metrics,sessionSummary,4);
         sessionSummary.setVisibility(View.GONE);
@@ -226,7 +230,9 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             public void key(int ascii,int scan,boolean down){if(canQueueGuestInput()){if(down)liveMetrics.input();worker.key(ascii,scan,down);}}
             public void pointer(int dx,int dy,int buttons){if(canQueueGuestInput()){liveMetrics.input();worker.pointer(dx,dy,buttons);}}
         },initialMode,light,speed/10f,()->showPage(1),()->showPage(2));
-        pages.addView(console);pages.addView(scroll);pages.addView(metricPage);
+        metricsWindow.changed(()->{telemetry.render();liveMetrics.render();});
+        settingsWindow.changed(this::updateDisplayValues);
+        pages.addView(console);pages.addView(settingsWindow);pages.addView(metricsWindow);
 
         LinearLayout setup = setupPanel;
         TextView bootTitle = label("Arranque", 16, TEXT);
@@ -283,18 +289,6 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         showPage(0);
     }
 
-    private LinearLayout pageBody(ScrollView view,String title){
-        view.setFillViewport(true);view.setBackgroundColor(0xff121b22);LinearLayout body=column();
-        body.setPadding(dp(14),dp(8),dp(14),dp(14));view.addView(body);
-        LinearLayout header=row(body);header.setGravity(Gravity.CENTER_VERTICAL);
-        Button back=action("‹  Consola",false,()->showPage(0));header.addView(back);
-        TextView heading=label(title,22,TEXT);heading.setTypeface(Typeface.DEFAULT_BOLD);
-        heading.setPadding(dp(14),0,0,0);header.addView(heading,new LinearLayout.LayoutParams(0,-2,1));
-        boolean settings=title.equals("Configuración");
-        header.addView(action(settings?"Métricas":"Configuración",false,()->showPage(settings?2:1)));
-        return body;
-    }
-
     private void addSlider(LinearLayout parent,String title,int value,int max,int min,String unit,String preference){
         boolean speed=min>0;
         TextView label=label("",13,MUTED);add(parent,label,8);
@@ -314,11 +308,11 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private void showPage(int next){
         if(page==0&&next!=0)console.release();page=next;
         console.setVisibility(next==0?View.VISIBLE:View.GONE);
-        scroll.setVisibility(next==1?View.VISIBLE:View.GONE);
-        metricPage.setVisibility(next==2?View.VISIBLE:View.GONE);
+        settingsWindow.setVisibility(next==1?View.VISIBLE:View.GONE);
+        metricsWindow.setVisibility(next==2?View.VISIBLE:View.GONE);
         liveMetrics.visible(next==0);
-        if(next==1){scroll.scrollTo(0,0);updateDisplayValues();}
-        if(next==2){metricPage.scrollTo(0,0);telemetry.render();liveMetrics.render();}
+        if(next==1){settingsWindow.select(0);updateDisplayValues();}
+        if(next==2){metricsWindow.select(0);telemetry.render();liveMetrics.render();}
         if(next==0)restoreGuestFocus();
     }
     private void updateDisplayValues(){
@@ -432,6 +426,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         blankTextFrame = false;
         executionRate.reset();
         liveMetrics.clear();
+        console.keyboard.resetGuest();
         showPage(0);
         monitor.reset();
         showTrace(false);

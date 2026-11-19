@@ -94,6 +94,7 @@ final class RgbKeyboard extends ViewGroup {
     Mode mode() {return mode;}
     void setMode(Mode next) {release(); mode=next; build();}
     void light(int level) {intensity=level; for(int i=0;i<getChildCount();i++) style((Button)getChildAt(i),slots.get(i));}
+    void resetGuest(){release();caps=false;highlight();}
     void release() {
         for(Map.Entry<Integer,Integer> k:new HashMap<>(activeChars).entrySet()) output.key(k.getValue(),k.getKey(),false);
         for(int scan:held) output.key(0,scan,false);
