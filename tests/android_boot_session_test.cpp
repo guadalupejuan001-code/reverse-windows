@@ -1312,7 +1312,9 @@ int main(int argc, char** argv) {
                                  "\"lapic_global_enabled\":true", "\"lapic_software_enabled\":false",
                                  "\"lapic_pending_vector\":0", "\"lapic_timer_count\":0",
                                  "\"lapic_in_service_delivery_id\":0", "\"lapic_in_service_since_tick\":0",
-                                 "\"irq8_acknowledgements\":0", "\"irq8_redirection_low\":65536"})
+                                 "\"irq8_acknowledgements\":0", "\"irq8_delivered\":0",
+                                 "\"irq8_redirection_low\":65536", "\"lapic_vectors\":[]",
+                                 "\"secondary_rep_elements\":0", "\"secondary_rep_bytes\":0"})
         require(progress.find(marker) != std::string::npos, marker);
       const auto text = screen(frame);
       require(progress.find("\"data_disk\":{\"logical_bytes\":9007199254740992,\"physical_bytes\":64,") !=

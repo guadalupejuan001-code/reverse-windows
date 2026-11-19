@@ -56,8 +56,35 @@ def compare_windows(path):
           f"median_full_windows={median(int(r['full']) for r in runs)} measured_runs=5")
 
 
+def compare_irq_work(path):
+    samples = defaultdict(list)
+    for line in path.read_text().splitlines():
+        version, marker, *pairs = line.split()
+        assert version in ("before", "after") and marker == "SMP_IRQ_SAMPLE"
+        fields = dict(pair.split("=") for pair in pairs)
+        samples[fields["work"], fields["pending"], version].append(fields)
+
+    for work, pending in (("registers", "0"), ("registers", "1"), ("rep", "1")):
+        before, after = (samples[work, pending, v] for v in ("before", "after"))
+        assert len(before) == len(after) == 7
+        state = ("steps", "checksum", "flags", "deliveries")
+        assert len({tuple(row[k] for k in state) for row in before + after}) == 1
+        assert all(row["deliveries"] == pending for row in before + after)
+        if platform.machine() == "aarch64" and work == "registers" and pending == "1":
+            assert min(int(row["native"]) for row in after) > max(int(row["native"]) for row in before)
+        if work == "rep":
+            assert min(int(row["rep"]) for row in after) > 65536
+        old_ns, new_ns = (median(int(row["wall_ns"]) for row in rows) for rows in (before, after))
+        native = [median(int(row["native"]) for row in rows) for rows in (before, after)]
+        print(f"PRIME_SMP_IRQ_COMPARE work={work} pending={pending} steps={after[0]['steps']} "
+              f"before_ms={old_ns/1e6:.3f} after_ms={new_ns/1e6:.3f} speedup={old_ns/new_ns:.2f} "
+              f"native_before={native[0]} native_after={native[1]} rep_after={after[0]['rep']} samples=7")
+
+
 if __name__ == "__main__":
-    if sys.argv[1] == "--windows":
+    if sys.argv[1] == "--irq-work":
+        compare_irq_work(Path(sys.argv[2]))
+    elif sys.argv[1] == "--windows":
         compare_windows(Path(sys.argv[2]))
     else:
         compare(Path(sys.argv[1]))

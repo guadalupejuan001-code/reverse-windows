@@ -738,6 +738,7 @@ void prime_rtc_cmos_guest() {
     const auto elapsed = cpu.read32(0x9014) - cpu.read32(0x9010);
     need(cpu.halted && !cpu.flag(Cpu::IF) && cpu.regs[Cpu::ESP] == stack &&
          board.evidence().irq_delivered == 2 && board.evidence().apic_irqs == (apic ? 2U : 0U) &&
+         board.rtc_evidence().irq8_delivered == 2 &&
          (cpu.read8(0x9007) & 0xc0U) == 0xc0U &&
          !(cpu.read8(0x9008) & 0xc0U) && elapsed >= period * Cpu::kTscTicksPerCycle &&
          elapsed <= (period + 1) * Cpu::kTscTicksPerCycle,
@@ -811,6 +812,9 @@ void rtc_irq8_during_service() {
     board.advance_one();
     const auto idle = board.interrupt_state();
     const auto rtc = board.rtc_evidence();
+    const auto& service = board.lapic_vector_stats()[vector];
+    need(service.deliveries == 2 && service.eois == 2 && service.entry_to_eoi_steps == 2 &&
+         rtc.irq8_delivered == 2, "RTC source and pre-EOI instruction accounting");
     need(board.evidence().apic_irqs == 2 && idle.pending == 0 && idle.in_service == 0 &&
          idle.in_service_delivery_id == 0 && idle.in_service_since_tick == 0 &&
          cpu.regs[Cpu::ESP] == stack && rtc.irq8_acknowledgements == rtc.irq8_assertions &&
@@ -1023,6 +1027,13 @@ void nested_apic_guest(){
   need(cpu.read32(apic+0x120)==0&&cpu.read32(apic+0x130)==0&&
        board.interrupt_state().in_service==0&&board.interrupt_state().priority==0,
        "EOI must release exactly the highest in-service interrupt");
+  const auto& vectors = board.lapic_vector_stats();
+  need(vectors[0x42].deliveries == 1 && vectors[0x42].eois == 1 &&
+       vectors[0x61].deliveries == 1 && vectors[0x61].eois == 1 &&
+       vectors[0x61].entry_to_eoi_steps > 0 &&
+       vectors[0x42].entry_to_eoi_steps > vectors[0x61].entry_to_eoi_steps &&
+       vectors[0x42].entry_to_eoi_ticks > vectors[0x61].entry_to_eoi_ticks &&
+       board.rtc_evidence().irq8_delivered == 0, "nested service intervals and RTC attribution");
   std::cout<<"C06_APIC_NESTED_HLT_PASS timer=0x42 self_ipi=0x61 eoi=2\n";
 }
 void apic_timer_divisor_and_global_enable(){

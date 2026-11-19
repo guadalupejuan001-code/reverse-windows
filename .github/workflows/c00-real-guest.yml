@@ -31,6 +31,13 @@ jobs:
           test "$(uname -m)" = "${{ matrix.architecture }}"
           git rev-parse HEAD
           python3 scripts/verify_deps.py --checkout
+      - name: Measure ARM64 dispatch and REP with an IRQ held by priority
+        shell: bash
+        run: |
+          baseline=9e6baec677e7a90f7b593e2a5651cc7623300dc9
+          git fetch --no-tags --depth=1 origin "$baseline"
+          git worktree add --detach "$RUNNER_TEMP/prime-r101-irq" "$baseline"
+          bash tests/compare_smp_irq.sh "$RUNNER_TEMP/prime-r101-irq" build
       - name: Compare 0.3.65 and current engines on equal guest work
         shell: bash
         run: |
@@ -624,6 +631,8 @@ jobs:
             build/prime-c02-boot-profile.json
             build/prime-x86-measure.log
             build/prime-smp-clock.log
+            build/smp-irq-samples.log
+            build/smp-irq-summary.log
             build/prime-execution.log
             build/prime-c03-ether-arm64.log
             build/prime-c03-ether-arm64.json
