@@ -148,6 +148,8 @@ void correctness() {
   require(watch.pages().size() == 2, "The guest REP should cross two physical pages");
   require(apply(video.capture(w, h), w, h, canvas) == 4,
           "Four changed pixels must cross pages without sending other pixels");
+  require(metric(metrics(video), "read_bytes") - metric(first, "read_bytes") == 16,
+          "Four adjacent pixels must read exactly 16 bytes across the two pages");
   check(pc, w, h, canvas);
   const auto serial = metric(metrics(video), "qssd_graphics_serial");
   draw(pc, {222, 1, 4, 1}, 0x80996633);
@@ -160,6 +162,13 @@ void correctness() {
   draw(pc, {w - 1, h - 1, 1, 1}, 0);
   require(apply(video.capture(w, h), w, h, canvas) == 3, "Tiny and edge changes must all arrive");
   check(pc, w, h, canvas);
+  const auto before_sparse = metric(metrics(video), "read_bytes");
+  const auto address0 = pc.video_info().physical_address;
+  const auto pages = pc.video_info().byte_size / cosmic_pc::MemoryFabric::kPageSize;
+  for (unsigned i = 0; i < pages; ++i)
+    pc.cpu.write8(address0 + i * cosmic_pc::MemoryFabric::kPageSize + 3, 0x5a);
+  require(video.capture(w, h).empty() && metric(metrics(video), "read_bytes") - before_sparse == 4 * pages,
+          "One reserved byte on each page must inspect only the intersecting pixels");
   pc.cpu.write8(pc.video_info().physical_address + pc.video_info().byte_size, 0x11);
   require(!watch.pending(), "Offscreen memory must not schedule presentation");
 
@@ -262,7 +271,7 @@ void measure() {
   run_demo(pc, 1280, 720);
   Pixels full, previous, actual;
   std::vector<std::uint8_t> row;
-  Clock::duration baseline{}, update{};
+  Clock::duration baseline{}, first_capture{}, later_captures{};
   std::uint64_t total_legacy_bytes = 0, total_legacy_reads = 0;
   unsigned legacy_frames = 0;
   for (unsigned tick = 0; tick < slots; ++tick) {
@@ -283,7 +292,9 @@ void measure() {
     const auto start = Clock::now();
     if (pc.cpu.memory.write_watch()->pending())
       apply(video.capture(width, height), width, height, actual);
-    update += Clock::now() - start;
+    const auto elapsed = Clock::now() - start;
+    if (tick == 0) first_capture += elapsed;
+    else later_captures += elapsed;
     require(actual == previous, "C06 and C07 must present equal pixels at each display opportunity");
   }
   const auto data = metrics(video);
@@ -298,12 +309,18 @@ void measure() {
             << " frames=" << frames << " legacy_bytes=" << total_legacy_bytes
             << " packet_bytes=" << packet_bytes << " legacy_read_bytes=" << total_legacy_reads
             << " read_bytes=" << read_bytes << " legacy_ns=" << nanoseconds(baseline)
-            << " delta_ns=" << nanoseconds(update) << " pixels=exact\n";
+            << " first_ns=" << nanoseconds(first_capture) << " partial_ns=" << nanoseconds(later_captures)
+            << " delta_ns=" << nanoseconds(first_capture + later_captures) << " pixels=exact\n";
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string_view(argv[1]) == "--measure") {
+      measure();
+      return 0;
+    }
+    require(argc == 1, "Use --measure to benchmark identical display work separately");
     correctness();
     android_session();
     measure();

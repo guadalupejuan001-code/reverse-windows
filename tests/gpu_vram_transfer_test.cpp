@@ -178,6 +178,14 @@ void verify_coalesced_reads(const std::filesystem::path& path, std::vector<std::
             std::equal(actual.begin(), actual.begin() + kChunk, expected.begin()) &&
             volume.io_stats().read_calls - reads == 1,
             "QSSD must fetch contiguous records with one read and preserve exact bytes");
+    constexpr auto small = 8 * block_bytes;
+    for (unsigned i = 0; i < 2; ++i)
+      require(volume.read_bytes(kVram, actual.data(), small) &&
+              std::equal(actual.begin(), actual.begin() + small, expected.begin()),
+              "A short verified VRAM reread changed the guest bytes");
+    for (std::size_t pos = 0; pos < small; pos += block_bytes)
+      require(volume.read_bytes(kVram + pos, actual.data() + pos, block_bytes),
+              "Could not seed the single-block decode cache");
     const auto fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
     require(fd >= 0, "Cannot open private checksum fixture");
     const auto changed = std::uint8_t(expected[3 * block_bytes + 31] ^ 1U);
@@ -186,6 +194,9 @@ void verify_coalesced_reads(const std::filesystem::path& path, std::vector<std::
     ::close(fd);
     require(written == 1, "Cannot damage private checksum fixture");
     std::fill_n(actual.begin(), kChunk, 0x5a);
+    require(!volume.read_bytes(kVram, actual.data(), small) &&
+            std::all_of(actual.begin(), actual.begin() + small, [](auto byte) { return byte == 0x5a; }),
+            "An externally changed RAW record escaped a warm short reread");
     require(!volume.read_bytes(kVram, actual.data(), kChunk) &&
             std::all_of(actual.begin(), actual.begin() + kChunk, [](auto byte) { return byte == 0x5a; }),
             "Corrupted raw records must fail before sending their run");
