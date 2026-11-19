@@ -18,6 +18,7 @@
 #include <ctime>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -49,6 +50,10 @@ class PcMotherboardC06 {
     unsigned selected_register, register_a, register_b, register_c;
     bool nmi_masked;
     std::uint64_t irq8_assertions, data_writes;
+  };
+  struct ThreadedSmpStats {
+    std::uint64_t dispatches = 0, guest_steps = 0;
+    unsigned last_workers = 0, peak_workers = 0;
   };
 
  private:
@@ -259,10 +264,12 @@ class PcMotherboardC06 {
   StartupIpis startup_ipis_{};
   unsigned processor_count_ = 1;
   const bool experimental_mixed_smp_;
+  bool threaded_smp_enabled_ = false;
   unsigned next_cpu_ = 0;
   std::optional<unsigned> faulted_processor_;
   std::unique_ptr<SmpWorkers> workers_;
   std::unique_ptr<EtherX86Sessions> ether_x86_sessions_;
+  ThreadedSmpStats threaded_smp_stats_;
   std::uint64_t parallel_register_batches_ = 0, parallel_register_steps_ = 0;
   std::uint64_t parallel_register_continuations_ = 0;
   std::uint64_t parallel_ram_batches_ = 0, parallel_ram_steps_ = 0;
@@ -325,6 +332,7 @@ class PcMotherboardC06 {
     startup_ipis_ = {};
     faulted_processor_.reset();
     next_cpu_ = 0;
+    threaded_smp_stats_ = {};
     parallel_register_batches_ = parallel_register_steps_ = 0;
     parallel_register_continuations_ = 0;
     parallel_ram_batches_ = parallel_ram_steps_ = 0;
@@ -1243,8 +1251,8 @@ class PcMotherboardC06 {
     return std::max(kSmpQuantum, batch_limit(kExtendedSmpQuantum));
   }
 
-  void run_secondary(unsigned id, unsigned budget, cosmic_pc::PcMachine::RunClock::time_point deadline,
-                     bool preserve_ether_loop_entry) {
+  void run_secondary(unsigned id, unsigned budget, Clock::time_point deadline,
+                     bool preserve_ether_loop_entry, std::unique_lock<std::mutex>* bus = nullptr) {
     using Clock = cosmic_pc::PcMachine::RunClock;
     const bool timed = deadline != Clock::time_point::max();
     auto& apic = apics_[id];
@@ -1271,7 +1279,7 @@ class PcMotherboardC06 {
       }
       if (cpu.halted) return;
       const auto remaining = budget - used;
-      const auto native_steps = cpu.try_ether_arm64_block(remaining);
+      const auto native_steps = cpu.try_ether_arm64_block(remaining, bus);
       if (native_steps) {
         used += native_steps;
         continue;
@@ -1410,6 +1418,7 @@ class PcMotherboardC06 {
       pc_.finish_parallel_ether_work();
       advance_batch(bsp_steps);
     }
+    if (threaded_smp_enabled_) record_threaded_dispatch(processors, total);
     if (processors > 1) {
       parallel_mixed_batches_ += experimental_mixed_smp_ && processors < active_count;
       if (ram_steps) {
@@ -1439,6 +1448,71 @@ class PcMotherboardC06 {
                bool preserve_ether_loop_entry = false) {
     const cosmic_pc::MemoryFabric::ExclusiveRamReads exclusive(pc_.cpu.memory);
     pc_.run(budget, deadline, preserve_ether_loop_entry);
+  }
+
+  void record_threaded_dispatch(unsigned workers, std::uint64_t steps) noexcept {
+    ++threaded_smp_stats_.dispatches;
+    threaded_smp_stats_.guest_steps += steps;
+    threaded_smp_stats_.last_workers = workers;
+    threaded_smp_stats_.peak_workers = std::max(threaded_smp_stats_.peak_workers, workers);
+  }
+
+  unsigned run_threaded_smp(const std::array<unsigned, kMaxProcessors>& runnable, unsigned count,
+                            unsigned budget, Clock::time_point deadline) {
+    if (!threaded_smp_enabled_ || !pc_.guest_execution_available()) return 0;
+
+    sync_active_clock();
+    std::array<unsigned, kMaxProcessors> ready{};
+    unsigned jobs = 1;
+    for (unsigned i = 1; i < count; ++i) {
+      const auto id = runnable[i];
+      auto& apic = apics_[id];
+      if (apic.cpu->halted && !apic.init_pending && !apic.startup_vector) {
+        update_secondary_timer(apic);
+        if (!deliverable_lapic_vector(apic)) continue;
+      }
+      ready[jobs++] = id;
+    }
+    constexpr unsigned bus_steps = 64, timed_grant = 512;
+    const auto grant = std::min(budget / jobs, active_clock_running_ ? timed_grant : kSmpQuantum);
+    if (jobs < 2 || grant < kSmpQuantum) return 0;
+
+    if (!workers_) workers_ = std::make_unique<SmpWorkers>(processor_count_);
+    const auto workers = workers_->prepare(jobs);
+    if (workers < 2) return 0;
+
+    // Each CPU stays on its worker for the dispatch. The bus protects RAM,
+    // devices and IRQ delivery. Only native register work can drop the lock,
+    // and it validates its code again before committing the private frame.
+    const cosmic_pc::MemoryFabric::ExclusiveRamReads exclusive(pc_.cpu.memory);
+    std::mutex bus;
+    std::array<std::uint64_t, kMaxProcessors> progress{};
+    workers_->run(workers, [&](unsigned worker) {
+      for (unsigned job = worker; job < jobs; job += workers) {
+        const auto id = ready[job];
+        for (unsigned used = 0; used < grant;) {
+          std::unique_lock<std::mutex> lock(bus);
+          if (faulted_processor_ || !pc_.guest_execution_available() ||
+              (deadline != Clock::time_point::max() && Clock::now() >= deadline)) return;
+          const auto before = processor_steps(id);
+          const auto steps = std::min(bus_steps, grant - used);
+          if (id) run_secondary(id, steps, deadline, false, &lock);
+          else pc_.run(steps, deadline, false, &lock);
+          const auto retired = processor_steps(id) - before;
+          progress[worker] += retired;
+          if (retired < steps) break;
+          used += steps;
+        }
+      }
+    });
+    std::uint64_t retired = 0;
+    unsigned active = 0;
+    for (const auto steps : progress) {
+      retired += steps;
+      active += steps != 0;
+    }
+    record_threaded_dispatch(active, retired);
+    return jobs * grant;
   }
 
  public:
@@ -1591,6 +1665,9 @@ class PcMotherboardC06 {
             rtc_irq8_assertions_,rtc_data_writes_};
   }
   unsigned worker_count() const noexcept { return workers_ ? workers_->size() : 1; }
+  void enable_threaded_smp() noexcept { threaded_smp_enabled_ = true; }
+  bool threaded_smp_enabled() const noexcept { return threaded_smp_enabled_; }
+  const ThreadedSmpStats& threaded_smp_stats() const noexcept { return threaded_smp_stats_; }
   void configure_ether_x86_sessions(unsigned workers, unsigned max_sessions_per_vcpu) {
     if (!workers || !max_sessions_per_vcpu || ether_x86_sessions_) return;
     const auto slots = std::min<std::uint64_t>(workers, std::uint64_t(processor_count_) * max_sessions_per_vcpu);
@@ -1700,6 +1777,10 @@ class PcMotherboardC06 {
       }
       if (const auto completed = run_parallel_ether_loops(runnable, count, budget, deadline)) {
         budget -= completed;
+        continue;
+      }
+      if (const auto scheduled = run_threaded_smp(runnable, count, budget, deadline)) {
+        budget -= scheduled;
         continue;
       }
       const auto chunk = std::min(budget, count * smp_quantum(runnable, count));

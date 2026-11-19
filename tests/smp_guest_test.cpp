@@ -5,8 +5,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using cosmic_pc::Cpu;
@@ -80,6 +82,7 @@ void install_trampoline(Cpu& boot) {
         0x66,0xb8,0x0b,0x00,0x00,0x00, 0x66,0xb9,0x01,0x00,0x00,0x00,0x0f,0xa2,
         0x66,0x89,0x84,0x80,0x30, 0x66,0x89,0x9c,0xc0,0x30,        // shift; package count
         0x66,0x89,0x94,0x00,0x31,                                 // APIC ID
+        0x88,0xd0,0xe6,0xe9,                                       // OUT 0xE9, APIC ID.
         0x66,0xb9,0x1b,0x00,0x00,0x00, 0x0f,0x32,                 // RDMSR IA32_APIC_BASE
         0x66,0x89,0x84,0x40,0x31,
         0xf0,0x66,0xff,0x06,0x00,0x32,                             // LOCK INC [0x3200]
@@ -88,10 +91,18 @@ void install_trampoline(Cpu& boot) {
     boot.memory.write_block(std::uint32_t(kStartupVector) << 12, startup, sizeof(startup));
 }
 
-void test_eight_cores_sixteen_threads() {
+void test_eight_cores_sixteen_threads(bool threaded) {
+    std::array<std::thread::id, kProcessors> hosts{};
+    hosts[0] = std::this_thread::get_id();
     PcMachine pc(4U << 20);
     pc.boot_demo();
+    pc.cpu.out_hook = [&](std::uint16_t port, unsigned width, std::uint32_t value) {
+        if (port != 0xe9 || width != 1 || value == 0 || value >= kProcessors) return false;
+        hosts[value] = std::this_thread::get_id();
+        return true;
+    };
     PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {8, 2});
+    if (threaded) board.enable_threaded_smp();
     check_acpi(pc.cpu);
     require(topology_leaf(pc.cpu,0) == (1ULL | (2ULL << 8) | (0x100ULL << 24)), "SMT topology");
     require(topology_leaf(pc.cpu,1) == (4ULL | (16ULL << 8) | (0x201ULL << 24)), "package topology");
@@ -129,11 +140,24 @@ void test_eight_cores_sixteen_threads() {
     require(board.worker_count() >= 1 && board.worker_count() <= kProcessors, "bounded host worker count");
     for (unsigned id = 1; id < kProcessors; ++id) {
         const auto offset = id * 4;
+        require(hosts[id] != std::thread::id{}, "each AP must reach the guest I/O probe");
         require(pc.cpu.read32(0x3000 + offset) == 1 && pc.cpu.read32(0x3040 + offset) == 2 &&
                 pc.cpu.read32(0x3080 + offset) == 4 && pc.cpu.read32(0x30c0 + offset) == 16 &&
                 pc.cpu.read32(0x3100 + offset) == id &&
                 pc.cpu.read32(0x3140 + offset) == (kLapic | 0x800U) &&
                 board.processor_steps(id) > 0, "independent CPU state and APIC ID " + std::to_string(id));
+    }
+    const std::set<std::thread::id> distinct_hosts(hosts.begin(), hosts.end());
+    const auto& dispatch = board.threaded_smp_stats();
+    if (threaded) {
+        require(distinct_hosts.size() == kProcessors && board.worker_count() == kProcessors &&
+                    dispatch.peak_workers == kProcessors && dispatch.dispatches && dispatch.guest_steps,
+                "all 16 real-mode vCPUs execute on distinct host threads without cached ARM64 loops");
+        std::cout << "SMP_THREADED_INTERPRETER_PASS workers=" << distinct_hosts.size()
+                  << " shared_atomic_counter=" << pc.cpu.read32(kSharedCounter) << '\n';
+    } else {
+        require(distinct_hosts.size() == 1 && !dispatch.dispatches,
+                "the default scheduler keeps the deterministic serial startup path");
     }
 
     const auto ap1_steps = board.processor_steps(1);
@@ -164,12 +188,15 @@ void test_eight_cores_sixteen_threads() {
     require(reset.init_icr_writes == 0 && reset.sipi_icr_writes == 0 && reset.init_targets_queued == 0 &&
                 reset.sipi_targets_queued == 0 && reset.sipi_targets_applied == 0,
             "a machine reset begins a new phase for the startup counters");
+    require(!dispatch.dispatches && !dispatch.guest_steps && !dispatch.last_workers && !dispatch.peak_workers,
+            "a machine reset clears per-phase thread evidence");
     check_acpi(pc.cpu);
 }
-void test_secondary_interrupts() {
+void test_secondary_interrupts(bool threaded) {
     PcMachine pc(4U << 20);
     pc.boot_demo();
     PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {2, 1});
+    if (threaded) board.enable_threaded_smp();
     auto& cpu = pc.cpu;
     cpu.reset(0,0x7200);
     cpu.a20_enabled = true;
@@ -247,6 +274,8 @@ void test_ether_worker_block() {
     }
     require(steps == 3 && cpu.regs[Cpu::EAX] == 42 && lock.owns_lock(),
             "the private ARM64 block retires and returns with the bus lock held");
+    require(cpu.ether_arm64_stats().off_bus_register_steps == steps,
+            "the retired register work must have run outside the bus lock");
 
     constexpr unsigned loop = address + 32;
     constexpr std::uint8_t loop_code[] = {
@@ -360,7 +389,7 @@ void start_long_mode_smp_guest(Cpu& cpu) {
     cpu.write32(kLapic + 0x300, 0x000c0600 | kStartupVector);
 }
 
-void test_signed_projection_with_smp_quantum() {
+void test_signed_projection_with_smp_quantum(bool threaded) {
     if (!Cpu::ether_arm64_host()) return;
     constexpr unsigned loop = 0x7000;
     constexpr unsigned quantum = 32;
@@ -375,6 +404,7 @@ void test_signed_projection_with_smp_quantum() {
     auto& cpu = pc.cpu;
     require(cpu.is_long_mode() && cpu.halted && !cpu.fault, "signed SMP loop fixture must boot in long mode");
     PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {2, 1});
+    if (threaded) board.enable_threaded_smp();
     pc.enable_boot_acceleration();
     cpu.enable_page_translation_cache();
     cpu.enable_ether_arm64_blocks();
@@ -398,16 +428,27 @@ void test_signed_projection_with_smp_quantum() {
     const auto bsp_start = board.processor_steps(0);
     const auto ap_start = board.processor_steps(1);
     const auto projected_start = board.processor_state_vector_steps(0);
+    const auto off_bus_start = cpu.ether_arm64_stats().off_bus_register_steps;
     board.run(2 * quantum);
     const auto projected = board.processor_state_vector_steps(0) - projected_start;
     require(!cpu.fault && !board.faulted_cpu() && cpu.flag(Cpu::IF) && cpu.eip == loop &&
                 cpu.regs[Cpu::EAX] == 99916 && cpu.regs[Cpu::EDX] == 15,
             "projecting the short SMP loop changed the guest state");
     require(board.processor_steps(0) - bsp_start == quantum &&
-                board.processor_steps(1) - ap_start == quantum && board.worker_count() == 1 &&
-                projected == 28 && board.cpu_execution_totals().projected_steps == projected,
-            "the normal 32-step SMP grant must project the signed loop and preserve AP progress");
-    std::cout << "SMP_SIGNED_PROJECTION_PASS quantum=" << quantum << " projected=" << projected << '\n';
+                board.processor_steps(1) - ap_start == quantum &&
+                board.cpu_execution_totals().projected_steps == projected,
+            "both CPUs must receive exactly one quantum");
+    if (threaded) {
+        const auto off_bus = cpu.ether_arm64_stats().off_bus_register_steps - off_bus_start;
+        require(board.worker_count() == 2 && board.threaded_smp_stats().peak_workers == 2 &&
+                    off_bus == quantum && !projected,
+                "the BSP must run native register blocks outside the bus while the scalar AP has a worker");
+        std::cout << "SMP_THREADED_ARM64_PASS workers=2 off_bus_steps=" << off_bus << '\n';
+    } else {
+        require(board.worker_count() == 1 && projected == 28,
+                "the serial 32-step SMP grant must project the signed loop");
+        std::cout << "SMP_SIGNED_PROJECTION_PASS quantum=" << quantum << " projected=" << projected << '\n';
+    }
 }
 
 void test_secondary_interpreter_projection() {
@@ -689,10 +730,13 @@ void test_parallel_ram_vectors(bool shared) {
 
 int main() {
     try {
-        test_eight_cores_sixteen_threads();
-        test_secondary_interrupts();
+        test_eight_cores_sixteen_threads(false);
+        test_eight_cores_sixteen_threads(true);
+        test_secondary_interrupts(false);
+        test_secondary_interrupts(true);
         test_ether_worker_block();
-        test_signed_projection_with_smp_quantum();
+        test_signed_projection_with_smp_quantum(false);
+        test_signed_projection_with_smp_quantum(true);
         test_secondary_interpreter_projection();
         test_mixed_parallel_and_shared_writes(2, true, true);
         test_mixed_parallel_and_shared_writes(0, true, true);

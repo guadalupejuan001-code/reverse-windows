@@ -194,6 +194,7 @@ class AndroidBootSession final {
           pc_, disk_.get(), AtapiCdrom::Reader{}, 0, graphics_vram, data_disk_.get(), topology);
     }
     board_->enable_ps2_keyboard();
+    board_->enable_threaded_smp();
     if (source != BootSource::SelfTest) pc_.enable_guest_restart();
     pc_.enable_boot_acceleration();
     pc_.cpu.enable_page_translation_cache();
@@ -503,11 +504,17 @@ class AndroidBootSession final {
     const auto topology = pc_.cpu.topology();
     const auto execution = board_->cpu_execution_totals();
     const auto startup = board_->startup_ipis();
+    const auto& threaded = board_->threaded_smp_stats();
     out << ",\"cpu_topology\":{\"sockets\":1,\"cores\":" << topology.cores
         << ",\"threads_per_core\":" << topology.threads_per_core
         << ",\"logical_processors\":" << topology.logical_processors()
         << ",\"started\":" << board_->processors_started()
         << ",\"host_workers\":" << board_->worker_count()
+        << ",\"threaded_execution\":" << (board_->threaded_smp_enabled() ? "true" : "false")
+        << ",\"host_workers_last_dispatch\":" << threaded.last_workers
+        << ",\"host_workers_peak_dispatch\":" << threaded.peak_workers
+        << ",\"threaded_dispatches\":" << threaded.dispatches
+        << ",\"threaded_guest_steps\":" << threaded.guest_steps
         << ",\"phase_x86_steps\":" << execution.guest_steps
         << ",\"phase_ether_arm64_steps\":" << execution.ether_steps
         << ",\"phase_projected_steps\":" << execution.projected_steps
