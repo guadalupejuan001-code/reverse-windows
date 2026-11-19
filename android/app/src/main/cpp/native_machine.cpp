@@ -159,6 +159,12 @@ JNIEXPORT jlong JNICALL Java_com_reversewindows_android_NativeMachine_engineTarg
     return Session::kEngineTargetHz;
 }
 
+JNIEXPORT jlong JNICALL Java_com_reversewindows_android_NativeMachine_engineDelayNs(JNIEnv* env, jclass, jlong handle) {
+    return call<jlong>(env, 0, [&] {
+        return session(handle, [](Session& machine) { return static_cast<jlong>(machine.engine_delay().count()); });
+    });
+}
+
 JNIEXPORT jlong JNICALL Java_com_reversewindows_android_NativeMachine_step(
         JNIEnv* env, jclass, jlong handle, jlong hostBudgetNs) {
     return call<jlong>(env, 3, [&] {

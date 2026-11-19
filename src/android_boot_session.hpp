@@ -423,10 +423,25 @@ class AndroidBootSession final {
       if (status != Step::Running || !progressed || retired >= engine_requested_) break;
     } while (Clock::now() < deadline);
     engine_elapsed_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+    if (engine_retired_ == engine_requested_ && status == Step::Running) {
+      // Keep phase across short OS wake-up delays. Drop stale slots after a
+      // pause or a missed window so the foreground VM never accrues a backlog.
+      const bool on_time = next_engine_window_ != Clock::time_point{} && start >= next_engine_window_ &&
+                           start - next_engine_window_ < duration;
+      next_engine_window_ = (on_time ? next_engine_window_ : start) + duration;
+    } else {
+      next_engine_window_ = {};
+    }
     return status;
   }
 
   std::uint64_t last_engine_retired() const noexcept { return engine_retired_; }
+  std::chrono::nanoseconds engine_delay() const noexcept {
+    using Clock = cosmic_pc::PcMachine::RunClock;
+    const auto now = Clock::now();
+    return now < next_engine_window_ ? std::chrono::duration_cast<std::chrono::nanoseconds>(next_engine_window_ - now)
+                                     : std::chrono::nanoseconds::zero();
+  }
 
   void set_experimental_tsc(bool enabled) { board_->set_experimental_tsc(enabled); }
 
@@ -1185,6 +1200,7 @@ class AndroidBootSession final {
   std::uint64_t restarts_ = 0;
   std::uint64_t previous_boot_steps_ = 0;
   std::uint64_t engine_requested_ = 0, engine_retired_ = 0, engine_elapsed_ns_ = 0;
+  cosmic_pc::PcMachine::RunClock::time_point next_engine_window_{};
   unsigned rapid_restarts_ = 0;
   const char* last_restart_ = "";
 };

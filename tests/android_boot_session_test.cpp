@@ -810,6 +810,12 @@ void measure_engine_window(std::uint64_t rounds, bool paced, bool mixed=false) {
   std::uint64_t active_ns = 0, full = 0, windows = 0;
 #ifdef PRIME_PREVIOUS_ENGINE_WINDOW
   std::uint64_t request = 4096;
+#else
+  for (const auto invalid : {nanoseconds::zero(), duration_cast<nanoseconds>(milliseconds(9))}) {
+    bool rejected = false;
+    try { session.step_engine_window(invalid); } catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected && session.session_steps() == before, "An invalid time window retired work");
+  }
 #endif
   const auto begin = Clock::now();
   auto status = Session::Step::Running;
@@ -830,9 +836,12 @@ void measure_engine_window(std::uint64_t rounds, bool paced, bool mixed=false) {
       request = std::clamp<std::uint64_t>((request + done * 8'000'000 / elapsed) / 2, 64, INT32_MAX);
 #else
     require(done == session.last_engine_retired() && done <= 36'000'000'000ULL, "Incorrect 64-bit grant");
+    require(session.engine_delay() <= milliseconds(8) &&
+                (done == 36'000'000'000ULL || session.engine_delay() == nanoseconds::zero()),
+            "An incomplete guest window requested pacing");
     if (done == 36'000'000'000ULL) {
       ++full;
-      if (paced && status == Session::Step::Running) std::this_thread::sleep_until(turn + milliseconds(8));
+      if (paced && status == Session::Step::Running) std::this_thread::sleep_for(session.engine_delay());
     }
 #endif
   }

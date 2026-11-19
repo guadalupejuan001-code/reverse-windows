@@ -479,9 +479,8 @@ final class VmWorker {
             if (now - lastStatus >= STATUS_INTERVAL_MS || outcome != previous)
                 publishState(outcome == NativeMachine.WAITING_KEY);
             // Yield the remainder only when the engine really earned the full grant.
-            long remainingNs = TARGET_SLICE_NS - (SystemClock.elapsedRealtimeNanos() - started);
-            long delayMs = lastSliceCompleted == lastSliceSteps && remainingNs > 0
-                    ? (remainingNs + 999_999L) / 1_000_000L : 0;
+            long delayMs = lastSliceCompleted == lastSliceSteps && outcome == NativeMachine.RUNNING
+                    ? (NativeMachine.engineDelayNs(handle) + 999_999L) / 1_000_000L : 0;
             schedule(outcome == NativeMachine.HALTED ? HALTED_POLL_DELAY_MS : delayMs);
         } catch (RuntimeException | LinkageError | OutOfMemoryError error) {
             report(error);
