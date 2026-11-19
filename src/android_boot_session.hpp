@@ -694,7 +694,7 @@ class AndroidBootSession final {
     const auto batched_steps = boot_work.rep_elements + boot_work.shift_loop_steps +
         boot_work.zero_loop_steps + boot_work.scan_loop_steps + boot_work.counter_loop_steps +
         boot_work.affine_ram_rotate_steps + boot_work.movntdq_store_steps + board_->secondary_store_steps() +
-        execution.state_vector_interpreter_steps;
+        board_->secondary_rep_elements() + execution.state_vector_interpreter_steps;
     const auto accelerated_steps = execution.ether_steps + batched_steps;
     out << ",\"ether_coverage\":{\"phase_steps\":" << execution.guest_steps
         << ",\"translated_steps\":" << execution.ether_steps
@@ -730,7 +730,9 @@ class AndroidBootSession final {
         << ",\"boot_movntdq_store_batches\":" << boot_work.movntdq_store_batches
         << ",\"boot_movntdq_store_steps\":" << boot_work.movntdq_store_steps
         << ",\"secondary_movntdq_store_batches\":" << board_->secondary_store_batches()
-        << ",\"secondary_movntdq_store_steps\":" << board_->secondary_store_steps();
+        << ",\"secondary_movntdq_store_steps\":" << board_->secondary_store_steps()
+        << ",\"secondary_rep_elements\":" << board_->secondary_rep_elements()
+        << ",\"secondary_rep_bytes\":" << board_->secondary_rep_bytes();
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     const auto ether = pc_.cpu.ether_next_stats();
     out << ",\"neon_requested\":" << (pc_.cpu.ether_next_enabled() ? "true" : "false")
@@ -791,6 +793,7 @@ class AndroidBootSession final {
         << ",\"register_c\":" << rtc.register_c
         << ",\"irq8_assertions\":" << rtc.irq8_assertions
         << ",\"irq8_acknowledgements\":" << rtc.irq8_acknowledgements
+        << ",\"irq8_delivered\":" << rtc.irq8_delivered
         << ",\"irq8_redirection_low\":" << rtc.irq8_redirection_low
         << ",\"data_writes\":" << rtc.data_writes
         << "},\"ata\":{\"commands\":" << counts.commands
@@ -817,8 +820,23 @@ class AndroidBootSession final {
         << ",\"lapic_priority\":" << interrupts.priority
         << ",\"lapic_timer_count\":" << interrupts.timer_count
         << ",\"ioapic_select\":" << interrupts.ioapic_select
-        << ",\"ioapic_id\":" << interrupts.ioapic_id
-        << "},\"vga\":{\"qssd_graphics_serial\":"
+        << ",\"ioapic_id\":" << interrupts.ioapic_id;
+    if (detailed) {
+      out << ",\"lapic_vectors\":[";
+      bool first = true;
+      const auto& vectors = board_->lapic_vector_stats();
+      for (unsigned vector = 0; vector < vectors.size(); ++vector) {
+        const auto& stats = vectors[vector];
+        if (!stats.deliveries) continue;
+        out << (first ? "" : ",") << "{\"vector\":" << vector
+            << ",\"deliveries\":" << stats.deliveries << ",\"eois\":" << stats.eois
+            << ",\"entry_to_eoi_ticks\":" << stats.entry_to_eoi_ticks
+            << ",\"entry_to_eoi_steps\":" << stats.entry_to_eoi_steps << '}';
+        first = false;
+      }
+      out << ']';
+    }
+    out << "},\"vga\":{\"qssd_graphics_serial\":"
         << vga_serial_ << ",\"planned_update_bytes\":" << vga_transfer_bytes_
         << "},\"vbe\":";
     vbe_.write_json(out);

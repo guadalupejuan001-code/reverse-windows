@@ -393,6 +393,118 @@ void start_long_mode_smp_guest(Cpu& cpu) {
     cpu.write32(kLapic + 0x300, 0x000c0600 | kStartupVector);
 }
 
+// Run the public board scheduler with one application processor. A fixed IPI
+// lets both versions see exactly one request independent of the host's speed.
+void measure_secondary_irq_work(bool copy, bool pending) {
+    constexpr unsigned vector = 0xd1, handler = 0x18000, idt = 0x15000;
+    constexpr unsigned source = 0x100000, destination = 0x150000, bytes = 0x20000;
+    constexpr unsigned iterations = 65536;
+    PcMachine pc(4U << 20);
+    pc.boot_long_mode_demo();
+    pc.run(4000);
+    auto& cpu = pc.cpu;
+    require(cpu.is_long_mode() && cpu.halted && !cpu.fault, "long-mode SMP IRQ fixture");
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {2, 1}, true, {},
+                           PcMotherboardC06::CpuClock::Experimental4_5THz);
+    pc.enable_boot_acceleration();
+    cpu.enable_page_translation_cache();
+    cpu.enable_ether_arm64_blocks();
+    board.enable_active_clock();
+    board.enable_threaded_smp(2);
+    board.enable_execution_target();
+    cpu.write64(0x2000 + 3 * 8, 0x6003);
+    cpu.write64(0x6000 + ((kLapic >> 21) & 511) * 8, kLapic | 0x83);
+    cpu.write16(0x5180, 4095);
+    cpu.write64(0x5182, idt);
+    cpu.write64(idt + 16 * vector, (handler & 0xffffU) | (0x18ULL << 16) |
+                                    (0x8eULL << 40) | (std::uint64_t(handler >> 16) << 48));
+    cpu.write64(idt + 16 * vector + 8, 0);
+    // The handler records the stage it interrupted, then issues EOI and IRETQ.
+    constexpr std::uint8_t irq[] = {
+        0x50, 0x8b,0x04,0x25,0,0x40,1,0, 0x89,0x04,0x25,4,0x40,1,0,
+        0xc7,0x83,0xb0,0,0,0,0,0,0,0, 0x58,0x48,0xcf
+    };
+    cpu.memory.write_block(handler, irq, sizeof(irq));
+    std::vector<std::uint8_t> program{
+        0xbc,0,0,0x1f,0,                         // MOV ESP,1F0000h.
+        0x0f,0x01,0x1c,0x25,0x80,0x51,0,0,       // LIDT [5180h].
+        0xbb,0,0,0xe0,0xfe,                      // EBX = LAPIC MMIO base.
+        0xc7,0x83,0xf0,0,0,0,0xff,1,0,0,        // Enable the LAPIC.
+        0xc7,0x83,0x80,0,0,0,0xf0,0,0,0         // TPR = F0h masks D1h.
+    };
+    const auto emit = [&](std::initializer_list<std::uint8_t> code) {
+        program.insert(program.end(), code);
+    };
+    if (pending) emit({0xc7,0x83,0,3,0,0,0xd1,0,4,0});  // Send D1h to self.
+    emit({0xfb,0x90,0x31,0xd2});                           // STI; NOP; XOR EDX,EDX.
+    std::uint32_t expected = 0;
+    std::vector<std::uint8_t> pattern;
+    if (copy) {
+        emit({0xbe,0,0,0x10,0, 0xbf,0,0,0x15,0, 0xb9,0,0,2,0, 0xf3,0xa4});
+        pattern.resize(bytes);
+        for (unsigned i = 0; i < bytes; ++i) pattern[i] = std::uint8_t(i ^ (i >> 8));
+        cpu.memory.write_block(source, pattern.data(), bytes);
+        cpu.write8(destination - 1, 0xa6);
+        cpu.write8(destination + bytes, 0x5b);
+    } else {
+        emit({0xb9,0,0,1,0,                               // ECX = 65536.
+              0x01,0xca, 0x81,0xf2,0xdf,0x9b,0x57,0x13,  // ADD EDX,ECX; XOR EDX,13579BDFh.
+              0xc1,0xc2,5, 0xff,0xc9, 0x75,0xf1});       // ROL EDX,5; DEC ECX; JNZ.
+        for (unsigned n = iterations; n; --n) {
+            expected = (expected + n) ^ 0x13579bdfU;
+            expected = (expected << 5) | (expected >> 27);
+        }
+    }
+    emit({0x9c,0x58, 0x89,0x04,0x25,8,0x40,1,0,       // Save flags, result and final ECX.
+          0x89,0x14,0x25,12,0x40,1,0, 0x89,0x0c,0x25,16,0x40,1,0,
+          0xc7,0x04,0x25,0,0x40,1,0,1,0,0,0,         // Stage = 1.
+          0xc7,0x83,0x80,0,0,0,0,0,0,0,              // Unmask D1h.
+          0xc7,0x04,0x25,0,0x40,1,0,2,0,0,0, 0xfa,0xf4}); // Stage = 2; CLI; HLT.
+    install_long_mode_smp_guest(cpu, program.data(), program.size());
+    start_long_mode_smp_guest(cpu);
+    cpu.eip = 0x7000;
+    cpu.write8(0x7000, 0xf4); // Halt just the BSP.
+    const auto begin = PcMachine::RunClock::now();
+    const auto deadline = begin + std::chrono::seconds(15);
+    while (board.secondary_can_run() && PcMachine::RunClock::now() < deadline &&
+           !board.faulted_cpu() && !cpu.fault) {
+        board.run(8192, std::min(deadline, PcMachine::RunClock::now() + std::chrono::milliseconds(8)));
+    }
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        PcMachine::RunClock::now() - begin).count();
+    if (const auto* fault = board.faulted_cpu()) throw std::runtime_error(fault->fault->describe());
+    const auto flags = cpu.read32(0x14008);
+    require(!cpu.fault && board.processors_started() == 2 && !board.secondary_can_run() &&
+            board.threaded_smp_stats().dispatches && cpu.read32(0x14000) == 2 &&
+            cpu.read32(0x14004) == unsigned(pending) && board.evidence().apic_irqs == unsigned(pending) &&
+            cpu.read32(0x1400c) == expected && cpu.read32(0x14010) == 0 &&
+            (flags & (Cpu::IF | Cpu::ZF)) == (Cpu::IF | Cpu::ZF),
+            "AP arithmetic, retirement boundary or deferred IPI changed");
+    auto checksum = expected;
+    if (copy) {
+        std::vector<std::uint8_t> result(bytes);
+        cpu.memory.read_block(destination, result.data(), bytes);
+        require(result == pattern && cpu.read8(destination - 1) == 0xa6 &&
+                cpu.read8(destination + bytes) == 0x5b, "REP changed guest bytes");
+        checksum = 2166136261U;
+        for (const auto byte : result) checksum = (checksum ^ byte) * 16777619U;
+    }
+    const auto native = board.processor_ether_arm64_steps(1);
+    std::uint64_t rep = 0;
+#ifndef PRIME_R101_BASELINE
+    rep = board.secondary_rep_elements();
+    require(board.lapic_vector_stats()[vector].eois == unsigned(pending) &&
+            board.rtc_evidence().irq8_delivered == 0, "self IPI attribution");
+    if (copy) require(rep > bytes / 2 && rep == board.secondary_rep_bytes(), "inactive AP REP route");
+    if (!copy && Cpu::ether_arm64_host())
+        require(native > iterations * 4, "inactive AP ARM64 route with IF set");
+#endif
+    std::cout << "SMP_IRQ_SAMPLE work=" << (copy ? "rep" : "registers") << " pending=" << pending
+              << " wall_ns=" << ns << " steps=" << board.processor_steps(1) << " native=" << native
+              << " rep=" << rep << " checksum=" << checksum << " flags=" << flags
+              << " deliveries=" << board.evidence().apic_irqs << '\n';
+}
+
 void test_secondary_streaming_stores(bool threaded) {
     constexpr unsigned source = 0xa000, destination = 0xb000, rounds = 16;
     // Enable OSFXSR, load two distinct XMM values, then write eight consecutive
@@ -766,6 +878,19 @@ void test_parallel_ram_vectors(bool shared, unsigned worker_limit = kProcessors)
         check_guest();
     }
     require(reached(1) && board.processors_started() == kProcessors, "All readers must be ready");
+    if (shared) {
+        // IRQ8 latched in the legacy PIC while LAPIC LINT0 has ExtINT masked.
+        // The guest can read IRR, even though this route cannot interrupt the BSP.
+        cpu.write32(kLapic + 0xf0, 0x1ff);
+        cpu.out_hook(0x21, 1, 0xfb);
+        cpu.out_hook(0xa1, 1, 0xfe);
+        cpu.out_hook(0x70, 1, 0x0b);
+        cpu.out_hook(0x71, 1, 0x42);
+        for (unsigned i = 0; i < 4096 && !board.rtc_evidence().irq8_assertions; ++i) board.advance_one();
+        cpu.out_hook(0x71, 1, 0x02);
+        cpu.set_flag(Cpu::IF, true);
+        require(cpu.in_hook(0xa0, 1).value_or(0) & 1U, "IRQ8 must remain latched in PIC IRR");
+    }
     const auto before = board.parallel_ram_steps();
     cpu.write32(kStartFlag, 1);
     const auto deadline = PcMachine::RunClock::now() + std::chrono::seconds(10);
@@ -781,6 +906,8 @@ void test_parallel_ram_vectors(bool shared, unsigned worker_limit = kProcessors)
     require(parallel >= std::uint64_t(kProcessors) * words * 4 &&
                 cpu.memory.metrics().page_state_vectors >= (shared ? 2U : kProcessors + 1),
             "C06 must dispatch the RAM loop through the shared vectors");
+    if (shared) require(!board.evidence().irq_delivered && (cpu.in_hook(0xa0, 1).value_or(0) & 1U),
+                        "inactive PIC route must preserve IRR throughout parallel execution");
     for (unsigned id = 0; id < kProcessors; ++id) {
         const auto expected = std::uint64_t(words) * (words - 1) / 2 + (shared ? 0 : id * words);
         require(cpu.read64(kJobs + id * kJobBytes + 16) == expected,
@@ -1038,6 +1165,12 @@ void measure_smp_clock(PcMotherboardC06::CpuClock profile) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--measure-irq-work") {
+            measure_secondary_irq_work(false, false);
+            measure_secondary_irq_work(false, true);
+            measure_secondary_irq_work(true, true);
+            return 0;
+        }
         using Profile = PcMotherboardC06::CpuClock;
         check_cpu_clock(Profile::Standard, 1);
         check_cpu_clock(Profile::Double, 2);

@@ -54,6 +54,9 @@ class PcMotherboardC06 {
     std::uint32_t ioapic_select, ioapic_id;
     std::uint64_t in_service_delivery_id, in_service_since_tick;
   };
+  struct LapicVectorStats {
+    std::uint64_t deliveries = 0, eois = 0, entry_to_eoi_ticks = 0, entry_to_eoi_steps = 0;
+  };
   struct StartupIpis {
     std::uint64_t init_icr_writes = 0, sipi_icr_writes = 0;
     std::uint64_t init_targets_queued = 0, sipi_targets_queued = 0, sipi_targets_applied = 0;
@@ -64,6 +67,7 @@ class PcMotherboardC06 {
     std::uint64_t irq8_assertions, data_writes;
     std::uint64_t irq8_acknowledgements;
     std::uint32_t irq8_redirection_low;
+    std::uint64_t irq8_delivered;
   };
   struct ThreadedSmpStats {
     std::uint64_t dispatches = 0, guest_steps = 0;
@@ -225,7 +229,7 @@ class PcMotherboardC06 {
   std::time_t rtc_utc_offset_=0;
   std::uint64_t rtc_period_ticks_=0,rtc_next_periodic_tick_=UINT64_MAX;
   std::uint64_t rtc_irq8_assertions_=0,rtc_data_writes_=0;
-  std::uint64_t rtc_irq8_acknowledgements_=0;
+  std::uint64_t rtc_irq8_acknowledgements_=0, rtc_irq8_delivered_=0;
   std::array<std::uint8_t,256> host_cfg_{},isa_cfg_{};
   std::uint16_t pm_control_=0x0001; // SCI_EN: firmware starts in ACPI mode.
   std::uint16_t pm_status_=0,pm_enable_=0;
@@ -284,9 +288,9 @@ class PcMotherboardC06 {
     std::uint64_t timer_cycles = 0, last_tick = 0;
     ApicPriorityVectors pending, in_service;
     // A nested interrupt must have a higher priority class than the interrupted one.
-    struct Delivery { std::uint64_t id=0, tick=0; };
+    struct Delivery { std::uint64_t id=0, tick=0, steps=0; };
     std::array<Delivery,16> delivery_by_priority{};
-    std::bitset<256> pending_level, in_service_level, pending_ata, pending_sci;
+    std::bitset<256> pending_level, in_service_level, pending_ata, pending_sci, pending_rtc;
     PendingWrite mmio_pending;
   };
   static constexpr auto kMaxProcessors = cosmic_pc::CpuTopology::kMaxLogical;
@@ -295,6 +299,7 @@ class PcMotherboardC06 {
   static constexpr auto kParallelLoopAccess = cosmic_pc::Cpu::EtherLoopAccess::ReadOnlyRam;
   std::array<std::unique_ptr<cosmic_pc::Cpu>, kMaxProcessors> secondary_cpus_{};
   std::array<LocalApic, kMaxProcessors> apics_;
+  std::array<LapicVectorStats, 256> lapic_vectors_{};
   std::array<std::uint64_t, kMaxProcessors> retired_before_init_{};
   std::array<std::uint64_t, kMaxProcessors> ether_steps_before_init_{};
   std::array<std::uint64_t, kMaxProcessors> state_vector_steps_before_init_{};
@@ -314,6 +319,7 @@ class PcMotherboardC06 {
   std::uint64_t parallel_ram_batches_ = 0, parallel_ram_steps_ = 0;
   std::uint64_t parallel_mixed_batches_ = 0;
   std::uint64_t secondary_store_batches_ = 0, secondary_store_steps_ = 0;
+  std::uint64_t secondary_rep_elements_ = 0, secondary_rep_bytes_ = 0;
   unsigned longest_parallel_register_slice_ = 0;
   bool prior_local_apic_=false;
   const std::uint64_t* prior_clock_ = nullptr;
@@ -355,7 +361,8 @@ class PcMotherboardC06 {
     active_clock_enabled_=active_clock_running_=waiting_for_guest_mode_=false;
     active_clock_ns_=active_clock_ticks_=clock_tick_remainder_=0;
     clock_polls_=0;
-    rtc_irq8_assertions_=rtc_irq8_acknowledgements_=rtc_data_writes_=0;
+    rtc_irq8_assertions_=rtc_irq8_acknowledgements_=rtc_irq8_delivered_=rtc_data_writes_=0;
+    lapic_vectors_.fill({});
     rtc_schedule_periodic();
     if(ata_)ata_->reset();
     if(data_ata_)data_ata_->reset();
@@ -381,6 +388,7 @@ class PcMotherboardC06 {
     parallel_ram_batches_ = parallel_ram_steps_ = 0;
     parallel_mixed_batches_ = 0;
     secondary_store_batches_ = secondary_store_steps_ = 0;
+    secondary_rep_elements_ = secondary_rep_bytes_ = 0;
     longest_parallel_register_slice_ = 0;
     ioapic_select_=0;
     ioapic_id_=std::uint8_t(AcpiC06::ioapic_id(processor_count_));
@@ -1000,6 +1008,11 @@ class PcMotherboardC06 {
   void complete_lapic_irq(LocalApic& apic) {
     const auto vector=apic.in_service.highest();
     if(!vector)return;
+    const auto& entry = apic.delivery_by_priority[vector >> 4];
+    auto& stats = lapic_vectors_[vector];
+    ++stats.eois;
+    stats.entry_to_eoi_ticks += ticks_ - entry.tick;
+    stats.entry_to_eoi_steps += apic.cpu->instructions - entry.steps;
     apic.in_service.reset(vector);
     if(!apic.in_service_level.test(vector))return;
     apic.in_service_level.reset(vector);
@@ -1039,6 +1052,7 @@ class PcMotherboardC06 {
       if (level) apic.pending_level.set(vector);
       if (line == 14) apic.pending_ata.set(vector);
       if (line == AcpiC06::sci_irq) apic.pending_sci.set(vector);
+      if (line == kRtcLine) apic.pending_rtc.set(vector);
     }
   }
   void deliver_sci() {
@@ -1082,10 +1096,13 @@ class PcMotherboardC06 {
       apic.pending_level.reset(vector);
       if (apic.pending_ata[vector]) ++ata_irq_delivered_;
       if (apic.pending_sci[vector]) ++sci_irqs_;
+      if (apic.pending_rtc[vector]) ++rtc_irq8_delivered_;
       apic.pending_ata.reset(vector);
       apic.pending_sci.reset(vector);
+      apic.pending_rtc.reset(vector);
       ++apic_irqs_; ++irq_delivered_;
-      apic.delivery_by_priority[vector >> 4] = {apic_irqs_, ticks_};
+      ++lapic_vectors_[vector].deliveries;
+      apic.delivery_by_priority[vector >> 4] = {apic_irqs_, ticks_, apic.cpu->instructions};
     }
     return true;
   }
@@ -1255,6 +1272,7 @@ class PcMotherboardC06 {
           slave_.accepted(sn);master_.accepted(2);
           ++irq_delivered_;if(sn==6)++ata_irq_delivered_;
           if(sn==AcpiC06::sci_irq-8)++sci_irqs_;
+          if(sn==kRtcLine-8)++rtc_irq8_delivered_;
         }
       }else if(cpu.raise_external_irq(std::uint8_t(master_.vector+n))){
         master_.accepted(n);++irq_delivered_;
@@ -1400,7 +1418,9 @@ class PcMotherboardC06 {
 
   unsigned secondary_batch_limit(const LocalApic& apic, unsigned remaining) const {
     const bool accepts_irq = apic.cpu->flag(cosmic_pc::Cpu::IF);
-    if (accepts_irq && apic.pending.highest()) return 1;
+    // A masked request stays in IRR. A translated block cannot change guest
+    // interrupt priority or issue an EOI without returning to the device bus.
+    if (accepts_irq && deliverable_lapic_vector(apic)) return 1;
     auto limit = batch_limit(remaining);
     if (accepts_irq && apic.timer_cycles && !(apic.lvt[kTimer] & kLvtMasked) && lapic_on(apic))
       limit = unsigned(std::min<std::uint64_t>(limit, apic.timer_cycles));
@@ -1414,6 +1434,7 @@ class PcMotherboardC06 {
     auto& apic = apics_[id];
     auto& cpu = *apic.cpu;
     unsigned dispatches = 0;
+    std::optional<std::uint64_t> rejected_vector_ip;
     for (unsigned used = 0; used < budget;) {
       // The workers have joined before shared RAM or devices can change.
       if ((dispatches++ & 7U) == 0) {
@@ -1436,6 +1457,14 @@ class PcMotherboardC06 {
       if (cpu.halted) return;
       observe_guest_clock_mode(cpu);
       const auto remaining = budget - used;
+      if (pc_.boot_acceleration_enabled() && cpu.rep_batch_candidate()) {
+        if (const auto elements = cpu.try_rep_batch(secondary_batch_limit(apic, remaining))) {
+          secondary_rep_elements_ += elements;
+          secondary_rep_bytes_ += cpu.last_rep_batch_bytes();
+          used += elements;
+          continue;
+        }
+      }
       // Apply the same one-page XMM store coalescer as the boot CPU. Shared
       // writes stay inside the scheduler's bus grant in threaded mode.
       if (pc_.boot_acceleration_enabled() && cpu.movntdq_store_batch_candidate()) {
@@ -1455,11 +1484,16 @@ class PcMotherboardC06 {
           continue;
         }
       }
-      if (pc_.boot_acceleration_enabled() && cpu.state_vector_batch_candidate()) {
+      if (pc_.boot_acceleration_enabled() && cpu.state_vector_batch_candidate() &&
+          rejected_vector_ip != cpu.eip) {
+        const auto entry = cpu.eip;
         if (const auto vector_steps = cpu.try_state_vector_batch(secondary_batch_limit(apic, remaining))) {
           used += vector_steps;
           continue;
         }
+        // Do not decode the same rejected loop on every backedge of this grant.
+        // Scalar execution remains exact, and the next grant retries changed code or state.
+        rejected_vector_ip = entry;
       }
       const auto result = cpu.step();
       if (result == cosmic_pc::StepResult::Faulted) faulted_processor_ = id;
@@ -1479,7 +1513,7 @@ class PcMotherboardC06 {
                                     cosmic_pc::PcMachine::RunClock::time_point deadline) {
     if (budget < 2 * kMinParallelLoopSteps || !cosmic_pc::Cpu::ether_arm64_host() ||
         !pc_.boot_acceleration_enabled() || !pc_.guest_execution_available() ||
-        (pc_.cpu.flag(cosmic_pc::Cpu::IF) && slave_.pending()) ||
+        (pc_.cpu.flag(cosmic_pc::Cpu::IF) && pic_connected() && slave_.pending()) ||
         (sci_active_ && (io_redir_low_[AcpiC06::sci_irq] & 0x8000U))) return 0;
 
     auto limit = budget;
@@ -1850,6 +1884,7 @@ class PcMotherboardC06 {
   Evidence evidence()const{
     return {ticks_,irq_delivered_,pit_irqs_,apic_irqs_,true,true,powered_off_,ata_irq_delivered_,sci_irqs_};
   }
+  const auto& lapic_vector_stats() const noexcept { return lapic_vectors_; }
   InterruptState interrupt_state()const{
     const auto vector = bsp().in_service.highest();
     const auto delivery = bsp().delivery_by_priority[vector >> 4]; // Class zero is never delivered.
@@ -1869,7 +1904,8 @@ class PcMotherboardC06 {
   StartupIpis startup_ipis() const noexcept { return startup_ipis_; }
   RtcEvidence rtc_evidence() const noexcept {
     return {cmos_index_&0x7fU,rtc_a_,rtc_b_,rtc_c_,bool(cmos_index_&0x80U),
-            rtc_irq8_assertions_,rtc_data_writes_,rtc_irq8_acknowledgements_,ioapic_redirection_low(kRtcLine)};
+            rtc_irq8_assertions_,rtc_data_writes_,rtc_irq8_acknowledgements_,
+            ioapic_redirection_low(kRtcLine),rtc_irq8_delivered_};
   }
   unsigned worker_count() const noexcept { return workers_ ? workers_->size() : 1; }
   unsigned host_workers_capacity() const noexcept { return std::min(worker_limit_, processor_count_); }
@@ -1902,6 +1938,8 @@ class PcMotherboardC06 {
   std::uint64_t parallel_ram_steps() const noexcept { return parallel_ram_steps_; }
   std::uint64_t secondary_store_batches() const noexcept { return secondary_store_batches_; }
   std::uint64_t secondary_store_steps() const noexcept { return secondary_store_steps_; }
+  std::uint64_t secondary_rep_elements() const noexcept { return secondary_rep_elements_; }
+  std::uint64_t secondary_rep_bytes() const noexcept { return secondary_rep_bytes_; }
   std::uint64_t parallel_mixed_batches() const noexcept { return parallel_mixed_batches_; }
   unsigned longest_parallel_register_slice() const noexcept { return longest_parallel_register_slice_; }
   const cosmic_pc::Cpu* faulted_cpu() const noexcept {
