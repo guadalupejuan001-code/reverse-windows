@@ -38,6 +38,17 @@ jobs:
           git fetch --no-tags --depth=1 origin "$baseline"
           git worktree add --detach "$RUNNER_TEMP/prime-r101-irq" "$baseline"
           bash tests/compare_smp_irq.sh "$RUNNER_TEMP/prime-r101-irq" build
+      - name: Measure partial VRAM and vCPU grants against r102
+        shell: bash
+        run: |
+          baseline=702edd72455ad1242a4d9de53f21a57773dcc5ec
+          git fetch --no-tags --depth=1 origin "$baseline"
+          git worktree add --detach "$RUNNER_TEMP/prime-r102-vram" "$baseline"
+          bash tests/compare_r103.sh "$RUNNER_TEMP/prime-r102-vram" build | tee build/r103-summary.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prime-r103-measurements-${{ matrix.architecture }}
+          path: build/r103-summary.log
       - name: Compare 0.3.65 and current engines on equal guest work
         shell: bash
         run: |

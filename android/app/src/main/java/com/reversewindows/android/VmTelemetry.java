@@ -39,7 +39,7 @@ final class VmTelemetry extends LinearLayout {
     private final TextView resident;
     private final TextView occupancy;
     private final ProgressBar meter;
-    private final LinearLayout[] rows = new LinearLayout[8];
+    private final LinearLayout[] rows = new LinearLayout[12];
     private final TextView[] keys = new TextView[rows.length];
     private final TextView[] values = new TextView[rows.length];
 
@@ -280,7 +280,15 @@ final class VmTelemetry extends LinearLayout {
         if (renderer.isEmpty() && number(gpu, "draw_requests") == 0 &&
                 number(gpu, "scheduler_submissions") == 0) renderer = "Sin solicitudes";
         metric(7, "Renderizador 3D C08", renderer.isEmpty() ? UNKNOWN : renderer);
-        showRows(8);
+        if (gpu == null || !gpu.has("qssd_ready")) { showRows(8); return; }
+        metric(8, "Captura VBE en memoria", storage(number(vbe, "scanout_cache_bytes")));
+        metric(9, "Respaldo qSSD de VRAM", gpu.optBoolean("qssd_ready")
+                ? storage(number(gpu, "qssd_backing_bytes")) : "No disponible");
+        metric(10, "Reloj virtual de VRAM", frequency(number(gpu, "vram_clock_hz")));
+        JSONObject quantum = gpu.optJSONObject("quantum_vram");
+        metric(11, "VRAM Éter · guardado / restaurado", storage(number(quantum, "saved_bytes"))
+                + " / " + storage(number(quantum, "restored_bytes")));
+        showRows(12);
     }
 
     private void heading(String title, String value, String hint) {

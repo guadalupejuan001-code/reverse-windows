@@ -263,7 +263,8 @@ void android_session() {
   const auto c08 = diagnostic.substr(gpu);
   require(metric(c08, "virtual_clock_hz") == 4500000000000ULL &&
           metric(c08, "resident_vram_bytes") == 0 && metric(c08, "draws") == 0 &&
-          metric(c08, "scheduler_submissions") == 0 && !std::filesystem::exists(vram),
+          metric(c08, "scheduler_submissions") == 0 && std::filesystem::file_size(vram) == 64 &&
+          metric(diagnostic.substr(vbe), "scanout_cache_bytes") == 960 * 540 * 4,
           "Showing a VBE image must not synthesize C08 commands or allocate its VRAM");
   std::cout << "PRIME_C07_ANDROID_VBE_PASS frames=" << frames << " qssd=1 pixels=exact c08_resident=0\n";
 }

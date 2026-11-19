@@ -167,6 +167,30 @@ private:
     HANDLE device_;
 };
 
+// Round-trip the last byte and restore its original basis state. A
+// non-basis value is returned by the driver as unavailable before any store.
+void verify_quantum() {
+    GuestGpu gpu;
+    RwGpuQuantumRequest load{RWGPU_LOGICAL_BYTES - 1, 0, RWGPU_ABI, RWGPU_QUANTUM_LOAD, 1, 0};
+    std::uint8_t original = 0, actual = 0;
+    gpu.cmd(RWGPU_IOCTL_QUANTUM, &load, sizeof(load), &original, 1, 1);
+    const auto store = [&](std::uint8_t value) {
+        std::array<std::uint8_t, sizeof(RwGpuQuantumRequest) + 1> packet{};
+        auto request = load;
+        request.operation = RWGPU_QUANTUM_STORE;
+        std::memcpy(packet.data(), &request, sizeof(request));
+        packet.back() = value;
+        gpu.cmd(RWGPU_IOCTL_QUANTUM, packet.data(), DWORD(packet.size()), nullptr, 0, 0);
+    };
+    const auto expected = std::uint8_t(original ^ 0x5a);
+    store(expected);
+    try { gpu.cmd(RWGPU_IOCTL_QUANTUM, &load, sizeof(load), &actual, 1, 1); }
+    catch (...) { store(original); throw; }
+    store(original);
+    if (actual != expected) throw std::runtime_error("Quantum VRAM readback mismatch");
+    std::puts("PRIME_QUANTUM_WINDOWS_PASS last_byte=119999999999");
+}
+
 void verify_pixels(const std::vector<std::uint8_t>& result,
                    const std::array<std::uint32_t, checks.size()>& expected) {
     for (std::size_t i = 0; i < checks.size(); ++i) {
@@ -252,6 +276,10 @@ void verify_reference(const std::array<std::uint32_t, checks.size()>& samples) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--quantum") {
+            verify_quantum();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--wddm") {
             const auto adapter = prime_wddm::find_adapter();
             if (!adapter) {
@@ -281,7 +309,7 @@ int main(int argc, char** argv) {
         if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--primevgc"))
             verify_primevgc(samples);
         else if (argc == 2 && std::string_view(argv[1]) == "--staged") verify_guest(samples);
-        else throw std::runtime_error("Usage: prime_gpu_scene [--reference | --primevgc | --staged | --wddm]");
+        else throw std::runtime_error("Usage: prime_gpu_scene [--reference | --primevgc | --staged | --wddm | --quantum]");
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());

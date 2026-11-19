@@ -5,6 +5,7 @@
 #include "qssd_disk.hpp"
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -40,6 +41,12 @@ class GpuVram {
   explicit GpuVram(std::filesystem::path path, std::shared_ptr<SmpWorkers> workers = {})
       : path_(std::move(path)), bulk_workers_(std::move(workers)) {}
 
+  bool power_on() noexcept {
+    try { volume(); return true; }
+    catch (const std::exception&) { return false; }
+  }
+  bool backing_ready() const noexcept { return bool(disk_); }
+
   // A view stays valid until this device's next cache update or reset.
   // The device and guest RAM are accessed by the same VM thread.
   const std::uint8_t* resident_read(std::uint64_t offset, std::size_t size) const noexcept {
@@ -53,9 +60,11 @@ class GpuVram {
     if (!size) return Result::Complete;
     try {
       if (const auto* data = resident_read(offset, size)) {
+        ++read_hits_;
         std::memcpy(target, data, size);
         return Result::Complete;
       }
+      ++backend_reads_;
       if (!volume().read_bytes(offset, target, size)) return Result::Unavailable;
       update_resident(offset, target, size);
       return Result::Complete;
@@ -89,6 +98,7 @@ class GpuVram {
         if (const auto* bytes = resident_read(address, kPageBytes)) {
           std::memcpy(page, bytes, kPageBytes);
         } else if (!disk.read_bytes(address, page, kPageBytes)) {
+          for (const auto& pending : frame->uploads) cache.valid.reset(pending.slot);
           cache.residency.discard_frame(false);
           return Result::Unavailable;
         }
@@ -101,6 +111,7 @@ class GpuVram {
                     cache.bytes.data() + binding.slot * kPageBytes + (start - address), end - start);
       }
       const auto uploaded = frame->uploads.size();
+      for (const auto& upload : frame->uploads) cache.valid.set(upload.slot);
       cache.residency.submit_frame();
       ++cache.fence;
       draw_page_uploads_ += uploaded;
@@ -127,6 +138,8 @@ class GpuVram {
 
   void reset() noexcept {
     resident_.reset();
+    resident_pages_ = 0;
+    cached_bytes_ = read_hits_ = backend_reads_ = 0;
     draw_.reset();
     draw_page_uploads_ = draw_page_reuses_ = 0;
   }
@@ -135,12 +148,19 @@ class GpuVram {
     cache_enabled_ = enabled;
     if (!enabled) {
       resident_.reset();
+      resident_pages_ = cached_bytes_ = 0;
       draw_.reset();
     }
   }
 
-  std::size_t resident_bytes() const noexcept { return (resident_ ? kResidentBytes : 0) + draw_resident_bytes(); }
-  std::size_t draw_resident_bytes() const noexcept { return draw_ ? kDrawResidentBytes : 0; }
+  std::size_t resident_bytes() const noexcept { return resident_pages_ * kPageBytes + draw_resident_bytes(); }
+  std::size_t draw_resident_bytes() const noexcept { return draw_ ? draw_->valid.count() * kPageBytes : 0; }
+  std::size_t cached_payload_bytes() const noexcept { return cached_bytes_; }
+  std::size_t cache_reserved_bytes() const noexcept {
+    return (resident_ ? kResidentBytes : 0) + (draw_ ? kDrawResidentBytes : 0);
+  }
+  std::uint64_t read_hits() const noexcept { return read_hits_; }
+  std::uint64_t backend_reads() const noexcept { return backend_reads_; }
   std::uint64_t draw_page_uploads() const noexcept { return draw_page_uploads_; }
   std::uint64_t draw_page_reuses() const noexcept { return draw_page_reuses_; }
   QssdDisk::ParallelIoStats parallel_io_stats() const noexcept {
@@ -156,6 +176,7 @@ class GpuVram {
   struct DrawCache {
     xgpu::GraphicsPageResidency residency{kDrawResidentPages};
     std::array<std::uint8_t, kDrawResidentBytes> bytes;
+    std::bitset<kDrawResidentPages> valid;
     std::vector<xgpu::GraphicsPageRequest> requests;
     std::uint64_t fence = 0;
   };
@@ -163,7 +184,13 @@ class GpuVram {
   std::shared_ptr<SmpWorkers> bulk_workers_;
   std::unique_ptr<QssdDisk> disk_;
   std::unique_ptr<std::uint8_t[]> resident_;
-  std::array<std::uint64_t, kResidentBytes / kPageBytes> tags_{};
+  struct CachedPage {
+    std::uint64_t address = kBytes;
+    std::uint16_t begin = 0, end = 0;
+  };
+  std::array<CachedPage, kResidentBytes / kPageBytes> tags_{};
+  std::size_t resident_pages_ = 0, cached_bytes_ = 0;
+  std::uint64_t read_hits_ = 0, backend_reads_ = 0;
   std::unique_ptr<DrawCache> draw_;
   std::uint64_t draw_page_uploads_ = 0, draw_page_reuses_ = 0;
   bool cache_enabled_ = true;
@@ -194,9 +221,13 @@ class GpuVram {
   bool resident_range(std::uint64_t offset, std::size_t position, std::size_t size) const noexcept {
     if (!resident_ || size > kResidentBytes - position) return false;
     auto page = offset - offset % kPageBytes;
+    const auto end = offset + size;
     const auto last = (position + size - 1) / kPageBytes;
-    for (auto index = position / kPageBytes; index <= last; ++index, page += kPageBytes)
-      if (tags_[index] != page) return false;
+    for (auto index = position / kPageBytes; index <= last; ++index, page += kPageBytes) {
+      const auto& tag = tags_[index];
+      if (tag.address != page || std::max(offset, page) < page + tag.begin ||
+          std::min(end, page + kPageBytes) > page + tag.end) return false;
+    }
     return true;
   }
 
@@ -205,7 +236,7 @@ class GpuVram {
     if (!resident_) {
       resident_.reset(new (std::nothrow) std::uint8_t[kResidentBytes]);
       if (!resident_) return;
-      tags_.fill(kBytes);
+      tags_.fill({});
     }
     while (size) {
       const auto inside = std::size_t(offset % kPageBytes);
@@ -213,10 +244,19 @@ class GpuVram {
       const auto page = offset - inside;
       const auto index = std::size_t(page % kResidentBytes);
       auto& tag = tags_[index / kPageBytes];
-      if (count == kPageBytes || tag == page) {
-        std::memcpy(resident_.get() + index + inside, source, count);
-        tag = page;
+      if (tag.address == kBytes) ++resident_pages_;
+      cached_bytes_ -= tag.end - tag.begin;
+      const auto end = std::uint16_t(inside + count);
+      // Keep one known interval per slot. Disjoint bytes stay authoritative on
+      // qSSD until requested. Never mark the gap or an aliased page as valid.
+      if (tag.address == page && inside <= tag.end && end >= tag.begin) {
+        tag.begin = std::min(tag.begin, std::uint16_t(inside));
+        tag.end = std::max(tag.end, end);
+      } else {
+        tag = {page, std::uint16_t(inside), end};
       }
+      cached_bytes_ += tag.end - tag.begin;
+      std::memcpy(resident_.get() + index + inside, source, count);
       offset += count;
       source += count;
       size -= count;

@@ -37,11 +37,17 @@ class GuestGpuC08 {
   static_assert(RWGPU_STAGE_OFFSET % 4 == 0 && RWGPU_STAGE_BYTES % 4 == 0);
 
   using Msi = std::function<bool(std::uint32_t, std::uint16_t)>;
+  using Clock = std::function<std::uint64_t()>;
   GuestGpuC08(cosmic_pc::PcMachine& machine, const std::filesystem::path& vram, Msi msi = {},
-              std::shared_ptr<SmpWorkers> workers = {})
-      : pc_(machine), memory_(vram, std::move(workers)), msi_(std::move(msi)) {}
+              std::shared_ptr<SmpWorkers> workers = {}, Clock clock = {})
+      : pc_(machine), memory_(vram, std::move(workers)), msi_(std::move(msi)), clock_(std::move(clock)) {}
 
-  void reset() noexcept {
+  void reset(std::uint64_t board_tick = 0) noexcept {
+    power_on_tick_ = board_tick;
+    memory_.power_on();
+    quantum_cached_size_ = 0;
+    quantum_hits_ = quantum_loads_ = quantum_stores_ = 0;
+    quantum_saved_ = quantum_restored_ = quantum_gates_ = quantum_unavailable_ = 0;
     pci_command_ = 0;
     bar_ = pci_window_start;
     params_.fill(0);
@@ -174,6 +180,8 @@ class GuestGpuC08 {
   }
 
   void set_vram_cache_enabled(bool enabled) noexcept {
+    quantum_cache_enabled_ = enabled;
+    quantum_cached_size_ = 0;
     memory_.set_cache_enabled(enabled);
     if (!enabled) std::vector<std::uint8_t>().swap(transfer_);
   }
@@ -183,12 +191,29 @@ class GuestGpuC08 {
 
   void write_json(std::ostream& out) const {
     const auto parallel = parallel_io_stats();
+    const auto cycles = clock_ ? clock_() : 0;
     out << "{\"logical_vram_bytes\":" << GpuVram::kBytes
         << ",\"virtual_clock_hz\":" << RW_PRIME_COMPONENT_HZ
+        << ",\"power_on_tick\":" << power_on_tick_
+        << ",\"clock_cycles\":" << cycles
+        << ",\"vram_clock_hz\":" << RW_PRIME_COMPONENT_HZ
+        << ",\"vram_clock_cycles\":" << cycles
+        << ",\"qssd_ready\":" << (memory_.backing_ready() ? "true" : "false")
+        << ",\"quantum_vram\":{\"logical_bytes\":" << GpuVram::kBytes
+        << ",\"logical_byte_base\":" << quantum_base
+        << ",\"max_transfer_bytes\":" << RWGPU_QUANTUM_TRANSFER_BYTES
+        << ",\"engine_reads\":" << quantum_loads_ << ",\"cache_hits\":" << quantum_hits_
+        << ",\"engine_writes\":" << quantum_stores_ << ",\"gates\":" << quantum_gates_
+        << ",\"unavailable\":" << quantum_unavailable_
+        << ",\"saved_bytes\":" << quantum_saved_ << ",\"restored_bytes\":" << quantum_restored_ << '}'
         << ",\"qssd_backing_bytes\":" << memory_.journal_bytes()
         << ",\"qssd_vram_commits\":" << memory_.commits()
         << ",\"stage_bytes\":" << stage_.size()
         << ",\"resident_vram_bytes\":" << memory_.resident_bytes()
+        << ",\"cached_payload_bytes\":" << memory_.cached_payload_bytes()
+        << ",\"cache_reserved_bytes\":" << memory_.cache_reserved_bytes()
+        << ",\"vram_read_cache_hits\":" << memory_.read_hits()
+        << ",\"vram_backend_reads\":" << memory_.backend_reads()
         << ",\"resident_download_bytes\":" << resident_download_bytes_
         << ",\"c13_geometry_cache_bytes\":" << memory_.draw_resident_bytes()
         << ",\"c13_geometry_page_uploads\":" << memory_.draw_page_uploads()
@@ -233,6 +258,16 @@ class GuestGpuC08 {
   cosmic_pc::PcMachine& pc_;
   GpuVram memory_;
   Msi msi_;
+  Clock clock_;
+  std::uint64_t power_on_tick_ = 0;
+  static constexpr auto quantum_base = cosmic_pc::PcMachine::kEtherMemoryLogicalByteBase;
+  static_assert(RWGPU_QUANTUM_TRANSFER_BYTES == mundo_x::InfiniteSession::pc_window_bytes);
+  std::array<std::uint8_t, RWGPU_QUANTUM_TRANSFER_BYTES> quantum_cache_{};
+  std::size_t quantum_cached_size_ = 0;
+  std::uint64_t quantum_cached_at_ = 0, quantum_cached_epoch_ = 0;
+  std::uint64_t quantum_hits_ = 0, quantum_loads_ = 0, quantum_stores_ = 0;
+  std::uint64_t quantum_gates_ = 0, quantum_saved_ = 0, quantum_restored_ = 0, quantum_unavailable_ = 0;
+  bool quantum_cache_enabled_ = true;
   xgpu::GuestTriangleWork planner_;
   using RenderPlan = std::shared_ptr<const xgpu::GuestTrianglePlan>;
   qssd::GraphicsWorkMemory<RenderPlan> work_;
@@ -288,7 +323,7 @@ class GuestGpuC08 {
       case RWGPU_REG_LOGICAL_LO: return static_cast<std::uint32_t>(GpuVram::kBytes);
       case RWGPU_REG_LOGICAL_HI: return static_cast<std::uint32_t>(GpuVram::kBytes >> 32);
       case RWGPU_REG_CAPS:
-        return RWGPU_CAP_VRAM | RWGPU_CAP_DIRECT_VRAM | RWGPU_CAP_SUM_INDICES
+        return RWGPU_CAP_VRAM | RWGPU_CAP_DIRECT_VRAM | RWGPU_CAP_SUM_INDICES | RWGPU_CAP_QUANTUM_VRAM
 #ifdef REVERSE_WINDOWS_GLES_GUEST
             | RWGPU_CAP_TRIANGLES | RWGPU_CAP_DRAW_VRAM | RWGPU_CAP_COLOR_DMA |
               RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_ALPHA | RWGPU_CAP_DRAW_READBACK |
@@ -301,6 +336,9 @@ class GuestGpuC08 {
       case RWGPU_REG_MODE_WIDTH: return pc_.video_info().graphics ? pc_.video_info().width : 0;
       case RWGPU_REG_MODE_HEIGHT: return pc_.video_info().graphics ? pc_.video_info().height : 0;
       case RWGPU_REG_VRAM_BATCH_BYTES: return RWGPU_VRAM_BATCH_BYTES;
+      case RWGPU_REG_QUANTUM_MAX: return RWGPU_QUANTUM_TRANSFER_BYTES;
+      case RWGPU_REG_QUANTUM_BASE_LO: return std::uint32_t(quantum_base);
+      case RWGPU_REG_QUANTUM_BASE_HI: return std::uint32_t(quantum_base >> 32);
       case RWGPU_REG_DIRECT_MAX: return GpuVram::kTransferBytes;
       case RWGPU_REG_BUS_MASTER: return (pci_command_ & 4U) != 0;
       case RWGPU_REG_FENCE_LAST: return fence_last_;
@@ -343,6 +381,11 @@ class GuestGpuC08 {
         case RWGPU_READ_COLOR_RAM: status_ = read_color_ram(offset, auxiliary, count); break;
         case RWGPU_UPLOAD: case RWGPU_DOWNLOAD: case RWGPU_COPY:
           status_ = direct_transfer(op, offset, auxiliary, count);
+          break;
+        case RWGPU_QUANTUM_STORE: case RWGPU_QUANTUM_LOAD:
+        case RWGPU_QUANTUM_SAVE: case RWGPU_QUANTUM_RESTORE:
+        case RWGPU_QUANTUM_H: case RWGPU_QUANTUM_CX:
+          status_ = quantum_command(op, offset, auxiliary, count);
           break;
         case RWGPU_SUM_INDICES: status_ = sum_indices(count); break;
         case RWGPU_SUBMIT_DMA: status_ = execute_dma(offset, auxiliary, count); break;
@@ -397,6 +440,74 @@ class GuestGpuC08 {
     if (stage_.empty()) stage_.resize(RWGPU_STAGE_BYTES);
     return result_status(op == RWGPU_READ ? memory_.read(offset, stage_.data(), bytes)
                                          : memory_.write(offset, stage_.data(), bytes));
+  }
+
+  void read_quantum(std::uint64_t offset, std::uint8_t* out, std::size_t count) {
+    auto& session = *pc_.quantum_session;
+    const auto epoch = session.epoch();
+    if (quantum_cached_size_ && quantum_cached_epoch_ == epoch && offset >= quantum_cached_at_ &&
+        offset + count <= quantum_cached_at_ + quantum_cached_size_) {
+      std::memcpy(out, quantum_cache_.data() + (offset - quantum_cached_at_), count);
+      ++quantum_hits_;
+      return;
+    }
+    session.qload_pc_bytes(quantum_base + offset, out, count);
+    ++quantum_loads_;
+    // A CPU write, restore, gate or measurement on this shared session
+    // invalidates the observation, including writes between the two locks.
+    if (quantum_cache_enabled_ && session.epoch() == epoch) {
+      std::memcpy(quantum_cache_.data(), out, count);
+      quantum_cached_at_ = offset;
+      quantum_cached_size_ = count;
+      quantum_cached_epoch_ = epoch;
+    }
+  }
+
+  unsigned quantum_command(unsigned op, std::uint64_t offset, std::uint64_t aux, std::uint64_t count) {
+    auto& session = *pc_.quantum_session;
+    try {
+      if (op == RWGPU_QUANTUM_H || op == RWGPU_QUANTUM_CX) {
+        constexpr auto bits = GpuVram::kBytes * 8;
+        const bool pair = op == RWGPU_QUANTUM_CX;
+        if (count || offset >= bits || (pair ? aux >= bits || aux == offset : aux != 0))
+          return RWGPU_INVALID;
+        const auto target = pair ? std::to_string(quantum_base * 8 + aux) : std::string{};
+        session.apply({{pair ? 'C' : 'H', std::to_string(quantum_base * 8 + offset), target}});
+        ++quantum_gates_;
+        return RWGPU_OK;
+      }
+      if (aux || !count || count > RWGPU_QUANTUM_TRANSFER_BYTES || !GpuVram::valid_range(offset, count))
+        return RWGPU_INVALID;
+      std::array<std::uint8_t, RWGPU_QUANTUM_TRANSFER_BYTES> data;
+      if (op == RWGPU_QUANTUM_LOAD || op == RWGPU_QUANTUM_SAVE) {
+        read_quantum(offset, data.data(), count);
+        if (op == RWGPU_QUANTUM_LOAD) {
+          if (stage_.empty()) stage_.resize(RWGPU_STAGE_BYTES);
+          std::copy_n(data.data(), count, stage_.data());
+        } else {
+          const auto result = memory_.write(offset, data.data(), count);
+          if (result != GpuVram::Result::Complete) return result_status(result);
+          quantum_saved_ += count;
+        }
+      } else {
+        if (op == RWGPU_QUANTUM_RESTORE) {
+          const auto result = memory_.read(offset, data.data(), count);
+          if (result != GpuVram::Result::Complete) return result_status(result);
+        } else {
+          if (stage_.empty()) return RWGPU_INVALID;
+          std::copy_n(stage_.data(), count, data.data());
+        }
+        session.qstore_pc_bytes(quantum_base + offset, data.data(), count);
+        ++quantum_stores_;
+        if (op == RWGPU_QUANTUM_RESTORE) quantum_restored_ += count;
+      }
+      return RWGPU_OK;
+    } catch (const std::runtime_error&) {
+      // InfiniteCore rejects non-basis operands and exhausted state budgets
+      // before committing any changes to the session or a destination.
+      ++quantum_unavailable_;
+      return RWGPU_QUANTUM_UNAVAILABLE;
+    }
   }
 
   bool ordinary_ram(std::uint64_t address, std::size_t size) const {

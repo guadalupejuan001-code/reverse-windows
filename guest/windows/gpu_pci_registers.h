@@ -35,6 +35,7 @@ static inline NTSTATUS rwgpu_submit(PUCHAR bar, ULONG command, uint64_t source,
     const ULONG status = rwgpu_read(bar, RWGPU_REG_STATUS);
     if (status == RWGPU_OK) return STATUS_SUCCESS;
     if (status == RWGPU_UNAVAILABLE) return STATUS_DEVICE_NOT_READY;
+    if (status == RWGPU_QUANTUM_UNAVAILABLE) return STATUS_DEVICE_NOT_READY;
     if (status == RWGPU_INVALID) return STATUS_INVALID_PARAMETER;
     return STATUS_DEVICE_DATA_ERROR;
 }

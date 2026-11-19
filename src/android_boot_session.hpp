@@ -648,7 +648,10 @@ class AndroidBootSession final {
         << ",\"sipi_targets_queued\":" << startup.sipi_targets_queued
         << ",\"sipi_targets_applied\":" << startup.sipi_targets_applied << '}';
     if (detailed) {
-      out << ",\"steps_by_logical_processor\":[";
+      out << ",\"states_by_logical_processor\":[";
+      for (unsigned id = 0; id < topology.logical_processors(); ++id)
+        out << (id ? "," : "") << '"' << board_->processor_state(id) << '"';
+      out << "],\"steps_by_logical_processor\":[";
       for (unsigned id = 0; id < topology.logical_processors(); ++id)
         out << (id ? "," : "") << board_->processor_steps(id);
       out << "],\"ether_arm64_steps_by_logical_processor\":[";
