@@ -771,6 +771,9 @@ void check_cpu_clock(PcMotherboardC06::CpuClock profile, unsigned ratio) {
     const auto before = read_tsc();
     const auto cycles = std::uint64_t(work) + 3 * ratio + (ratio > 1 ? 1 : 0);
     require(before == firmware_tsc(cycles), "Batched firmware timestamp");
+    const auto ram_before = board.ram_clock_cycles();
+    require(ram_before == cycles * 4'500'000'000'000ULL / firmware_rate,
+            "Firmware RAM clock must retain a partial peripheral tick across batches");
     const auto origin = PcMachine::RunClock::time_point{};
     unsigned samples = 0;
     board.enable_active_clock([&] {
@@ -781,6 +784,8 @@ void check_cpu_clock(PcMotherboardC06::CpuClock profile, unsigned ratio) {
     require(board.active_clock_ticks() == PcMachine::kVirtualCyclesPerSecond &&
             read_tsc() - before == hz && board.guest_tsc_hz() == hz,
             "A guest second must preserve the ACPI oscillator and the requested TSC rate");
+    require(board.ram_clock_cycles() - ram_before == 4'500'000'000'000ULL,
+            "One active second must give 4.5 trillion RAM cycles in every CPU profile");
     std::cout << "PRIME_CPU_CLOCK_PASS guest_tsc_hz=" << hz << " peripheral_ticks=512 retired=" << work << '\n';
 }
 
@@ -906,14 +911,20 @@ void check_live_x64_clock_switch() {
         return (cpu.regs[Cpu::EDX] << 32) | cpu.regs[Cpu::EAX];
     };
     const auto first = read_after(nanoseconds::zero());
+    const auto ram_first = board.ram_clock_cycles();
     auto latest = first;
     for (unsigned i = 0; i < 16; ++i) latest = read_after(nanoseconds(1));
     require(latest - first == 72'000, "Accumulate fractional cycles before a peripheral tick");
+    require(board.ram_clock_cycles() - ram_first == 72'000, "RAM clock advances below one peripheral tick");
     board.set_experimental_tsc(false);
     now += hours(1);  // Elapsed outside the VM.
     require(read_after(nanoseconds::zero()) == latest, "Switch down without a timestamp jump");
+    const auto ram_resumed = board.ram_clock_cycles();
+    require(ram_resumed == ram_first + 72'000, "A paused hour must not advance RAM time");
     const auto reference = read_after(seconds(1));
     require(reference - latest == 4'581'817'600ULL, "Reference rate in the same long64 session");
+    require(board.ram_clock_cycles() - ram_resumed == 4'500'000'000'000ULL,
+            "Changing the live TSC rate must leave the RAM oscillator independent");
     board.set_experimental_tsc(true);
     require(read_after(nanoseconds::zero()) == reference, "Switch up without a timestamp jump");
     const auto fast = read_after(seconds(1));

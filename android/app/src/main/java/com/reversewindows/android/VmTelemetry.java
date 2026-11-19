@@ -181,7 +181,8 @@ final class VmTelemetry extends LinearLayout {
         metric(2, "Metadatos de RAM", storage(number(ram, "resident_metadata_bytes")));
         metric(3, "Vectores de páginas", count(number(ram, "page_state_vectors")));
         metric(4, "Proceso Android (PSS)", pssKiB > 0 ? units(pssKiB, KIB, "MiB", 1) : UNKNOWN);
-        showRows(5);
+        metric(5, "Reloj de la RAM virtual", frequency(number(ram, "ram_clock_hz")));
+        showRows(6);
     }
 
     private void renderCpu() {
@@ -203,12 +204,7 @@ final class VmTelemetry extends LinearLayout {
         metric(3, "Bloques encadenados en paralelo", count(number(topology, "parallel_register_continuations")));
         metric(4, "vCPU iniciadas / configuradas", count(number(topology, "started")) + " / "
                 + count(number(topology, "logical_processors")));
-        long tscHz = number(topology, "guest_tsc_hz");
-        String tsc;
-        if (tscHz >= 1_000_000_000_000L) tsc = units(tscHz, 1_000_000_000_000L, "THz", 1);
-        else if (tscHz >= 1_000_000_000L) tsc = units(tscHz, 1_000_000_000L, "GHz", 3);
-        else tsc = units(tscHz, 1_000_000, "MHz", 2);
-        metric(5, "Reloj virtual (TSC)", tsc);
+        metric(5, "Reloj virtual (TSC)", frequency(number(topology, "guest_tsc_hz")));
         JSONObject host = snapshot.optJSONObject("host_cpu");
         long low = number(host, "min_reported_khz");
         long high = number(host, "max_reported_khz");
@@ -306,6 +302,12 @@ final class VmTelemetry extends LinearLayout {
 
     private static String units(long value, long divisor, String name, int decimals) {
         return value < 0 ? UNKNOWN : formatted(value, divisor, decimals) + " " + name;
+    }
+
+    private static String frequency(long hz) {
+        if (hz >= 1_000_000_000_000L) return units(hz, 1_000_000_000_000L, "THz", 1);
+        if (hz >= 1_000_000_000L) return units(hz, 1_000_000_000L, "GHz", 3);
+        return units(hz, 1_000_000, "MHz", 2);
     }
 
     private static String storage(long bytes) {

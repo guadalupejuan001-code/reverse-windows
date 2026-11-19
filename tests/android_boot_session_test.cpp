@@ -75,6 +75,7 @@ void verify_ram_profile() {
   }
   const auto prime = Session::ram_profile(4096 * mib, 256 * mib, false, true);
   const auto report = Session::check_hardware({}, -1, 0, {}, prime);
+  require(counter(report, "ram_clock_hz") == 4'500'000'000'000ULL, "RAM clock in hardware preflight");
   require(counter(report, "usable_bytes") == Session::kPrimeRamBytes &&
               counter(report, "address_space_bytes") == prime.physical_bytes &&
               counter(report, "backing_budget_bytes") == 2880 * mib &&
@@ -87,6 +88,7 @@ void verify_ram_profile() {
   require(abundant_prime.backing_bytes == abundant_prime.physical_bytes,
           "Overflow must not limit backing on a host with abundant RAM");
   Session live({}, 0, Session::BootSource::SelfTest, -1, 0, phone);
+  require(counter(live.diagnostic(), "ram_clock_hz") == 4'500'000'000'000ULL, "RAM clock in live telemetry");
   const auto used = counter(live.diagnostic(), "resident_bytes");
   constexpr std::uint64_t page = cosmic_pc::MemoryFabric::kPageSize;
   live.sample_ram_pressure(768 * mib - used, 256 * mib, false);

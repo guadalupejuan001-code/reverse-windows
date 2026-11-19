@@ -555,6 +555,12 @@ void pci_acpi_cmos_guest(){
           0x66,0xba,0xf8,0x0c,0xef,  // MOV DX,CF8; OUT DX,EAX
           0x66,0xba,0xfc,0x0c,0xed,  // MOV DX,CFC; IN EAX,DX
           0xa3,0x00,0x90,0,0,       // store to RAM
+          0xb8,0x40,0,0,0x80,       // RAM clock Hz, low dword at 0:0.0 + 40h.
+          0x66,0xba,0xf8,0x0c,0xef,0x66,0xba,0xfc,0x0c,0xed,
+          0xa3,0x14,0x90,0,0,
+          0xb8,0x44,0,0,0x80,       // High dword at 0:0.0 + 44h.
+          0x66,0xba,0xf8,0x0c,0xef,0x66,0xba,0xfc,0x0c,0xed,
+          0xa3,0x18,0x90,0,0,
           0xb8,0,0xf8,0,0x80,      // absent dev31
           0x66,0xba,0xf8,0x0c,0xef,
           0x66,0xba,0xfc,0x0c,0xed,
@@ -577,6 +583,8 @@ void pci_acpi_cmos_guest(){
   need(pc.cpu.read32(0x9000)==0x00011b36,
        "real x86 guest PCI CF8/CFC failed to read host bridge ID");
   const auto guest_pci_id=pc.cpu.read32(0x9000);
+  need(pc.cpu.read64(0x9014)==4'500'000'000'000ULL,
+       "x86 guest must discover the full 64-bit RAM clock in the host bridge");
   need(pc.cpu.read32(0x9004)==0xffffffffU,
        "nonexistent PCI device must read all ones");
   need(pc.cpu.memory[0x9008]==2,"guest CMOS status B does not indicate BCD 24-hour");
@@ -600,6 +608,7 @@ void pci_acpi_cmos_guest(){
        "reboot lost ACPI discovery in reserved firmware memory");
   need(!board.evidence().powered_off && board.evidence().ticks==0,
        "motherboard retained stale PM/timer state across reboot");
+  need(board.ram_clock_cycles()==0,"RAM clock must restart with the motherboard");
   need(pc.cpu.read32(facs+16)==0 &&
        pc.cpu.read32(AcpiC06::fadt_address+36)==facs &&
        checksum(pc.cpu,AcpiC06::dsdt_address,dsdt_size)==0,
@@ -607,6 +616,28 @@ void pci_acpi_cmos_guest(){
   std::cout<<"C06_PCI_ACPI_CMOS_REAL_GUEST_PASS pci=0x"<<std::hex
            <<guest_pci_id<<std::dec<<" tables=5 reboot=PASS\n";
 }
+void ram_refresh_guest() {
+  PcMachine pc(4U << 20);
+  pc.boot_demo();
+  PcMotherboardC06 board(pc);
+  auto& cpu = pc.cpu;
+  cpu.reset(0, 0x7200);
+  code(cpu, 0x7200, {0xe4, 0x61}); // IN AL,61h reads the DRAM refresh output.
+  const auto refresh = [&] {
+    cpu.eip = 0x7200;
+    need(cpu.step() == cosmic_pc::StepResult::Executed, "Guest RAM refresh read");
+    return (cpu.regs[Cpu::EAX] & 0x10U) != 0;
+  };
+  pc.device_batch_advance_hook(53);
+  need(!refresh(), "Refresh must stay low until RAM cycle 2^26");
+  board.advance_one();
+  need(refresh(), "First RAM refresh edge");
+  pc.device_batch_advance_hook(52);
+  need(refresh(), "Refresh must stay high until RAM cycle 2^27");
+  board.advance_one();
+  need(!refresh(), "Second RAM refresh edge");
+}
+
 void prime_rtc_cmos_guest() {
   const auto exercise = [](bool apic, bool accelerate) {
     PcMachine pc(16U << 20);
@@ -1616,6 +1647,7 @@ int main(){
     optical_irq_wakes_sti_hlt();
     pic_legacy_x87_guest();
     pci_acpi_cmos_guest();
+    ram_refresh_guest();
     prime_rtc_cmos_guest();
     prime_pci_inventory();
     ioapic_lapic_guest();

@@ -12,6 +12,13 @@
 
 ## Dispositivos C06 y pruebas del huésped
 
+La RAM virtual de C06 tiene un reloj de 4,5 THz, independiente del TSC de la CPU.
+El invitado puede leer su frecuencia en Hz en dos registros PCI de solo lectura
+del puente anfitrión (bus 0, dispositivo 0, función 0). El registro `0x40` contiene
+la mitad baja y `0x44` la alta. El bit 4 del puerto `0x61` cambia cada 2²⁶ ciclos de RAM
+(unos 14,9 µs de tiempo virtual). El panel RAM de Android muestra la frecuencia
+del modelo. El rendimiento de las copias depende de la ejecución en el anfitrión.
+
 | Ruta | Función comprobada | Límites expresos |
 |---|---|---|
 | PCI 0xCF8 / 0xCFC | El invitado ejecuta OUT/IN x86 en bus0/dev0 host bridge y recibe ID, consulta dev31 y obtiene 0xffffffff | Sólo host bridge/ISA bridge; no hay controlador IDE/AHCI PCI hasta C07 |

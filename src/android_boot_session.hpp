@@ -908,6 +908,7 @@ class AndroidBootSession final {
     using Adjustment = cosmic_pc::SparseRam::BudgetAdjustment;
     out << "{\"address_space_bytes\":" << pc.cpu.memory.size()
         << ",\"usable_bytes\":" << usable
+        << ",\"ram_clock_hz\":" << PcMotherboardC06::kRamClockHz
         << ",\"backing_budget_bytes\":" << pc.cpu.memory.budget_bytes()
         << ",\"raw_backing_capacity_bytes\":" << raw_backing_capacity
         << ",\"resident_policy\":\""
