@@ -21,10 +21,12 @@ class AtaC07 {
   static constexpr std::uint16_t kDrive=0x1f6;
   static constexpr std::uint16_t kControl=0x3f6;
   static constexpr unsigned kMaxMultipleSectors=16;
+  static constexpr std::uint64_t kControllerClockHz = 4'500'000'000'000ULL;
   enum class Unit { Master, Slave };
   using ClockReader = std::function<std::uint64_t(std::uint64_t frequency_hz)>;
   struct Counters {
     std::uint64_t commands=0,read_sectors=0,write_sectors=0,identifies=0;
+    std::uint64_t last_command_cycle=0;
     std::uint64_t flushes=0,aborts=0,irqs_signaled=0;
     std::uint64_t identify_data_transfers=0;
     std::uint64_t batched_pio_bytes=0;
@@ -40,6 +42,7 @@ class AtaC07 {
   const Unit unit_;
   std::function<void()> irq14_;
   ClockReader read_clock_;
+  mutable std::optional<std::uint64_t> reset_release_cycle_;
   std::array<std::uint8_t,kMaxMultipleSectors*512> buffer_{};
   enum class Transfer {Idle,Identify,Read,Write} transfer_=Transfer::Idle;
   std::uint8_t error_=1,features_=0,sector_count_=1,sector_number_=1;
@@ -54,7 +57,14 @@ class AtaC07 {
   Counters stats_{};
   Backend backend_{};
 
-  static constexpr std::uint8_t kErr=0x01,kDrq=0x08,kReady=0x40,kDsc=0x10;
+  static constexpr std::uint8_t kErr=0x01,kDrq=0x08,kReady=0x40,kDsc=0x10,kBusy=0x80;
+  bool reset_settling() const {
+    if (!reset_release_cycle_) return false;
+    // The first controller edge after SRST deassertion releases the task file.
+    if (read_clock_(kControllerClockHz) == *reset_release_cycle_) return true;
+    reset_release_cycle_.reset();
+    return false;
+  }
   bool lba_mode() const {return (drive_&0x40U)!=0;}
   bool irq_enabled() const {return (control_&2U)==0;}
   void signal_irq() {
@@ -105,7 +115,8 @@ class AtaC07 {
     // clock at command issue so one IDENTIFY response is a coherent sample.
     const auto hz = disk_.clock_hz();
     if (hz) {
-      const auto cycles = read_clock_ ? read_clock_(hz) : 0;
+      auto cycles = stats_.last_command_cycle;
+      if (read_clock_ && hz != kControllerClockHz) cycles = read_clock_(hz);
       for (unsigned i = 0; i < 4; ++i) {
         word(identify_data, 129 + i, std::uint16_t(hz >> (16 * i)));
         word(identify_data, 133 + i, std::uint16_t(cycles >> (16 * i)));
@@ -201,6 +212,7 @@ class AtaC07 {
   }
   void execute(std::uint8_t cmd) {
     ++stats_.commands;
+    if (read_clock_) stats_.last_command_cycle = read_clock_(kControllerClockHz);
     interrupt_pending_=false;
     transfer_=Transfer::Idle;pos_=0;remaining_=0;
     read_error_=multiple_transfer_=false;
@@ -275,12 +287,16 @@ class AtaC07 {
   AtaC07(const AtaC07&)=delete;
   AtaC07& operator=(const AtaC07&)=delete;
   void reset(bool device_only=false) {
+    reset_release_cycle_.reset();
     transfer_=Transfer::Idle;pos_=0;remaining_=0;multiple_count_=0;group_sectors_=active_sectors_=1;
     error_=1;features_=0;sector_count_=1;sector_number_=1;
     cylinder_low_=cylinder_high_=prev_count_=prev_sector_=prev_cyl_low_=prev_cyl_high_=0;
     drive_=0xe0;control_=0;status_=kReady|kDsc;
     lba_=0;ext_=false;interrupt_pending_=false;read_error_=multiple_transfer_=false;
-    if(!device_only)backend_={};
+    if (!device_only) {
+      backend_ = {};
+      stats_.last_command_cycle = 0;
+    }
   }
   bool handles(std::uint16_t port) const {
     return (port>=kData&&port<=kLast)||port==kControl;
@@ -313,8 +329,8 @@ class AtaC07 {
       case 0x1f4:return cylinder_low_;
       case 0x1f5:return cylinder_high_;
       case kDrive:return drive_;
-      case 0x1f7:interrupt_pending_=false;return status_;
-      case 0x3f6:return status_; // alternate status never acknowledges IRQ
+      case 0x1f7:interrupt_pending_=false;return status();
+      case 0x3f6:return status(); // alternate status never acknowledges IRQ
       default:return std::nullopt;
     }
   }
@@ -324,7 +340,7 @@ class AtaC07 {
     if(width!=1)return false;
     const auto v=std::uint8_t(value);
     if(p==kDrive){drive_=v;return true;}
-    if(p!=kControl&&(!selected()||(control_&4U)))return true;
+    if(p!=kControl&&(!selected()||(control_&4U)||reset_settling()))return true;
     switch(p) {
       case 0x1f1:features_=v;return true;
       case 0x1f2:prev_count_=sector_count_;sector_count_=v;return true;
@@ -336,9 +352,12 @@ class AtaC07 {
         const auto was_reset=(control_&4U)!=0;
         const auto was_enabled=irq_enabled();
         control_=v;
-        if(control_&4U){reset(true);control_=v;status_=0x80;return true;}
-        if(was_reset){reset(true);control_=v;}
-        else if(!was_enabled&&irq_enabled()&&interrupt_pending_)signal_irq();
+        if(control_&4U){reset(true);control_=v;status_=kBusy;return true;}
+        if (was_reset) {
+          reset(true);
+          control_ = v;
+          if (read_clock_) reset_release_cycle_ = read_clock_(kControllerClockHz);
+        } else if(!was_enabled&&irq_enabled()&&interrupt_pending_)signal_irq();
         return true;
       }
       default:return false;
@@ -346,8 +365,11 @@ class AtaC07 {
   }
   Counters counters()const{return stats_;}
   bool irq_pending()const{return interrupt_pending_;}
-  bool ready()const{return selected() && (status_&kReady)!=0;}
-  std::uint8_t status()const{return selected()?status_:0;}
+  bool ready() const { return (status() & kReady) != 0; }
+  std::uint8_t status() const {
+    if (!selected()) return 0;
+    return reset_settling() ? kBusy : status_;
+  }
   std::uint8_t error()const{return selected()?error_:0;}
 };
 } // namespace reverse_windows

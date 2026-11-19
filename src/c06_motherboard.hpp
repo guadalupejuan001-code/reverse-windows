@@ -205,6 +205,7 @@ class PcMotherboardC06 {
   std::unique_ptr<GuestGpuC08> gpu_;
   bool prior_pci_reservation_=false;
   std::array<std::uint8_t,256> ata_cfg_{};
+  static constexpr unsigned kAtaClockSample = 0x48;
   std::uint64_t ata_irq_delivered_=0;
   Pit pit_{},pit2_{};
   unsigned pit_phase_=0;
@@ -321,6 +322,10 @@ class PcMotherboardC06 {
   static void config32(std::array<std::uint8_t,256>& bytes,unsigned at,std::uint32_t v){
     for(unsigned i=0;i<4;++i)bytes[at+i]=std::uint8_t(v>>(8*i));
   }
+  static void config64(std::array<std::uint8_t,256>& bytes,unsigned at,std::uint64_t value){
+    config32(bytes, at, static_cast<std::uint32_t>(value));
+    config32(bytes, at + 4, static_cast<std::uint32_t>(value >> 32));
+  }
   static void build_config(std::array<std::uint8_t,256>& b,std::uint16_t device,
                            std::uint8_t type){
     b.fill(0);
@@ -375,8 +380,7 @@ class PcMotherboardC06 {
     io_remote_targets_.fill(0);
     build_config(host_cfg_,0x0001,0x00);
     // Read-only, little-endian RAM clock (Hz) in the virtual host bridge.
-    config32(host_cfg_, 0x40, static_cast<std::uint32_t>(kRamClockHz));
-    config32(host_cfg_, 0x44, static_cast<std::uint32_t>(kRamClockHz >> 32));
+    config64(host_cfg_, 0x40, kRamClockHz);
     build_config(isa_cfg_,0x0002,0x01);
     if(ide_present()){
       ata_cfg_.fill(0);
@@ -387,6 +391,7 @@ class PcMotherboardC06 {
       ata_cfg_[10]=0x01;ata_cfg_[11]=0x01; // PCI 0x0101 IDE controller
       // Legacy IDE decodes fixed ports and IRQ14/15, without PCI BARs or INTx.
       ata_cfg_[0x3c]=0xff;
+      config64(ata_cfg_, 0x40, AtaC07::kControllerClockHz);
     }
     // After a real PcMachine::reset, firmware RAM is new; republish the
     // same discovered tables and keep their E820-reserved addresses.
@@ -429,6 +434,11 @@ class PcMotherboardC06 {
         return (value>>((offset&3U)*8))&part_mask(width);
       }
       const auto config=selected_pci(dev);
+      if (config == &ata_cfg_ && offset == kAtaClockSample) {
+        // Reading the low byte latches all 64 bits for subsequent PCI reads.
+        sync_active_clock();
+        config64(ata_cfg_, kAtaClockSample, device_clock_cycles(AtaC07::kControllerClockHz));
+      }
       std::uint32_t value=0;
       for(unsigned i=0;i<width;++i)
         value|=std::uint32_t(config?(*config)[offset+i]:0xff)<<(i*8);
@@ -1683,13 +1693,13 @@ class PcMotherboardC06 {
     }
     pc_.cpu.configure_topology(topology,0);
     if(data_disk&&!disk)throw std::invalid_argument("ATA data disk requires a primary disk");
-    const auto disk_clock = [this](std::uint64_t hz) {
+    const auto storage_clock = [this](std::uint64_t hz) {
       sync_active_clock();
       return device_clock_cycles(hz);
     };
-    if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_isa_irq(14);},AtaC07::Unit::Master,disk_clock);
+    if(disk)ata_=std::make_unique<AtaC07>(*disk,[this](){signal_isa_irq(14);},AtaC07::Unit::Master,storage_clock);
     if(data_disk)data_ata_=std::make_unique<AtaC07>(
-        *data_disk,[this](){signal_isa_irq(14);},AtaC07::Unit::Slave,disk_clock);
+        *data_disk,[this](){signal_isa_irq(14);},AtaC07::Unit::Slave,storage_clock);
     if(optical)optical_=std::make_unique<AtapiCdrom>(
         std::move(optical),optical_bytes,[this](){signal_isa_irq(15);});
     if(!graphics_vram.empty())gpu_=std::make_unique<GuestGpuC08>(
@@ -1887,6 +1897,9 @@ class PcMotherboardC06 {
   }
   std::uint64_t guest_tsc_hz() const noexcept {
     return tsc_cycles_per_second_ * cosmic_pc::Cpu::kTscTicksPerCycle;
+  }
+  std::uint64_t ata_clock_hz() const noexcept {
+    return ide_present() ? AtaC07::kControllerClockHz : 0;
   }
   std::uint64_t device_clock_cycles(std::uint64_t hz) const noexcept {
     // Derive the free-running oscillator on demand, once for the entire board.

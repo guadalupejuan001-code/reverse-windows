@@ -23,7 +23,11 @@ QssdDisk .rqvd (journal, commit, fsync, Estado QSSD)
 
 ## Funcionalidad probada
 
-En Prime, el reloj virtual del QSSD avanza a 4,5 THz durante el arranque y el tiempo activo del invitado. Cada disco QSSD devuelve dos enteros de 64 bits en las palabras de fabricante de `IDENTIFY DEVICE`, con la palabra menos significativa primero. Las palabras 129–132 contienen la frecuencia en Hz y las 133–136 contienen los ciclos al recibir el comando. Android muestra la frecuencia en la pestaña Disco. Las duraciones de lectura, escritura y sincronización del archivo se siguen midiendo con el reloj del anfitrión.
+El controlador PCI IDE C07 tiene un reloj virtual de **4,5 THz** con cualquier disco conectado, incluida una imagen RAW. El invitado puede leer dos registros de 64 bits de solo lectura en la función PCI `00:02.0`. En `0x40–0x47` está la frecuencia en Hz. Una lectura que empieza en `0x48` captura los ciclos actuales y permite leer la misma muestra completa en `0x48–0x4F`, en orden little-endian.
+
+El contador avanza durante el arranque y el tiempo activo de la máquina. Una pausa lo congela y un reinicio de la máquina lo devuelve a cero. Cada unidad registra el ciclo en el que recibe un comando. Al liberar el reinicio de software ATA (`SRST`), el controlador acepta comandos desde el siguiente ciclo. En Android, la pestaña Disco muestra el reloj del controlador junto al del QSSD cuando ambos están presentes. El rendimiento efectivo de las transferencias PIO depende de la ejecución del invitado y del almacenamiento anfitrión.
+
+Cada disco QSSD devuelve su propio reloj de 4,5 THz en las palabras de fabricante de `IDENTIFY DEVICE`, con la palabra menos significativa primero. Las palabras 129–132 contienen la frecuencia en Hz y las 133–136 contienen los ciclos al recibir el comando. Las duraciones de lectura, escritura y sincronización del archivo se siguen midiendo con el reloj del anfitrión.
 
 1. `PcMotherboardC06` publica el dispositivo PCI IDE sólo si se conectó un `BlockDisk`. ID PCI sintético `1b36:c071`, clase `0x0101`, modo legacy, IRQ14, I/O habilitado; sin afirmar DMA ni SATA AHCI.
 2. `AtaC07` implementa task file de 8 registros, alt status/registro de control, selección de master, ATA status DRDY/DSC/DRQ/ERR, identificador del fabricante y la geometría/capacidad desde el BlockDisk real. El slave está ausente.

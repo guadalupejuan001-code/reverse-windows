@@ -577,6 +577,7 @@ class AndroidBootSession final {
     if (status == "halted" && board_->secondary_can_run()) status = "running";
     const auto* ata = board_->attached_ata();
     const auto counts = ata ? ata->counters() : AtaC07::Counters{};
+    const auto ata_hz = board_->ata_clock_hz();
     std::ostringstream out;
     out << "{\"schema\":\"reverse-windows-android-session-v1\",\"source\":\""
         << source_name() << "\",\"status\":\"" << status << "\",\"iso_bytes\":"
@@ -607,6 +608,7 @@ class AndroidBootSession final {
           << ",\"clock_hz\":" << data_disk_->clock_hz()
           << ",\"clock_cycles\":" << board_->device_clock_cycles(data_disk_->clock_hz())
           << ",\"ata_identify_data_transfers\":" << activity.identify_data_transfers
+          << ",\"ata_last_command_cycle\":" << activity.last_command_cycle
           << ",\"ata_read_sectors\":" << activity.read_sectors
           << ",\"ata_write_sectors\":" << activity.write_sectors << ",\"qssd_parallel_io\":";
       write_qssd_parallel_io(out,data_disk_->parallel_io_stats());
@@ -790,6 +792,9 @@ class AndroidBootSession final {
         << ",\"identify_data_transfers\":" << counts.identify_data_transfers
         << ",\"read_sectors\":" << counts.read_sectors
         << ",\"write_sectors\":" << counts.write_sectors << ",\"flushes\":" << counts.flushes
+        << ",\"clock_hz\":" << ata_hz
+        << ",\"clock_cycles\":" << board_->device_clock_cycles(ata_hz)
+        << ",\"last_command_cycle\":" << counts.last_command_cycle
         << "},\"irq\":{\"ticks\":" << platform.ticks << ",\"delivered\":" << platform.irq_delivered
         << ",\"irq14\":" << platform.ata_irqs << ",\"lapic_delivered\":" << platform.apic_irqs
         << ",\"sci_delivered\":" << platform.sci_irqs
