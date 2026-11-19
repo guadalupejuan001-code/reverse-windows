@@ -85,6 +85,7 @@ jobs:
           LIBGL_ALWAYS_SOFTWARE: '1'
         run: ctest --test-dir build --output-on-failure
       - name: Compare the guest clocks on sixteen vCPUs with identical arithmetic
+        shell: bash
         run: ./build/reverse_windows_smp_guest_test --measure-cpu-clock | tee build/prime-smp-clock.log
       - name: Verify Prime C08 PCI, QSSD VRAM, and REgraphics rasterization
         env:
