@@ -226,7 +226,7 @@ jobs:
           adb shell settings put secure immersive_mode_confirmations confirmed
           adb install -r "$apk"
           adb install -r android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
-          adb shell am instrument -w "$ANDROID_APP_ID.test/com.reversewindows.android.VbeRenderTest" \
+          adb shell am instrument -w -r "$ANDROID_APP_ID.test/com.reversewindows.android.VbeRenderTest" \
             | tee "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/vbe-display-test.log"
           grep -Fxq 'INSTRUMENTATION_CODE: -1' "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/vbe-display-test.log"
           adb shell am force-stop "$ANDROID_APP_ID"
