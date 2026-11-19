@@ -30,7 +30,9 @@ class PcMotherboardC06 {
  public:
   using Clock = cosmic_pc::PcMachine::RunClock;
   using ClockSource = std::function<Clock::time_point()>;
-  enum class CpuClock : unsigned { Standard = 1, Double = 2, Twentyfold = 20 };
+  enum class CpuClock : unsigned { Standard = 1, Double = 2, Twentyfold = 20, Experimental4_5THz };
+  static constexpr std::uint64_t kExperimentalTscHz = 4'500'000'000'000ULL;
+  static_assert(kExperimentalTscHz % cosmic_pc::Cpu::kTscTicksPerCycle == 0);
   enum class ClockStart { Immediate, Guest32Or64 };
   static constexpr std::uint64_t kLocalApic=cosmic_pc::PcMachine::kLocalApicAddress,
       kIoApic=cosmic_pc::PcMachine::kIoApicAddress;
@@ -153,8 +155,11 @@ class PcMotherboardC06 {
 
   cosmic_pc::PcMachine& pc_;
   const unsigned cpu_clock_ratio_;
+  const std::uint64_t firmware_cycles_per_second_;
+  std::uint64_t tsc_cycles_per_second_;
   unsigned cpu_cycle_phase_ = 0;
   std::uint64_t cpu_cycles_ = 0;
+  std::uint64_t firmware_tsc_remainder_ = 0, active_tsc_remainder_ = 0;
   std::optional<Ps2Keyboard> keyboard_;
   std::function<std::optional<std::uint32_t>(std::uint16_t,unsigned)> prior_in_;
   std::function<bool(std::uint16_t,unsigned,std::uint32_t)> prior_out_;
@@ -319,6 +324,7 @@ class PcMotherboardC06 {
     ferr_was_asserted_=false;pc_.cpu.set_x87_ignne(false);
     cpu_cycles_=ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=sci_irqs_=0;
     cpu_cycle_phase_ = 0;
+    firmware_tsc_remainder_ = active_tsc_remainder_ = 0;
     active_clock_enabled_=active_clock_running_=waiting_for_guest_mode_=false;
     active_clock_ns_=active_clock_ticks_=clock_tick_remainder_=0;
     clock_polls_=0;
@@ -1011,6 +1017,20 @@ class PcMotherboardC06 {
   Clock::time_point active_now() const {
     return clock_source_ ? clock_source_() : Clock::now();
   }
+  // Accumulate units * rate / units_per_second. Splitting both factors keeps
+  // the fractional product below 10^18 even for long host time intervals.
+  static std::uint64_t scaled_cycles(std::uint64_t units, std::uint64_t rate,
+                                     std::uint64_t units_per_second, std::uint64_t& remainder) {
+    const auto part = units % units_per_second;
+    const auto fraction = part * (rate % units_per_second) + remainder;
+    remainder = fraction % units_per_second;
+    return (units / units_per_second) * rate + part * (rate / units_per_second) + fraction / units_per_second;
+  }
+  void advance_firmware_tsc(unsigned steps) {
+    if (tsc_cycles_per_second_ == firmware_cycles_per_second_) cpu_cycles_ += steps;
+    else cpu_cycles_ += scaled_cycles(steps, tsc_cycles_per_second_, firmware_cycles_per_second_,
+                                      firmware_tsc_remainder_);
+  }
   void sync_active_clock() {
     if(!active_clock_running_)return;
     const auto now=active_now();
@@ -1021,6 +1041,7 @@ class PcMotherboardC06 {
     active_clock_ns_+=ns;
     constexpr std::uint64_t second=1000000000U;
     constexpr std::uint64_t frequency=cosmic_pc::PcMachine::kVirtualCyclesPerSecond;
+    cpu_cycles_ += scaled_cycles(ns, tsc_cycles_per_second_, second, active_tsc_remainder_);
     const auto fraction=std::uint64_t(ns)%second*frequency+clock_tick_remainder_;
     clock_tick_remainder_=fraction%second;
     const auto elapsed=std::uint64_t(ns)/second*frequency+fraction/second;
@@ -1030,7 +1051,6 @@ class PcMotherboardC06 {
     // boundaries. Count PIT expirations, but queue a single pending edge.
     const auto previous=ticks_;
     ticks_+=elapsed;
-    cpu_cycles_ += elapsed * cpu_clock_ratio_;
     active_clock_ticks_+=elapsed;
     const auto pit_elapsed=pit_phase_+elapsed;
     const auto clocks=pit_elapsed/kPitClockDivider;
@@ -1050,11 +1070,16 @@ class PcMotherboardC06 {
     if((rtc_b_&kRtcPeriodic)&&!(rtc_c_&kRtcIrq))rtc_update_periodic();
     advance_apic_timer(bsp(),elapsed);
   }
-  void activate_clock() {
+  void attach_cpu_clock() {
     if (!clock_attached_) {
       prior_clock_ = pc_.cpu.set_shared_clock(&cpu_cycles_);
+      cpu_cycles_ = prior_clock_ ? *prior_clock_ : pc_.cpu.clock_cycles();
       clock_attached_ = true;
     }
+  }
+  void activate_clock() {
+    attach_cpu_clock();
+    active_tsc_remainder_ = firmware_tsc_remainder_ * 1'000'000'000ULL / firmware_cycles_per_second_;
     active_clock_enabled_ = true;
   }
   void start_clock_sample() {
@@ -1099,7 +1124,7 @@ class PcMotherboardC06 {
     if(active_clock_running_){
       if((++clock_polls_&15U)==0)sync_active_clock();
     }else{
-      ++cpu_cycles_;
+      advance_firmware_tsc(1);
       device_tick = ++cpu_cycle_phase_ == cpu_clock_ratio_;
       if (device_tick) {
         cpu_cycle_phase_ = 0;
@@ -1183,7 +1208,7 @@ class PcMotherboardC06 {
     const auto cycles = std::uint64_t(cpu_cycle_phase_) + extra_steps;
     const auto device_ticks = cycles / cpu_clock_ratio_;
     cpu_cycle_phase_ = static_cast<unsigned>(cycles % cpu_clock_ratio_);
-    cpu_cycles_ += extra_steps;
+    advance_firmware_tsc(extra_steps);
     ticks_ += device_ticks;
     const auto pit_elapsed=std::uint64_t(pit_phase_)+device_ticks;
     if(pit_.enabled)pit_.counter-=pit_elapsed/kPitClockDivider;
@@ -1587,11 +1612,16 @@ class PcMotherboardC06 {
                             BlockDisk* data_disk=nullptr, cosmic_pc::CpuTopology topology={},
                             bool experimental_mixed_smp=false, std::shared_ptr<SmpWorkers> workers={},
                             CpuClock cpu_clock=CpuClock::Standard)
-      :pc_(machine), cpu_clock_ratio_(static_cast<unsigned>(cpu_clock)),
+      :pc_(machine), cpu_clock_ratio_(static_cast<unsigned>(
+           cpu_clock == CpuClock::Experimental4_5THz ? CpuClock::Twentyfold : cpu_clock)),
+       firmware_cycles_per_second_(std::uint64_t(cosmic_pc::PcMachine::kVirtualCyclesPerSecond) * cpu_clock_ratio_),
+       tsc_cycles_per_second_(cpu_clock == CpuClock::Experimental4_5THz
+           ? kExperimentalTscHz / cosmic_pc::Cpu::kTscTicksPerCycle : firmware_cycles_per_second_),
        processor_count_(topology.logical_processors()),
        experimental_mixed_smp_(experimental_mixed_smp), workers_(std::move(workers)) {
     if (!topology.valid()) throw std::invalid_argument("Invalid virtual processor topology");
-    if (cpu_clock != CpuClock::Standard && cpu_clock != CpuClock::Double && cpu_clock != CpuClock::Twentyfold)
+    if (cpu_clock != CpuClock::Standard && cpu_clock != CpuClock::Double &&
+        cpu_clock != CpuClock::Twentyfold && cpu_clock != CpuClock::Experimental4_5THz)
       throw std::invalid_argument("Invalid virtual CPU clock ratio");
     prior_topology_ = pc_.cpu.topology();
     prior_apic_id_ = pc_.cpu.apic_id();
@@ -1786,9 +1816,16 @@ class PcMotherboardC06 {
     if (start == ClockStart::Immediate) activate_clock();
   }
   bool active_clock_enabled() const noexcept {return active_clock_enabled_;}
+  // Android serializes this with run(). Preserve the counter, including per-vCPU
+  // IA32_TSC offsets. Only subsequent elapsed time accrues at the chosen rate.
+  void set_experimental_tsc(bool enabled) {
+    sync_active_clock();
+    if (enabled) attach_cpu_clock();
+    tsc_cycles_per_second_ = enabled ? kExperimentalTscHz / cosmic_pc::Cpu::kTscTicksPerCycle
+                                     : firmware_cycles_per_second_;
+  }
   std::uint64_t guest_tsc_hz() const noexcept {
-    return std::uint64_t(cosmic_pc::PcMachine::kVirtualCyclesPerSecond) * cpu_clock_ratio_ *
-           cosmic_pc::Cpu::kTscTicksPerCycle;
+    return tsc_cycles_per_second_ * cosmic_pc::Cpu::kTscTicksPerCycle;
   }
   std::uint64_t active_clock_elapsed_ns() const noexcept {return active_clock_ns_;}
   std::uint64_t active_clock_ticks() const noexcept {return active_clock_ticks_;}

@@ -331,6 +331,18 @@ final class VmWorker {
         });
     }
 
+    void setExperimentalClock(boolean enabled) {
+        worker.post(() -> {
+            if (handle == 0 || isTerminal()) return;
+            try {
+                NativeMachine.setExperimentalClock(handle, enabled);
+                publishState(true);
+            } catch (RuntimeException | LinkageError error) {
+                report(error);
+            }
+        });
+    }
+
     void setRunning(boolean resume) {
         worker.post(() -> {
             if (handle == 0 || isTerminal()) return;

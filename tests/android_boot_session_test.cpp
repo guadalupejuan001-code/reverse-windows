@@ -920,8 +920,8 @@ void verify_active_guest_clock(const std::filesystem::path& path) {
   constexpr std::uint64_t second = 1'000'000'000, hz = cosmic_pc::PcMachine::kVirtualCyclesPerSecond;
   const auto elapsed = counter(result, "active_clock_elapsed_ns");
   const auto ticks = counter(result, "active_clock_ticks");
-  require(counter(result, "guest_tsc_hz") == 4'581'817'600ULL,
-          "The Android TSC must run at ten times the 0.3.62 rate");
+  require(counter(result, "guest_tsc_hz") == 4'500'000'000'000ULL,
+          "The Android TSC must start at the experimental 4.5 THz rate");
   require(ticks > 0 && ticks == elapsed / second * hz + elapsed % second * hz / second,
           "Active clock ticks must follow the declared oscillator rate");
   std::cout << "PRIME_ANDROID_ACTIVE_CLOCK_PASS deterministic_firmware=1 long64=1 ticks=" << ticks << '\n';
@@ -1148,7 +1148,7 @@ int main(int argc, char** argv) {
       frame = capture_cells(session);
       progress = session.diagnostic();
       require(progress.find("\"clock_source\":\"host-active-monotonic\"") != std::string::npos &&
-                  counter(progress, "active_clock_ticks") > 0 && counter(progress, "guest_tsc_hz") == 4'581'817'600ULL,
+                  counter(progress, "active_clock_ticks") > 0 && counter(progress, "guest_tsc_hz") == 4'500'000'000'000ULL,
               "A protected32 ISO must activate the Prime clock without entering long mode");
       require(progress.find("\"cpuid_vendor\":\"GenuineIntel\"") != std::string::npos,
               "ISO startup did not select the Windows x64 processor profile");

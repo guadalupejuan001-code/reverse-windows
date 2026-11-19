@@ -12,6 +12,7 @@
     </style>
     <item name="vm_monitor" type="id" />
     <item name="vm_status" type="id" />
+    <item name="vm_experimental_clock" type="id" />
     <item name="vm_copy_diagnostic" type="id" />
     <item name="vm_hardware_check" type="id" />
     <item name="vm_hardware_result" type="id" />

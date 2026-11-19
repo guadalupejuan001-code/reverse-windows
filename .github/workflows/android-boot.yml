@@ -292,7 +292,7 @@ jobs:
           assert cpu_us is None or cpu_us > 0
           thermal = snapshot["android_thermal_status"]
           assert thermal is None or 0 <= thermal <= 6
-          assert snapshot["cpu_topology"]["guest_tsc_hz"] == 4_581_817_600
+          assert snapshot["cpu_topology"]["guest_tsc_hz"] == 4_500_000_000_000
           host = snapshot["host_cpu"]
           assert host["hint_threads"] == 0, "Android hints must close when the guest stops"
           if host["readable_policies"]:
@@ -411,7 +411,7 @@ jobs:
           assert timing["diagnostic_save_interval_ms"] == 5_000
           topology = report["cpu_topology"]
           assert (topology["cores"], topology["threads_per_core"], topology["logical_processors"]) == (8, 2, 16)
-          assert topology["guest_tsc_hz"] == 4_581_817_600
+          assert topology["guest_tsc_hz"] == 4_500_000_000_000
           assert report["irq"]["clock_source"] == "host-active-monotonic" and report["irq"]["active_clock_ticks"] > 0
           assert report["ram_profile"]["usable_bytes"] == 64 << 30, report["ram_profile"]
           ether = report["ether_arm64"]
@@ -421,6 +421,27 @@ jobs:
           print("PRIME_ANDROID_ISO_PICKER_PASS boot=el-torito ram_gib=64 qssd_boot_gib=64 qssd_data_pib=8",
                 f"protected32_tsc_hz={topology['guest_tsc_hz']}")
           PY
+          for rate in 4581817600 4500000000000; do
+            tap_visible resource-id "$ANDROID_APP_ID:id/vm_experimental_clock" down
+            live="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/iso-clock-$rate.json"
+            for attempt in {1..20}; do
+              if adb exec-out run-as "$ANDROID_APP_ID" cat files/ultimo-diagnostico.json > "$live" &&
+                  grep -Fq "\"guest_tsc_hz\":$rate}" "$live"; then
+                break
+              fi
+              sleep 1
+            done
+            python3 - "$snapshot" "$live" "$rate" <<'PY'
+          import json, sys
+          from pathlib import Path
+          before, after = [json.loads(Path(path).read_text()) for path in sys.argv[1:3]]
+          assert after["cpu_topology"]["guest_tsc_hz"] == int(sys.argv[3])
+          assert after["source"] == "iso" and after["status"] == "waiting_key"
+          assert after["boot_progress"]["session_steps"] == before["boot_progress"]["session_steps"] > 0
+          assert after["irq"]["active_clock_elapsed_ns"] == before["irq"]["active_clock_elapsed_ns"]
+          print("PRIME_ANDROID_LIVE_CLOCK_PASS same_session=1 guest_tsc_hz=" + sys.argv[3])
+          PY
+          done
           BASH
       - name: Run BIOS, keyboard and synthetic ISO from Downloads on Android
         if: matrix.abi == 'x86_64' && steps.kvm.outputs.available == 'true'

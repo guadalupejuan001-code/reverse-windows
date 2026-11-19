@@ -175,6 +175,16 @@ JNIEXPORT jlong JNICALL Java_com_reversewindows_android_NativeMachine_step(
     });
 }
 
+JNIEXPORT void JNICALL Java_com_reversewindows_android_NativeMachine_setExperimentalClock(
+        JNIEnv* env, jclass, jlong handle, jboolean enabled) {
+    call(env, false, [&] {
+        return session(handle, [=](Session& machine) {
+            machine.set_experimental_tsc(enabled == JNI_TRUE);
+            return true;
+        });
+    });
+}
+
 JNIEXPORT jintArray JNICALL Java_com_reversewindows_android_NativeMachine_cpuThreadIds(
         JNIEnv* env, jclass, jlong handle) {
     return call<jintArray>(env, nullptr, [&] {

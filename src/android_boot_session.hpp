@@ -44,7 +44,7 @@ class AndroidBootSession final {
   static constexpr unsigned kMaxVideoWidth = 960, kMaxVideoHeight = 720;
   static constexpr RamProfile kDefaultRamProfile{2048ULL * 1024 * 1024, 256ULL * 1024 * 1024};
   static constexpr cosmic_pc::CpuTopology kPrimeCpuTopology{8, 2};
-  static constexpr auto kPrimeCpuClock = PcMotherboardC06::CpuClock::Twentyfold;
+  static constexpr auto kPrimeCpuClock = PcMotherboardC06::CpuClock::Experimental4_5THz;
   static constexpr unsigned kPrimeHostWorkers = 8;
   static constexpr std::uint64_t kPrimeRamBytes = 64ULL << 30;
   static constexpr std::uint64_t kMaxResidentBytes = 1024ULL * 1024 * 1024;
@@ -396,6 +396,8 @@ class AndroidBootSession final {
   }
 
   std::uint64_t session_steps() const noexcept { return previous_boot_steps_+board_->total_processor_steps(); }
+
+  void set_experimental_tsc(bool enabled) { board_->set_experimental_tsc(enabled); }
 
   void configure_ether_x86_sessions(unsigned workers, unsigned max_sessions_per_vcpu) {
     board_->configure_ether_x86_sessions(workers, max_sessions_per_vcpu);

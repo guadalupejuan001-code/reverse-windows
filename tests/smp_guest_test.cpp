@@ -753,7 +753,13 @@ void check_cpu_clock(PcMotherboardC06::CpuClock profile, unsigned ratio) {
         require(cpu.step() == cosmic_pc::StepResult::Executed, "Guest RDTSC");
         return (cpu.regs[Cpu::EDX] << 32) | cpu.regs[Cpu::EAX];
     };
-    require(read_tsc() == std::uint64_t(work) * Cpu::kTscTicksPerCycle, "Firmware timestamp");
+    const auto firmware_rate = std::uint64_t(PcMachine::kVirtualCyclesPerSecond) * ratio;
+    const auto hz = profile == PcMotherboardC06::CpuClock::Experimental4_5THz
+        ? 4'500'000'000'000ULL : firmware_rate * Cpu::kTscTicksPerCycle;
+    const auto firmware_tsc = [&](std::uint64_t steps) {
+        return (steps * (hz / Cpu::kTscTicksPerCycle) / firmware_rate) * Cpu::kTscTicksPerCycle;
+    };
+    require(read_tsc() == firmware_tsc(work), "Firmware timestamp");
     // Mix the batch and scalar paths across a device edge, then switch clock
     // sources with a partial device tick still pending.
     const auto ticks = board.evidence().ticks;
@@ -764,7 +770,7 @@ void check_cpu_clock(PcMotherboardC06::CpuClock profile, unsigned ratio) {
     if (ratio > 1) board.advance_one();
     const auto before = read_tsc();
     const auto cycles = std::uint64_t(work) + 3 * ratio + (ratio > 1 ? 1 : 0);
-    require(before == cycles * Cpu::kTscTicksPerCycle, "Batched firmware timestamp");
+    require(before == firmware_tsc(cycles), "Batched firmware timestamp");
     const auto origin = PcMachine::RunClock::time_point{};
     unsigned samples = 0;
     board.enable_active_clock([&] {
@@ -772,7 +778,6 @@ void check_cpu_clock(PcMotherboardC06::CpuClock profile, unsigned ratio) {
     });
     cpu.eip = 0x7200;
     board.run(64);
-    const auto hz = std::uint64_t(PcMachine::kVirtualCyclesPerSecond) * Cpu::kTscTicksPerCycle * ratio;
     require(board.active_clock_ticks() == PcMachine::kVirtualCyclesPerSecond &&
             read_tsc() - before == hz && board.guest_tsc_hz() == hz,
             "A guest second must preserve the ACPI oscillator and the requested TSC rate");
@@ -873,6 +878,54 @@ void check_protected32_timestamps(PcMotherboardC06::CpuClock profile, std::uint6
               << " rdtsc_delta=" << cpu.read64(0x3608) - initial << '\n';
 }
 
+void check_live_x64_clock_switch() {
+    using namespace std::chrono;
+    PcMachine pc(4U << 20);
+    pc.boot_long_mode_demo();
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {8,2}, true, {},
+                           PcMotherboardC06::CpuClock::Experimental4_5THz);
+    PcMachine::RunClock::time_point now{};
+    nanoseconds next_interval{};
+    board.enable_active_clock([&] {
+        const auto sample = now;
+        now += next_interval;
+        next_interval = nanoseconds::zero();
+        return sample;
+    }, PcMotherboardC06::ClockStart::Guest32Or64);
+    board.run(8192);
+    auto& cpu = pc.cpu;
+    require(cpu.is_long_mode() && !cpu.fault && board.active_clock_enabled(), "Long64 clock guest boot");
+    const std::uint8_t probe[]{0x0f,0x31,0xeb,0xfc};  // RDTSC; repeat.
+    cpu.memory.write_block(0x7200, probe, sizeof(probe));
+    cpu.halted = false;
+    cpu.eip = 0x7200;
+    const auto read_after = [&](nanoseconds active) {
+        next_interval = active;
+        board.run(64);
+        require(!cpu.fault && cpu.is_long_mode(), "Long64 timestamp loop");
+        return (cpu.regs[Cpu::EDX] << 32) | cpu.regs[Cpu::EAX];
+    };
+    const auto first = read_after(nanoseconds::zero());
+    auto latest = first;
+    for (unsigned i = 0; i < 16; ++i) latest = read_after(nanoseconds(1));
+    require(latest - first == 72'000, "Accumulate fractional cycles before a peripheral tick");
+    board.set_experimental_tsc(false);
+    now += hours(1);  // Elapsed outside the VM.
+    require(read_after(nanoseconds::zero()) == latest, "Switch down without a timestamp jump");
+    const auto reference = read_after(seconds(1));
+    require(reference - latest == 4'581'817'600ULL, "Reference rate in the same long64 session");
+    board.set_experimental_tsc(true);
+    require(read_after(nanoseconds::zero()) == reference, "Switch up without a timestamp jump");
+    const auto fast = read_after(seconds(1));
+    require(fast - reference == 4'500'000'000'000ULL, "Long64 RDTSC at 4.5 THz");
+    require(read_after(seconds(30)) - fast == 30 * 4'500'000'000'000ULL,
+            "Long active sample must not overflow intermediate arithmetic");
+    require(board.active_clock_ticks() == std::uint64_t(PcMachine::kVirtualCyclesPerSecond) * 32,
+            "Only the TSC changes frequency");
+    std::cout << "PRIME_LIVE_X64_TSC_PASS reference_hz=" << reference - latest
+              << " experimental_hz=" << fast - reference << " clock_continuous=1\n";
+}
+
 // Complete identical arithmetic on all 16 vCPUs. Count only the loop body,
 // excluding setup, BSP polling and virtual timer ticks from the reported rate.
 void measure_smp_clock(PcMotherboardC06::CpuClock profile) {
@@ -923,9 +976,12 @@ int main(int argc, char** argv) {
         check_cpu_clock(Profile::Standard, 1);
         check_cpu_clock(Profile::Double, 2);
         check_cpu_clock(Profile::Twentyfold, 20);
+        check_cpu_clock(Profile::Experimental4_5THz, 20);
         check_all_smp_timestamps();
         check_protected32_timestamps(Profile::Double, 458'181'760ULL);
         check_protected32_timestamps(Profile::Twentyfold, 4'581'817'600ULL);
+        check_protected32_timestamps(Profile::Experimental4_5THz, 4'500'000'000'000ULL);
+        check_live_x64_clock_switch();
         if (argc == 2 && std::string(argv[1]) == "--measure-cpu-clock") {
             for (unsigned trial = 0; trial < 4; ++trial) {
                 measure_smp_clock(trial % 2 ? Profile::Twentyfold : Profile::Double);
