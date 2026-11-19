@@ -91,7 +91,7 @@ void install_trampoline(Cpu& boot) {
     boot.memory.write_block(std::uint32_t(kStartupVector) << 12, startup, sizeof(startup));
 }
 
-void test_eight_cores_sixteen_threads(bool threaded) {
+void test_eight_cores_sixteen_threads(bool threaded, unsigned worker_limit = kProcessors) {
     std::array<std::thread::id, kProcessors> hosts{};
     hosts[0] = std::this_thread::get_id();
     PcMachine pc(4U << 20);
@@ -102,7 +102,7 @@ void test_eight_cores_sixteen_threads(bool threaded) {
         return true;
     };
     PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {8, 2});
-    if (threaded) board.enable_threaded_smp();
+    if (threaded) board.enable_threaded_smp(worker_limit);
     check_acpi(pc.cpu);
     require(topology_leaf(pc.cpu,0) == (1ULL | (2ULL << 8) | (0x100ULL << 24)), "SMT topology");
     require(topology_leaf(pc.cpu,1) == (4ULL | (16ULL << 8) | (0x201ULL << 24)), "package topology");
@@ -150,9 +150,9 @@ void test_eight_cores_sixteen_threads(bool threaded) {
     const std::set<std::thread::id> distinct_hosts(hosts.begin(), hosts.end());
     const auto& dispatch = board.threaded_smp_stats();
     if (threaded) {
-        require(distinct_hosts.size() == kProcessors && board.worker_count() == kProcessors &&
-                    dispatch.peak_workers == kProcessors && dispatch.dispatches && dispatch.guest_steps,
-                "all 16 real-mode vCPUs execute on distinct host threads without cached ARM64 loops");
+        require(distinct_hosts.size() == worker_limit && board.worker_count() == worker_limit &&
+                    dispatch.peak_workers == worker_limit && dispatch.dispatches && dispatch.guest_steps,
+                "All 16 real-mode vCPUs must use the bounded host pool without cached ARM64 loops");
         std::cout << "SMP_THREADED_INTERPRETER_PASS workers=" << distinct_hosts.size()
                   << " shared_atomic_counter=" << pc.cpu.read32(kSharedCounter) << '\n';
     } else {
@@ -736,6 +736,7 @@ int main() {
     try {
         test_eight_cores_sixteen_threads(false);
         test_eight_cores_sixteen_threads(true);
+        test_eight_cores_sixteen_threads(true, 8);
         test_secondary_interrupts(false);
         test_secondary_interrupts(true);
         test_ether_worker_block();

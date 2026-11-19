@@ -1303,6 +1303,12 @@ class PcMotherboardC06 {
     }
   }
 
+  // Keep the first job on the calling lane. Rotate the remaining jobs when
+  // more vCPUs are ready than can start in the first wave.
+  static unsigned rotate_smp_job(unsigned position, unsigned count, unsigned rotation) noexcept {
+    return rotation && position ? 1 + (position - 1 + rotation) % (count - 1) : position;
+  }
+
   unsigned run_parallel_ether_loops(const std::array<unsigned, kMaxProcessors>& runnable,
                                     unsigned count, unsigned budget,
                                     cosmic_pc::PcMachine::RunClock::time_point deadline) {
@@ -1375,8 +1381,11 @@ class PcMotherboardC06 {
       unsigned steps = 0, ram_steps = 0, continuations = 0;
     };
     std::array<Progress, kMaxProcessors> progress{};
+    const auto next_job = next_cpu_ % (job_count - 1);
     const auto lanes = workers_->try_run(std::min(job_count, host_workers_capacity()), [&](unsigned lane, unsigned count) {
-      for (unsigned job = lane; job < job_count; job += count) {
+      const auto rotation = count < job_count ? next_job : 0U;
+      for (unsigned position = lane; position < job_count; position += count) {
+        const auto job = rotate_smp_job(position, job_count, rotation);
         const auto id = jobs[job];
         auto& cpu = *apics_[id].cpu;
         auto& block = work[job];
@@ -1399,13 +1408,16 @@ class PcMotherboardC06 {
       }
     });
     if (!lanes) return 0;
+    const auto rotation = lanes < job_count ? next_job : 0U;
+    if (lanes < job_count) next_cpu_ = (rotation + lanes - 1) % (job_count - 1);
     unsigned total = 0, processors = 0, longest = 0, ram_steps = 0, bsp_steps = 0;
     std::array<bool, kMaxProcessors> active_lanes{};
     std::array<bool, kMaxProcessors> serviced{};
-    for (unsigned job = 0; job < job_count; ++job) {
+    for (unsigned position = 0; position < job_count; ++position) {
+      const auto job = rotate_smp_job(position, job_count, rotation);
       const auto& result = progress[job];
       serviced[jobs[job]] = result.steps != 0;
-      active_lanes[job % lanes] |= result.steps != 0;
+      active_lanes[position % lanes] |= result.steps != 0;
       if (jobs[job] == 0) bsp_steps = result.steps;
       total += result.steps;
       processors += result.steps != 0;
@@ -1485,9 +1497,11 @@ class PcMotherboardC06 {
     const cosmic_pc::MemoryFabric::ExclusiveRamReads exclusive(pc_.cpu.memory);
     std::mutex bus;
     std::array<std::uint64_t, kMaxProcessors> progress{};
+    const auto next_job = next_cpu_ % (jobs - 1);
     const auto lanes = workers_->try_run(std::min(jobs, host_workers_capacity()), [&](unsigned worker, unsigned workers) {
-      for (unsigned job = worker; job < jobs; job += workers) {
-        const auto id = ready[job];
+      const auto rotation = workers < jobs ? next_job : 0U;
+      for (unsigned position = worker; position < jobs; position += workers) {
+        const auto id = ready[rotate_smp_job(position, jobs, rotation)];
         for (unsigned used = 0; used < grant;) {
           std::unique_lock<std::mutex> lock(bus);
           if (faulted_processor_ || !pc_.guest_execution_available() ||
@@ -1504,6 +1518,7 @@ class PcMotherboardC06 {
       }
     });
     if (!lanes) return 0;
+    if (lanes < jobs) next_cpu_ = (next_job + lanes - 1) % (jobs - 1);
     std::uint64_t retired = 0;
     unsigned active = 0;
     for (const auto steps : progress) {

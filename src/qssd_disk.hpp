@@ -355,8 +355,8 @@ class QssdDisk final : public BlockDisk {
     }
     return u64(reinterpret_cast<const std::uint8_t*>(&aggregate));
   }
-  static std::uint64_t xor_rule(const BlockData& data,std::size_t period) noexcept {
-    if(!period)return xor_words(data.data());
+  static std::uint64_t xor_rule(const std::uint8_t* data,std::size_t period) noexcept {
+    if(!period)return xor_words(data);
     // Each XOR lane repeats after period bytes even with a non-aligned motif.
     // Pairs of complete repetitions cancel. Only odd repetitions and the tail contribute.
     std::uint8_t lanes[8]{};
@@ -440,7 +440,7 @@ class QssdDisk final : public BlockDisk {
                                    const std::uint8_t* payload,std::size_t size) {
     const auto position=bytes.size();
     const auto length=kRecHeader+size+kRecFooter;
-    bytes.resize(position+length);
+    bytes.resize(position+kRecHeader);
     auto* record=bytes.data()+position;
     std::memcpy(record,"QBLK",4);
     put32(record+4,kind);
@@ -448,8 +448,9 @@ class QssdDisk final : public BlockDisk {
     put32(record+16,static_cast<std::uint32_t>(size));
     put64(record+24,hash);
     put64(record+32,reference);
-    if(size)std::memcpy(record+kRecHeader,payload,size);
-    auto* end=record+kRecHeader+size;
+    if(size)bytes.insert(bytes.end(),payload,payload+size);
+    bytes.resize(position+length);
+    auto* end=bytes.data()+position+kRecHeader+size;
     std::memcpy(end,"QEND",4);
     put32(end+4,static_cast<std::uint32_t>(length));
     return position;
@@ -470,10 +471,9 @@ class QssdDisk final : public BlockDisk {
     write_all(fd,at,bytes.data(),bytes.size());
     return at+bytes.size();
   }
-  static std::size_t rule_period(const BlockData& data) noexcept {
-    const auto* start=data.data();
+  static std::size_t rule_period(const std::uint8_t* data) noexcept {
     for(unsigned period=1;period<=32;++period)
-      if(std::memcmp(start,start+period,data.size()-period)==0)return period;
+      if(data[0]==data[period]&&std::memcmp(data,data+period,kBlockSize-period)==0)return period;
     return 0;
   }
   void cache_insert_locked(std::uint64_t off,std::shared_ptr<const BlockData> data) const {
@@ -655,7 +655,7 @@ class QssdDisk final : public BlockDisk {
         if(!rec||rec->kind==Commit||rec->block!=block)
           throw std::runtime_error("QSSD checkpoint references non-block record");
         const auto data=decode(*rec,cutoff);
-        const auto word=rec->kind==Zero?0:xor_rule(data,rec->kind==Pattern?rec->payload.size():0);
+        const auto word=rec->kind==Zero?0:xor_rule(data.data(),rec->kind==Pattern?rec->payload.size():0);
         state.root=replace(state.root,block,index_levels_,Ref{off,word,rec->kind});
         if(rec->kind==Raw)remember(rec->digest,off);
         previous=block;
@@ -825,7 +825,7 @@ class QssdDisk final : public BlockDisk {
         if(record->block>=capacity_/kBlockSize||pending.size()>=kMaxBulkTransactionBlocks)
           throw std::runtime_error("QSSD journal record address/count invalid");
         const auto data=decode(*record,sz);
-        const auto word=record->kind==Zero?0:xor_rule(data,record->kind==Pattern?record->payload.size():0);
+        const auto word=record->kind==Zero?0:xor_rule(data.data(),record->kind==Pattern?record->payload.size():0);
         pending.push_back({record->block,record->digest,{pos,word,record->kind}});
       }
       pos=record->next;
@@ -881,7 +881,7 @@ class QssdDisk final : public BlockDisk {
             const auto data=original.decode(offset,old_end);
             // An all-zero block is indistinguishable from an absent block and
             // can be safely removed from the compacted sparse map.
-            const auto period=rule_period(data);
+            const auto period=rule_period(data.data());
             if(period==1&&!data.front())return;
             const auto kind=period?Pattern:Raw;
             const std::vector<std::uint8_t> payload(data.begin(),
@@ -1137,14 +1137,20 @@ class QssdDisk final : public BlockDisk {
       journal.reserve(block_count*(kRecHeader+kBlockSize+kRecFooter)+kRecHeader+kRecFooter);
       const auto head=std::min(total,std::size_t((kBlockSize-first%kBlockSize)%kBlockSize));
       const auto full_pages=(total-head)/kBlockSize;
-      std::vector<std::uint64_t> full_hashes;
+      struct PageInfo {std::uint64_t hash,word_xor;std::size_t period;};
+      std::vector<PageInfo> full_pages_info;
       unsigned hash_lanes=1;
       if(bulk_workers_&&full_pages>=2*kBulkPagesPerWorker){
-        full_hashes.resize(full_pages);
+        full_pages_info.resize(full_pages);
         hash_lanes=run_bulk(full_pages,[&](std::size_t begin,std::size_t end){
-          digest_range(begin,end,kBlockSize,[&](std::size_t index){
+          const auto data_at=[&](std::size_t index){
             return source+head+index*kBlockSize;
-          },[&](std::size_t index,std::uint64_t hash){full_hashes[index]=hash;});
+          };
+          digest_range(begin,end,kBlockSize,data_at,[&](std::size_t index,std::uint64_t hash){
+            const auto* data=data_at(index);
+            const auto period=rule_period(data);
+            full_pages_info[index]={hash,xor_rule(data,period),period};
+          });
         });
       }
       std::size_t done=0,digested_lane=kDigestLanes;
@@ -1153,12 +1159,14 @@ class QssdDisk final : public BlockDisk {
         const auto block=(first+done)/kBlockSize;
         const auto start=static_cast<std::size_t>((first+done)%kBlockSize);
         const auto n=std::min<std::size_t>(total-done,kBlockSize-start);
-        BlockData data;
+        BlockData partial;
+        const auto* data=source+done;
+        const PageInfo* inspected=nullptr;
         auto hash=std::uint64_t{0};
         if(n==kBlockSize){
-          std::memcpy(data.data(),source+done,n);
-          if(!full_hashes.empty()){
-            hash=full_hashes[(done-head)/kBlockSize];
+          if(!full_pages_info.empty()){
+            inspected=&full_pages_info[(done-head)/kBlockSize];
+            hash=inspected->hash;
           }else{
             if(digested_lane==kDigestLanes&&total-done>=kDigestLanes*kBlockSize){
               std::array<const std::uint8_t*,kDigestLanes> blocks{};
@@ -1167,39 +1175,43 @@ class QssdDisk final : public BlockDisk {
               content_digests=digest_four(blocks,kBlockSize);
               digested_lane=0;
             }
-            hash=digested_lane<kDigestLanes?content_digests[digested_lane++]:digest(data.data(),n);
+            hash=digested_lane<kDigestLanes?content_digests[digested_lane++]:digest(data,n);
           }
         }else{
           const auto ref=locate(old->value->root,block);
-          if(ref.offset)data=*cached_decode(ref.offset,original_end);
-          else data.fill(0);
-          std::memcpy(data.data()+start,source+done,n);
-          hash=digest(data.data(),data.size());
+          if(ref.offset)partial=*cached_decode(ref.offset,original_end);
+          else partial.fill(0);
+          std::memcpy(partial.data()+start,data,n);
+          data=partial.data();
+          hash=digest(data,kBlockSize);
         }
-        const auto period=rule_period(data);
+        const auto period=inspected?inspected->period:rule_period(data);
         Kind kind=Raw;
         std::uint64_t backref=0;
         std::uint64_t word_xor=0;
-        std::size_t payload=data.size();
+        std::size_t payload=kBlockSize;
         if(period){
-          kind=period==1&&!data.front()?Zero:Pattern;
+          kind=period==1&&!data[0]?Zero:Pattern;
           payload=kind==Zero?0:period;
-          word_xor=xor_rule(data,period);
+          word_xor=inspected?inspected->word_xor:xor_rule(data,period);
         }else{
           const auto matching=staged_hashes.equal_range(hash);
           for(auto entry=matching.first;entry!=matching.second;++entry){
             const auto& staged=new_raw[entry->second];
             const auto* bytes=journal.data()+std::size_t(staged.offset-original_end)+kRecHeader;
-            if(std::memcmp(bytes,data.data(),data.size())!=0||(backref&&staged.offset>=backref))
+            if(std::memcmp(bytes,data,kBlockSize)!=0||(backref&&staged.offset>=backref))
               continue;
             backref=staged.offset;
             word_xor=staged.word_xor;
           }
           if(!backref){
-            word_xor=xor_words(data.data());
+            word_xor=inspected?inspected->word_xor:xor_words(data);
             const auto it=dedup_.find(hash);
             if(it!=dedup_.end())for(const auto candidate:it->second){
-              if(*cached_decode(candidate,original_end)==data){backref=candidate;break;}
+              if(std::memcmp(cached_decode(candidate,original_end)->data(),data,kBlockSize)==0){
+                backref=candidate;
+                break;
+              }
             }
           }
           if(backref){kind=Reference;payload=0;}
@@ -1207,9 +1219,9 @@ class QssdDisk final : public BlockDisk {
         const auto position=journal.size();
         const auto record_offset=original_end+position;
         if(kind==Raw)
-          raw_positions.push_back(append_record(journal,kind,block,hash,backref,data.data(),payload));
+          raw_positions.push_back(append_record(journal,kind,block,hash,backref,data,payload));
         else
-          encode_record(journal,kind,block,hash,backref,data.data(),payload);
+          encode_record(journal,kind,block,hash,backref,data,payload);
         if(kind==Raw){
           staged_hashes.emplace(hash,new_raw.size());
           new_raw.push_back({hash,record_offset,word_xor});
