@@ -29,6 +29,7 @@ class PcMotherboardC06 {
  public:
   using Clock = cosmic_pc::PcMachine::RunClock;
   using ClockSource = std::function<Clock::time_point()>;
+  enum class CpuClock { Standard, Double };
   static constexpr std::uint64_t kLocalApic=cosmic_pc::PcMachine::kLocalApicAddress,
       kIoApic=cosmic_pc::PcMachine::kIoApicAddress;
   struct Evidence {
@@ -149,6 +150,8 @@ class PcMotherboardC06 {
   };
 
   cosmic_pc::PcMachine& pc_;
+  const unsigned cpu_clock_shift_;
+  std::uint64_t cpu_cycles_ = 0;
   std::optional<Ps2Keyboard> keyboard_;
   std::function<std::optional<std::uint32_t>(std::uint16_t,unsigned)> prior_in_;
   std::function<bool(std::uint16_t,unsigned,std::uint32_t)> prior_out_;
@@ -309,7 +312,7 @@ class PcMotherboardC06 {
     cmos_index_=rtc_c_=0;rtc_a_=0x26;rtc_b_=0x02;pm_control_=0x0001;powered_off_=false;
     pm_status_=pm_enable_=0;sci_active_=false;
     ferr_was_asserted_=false;pc_.cpu.set_x87_ignne(false);
-    ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=sci_irqs_=0;
+    cpu_cycles_=ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=sci_irqs_=0;
     active_clock_enabled_=false;
     active_clock_ns_=active_clock_ticks_=clock_tick_remainder_=0;
     clock_polls_=0;
@@ -1021,6 +1024,7 @@ class PcMotherboardC06 {
     // boundaries. Count PIT expirations, but queue a single pending edge.
     const auto previous=ticks_;
     ticks_+=elapsed;
+    cpu_cycles_ += elapsed << cpu_clock_shift_;
     active_clock_ticks_+=elapsed;
     const auto pit_elapsed=pit_phase_+elapsed;
     const auto clocks=pit_elapsed/kPitClockDivider;
@@ -1065,12 +1069,25 @@ class PcMotherboardC06 {
     return (port>=0x40&&port<=0x43)||port==0x61||(port>=0x70&&port<=0x71)||
         (port>=AcpiC06::pm_event_port&&port<AcpiC06::pm_timer_port+4);
   }
+  unsigned cpu_cycle_phase() const noexcept {
+    return static_cast<unsigned>(cpu_cycles_ & ((1U << cpu_clock_shift_) - 1));
+  }
+  // During firmware boot one board tick spans one or two CPU cycles. Keep the
+  // fractional phase across steps, batches and the switch to host-active time.
+  unsigned advance_cpu_cycles(unsigned steps) {
+    const std::uint64_t phase = cpu_cycle_phase();
+    cpu_cycles_ += steps;
+    const auto elapsed = static_cast<unsigned>((phase + steps) >> cpu_clock_shift_);
+    ticks_ += elapsed;
+    return elapsed;
+  }
   void poll(){
+    bool device_tick = false;
     if(active_clock_running_){
       if((++clock_polls_&15U)==0)sync_active_clock();
     }else{
-      ++ticks_;
-      if((rtc_b_&kRtcPeriodic)&&!(rtc_c_&kRtcIrq)&&ticks_>=rtc_next_periodic_tick_)
+      device_tick = advance_cpu_cycles(1) != 0;
+      if(device_tick&&(rtc_b_&kRtcPeriodic)&&!(rtc_c_&kRtcIrq)&&ticks_>=rtc_next_periodic_tick_)
         rtc_update_periodic();
     }
     auto& cpu=pc_.cpu;
@@ -1078,7 +1095,7 @@ class PcMotherboardC06 {
     if(ferr&&!ferr_was_asserted_)signal_isa_irq(13);
     if(!ferr&&ferr_was_asserted_)cpu.set_x87_ignne(false);
     ferr_was_asserted_=ferr;
-    if(!active_clock_running_&&++pit_phase_==kPitClockDivider){
+    if(device_tick&&++pit_phase_==kPitClockDivider){
       pit_phase_=0;
       if(pit_.enabled&&pit_.tick()){
         ++pit_irqs_;
@@ -1086,7 +1103,7 @@ class PcMotherboardC06 {
       }
       if((speaker_control_&1)&&pit2_.enabled)pit2_.tick();
     }
-    if(!active_clock_running_&&(ticks_&(AcpiC06::pm_timer_half_period-1))==0){
+    if(device_tick&&(ticks_&(AcpiC06::pm_timer_half_period-1))==0){
       pm_status_|=1U;
       update_sci();
     }
@@ -1097,7 +1114,7 @@ class PcMotherboardC06 {
       signal_isa_irq(1);
       keyboard_->mark_irq();
     }
-    if(!active_clock_running_)advance_apic_timer(bsp(),1);
+    if(device_tick)advance_apic_timer(bsp(),1);
     // The slave's INT output reaches the master independently of CPU IF or
     // LAPIC acceptance. The guest can read both IRRs with interrupts disabled.
     const auto slave_irq=slave_.pending();
@@ -1129,27 +1146,29 @@ class PcMotherboardC06 {
     if(prior_tick_ || powered_off_ || pc_.cpu.x87_ferr_asserted()!=ferr_was_asserted_ ||
        (keyboard_&&keyboard_->needs_irq()) ||
        (pc_.cpu.flag(cosmic_pc::Cpu::IF)&&interrupt_pending())) return 1;
-    if(pit_.enabled)steps=std::min(steps,pit_.counter*kPitClockDivider-pit_phase_);
-    steps=std::min(steps,pm_timer_edge_in());
-    if((rtc_b_&kRtcPeriodic)&&!(rtc_c_&kRtcIrq)&&rtc_next_periodic_tick_-ticks_<steps)
-      steps=unsigned(rtc_next_periodic_tick_-ticks_);
-    if(bsp().timer_cycles&&bsp().timer_cycles<steps&&!(bsp().lvt[kTimer]&kLvtMasked)&&lapic_on(bsp()))
-      steps=unsigned(bsp().timer_cycles);
-    return steps;
+    std::uint64_t edge = pm_timer_edge_in();
+    if (pit_.enabled) edge = std::min<std::uint64_t>(edge, pit_.counter*kPitClockDivider-pit_phase_);
+    if ((rtc_b_ & kRtcPeriodic) && !(rtc_c_ & kRtcIrq))
+      edge = std::min(edge, rtc_next_periodic_tick_-ticks_);
+    if (bsp().timer_cycles && !(bsp().lvt[kTimer] & kLvtMasked) && lapic_on(bsp()))
+      edge = std::min<std::uint64_t>(edge, bsp().timer_cycles);
+    if (!edge) return std::min(1U, steps);
+    if (!active_clock_running_) edge = (edge << cpu_clock_shift_) - cpu_cycle_phase();
+    return static_cast<unsigned>(std::min<std::uint64_t>(steps, edge));
   }
   void advance_batch(unsigned extra_steps) {
     if(active_clock_running_){
       if(extra_steps>=128)sync_active_clock();
       return;
     }
-    ticks_+=extra_steps;
-    const auto pit_elapsed=pit_phase_+extra_steps;
+    const auto device_ticks = advance_cpu_cycles(extra_steps);
+    const auto pit_elapsed=std::uint64_t(pit_phase_)+device_ticks;
     if(pit_.enabled)pit_.counter-=pit_elapsed/kPitClockDivider;
     // Channel 2 only drives the speaker output. It can cross expirations
     // within a batch while leaving the guest-visible counter exact.
     if((speaker_control_&1)&&pit2_.enabled)pit2_.advance_without_irq(pit_elapsed/kPitClockDivider);
     pit_phase_=pit_elapsed%kPitClockDivider;
-    advance_apic_timer(bsp(),extra_steps);
+    advance_apic_timer(bsp(),device_ticks);
   }
   unsigned advance_idle(unsigned max_extra) {
     if(!pc_.cpu.halted||!pc_.cpu.flag(cosmic_pc::Cpu::IF))return 0;
@@ -1486,7 +1505,8 @@ class PcMotherboardC06 {
       ready[jobs++] = id;
     }
     constexpr unsigned bus_steps = 64, timed_grant = 512;
-    const auto grant = std::min(budget / jobs, active_clock_running_ ? timed_grant : kSmpQuantum);
+    const auto quantum = (active_clock_running_ ? timed_grant : kSmpQuantum) << cpu_clock_shift_;
+    const auto grant = std::min(budget / jobs, quantum);
     if (jobs < 2 || grant < kSmpQuantum) return 0;
     const bool preserve_loop_entries = cosmic_pc::Cpu::ether_arm64_host() &&
         pc_.boot_acceleration_enabled() && budget >= jobs * kMinParallelLoopSteps;
@@ -1540,8 +1560,10 @@ class PcMotherboardC06 {
                             AtapiCdrom::Reader optical={}, std::uint64_t optical_bytes=0,
                             const std::filesystem::path& graphics_vram={},
                             BlockDisk* data_disk=nullptr, cosmic_pc::CpuTopology topology={},
-                            bool experimental_mixed_smp=false, std::shared_ptr<SmpWorkers> workers={})
-      :pc_(machine), processor_count_(topology.logical_processors()),
+                            bool experimental_mixed_smp=false, std::shared_ptr<SmpWorkers> workers={},
+                            CpuClock cpu_clock=CpuClock::Standard)
+      :pc_(machine), cpu_clock_shift_(cpu_clock == CpuClock::Double ? 1U : 0U),
+       processor_count_(topology.logical_processors()),
        experimental_mixed_smp_(experimental_mixed_smp), workers_(std::move(workers)) {
     if (!topology.valid()) throw std::invalid_argument("Invalid virtual processor topology");
     prior_topology_ = pc_.cpu.topology();
@@ -1551,7 +1573,7 @@ class PcMotherboardC06 {
       ap->configure_topology(topology,id);
       ap->use_windows_x64_profile(pc_.cpu.windows_x64_profile());
       ap->set_local_apic_present(true);
-      ap->set_shared_clock(&ticks_);
+      ap->set_shared_clock(&cpu_cycles_);
       ap->enable_page_translation_cache();
       ap->enable_ether_arm64_blocks();
 #if defined(MUNDO_X_PC_ETHER_NEXT)
@@ -1631,8 +1653,8 @@ class PcMotherboardC06 {
     };
     prior_local_apic_=pc_.cpu.local_apic_present();
     pc_.cpu.set_local_apic_present(true);
-    if (processor_count_ > 1) {
-      prior_clock_ = pc_.cpu.set_shared_clock(&ticks_);
+    if (processor_count_ > 1 || cpu_clock_shift_) {
+      prior_clock_ = pc_.cpu.set_shared_clock(&cpu_cycles_);
       clock_attached_=true;
     }
   }
@@ -1721,7 +1743,7 @@ class PcMotherboardC06 {
   void enable_active_clock(ClockSource source={}) {
     if(active_clock_enabled_)return;
     if(!clock_attached_){
-      prior_clock_=pc_.cpu.set_shared_clock(&ticks_);
+      prior_clock_=pc_.cpu.set_shared_clock(&cpu_cycles_);
       clock_attached_=true;
     }
     if(!timestamp_hook_attached_){
@@ -1738,6 +1760,10 @@ class PcMotherboardC06 {
     active_clock_enabled_=true;
   }
   bool active_clock_enabled() const noexcept {return active_clock_enabled_;}
+  std::uint64_t guest_tsc_hz() const noexcept {
+    return (std::uint64_t(cosmic_pc::PcMachine::kVirtualCyclesPerSecond) << cpu_clock_shift_) *
+           cosmic_pc::Cpu::kTscTicksPerCycle;
+  }
   std::uint64_t active_clock_elapsed_ns() const noexcept {return active_clock_ns_;}
   std::uint64_t active_clock_ticks() const noexcept {return active_clock_ticks_;}
   std::uint64_t processor_steps(unsigned id) const noexcept {

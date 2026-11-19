@@ -118,7 +118,7 @@ JNIEXPORT jlong JNICALL Java_com_reversewindows_android_NativeMachine_openWithRa
             static_cast<Session::BootSource>(source), iso_fd,
             static_cast<std::uint64_t>(iso_bytes), ram_profile(available, threshold, low_memory, prime_ram),
             string_from(env, ram_cache), string_from(env, graphics_vram), string_from(env, data_disk),
-            Session::kPrimeCpuTopology, true);
+            Session::kPrimeCpuTopology, true, reverse_windows::PcMotherboardC06::CpuClock::Double);
         auto instance = std::make_shared<Instance>(std::move(machine));
         std::lock_guard<std::mutex> lock(registry_mutex);
         if (next_handle == std::numeric_limits<jlong>::max())
@@ -171,6 +171,19 @@ JNIEXPORT jlong JNICALL Java_com_reversewindows_android_NativeMachine_step(
             const auto flags = outcome | (machine.video_pending() ? kVideoDirty : 0);
             const auto completed = machine.session_steps() - before;
             return static_cast<jlong>((completed << 32) | static_cast<std::uint32_t>(flags));
+        });
+    });
+}
+
+JNIEXPORT jintArray JNICALL Java_com_reversewindows_android_NativeMachine_cpuThreadIds(
+        JNIEnv* env, jclass, jlong handle) {
+    return call<jintArray>(env, nullptr, [&] {
+        return session(handle, [env](Session& machine) {
+            const auto tids = machine.host_thread_ids();
+            const auto count = static_cast<jsize>(tids.size());
+            auto array = env->NewIntArray(count);
+            if (array) env->SetIntArrayRegion(array, 0, count, tids.data());
+            return array;
         });
     });
 }

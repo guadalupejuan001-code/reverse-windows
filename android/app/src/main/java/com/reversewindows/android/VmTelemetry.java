@@ -39,7 +39,7 @@ final class VmTelemetry extends LinearLayout {
     private final TextView resident;
     private final TextView occupancy;
     private final ProgressBar meter;
-    private final LinearLayout[] rows = new LinearLayout[5];
+    private final LinearLayout[] rows = new LinearLayout[8];
     private final TextView[] keys = new TextView[rows.length];
     private final TextView[] values = new TextView[rows.length];
 
@@ -203,7 +203,16 @@ final class VmTelemetry extends LinearLayout {
         metric(3, "Bloques encadenados en paralelo", count(number(topology, "parallel_register_continuations")));
         metric(4, "vCPU iniciadas / configuradas", count(number(topology, "started")) + " / "
                 + count(number(topology, "logical_processors")));
-        showRows(5);
+        metric(5, "Reloj virtual (TSC)", units(number(topology, "guest_tsc_hz"), 1_000_000, "MHz", 2));
+        JSONObject host = snapshot.optJSONObject("host_cpu");
+        long low = number(host, "min_reported_khz");
+        long high = number(host, "max_reported_khz");
+        String range = high <= 0 ? "Sin lectura" : units(high, 1000, "MHz", 0);
+        if (low > 0 && low < high) range = formatted(low, 1000, 0) + "–" + range;
+        metric(6, "CPU física reportada", range);
+        long threads = number(host, "hint_threads", 0);
+        metric(7, "Solicitud a Android", threads == 0 ? "Inactiva" : count(threads) + " hilos");
+        showRows(8);
     }
 
     private static String formatRate(long stepsPerSecond) {

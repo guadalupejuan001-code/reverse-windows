@@ -292,6 +292,13 @@ jobs:
           assert cpu_us is None or cpu_us > 0
           thermal = snapshot["android_thermal_status"]
           assert thermal is None or 0 <= thermal <= 6
+          assert snapshot["cpu_topology"]["guest_tsc_hz"] == 458181760
+          host = snapshot["host_cpu"]
+          assert host["hint_threads"] == 0, "Android hints must close when the guest stops"
+          if host["readable_policies"]:
+              assert 0 < host["min_reported_khz"] <= host["max_reported_khz"]
+          else:
+              assert host["min_reported_khz"] is None and host["max_reported_khz"] is None
           ether = snapshot["ether_arm64"]
           assert ether["staged_ram_blocks"] == ether["staged_ram_steps"] == ether["coalesced_ram_writes"] == 0
           assert snapshot["machine"]["page_translation_hits"] == 0

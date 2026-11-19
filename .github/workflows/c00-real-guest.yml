@@ -84,6 +84,8 @@ jobs:
         env:
           LIBGL_ALWAYS_SOFTWARE: '1'
         run: ctest --test-dir build --output-on-failure
+      - name: Compare the guest clocks on sixteen vCPUs with identical arithmetic
+        run: ./build/reverse_windows_smp_guest_test --measure-cpu-clock | tee build/prime-smp-clock.log
       - name: Verify Prime C08 PCI, QSSD VRAM, and REgraphics rasterization
         env:
           EGL_PLATFORM: surfaceless
@@ -484,6 +486,7 @@ jobs:
             build/prime-bios-keyboard.log
             build/prime-c02-boot-profile.json
             build/prime-x86-measure.log
+            build/prime-smp-clock.log
             build/prime-c03-ether-arm64.log
             build/prime-c03-ether-arm64.json
             build/prime-c04-ram.log

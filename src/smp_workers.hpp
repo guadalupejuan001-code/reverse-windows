@@ -11,6 +11,11 @@
 #include <new>
 #include <system_error>
 #include <thread>
+#ifdef __ANDROID__
+#include <pthread.h>
+#include <unistd.h>
+#include <vector>
+#endif
 
 namespace reverse_windows {
 
@@ -24,6 +29,19 @@ class SmpWorkers {
   ~SmpWorkers() { shutdown(); }
 
   unsigned size() const noexcept { return live_lanes_.load(std::memory_order_acquire); }
+
+#ifdef __ANDROID__
+  // The VM thread runs lane zero. Only include native lanes actually created.
+  std::vector<int> android_thread_ids() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<int> ids{gettid()};
+    for (auto& worker : workers_) {
+      const int tid = pthread_gettid_np(worker.thread.native_handle());
+      if (tid > 0) ids.push_back(tid);
+    }
+    return ids;
+  }
+#endif
 
   // Returns zero without executing the task when another dispatch owns the
   // pool or there is only enough capacity for serial work.
@@ -60,6 +78,8 @@ class SmpWorkers {
 
   unsigned prepare(unsigned wanted) {
     const auto total = std::min(wanted, maximum_);
+    if (size() >= total) return total;
+    std::lock_guard<std::mutex> lock(mutex_);
     try {
       while (size() < total) {
         const auto index = size();

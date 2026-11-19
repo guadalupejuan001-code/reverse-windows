@@ -78,6 +78,7 @@ final class NativeMachine {
     static native void close(long handle);
     // Low 32 bits contain the result flags. High 32 bits count retired guest steps.
     static native long step(long handle, int instructions, long hostBudgetNs);
+    static native int[] cpuThreadIds(long handle);
     private static native boolean sampleRamPressure(long handle, long available, long threshold,
                                                     boolean lowMemory);
     static native boolean maintainRamBudget(long handle);

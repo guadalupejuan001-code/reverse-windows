@@ -730,10 +730,97 @@ void test_parallel_ram_vectors(bool shared, unsigned worker_limit = kProcessors)
     std::cout << "SMP_RAM_PASS workers=" << board.worker_count()
               << " vcpus=" << kProcessors << " shared=" << shared << " parallel_steps=" << parallel << '\n';
 }
+void check_cpu_clock(PcMotherboardC06::CpuClock profile, unsigned ratio) {
+    PcMachine pc(4U << 20);
+    pc.boot_demo();
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {8, 2}, false, {}, profile);
+    auto& cpu = pc.cpu;
+    cpu.reset(0, 0x7200);
+    const std::uint8_t loop[]{0x43,0xeb,0xfd}; // INC BX; JMP back to INC
+    cpu.memory.write_block(0x7200, loop, sizeof(loop));
+    const unsigned work = 512 * ratio;
+    board.run(1);
+    board.run(work - 1);
+    require(board.evidence().ticks == 512 && board.total_processor_steps() == work &&
+            cpu.regs[Cpu::EBX] == work / 2, "CPU work per peripheral tick");
+    const auto read_tsc = [&] {
+        cpu.eip = 0x7300;
+        cpu.write16(0x7300, 0x310f);
+        require(cpu.step() == cosmic_pc::StepResult::Executed, "Guest RDTSC");
+        return (cpu.regs[Cpu::EDX] << 32) | cpu.regs[Cpu::EAX];
+    };
+    const auto before = read_tsc();
+    require(before == std::uint64_t(work) * Cpu::kTscTicksPerCycle, "Firmware timestamp");
+    const auto origin = PcMachine::RunClock::time_point{};
+    unsigned samples = 0;
+    board.enable_active_clock([&] {
+        return origin + std::chrono::milliseconds(samples++ ? 1000 : 0);
+    });
+    cpu.eip = 0x7200;
+    board.run(64);
+    const auto hz = std::uint64_t(PcMachine::kVirtualCyclesPerSecond) * Cpu::kTscTicksPerCycle * ratio;
+    require(board.active_clock_ticks() == PcMachine::kVirtualCyclesPerSecond &&
+            read_tsc() - before == hz && board.guest_tsc_hz() == hz,
+            "A guest second must preserve the ACPI oscillator and the requested TSC rate");
+    std::cout << "PRIME_CPU_CLOCK_PASS guest_tsc_hz=" << hz << " peripheral_ticks=512 retired=" << work << '\n';
+}
+
+// Complete identical arithmetic on all 16 vCPUs. Count only the loop body,
+// excluding setup, BSP polling and virtual timer ticks from the reported rate.
+void measure_smp_clock(PcMotherboardC06::CpuClock profile) {
+    constexpr unsigned iterations = 4096, result_address = 0x3600;
+    constexpr std::uint16_t checksum = (std::uint64_t(iterations) * (iterations + 1) / 2) & 0xffff;
+    PcMachine pc(4U << 20);
+    pc.boot_demo();
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {8, 2}, true, {}, profile);
+    board.enable_threaded_smp(8);
+    auto& cpu = pc.cpu;
+    cpu.reset(0,0x7200);
+    cpu.a20_enabled = true;
+    const std::uint8_t code[]{
+        0x66,0xb8,0x0b,0,0,0, 0x66,0x31,0xc9, 0x0f,0xa2, // CPUID gives this vCPU's APIC ID
+        0x89,0xd6,0xd1,0xe6, 0xb9,0,0x10, 0x31,0xdb,   // SI = ID*2; CX = 4096; BX = 0
+        0x01,0xcb,0xe2,0xfc,                             // ADD BX,CX; LOOP
+        0x89,0x9c,0,0x36, 0xfa,0xf4                     // publish checksum; CLI; HLT
+    };
+    cpu.memory.write_block(0x8000,code,sizeof(code));
+    cpu.memory.write_block(0x7200,code,sizeof(code));
+    cpu.write16(0x7200 + sizeof(code) - 2,0xfeeb); // BSP continues until all APs publish.
+    cpu.write32(kLapic+0x300,0x000cc500);
+    cpu.write32(kLapic+0x300,0x000c8500);
+    cpu.write32(kLapic+0x300,0x000c0600 | kStartupVector);
+    const auto start = PcMachine::RunClock::now();
+    for (unsigned turn = 0; turn < 96; ++turn) {
+        board.run(8192);
+        bool complete = true;
+        for (unsigned id = 0; id < kProcessors; ++id)
+            complete &= cpu.read16(result_address+id*2) == checksum;
+        if (complete) {
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(PcMachine::RunClock::now()-start).count();
+            const auto work = std::uint64_t(kProcessors)*iterations*2;
+            require(!board.faulted_cpu() && board.processors_started() == kProcessors, "All CPU checksums");
+            std::cout << "PRIME_SMP_CLOCK_BENCH guest_tsc_hz=" << board.guest_tsc_hz()
+                      << " vcpus=" << kProcessors << " useful_instructions=" << work
+                      << " elapsed_ns=" << ns << " instructions_per_second=" << work*1000000000ULL/ns << '\n';
+            return;
+        }
+    }
+    throw std::runtime_error("The SMP CPU clock benchmark did not complete on every vCPU");
+}
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        using Profile = PcMotherboardC06::CpuClock;
+        check_cpu_clock(Profile::Standard, 1);
+        check_cpu_clock(Profile::Double, 2);
+        if (argc == 2 && std::string(argv[1]) == "--measure-cpu-clock") {
+            for (unsigned trial = 0; trial < 4; ++trial) {
+                measure_smp_clock(trial % 2 ? Profile::Double : Profile::Standard);
+                measure_smp_clock(trial % 2 ? Profile::Standard : Profile::Double);
+            }
+            return 0;
+        }
         test_eight_cores_sixteen_threads(false);
         test_eight_cores_sixteen_threads(true);
         test_eight_cores_sixteen_threads(true, 8);

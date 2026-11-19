@@ -191,7 +191,8 @@ class AndroidBootSession final {
                      const std::filesystem::path& ram_cache={},
                      const std::filesystem::path& graphics_vram={},
                      const std::filesystem::path& data_disk={},
-                     cosmic_pc::CpuTopology topology={}, bool active_guest_clock=false)
+                     cosmic_pc::CpuTopology topology={}, bool active_guest_clock=false,
+                     PcMotherboardC06::CpuClock cpu_clock=PcMotherboardC06::CpuClock::Standard)
       : source_(source), use_active_guest_clock_(active_guest_clock && source != BootSource::SelfTest),
         pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_), vbe_(pc_) {
     if (disk.empty() && (create_gib || source != BootSource::SelfTest))
@@ -217,13 +218,12 @@ class AndroidBootSession final {
       default:
         throw std::invalid_argument("Origen de arranque desconocido.");
     }
-    const auto workers = std::make_shared<SmpWorkers>(kPrimeHostWorkers);
     if (!disk.empty()) {
       if (create_gib) create_disk(disk, create_gib);
-      disk_ = std::make_unique<QssdDisk>(disk, QssdDisk::Access::ReadWrite, workers);
+      disk_ = std::make_unique<QssdDisk>(disk, QssdDisk::Access::ReadWrite, workers_);
     }
     if (!data_disk.empty())
-      data_disk_ = std::make_unique<QssdDisk>(data_disk, QssdDisk::Access::ReadWrite, workers);
+      data_disk_ = std::make_unique<QssdDisk>(data_disk, QssdDisk::Access::ReadWrite, workers_);
     if (source == BootSource::Disk) {
       pc_.mount([this](auto offset, auto* target, auto count) {
         return disk_->read_bytes(offset, target, count);
@@ -237,10 +237,10 @@ class AndroidBootSession final {
       board_ = std::make_unique<PcMotherboardC06>(pc_, disk_.get(),
           [reader = iso_](auto offset, auto* target, auto count) {
             return reader->read(offset, target, count);
-          }, iso_->size(), graphics_vram, data_disk_.get(), topology, true, workers);
+          }, iso_->size(), graphics_vram, data_disk_.get(), topology, true, workers_, cpu_clock);
     } else {
       board_ = std::make_unique<PcMotherboardC06>(
-          pc_, disk_.get(), AtapiCdrom::Reader{}, 0, graphics_vram, data_disk_.get(), topology, true, workers);
+          pc_, disk_.get(), AtapiCdrom::Reader{}, 0, graphics_vram, data_disk_.get(), topology, true, workers_, cpu_clock);
     }
     board_->enable_ps2_keyboard();
     board_->enable_threaded_smp(kPrimeHostWorkers);
@@ -398,6 +398,9 @@ class AndroidBootSession final {
   void configure_ether_x86_sessions(unsigned workers, unsigned max_sessions_per_vcpu) {
     board_->configure_ether_x86_sessions(workers, max_sessions_per_vcpu);
   }
+#ifdef __ANDROID__
+  std::vector<int> host_thread_ids() const { return workers_->android_thread_ids(); }
+#endif
 
   std::optional<EtherX86Sessions::Ticket> submit_ether_x86_session(unsigned vcpu, EtherX86Sessions::Job job) {
     return board_->submit_ether_x86_session(vcpu, std::move(job));
@@ -561,6 +564,7 @@ class AndroidBootSession final {
     out << ",\"cpu_topology\":{\"sockets\":1,\"cores\":" << topology.cores
         << ",\"threads_per_core\":" << topology.threads_per_core
         << ",\"logical_processors\":" << topology.logical_processors()
+        << ",\"guest_tsc_hz\":" << board_->guest_tsc_hz()
         << ",\"started\":" << board_->processors_started()
         << ",\"host_workers\":" << board_->worker_count()
         << ",\"host_workers_capacity\":" << board_->host_workers_capacity()
@@ -1131,6 +1135,7 @@ class AndroidBootSession final {
   cosmic_pc::PcMachine pc_;
   SpillInfo spill_;
   RamPressure pressure_;
+  std::shared_ptr<SmpWorkers> workers_ = std::make_shared<SmpWorkers>(kPrimeHostWorkers);
   std::shared_ptr<OpticalReader> iso_;
   std::unique_ptr<QssdDisk> disk_;
   std::unique_ptr<QssdDisk> data_disk_;

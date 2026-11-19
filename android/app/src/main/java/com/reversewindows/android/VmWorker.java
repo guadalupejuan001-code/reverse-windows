@@ -4,13 +4,11 @@ import android.content.ContentResolver;
 import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Debug;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
-import android.os.PowerManager;
 import android.os.Process;
 import android.os.SystemClock;
 import android.provider.OpenableColumns;
@@ -65,6 +63,8 @@ final class VmWorker {
     private static final int MIN_SLICE_STEPS = 64;
     private static final int MAX_SLICE_STEPS = Integer.MAX_VALUE;
     private static final long TARGET_SLICE_NS = 8_000_000L;
+    // Aim to finish an eight-ms VM workload in six ms to leave room for controls.
+    private static final long CPU_TARGET_NS = 6_000_000L;
     private static final long HALTED_POLL_DELAY_MS = 35;
     private static final long STATUS_INTERVAL_MS = 350;
     private static final long DIAGNOSTIC_INTERVAL_MS = 5_000;
@@ -78,7 +78,7 @@ final class VmWorker {
 
     private final Context context;
     private final ContentResolver resolver;
-    private final PowerManager powerManager;
+    private final VmCpuPerformance cpuPerformance;
     private final File disk;
     private final File dataDisk;
     private final AtomicFile diagnosticFile;
@@ -102,7 +102,6 @@ final class VmWorker {
     private long sessionProcessCpuStartMs;
     private long nextAndroidSample;
     private long androidPssKiB;
-    private int androidThermalStatus = -1;
     private long stepNanos;
     private long lastSliceNanos;
     private int lastSliceSteps;
@@ -126,7 +125,7 @@ final class VmWorker {
     VmWorker(Context context, File disk, File dataDisk, Listener listener) {
         this.context = context.getApplicationContext();
         this.resolver = this.context.getContentResolver();
-        this.powerManager = this.context.getSystemService(PowerManager.class);
+        this.cpuPerformance = new VmCpuPerformance(this.context, CPU_TARGET_NS);
         this.disk = disk;
         this.dataDisk = dataDisk;
         this.diagnosticFile = new AtomicFile(new File(this.context.getFilesDir(), DIAGNOSTIC_FILE));
@@ -301,6 +300,7 @@ final class VmWorker {
         worker.post(() -> {
             foreground = visible;
             if (!visible) {
+                cpuPerformance.pause();
                 worker.removeCallbacks(slice);
                 worker.removeCallbacks(ramMaintenance);
             }
@@ -335,6 +335,7 @@ final class VmWorker {
         worker.post(() -> {
             if (handle == 0 || isTerminal()) return;
             running = resume;
+            if (!resume) cpuPerformance.pause();
             worker.removeCallbacks(slice);
             if (running) schedule(0);
             try {
@@ -443,6 +444,7 @@ final class VmWorker {
         if (released || !running || !foreground || handle == 0) return;
         try {
             int previous = outcome;
+            if (outcome == NativeMachine.RUNNING) cpuPerformance.beforeWork(handle);
             long started = SystemClock.elapsedRealtimeNanos();
             lastSliceSteps = sliceSteps;
             long step = NativeMachine.step(handle, lastSliceSteps, TARGET_SLICE_NS);
@@ -453,6 +455,8 @@ final class VmWorker {
             long elapsed = Math.max(1, SystemClock.elapsedRealtimeNanos() - started);
             lastSliceNanos = elapsed;
             stepNanos += elapsed;
+            if (outcome != NativeMachine.RUNNING) cpuPerformance.pause();
+            else if (lastSliceCompleted > 0) cpuPerformance.report(elapsed);
             // Devices can advance during a slice without retiring a guest instruction.
             if (outcome == NativeMachine.RUNNING && lastSliceCompleted != 0) {
                 long estimate = lastSliceCompleted * TARGET_SLICE_NS / elapsed;
@@ -546,10 +550,9 @@ final class VmWorker {
         long now = SystemClock.elapsedRealtime();
         if (now >= nextAndroidSample) {
             androidPssKiB = Debug.getPss();
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && powerManager != null)
-                androidThermalStatus = powerManager.getCurrentThermalStatus();
             nextAndroidSample = now + ANDROID_SAMPLE_INTERVAL_MS;
         }
+        cpuPerformance.sample(now);
         long workerCpuNs = Debug.threadCpuTimeNanos();
         String workerCpuUs = sessionWorkerCpuStartNs >= 0 && workerCpuNs >= sessionWorkerCpuStartNs
                 ? Long.toString((workerCpuNs - sessionWorkerCpuStartNs) / 1000) : "null";
@@ -558,8 +561,7 @@ final class VmWorker {
         return withBuildMetadata(NativeMachine.diagnostic(handle, detailed),
                 ",\"elapsed_ms\":" + (now - sessionStarted)
                 + ",\"android_pss_kib\":" + androidPssKiB
-                + ",\"android_thermal_status\":" + (androidThermalStatus >= 0
-                        ? Integer.toString(androidThermalStatus) : "null")
+                + cpuPerformance.diagnosticFields()
                 + ",\"worker_timing\":{\"step_us\":" + stepNanos / 1000
                 + ",\"host_thread_cpu_us\":" + workerCpuUs
                 + ",\"host_process_cpu_ms\":" + processCpuMs
@@ -636,6 +638,7 @@ final class VmWorker {
     }
 
     private void closeMachine() {
+        cpuPerformance.pause();
         worker.removeCallbacks(slice);
         worker.removeCallbacks(ramMaintenance);
         running = false;
@@ -652,6 +655,7 @@ final class VmWorker {
     }
 
     private void report(Throwable error) {
+        cpuPerformance.pause();
         worker.removeCallbacks(slice);
         worker.removeCallbacks(ramMaintenance);
         running = false;
