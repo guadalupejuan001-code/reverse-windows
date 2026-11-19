@@ -68,6 +68,7 @@ class GuestVbeFabric {
   void write_json(std::ostream& out) const {
     out << "{\"source\":\"real-guest-VBE\",\"owner\":\"GPU-VIRTUAL-plus-qSSD-StateBus\""
         << ",\"captures\":" << stats_.captures << ",\"frames\":" << stats_.frames
+        << ",\"scanout_cache_bytes\":" << pixels_.size() * sizeof(pixels_[0])
         << ",\"dirty_pages\":" << stats_.dirty_pages << ",\"read_bytes\":" << stats_.read_bytes
         << ",\"examined_pixels\":" << stats_.examined_pixels
         << ",\"sent_pixels\":" << stats_.sent_pixels << ",\"packet_bytes\":" << stats_.packet_bytes

@@ -344,8 +344,9 @@ void verify(const std::filesystem::path& volume) {
     pc.boot_graphics_demo(width, height);
     pc.enable_boot_acceleration();
     PcMotherboardC06 board(pc, nullptr, {}, 0, volume);
-    require(board.attached_gpu() && !std::filesystem::exists(volume),
-            "GPU backing must be lazy");
+    require(board.attached_gpu() && board.attached_gpu()->vram_journal_bytes() == 64 &&
+            board.evidence().ticks == 0 && pc.cpu.instructions == 0,
+            "GPU and sparse VRAM must be ready before the BSP retires an instruction");
     check_firmware(pc);
     pc.reset();
     graphics_boot(pc);
@@ -585,6 +586,127 @@ void verify(const std::filesystem::path& volume) {
             << " e820=1 acpi=1 restart=1 exact=1\n";
 }
 
+void verify_quantum_vram(const std::filesystem::path& volume) {
+  constexpr auto last = RWGPU_LOGICAL_BYTES - 1;
+  {
+    PcMachine pc(PcMachine::high_ram_address_space(4ULL << 30, true), 64 * MiB);
+    pc.boot_graphics_demo(width, height);
+    PcMotherboardC06 board(pc, nullptr, {}, 0, volume, nullptr, {8, 2});
+    const auto* gpu = board.attached_gpu();
+    require(gpu && board.processors_started() == 1 && pc.cpu.instructions == 0 &&
+            gpu->vram_journal_bytes() == 64 && board.ram_clock_cycles() == 0 &&
+            gpu_stats(*gpu).find("\"power_on_tick\":0,\"clock_cycles\":0") != std::string::npos,
+            "CPU, GPU and empty sparse VRAM must share the board's power-on tick");
+    graphics_boot(pc);
+    Guest32 setup;
+    setup.cfg_write(0x10, moved_bar);
+    setup.cfg_write(4, 2); // Only PCI memory decode; none of these commands is a DMA to guest RAM.
+    setup.run(pc);
+    auto& cpu = pc.cpu;
+    constexpr auto stage = moved_bar + RWGPU_STAGE_OFFSET;
+    constexpr auto ether = PcMachine::kEtherMemoryPhysicalBase;
+    constexpr auto base = PcMachine::kEtherMemoryLogicalByteBase;
+    constexpr std::uint32_t pattern = 0x010034a5;
+    unsigned ticket = 0;
+    auto issue = [&](unsigned op, std::uint64_t at, unsigned size, unsigned expected, std::uint64_t aux = 0) {
+      Guest32 guest;
+      guest.direct_command(op, ++ticket, at, aux, size);
+      guest.run(pc);
+      const auto actual = cpu.read32(moved_bar + RWGPU_REG_STATUS);
+      if (cpu.read32(moved_bar + RWGPU_REG_COMPLETED) != ticket || actual != expected)
+        throw std::runtime_error("quantum ticket " + std::to_string(ticket) + " op " + std::to_string(op) +
+            " status " + std::to_string(actual) + " expected " + std::to_string(expected));
+    };
+    require((cpu.read32(moved_bar + RWGPU_REG_CAPS) & RWGPU_CAP_QUANTUM_VRAM) &&
+            cpu.read32(moved_bar + RWGPU_REG_QUANTUM_MAX) == 256 &&
+            cpu.read64(moved_bar + RWGPU_REG_QUANTUM_BASE_LO) == base,
+            "guest cannot discover the quantum plane");
+    cpu.write32(ether + 8, pattern);
+    issue(RWGPU_QUANTUM_LOAD, 8, 4, RWGPU_OK);
+    require(cpu.read32(stage) == pattern, "GPU did not see CPU Ether memory");
+    cpu.write32(ether + 8, ~pattern);
+    issue(RWGPU_QUANTUM_LOAD, 8, 4, RWGPU_OK);
+    require(cpu.read32(stage) == ~pattern, "CPU write left a stale GPU observation");
+    cpu.write32(stage, pattern);
+    issue(RWGPU_QUANTUM_STORE, 8, 4, RWGPU_OK);
+    require(cpu.read32(ether + 8) == pattern, "CPU aperture did not see GPU write");
+    issue(RWGPU_QUANTUM_SAVE, 8, 4, RWGPU_OK);
+    issue(RWGPU_READ, 0, RWGPU_PAGE_BYTES, RWGPU_OK);
+    require(cpu.read32(stage + 8) == pattern, "qSSD checkpoint does not match the quantum plane");
+    cpu.write32(ether + 8, 0);
+    issue(RWGPU_QUANTUM_RESTORE, 8, 4, RWGPU_OK);
+    require(cpu.read32(ether + 8) == pattern, "quantum restore did not update shared CPU memory");
+
+    // The first byte is deterministic and the second contains a Bell pair.
+    // Failed multi-byte transfers leave every destination and the pair intact.
+    issue(RWGPU_QUANTUM_H, last * 8, 0, RWGPU_OK);
+    issue(RWGPU_QUANTUM_CX, last * 8, 0, RWGPU_OK, last * 8 + 1);
+    const auto first = std::to_string((base + last) * 8);
+    const auto second = std::to_string((base + last) * 8 + 1);
+    auto correlations = [&] {
+      return pc.quantum_session->query_batch({{1,{{first,'X'},{second,'X'}}},
+          {1,{{first,'Z'},{second,'Z'}}}, {1,{{first,'Z'}}}}).values;
+    };
+    const std::vector<double> bell{1,1,0};
+    const auto epoch = pc.quantum_session->epoch();
+    const auto journal = gpu->vram_journal_bytes();
+    cpu.write32(stage, 0x13572468);
+    for (auto op : {RWGPU_QUANTUM_LOAD, RWGPU_QUANTUM_STORE, RWGPU_QUANTUM_SAVE, RWGPU_QUANTUM_RESTORE})
+      issue(op, last - 1, 2, RWGPU_QUANTUM_UNAVAILABLE);
+    require(pc.quantum_session->epoch() == epoch && correlations() == bell &&
+            gpu->vram_journal_bytes() == journal && cpu.read32(stage) == 0x13572468,
+            "basis transfer changed a Bell pair, staging bytes or the qSSD journal");
+    issue(RWGPU_QUANTUM_CX, last * 8, 0, RWGPU_OK, last * 8 + 1);
+    issue(RWGPU_QUANTUM_H, last * 8, 0, RWGPU_OK);
+    issue(RWGPU_QUANTUM_STORE, last, 1, RWGPU_OK);
+    issue(RWGPU_QUANTUM_SAVE, last, 1, RWGPU_OK);
+    issue(RWGPU_QUANTUM_SAVE, last, 2, RWGPU_INVALID);
+    issue(RWGPU_QUANTUM_H, RWGPU_LOGICAL_BYTES * 8, 0, RWGPU_INVALID);
+    issue(RWGPU_QUANTUM_CX, 0, 0, RWGPU_INVALID, 0);
+    issue(RWGPU_QUANTUM_LOAD, 0, 257, RWGPU_INVALID);
+    issue(RWGPU_QUANTUM_LOAD, UINT64_MAX, 1, RWGPU_INVALID);
+
+    // Reuse the actual guest MOV/doorbell path under both cache policies.
+    // One x86 loop keeps guest work and the value observed by the guest equal.
+    for (bool cached : {false, true}) {
+      board.set_gpu_cache_enabled(cached);
+      Guest32 probe;
+      probe.write(moved_bar + RWGPU_REG_AUX_LO, 0);
+      probe.write(moved_bar + RWGPU_REG_AUX_HI, 0);
+      probe.write(moved_bar + RWGPU_REG_LENGTH, 32);
+      probe.write(moved_bar + RWGPU_REG_OFFSET_LO, 0);
+      probe.write(moved_bar + RWGPU_REG_OFFSET_HI, 0);
+      probe.emit({0xb9}); probe.word(512); // ECX = repetitions.
+      const auto loop = probe.bytes.size();
+      probe.emit({0xa1}); probe.word(moved_bar + RWGPU_REG_COMPLETED);
+      probe.emit({0x40,0xa3}); probe.word(moved_bar + RWGPU_REG_TICKET);
+      probe.write(moved_bar + RWGPU_REG_DOORBELL, RWGPU_QUANTUM_LOAD);
+      probe.read(stage + 8, 0xe100);
+      probe.emit({0xe2}); probe.word(std::uint8_t(loop - (probe.bytes.size() + 1)), 1);
+      const auto begin = std::chrono::steady_clock::now();
+      probe.run(pc);
+      const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - begin).count();
+      ticket += 512;
+      require(cpu.read32(0xe100) == pattern && cpu.read32(moved_bar + RWGPU_REG_COMPLETED) == ticket &&
+              cpu.read32(moved_bar + RWGPU_REG_STATUS) == RWGPU_OK, "warm quantum read returned stale data");
+      std::cout << "PRIME_QUANTUM_READ_PASS cache=" << cached << " reads=512 bytes=32 elapsed_ns=" << ns << '\n';
+    }
+    require(gpu_stats(*gpu).find("\"cache_hits\":511,") != std::string::npos,
+            "warm reads should reuse exactly 511 observations");
+    pc.reset();
+    require(board.ram_clock_cycles() == 0 && board.processors_started() == 1 &&
+            gpu_stats(*gpu).find("\"cache_hits\":0,") != std::string::npos,
+            "power reset left stale GPU clock or quantum observations");
+  }
+  reverse_windows::GpuVram reopened(volume);
+  std::uint8_t value = 0;
+  require(reopened.read(last, &value, 1) == reverse_windows::GpuVram::Result::Complete && value == 0x68,
+          "the checkpoint at the last logical byte did not survive reset");
+  std::cout << "PRIME_QUANTUM_VRAM_PASS power_tick=0 logical_bytes=" << RWGPU_LOGICAL_BYTES
+            << " clock_hz=" << RW_PRIME_COMPONENT_HZ << " bell_xx=1 bell_zz=1 bell_z=0 checkpoint=1\n";
+}
+
 void verify_c13_residency(const std::filesystem::path& path) {
   using Vram = reverse_windows::GpuVram;
   constexpr auto page = Vram::kPageBytes;
@@ -665,6 +787,7 @@ int main() {
     } remove{name};
     verify_pci_clocks(remove.path);
     verify(remove.path / "gpu.rqvd");
+    verify_quantum_vram(remove.path / "quantum.rqvd");
     verify_c13_residency(remove.path / "c13.rqvd");
     measure_vram(remove.path / "large-vram.rqvd");
   } catch (const std::exception& error) {

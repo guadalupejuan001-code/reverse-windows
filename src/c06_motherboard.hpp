@@ -367,7 +367,7 @@ class PcMotherboardC06 {
     if(ata_)ata_->reset();
     if(data_ata_)data_ata_->reset();
     if(optical_)optical_->reset();
-    if(gpu_)gpu_->reset();
+    if(gpu_)gpu_->reset(ticks_);
     pc_.cpu.set_apic_task_priority(0);
     bsp() = LocalApic{&pc_.cpu};
     bsp().started = true;
@@ -1283,9 +1283,13 @@ class PcMotherboardC06 {
   // The current step has already polled the board. Stop the batch before
   // another tick could change the interrupt or timer state visible to the CPU.
   unsigned batch_limit(unsigned steps) const {
+    if (pc_.cpu.flag(cosmic_pc::Cpu::IF) && interrupt_pending()) return std::min(steps, 1U);
+    return device_batch_limit(steps);
+  }
+
+  unsigned device_batch_limit(unsigned steps) const {
     if(prior_tick_ || powered_off_ || pc_.cpu.x87_ferr_asserted()!=ferr_was_asserted_ ||
-       ((keyboard_&&keyboard_->needs_irq()) || aux_irq()) ||
-       (pc_.cpu.flag(cosmic_pc::Cpu::IF)&&interrupt_pending())) return 1;
+       (keyboard_ && keyboard_->needs_irq()) || aux_irq()) return std::min(steps, 1U);
     std::uint64_t edge = pm_timer_edge_in();
     if (pit_.enabled) edge = std::min<std::uint64_t>(edge, pit_.counter*kPitClockDivider-pit_phase_);
     if ((rtc_b_ & kRtcPeriodic) && !(rtc_c_ & kRtcIrq))
@@ -1421,7 +1425,7 @@ class PcMotherboardC06 {
     // A masked request stays in IRR. A translated block cannot change guest
     // interrupt priority or issue an EOI without returning to the device bus.
     if (accepts_irq && deliverable_lapic_vector(apic)) return 1;
-    auto limit = batch_limit(remaining);
+    auto limit = device_batch_limit(remaining);
     if (accepts_irq && apic.timer_cycles && !(apic.lvt[kTimer] & kLvtMasked) && lapic_on(apic))
       limit = unsigned(std::min<std::uint64_t>(limit, apic.timer_cycles));
     return limit;
@@ -1668,22 +1672,10 @@ class PcMotherboardC06 {
     threaded_smp_stats_.peak_workers = std::max(threaded_smp_stats_.peak_workers, workers);
   }
 
-  unsigned run_threaded_smp(const std::array<unsigned, kMaxProcessors>& runnable, unsigned count,
+  unsigned run_threaded_smp(const std::array<unsigned, kMaxProcessors>& ready, unsigned jobs,
                             unsigned budget, Clock::time_point deadline) {
     if (!threaded_smp_enabled_ || !pc_.guest_execution_available()) return 0;
 
-    sync_active_clock();
-    std::array<unsigned, kMaxProcessors> ready{};
-    unsigned jobs = 1;
-    for (unsigned i = 1; i < count; ++i) {
-      const auto id = runnable[i];
-      auto& apic = apics_[id];
-      if (apic.cpu->halted && !apic.init_pending && !apic.startup_vector) {
-        update_secondary_timer(apic);
-        if (!deliverable_lapic_vector(apic)) continue;
-      }
-      ready[jobs++] = id;
-    }
     constexpr unsigned bus_steps = 64, timed_grant = 512;
     const auto quantum = std::min(kExtendedSmpQuantum,
         (active_clock_running_ ? timed_grant : kSmpQuantum) * cpu_clock_ratio_);
@@ -1781,7 +1773,8 @@ class PcMotherboardC06 {
     if(optical)optical_=std::make_unique<AtapiCdrom>(
         std::move(optical),optical_bytes,[this](){signal_isa_irq(15);});
     if(!graphics_vram.empty())gpu_=std::make_unique<GuestGpuC08>(
-        pc_,graphics_vram,[this](auto address,auto data){return signal_pci_msi(address,data);},workers_);
+        pc_,graphics_vram,[this](auto address,auto data){return signal_pci_msi(address,data);},workers_,
+        [this]{return device_clock_cycles(RW_PRIME_COMPONENT_HZ);});
     // The machine must be booted/mounted first. ACPI goes into reserved BIOS
     // memory and is never presented by E820 as allocatable guest RAM.
     prior_in_=pc_.cpu.in_hook;prior_out_=pc_.cpu.out_hook;
@@ -1896,6 +1889,13 @@ class PcMotherboardC06 {
     for (unsigned id = 1; id < processor_count_; ++id)
       if (needs_service(apics_[id])) return true;
     return false;
+  }
+  const char* processor_state(unsigned id) const {
+    const auto& apic = apics_.at(id);
+    if (!apic.cpu) throw std::out_of_range("Unknown vCPU");
+    if (apic.init_pending || apic.startup_vector) return "startup_pending";
+    if (!apic.started) return "wait_for_sipi";
+    return apic.cpu->halted ? "halted" : "running";
   }
   unsigned processors_started() const noexcept {
     return static_cast<unsigned>(std::count_if(apics_.begin(), apics_.begin() + processor_count_,
@@ -2053,21 +2053,36 @@ class PcMotherboardC06 {
       if(timed&&Clock::now()>=deadline)return;
       std::array<unsigned, kMaxProcessors> runnable{};
       unsigned count = 1;
-      for (unsigned id = 1; id < processor_count_; ++id)
-        if (needs_service(apics_[id])) runnable[count++] = id;
-      if (count == 1) {
-        run_bsp(budget, deadline);
-        return;
+      bool sleeping = false;
+      sync_active_clock();
+      for (unsigned id = 1; id < processor_count_; ++id) {
+        auto& apic = apics_[id];
+        if (!needs_service(apic)) continue;
+        if (apic.cpu->halted && !apic.init_pending && !apic.startup_vector) {
+          update_secondary_timer(apic);
+          if (!deliverable_lapic_vector(apic)) { sleeping = true; continue; }
+        }
+        runnable[count++] = id;
       }
-      if (const auto completed = run_parallel_ether_loops(runnable, count, budget, deadline)) {
+      // HLT/IF processors still need their timers and new IPIs sampled. Give
+      // their unused grants to runnable processors and poll again within the
+      // original per-processor quantum, including when only the BSP is awake.
+      const auto dispatch_budget = sleeping ? std::min(budget, count * kSmpQuantum) : budget;
+      if (count == 1) {
+        run_bsp(dispatch_budget, deadline);
+        if (!sleeping || pc_.waiting_key) return;
+        budget -= dispatch_budget;
+        continue;
+      }
+      if (const auto completed = run_parallel_ether_loops(runnable, count, dispatch_budget, deadline)) {
         budget -= completed;
         continue;
       }
-      if (const auto scheduled = run_threaded_smp(runnable, count, budget, deadline)) {
+      if (const auto scheduled = run_threaded_smp(runnable, count, dispatch_budget, deadline)) {
         budget -= scheduled;
         continue;
       }
-      const auto chunk = std::min(budget, count * smp_quantum(runnable, count));
+      const auto chunk = std::min(dispatch_budget, count * smp_quantum(runnable, count));
       std::array<unsigned, kMaxProcessors> work{};
       for (unsigned i = 0; i < count; ++i)
         work[(next_cpu_ + i) % count] = chunk / count + (i < chunk % count);

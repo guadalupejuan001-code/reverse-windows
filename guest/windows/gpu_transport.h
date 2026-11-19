@@ -10,6 +10,8 @@
 #define RWGPU_IOCTL_UPLOAD CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_IN_DIRECT, FILE_WRITE_DATA)
 #define RWGPU_IOCTL_DOWNLOAD CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_OUT_DIRECT, FILE_WRITE_DATA)
 #define RWGPU_IOCTL_DRAW_VRAM CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_OUT_DIRECT, FILE_WRITE_DATA)
+// Bounded staged access to the shared InfiniteCore session. No guest bus address.
+#define RWGPU_IOCTL_QUANTUM CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_WRITE_DATA)
 #define RWGPU_DEVICE_PATH L"\\\\.\\ReversePrimeGpu"
 
 typedef struct RwGpuDrawRequest {
@@ -31,3 +33,9 @@ typedef struct RwGpuDrawVramRequest {
   RwGpuDrawRequest draw;
   uint32_t reserved;
 } RwGpuDrawVramRequest;
+
+
+typedef struct RwGpuQuantumRequest {
+  uint64_t offset, auxiliary;
+  uint32_t version, operation, bytes, reserved;
+} RwGpuQuantumRequest;

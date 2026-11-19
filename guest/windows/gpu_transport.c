@@ -229,6 +229,34 @@ static BOOLEAN valid_vram(RwGpuDevice* state, uint64_t offset, ULONG size) {
     return offset <= capacity && size <= capacity - offset;
 }
 
+static NTSTATUS quantum_request(RwGpuDevice* state, PUCHAR data, ULONG input, ULONG output, ULONG* written) {
+    if (!data || input < sizeof(RwGpuQuantumRequest)) return STATUS_INVALID_PARAMETER;
+    const RwGpuQuantumRequest cmd = *(const RwGpuQuantumRequest*)data;
+    if (cmd.version != RWGPU_ABI || cmd.reserved || cmd.operation < RWGPU_QUANTUM_STORE ||
+        cmd.operation > RWGPU_QUANTUM_CX || cmd.bytes > RWGPU_QUANTUM_TRANSFER_BYTES ||
+        input != sizeof(cmd) + (cmd.operation == RWGPU_QUANTUM_STORE ? cmd.bytes : 0) ||
+        output != (cmd.operation == RWGPU_QUANTUM_LOAD ? cmd.bytes : 0)) return STATUS_INVALID_PARAMETER;
+    if (!state->bar) return STATUS_DEVICE_NOT_READY;
+    if (!(reg_read(state, RWGPU_REG_CAPS) & RWGPU_CAP_QUANTUM_VRAM)) return STATUS_NOT_SUPPORTED;
+    if (cmd.operation >= RWGPU_QUANTUM_H) {
+        const uint64_t bits = RWGPU_LOGICAL_BYTES * 8;
+        if (cmd.bytes || cmd.offset >= bits ||
+            (cmd.operation == RWGPU_QUANTUM_H ? cmd.auxiliary != 0 :
+                cmd.auxiliary >= bits || cmd.auxiliary == cmd.offset)) return STATUS_INVALID_PARAMETER;
+    } else if (!cmd.bytes || cmd.auxiliary || !valid_vram(state, cmd.offset, cmd.bytes)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    PUCHAR staging = state->bar + RWGPU_STAGE_OFFSET;
+    if (cmd.operation == RWGPU_QUANTUM_STORE)
+        WRITE_REGISTER_BUFFER_UCHAR(staging, data + sizeof(cmd), cmd.bytes);
+    const NTSTATUS status = transfer(state, cmd.operation, cmd.offset, cmd.auxiliary, cmd.bytes);
+    if (NT_SUCCESS(status) && cmd.operation == RWGPU_QUANTUM_LOAD) {
+        READ_REGISTER_BUFFER_UCHAR(staging, data, cmd.bytes);
+        *written = cmd.bytes;
+    }
+    return status;
+}
+
 static NTSTATUS checked_dma(RwGpuDevice* state, ULONG command, uint64_t from, uint64_t to,
                             ULONG bytes) {
     NTSTATUS status = transfer(state, command, from, to, bytes);
@@ -304,6 +332,10 @@ static NTSTATUS device_control(PDEVICE_OBJECT dev, PIRP irp) {
                 unlock_device(state);
             }
         }
+    } else if (code == RWGPU_IOCTL_QUANTUM) {
+        lock_device(state);
+        status = quantum_request(state, data, input, output, &written);
+        unlock_device(state);
     } else if (code == RWGPU_IOCTL_GET_DMA) {
         status = STATUS_INVALID_PARAMETER;
         if (data && input == 0 && output == sizeof(RwGpuDmaInfo)) {

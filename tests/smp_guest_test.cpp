@@ -255,6 +255,99 @@ void test_secondary_interrupts(bool threaded) {
             board.evidence().apic_irqs == 2, "directed IPI, EOI, and independent AP timer");
 }
 
+void test_bsp_irq_during_ap_rep() {
+    PcMachine pc(4U << 20);
+    pc.boot_demo();
+    pc.enable_boot_acceleration();
+    bool armed = false;
+    pc.cpu.out_hook = [&](std::uint16_t port, unsigned width, std::uint32_t) {
+        if (port != 0xe9 || width != 1) return false;
+        armed = true;
+        return true;
+    };
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {2, 1});
+    auto& cpu = pc.cpu;
+    cpu.reset(0, 0x7200);
+    cpu.a20_enabled = true;
+    cpu.eflags = Cpu::IF | 2;
+    cpu.regs[Cpu::ESP] = 0x7000;
+    cpu.write16(0x7200, 0xfeeb);
+    cpu.write32(0x51 * 4, 0x7400); // BSP real-mode IRQ vector and IRET.
+    cpu.write8(0x7400, 0xcf);
+    cpu.out_hook(0x21, 1, 0xff);
+    cpu.out_hook(0xa1, 1, 0xff);
+    cpu.write32(kLapic + 0xf0, 0x1ff);
+    install_protected32_entry(cpu, 0x9000);
+    constexpr std::uint8_t code[] = {
+        0x66,0xb8,0x10,0,0x8e,0xd8,0x8e,0xc0,       // Flat data and extra segments.
+        0xbb,0,0,0xe0,0xfe, 0xc7,0x83,0xf0,0,0,0,0xff,1,0,0,
+        0xbe,0,0x50,0,0, 0xbf,0,0x51,0,0, 0xb9,16,0,0,0,
+        0xfc,0xfb,0x90,0xe6,0xe9,                     // Mark entry to the measured grant.
+        0xc7,0x83,0,3,0,0,0x51,0,0,0,                // Interrupt BSP; AP's IRR stays clear.
+        0xf3,0xa4,0xfa,0xf4
+    };
+    cpu.memory.write_block(0x9020, code, sizeof(code));
+    for (unsigned i = 0; i < 16; ++i) cpu.write8(0x5000 + i, std::uint8_t(0x71 + i));
+    cpu.write32(kLapic + 0x310, 1U << 24);
+    cpu.write32(kLapic + 0x300, 0x609);
+    for (unsigned i = 0; !armed && i < 512; ++i) board.run(1);
+    require(armed, "AP did not arm the directed-IRQ fixture");
+    board.run(64);
+    require(!board.faulted_cpu() && board.interrupt_state().pending == 0x51,
+            "BSP IRQ must be pending throughout the AP's grant");
+    for (unsigned i = 0; i < 16; ++i)
+        require(cpu.read8(0x5100 + i) == 0x71 + i, "AP copy while BSP IRQ pending");
+#ifdef PRIME_R101_BASELINE
+    const auto elements = 0;
+#else
+    const auto elements = board.secondary_rep_elements();
+#endif
+#if !defined(PRIME_R101_BASELINE) && !defined(PRIME_R102_BASELINE)
+    // The first scalar iteration decodes REP. The remaining 15 are eligible.
+    require(elements == 15, "cross-vCPU REP batched " + std::to_string(elements) + " of 15 eligible elements");
+#endif
+    board.run(64);
+    require(board.evidence().apic_irqs == 1 && !board.interrupt_state().pending,
+            "the directed BSP interrupt was lost");
+    std::cout << "PRIME_BSP_IRQ_AP_REP_PASS bytes=16 batched=" << elements << " delivered=1\n";
+}
+
+// Fifteen application processors enter HLT with interrupts enabled. The BSP
+// stays in a deterministic real-mode JMP loop with external interrupts masked.
+void measure_sleeping_siblings(bool threaded) {
+    PcMachine pc(4U << 20);
+    pc.boot_demo();
+    auto& cpu = pc.cpu;
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {8, 2});
+    if (threaded) board.enable_threaded_smp(8);
+    cpu.reset(0, 0x7200);
+    cpu.a20_enabled = true;
+    cpu.write16(0x7200, 0xfeeb);
+    constexpr std::uint8_t ap_code[] = {0xfb, 0x90, 0xf4}; // STI; NOP; HLT.
+    cpu.memory.write_block(kStartupVector << 12, ap_code, sizeof(ap_code));
+    cpu.write32(kLapic + 0x300, 0x000c0600 | kStartupVector);
+    board.run(8192);
+    require(board.processors_started() == 16 && !board.faulted_cpu(), "15 APs reached their SIPI code");
+    const auto before = board.processor_steps(0);
+    const auto total = board.total_processor_steps();
+    constexpr unsigned budget = 32768;
+    const auto start = PcMachine::RunClock::now();
+    board.run(budget);
+    const auto retired = board.processor_steps(0) - before;
+    require(retired && board.total_processor_steps() - total == retired, "a sleeping AP executed guest code");
+#if !defined(PRIME_R101_BASELINE) && !defined(PRIME_R102_BASELINE)
+    require(retired == budget, "sleeping processors consumed the BSP's instruction budget");
+    for (unsigned id = 1; id < 16; ++id)
+        require(std::string(board.processor_state(id)) == "halted", "sleeping AP telemetry");
+#endif
+    unsigned slices = 1;
+    while (board.processor_steps(0) - before < budget && slices < 32) { board.run(budget); ++slices; }
+    require(board.processor_steps(0) - before == budget, "equal-work BSP comparison");
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(PcMachine::RunClock::now() - start).count();
+    std::cout << "PRIME_IDLE_APS_PASS sleeping=15 threaded=" << threaded << " budget=" << budget
+              << " retired=" << retired << " slices=" << slices << " equal_work_ns=" << ns << '\n';
+}
+
 void test_ether_worker_block() {
     if (!Cpu::ether_arm64_host()) return;
     PcMachine pc(4U << 20);
@@ -1172,6 +1265,15 @@ int main(int argc, char** argv) {
             return 0;
         }
         using Profile = PcMotherboardC06::CpuClock;
+        if (argc == 2 && std::string(argv[1]) == "--measure-idle-aps") {
+            test_bsp_irq_during_ap_rep();
+            measure_sleeping_siblings(false);
+            measure_sleeping_siblings(true);
+            return 0;
+        }
+        test_bsp_irq_during_ap_rep();
+        measure_sleeping_siblings(false);
+        measure_sleeping_siblings(true);
         check_cpu_clock(Profile::Standard, 1);
         check_cpu_clock(Profile::Double, 2);
         check_cpu_clock(Profile::Twentyfold, 20);
