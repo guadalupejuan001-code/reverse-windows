@@ -217,11 +217,13 @@ class AndroidBootSession final {
       default:
         throw std::invalid_argument("Origen de arranque desconocido.");
     }
+    const auto workers = std::make_shared<SmpWorkers>(kPrimeHostWorkers);
     if (!disk.empty()) {
       if (create_gib) create_disk(disk, create_gib);
-      disk_ = std::make_unique<QssdDisk>(disk);
+      disk_ = std::make_unique<QssdDisk>(disk, QssdDisk::Access::ReadWrite, workers);
     }
-    if (!data_disk.empty()) data_disk_ = std::make_unique<QssdDisk>(data_disk);
+    if (!data_disk.empty())
+      data_disk_ = std::make_unique<QssdDisk>(data_disk, QssdDisk::Access::ReadWrite, workers);
     if (source == BootSource::Disk) {
       pc_.mount([this](auto offset, auto* target, auto count) {
         return disk_->read_bytes(offset, target, count);
@@ -235,10 +237,10 @@ class AndroidBootSession final {
       board_ = std::make_unique<PcMotherboardC06>(pc_, disk_.get(),
           [reader = iso_](auto offset, auto* target, auto count) {
             return reader->read(offset, target, count);
-          }, iso_->size(), graphics_vram, data_disk_.get(), topology);
+          }, iso_->size(), graphics_vram, data_disk_.get(), topology, true, workers);
     } else {
       board_ = std::make_unique<PcMotherboardC06>(
-          pc_, disk_.get(), AtapiCdrom::Reader{}, 0, graphics_vram, data_disk_.get(), topology);
+          pc_, disk_.get(), AtapiCdrom::Reader{}, 0, graphics_vram, data_disk_.get(), topology, true, workers);
     }
     board_->enable_ps2_keyboard();
     board_->enable_threaded_smp(kPrimeHostWorkers);
@@ -546,7 +548,9 @@ class AndroidBootSession final {
           << ",\"physical_bytes\":" << stats.physical_bytes << ",\"commits\":" << stats.commits
           << ",\"ata_identify_data_transfers\":" << activity.identify_data_transfers
           << ",\"ata_read_sectors\":" << activity.read_sectors
-          << ",\"ata_write_sectors\":" << activity.write_sectors << '}';
+          << ",\"ata_write_sectors\":" << activity.write_sectors << ",\"qssd_parallel_io\":";
+      write_qssd_parallel_io(out,data_disk_->parallel_io_stats());
+      out << '}';
     }
     out << ",\"storage_io\":";
     write_storage_profile(out, pc_, bios_disk_.get(), ata, disk_.get());
@@ -574,6 +578,7 @@ class AndroidBootSession final {
         << ",\"parallel_register_continuations\":" << board_->parallel_register_continuations()
         << ",\"parallel_ram_batches\":" << board_->parallel_ram_batches()
         << ",\"parallel_ram_steps\":" << board_->parallel_ram_steps()
+        << ",\"parallel_mixed_batches\":" << board_->parallel_mixed_batches()
         << ",\"longest_parallel_register_slice\":" << board_->longest_parallel_register_slice()
         << ",\"startup_ipis\":{\"init_icr_writes\":" << startup.init_icr_writes
         << ",\"sipi_icr_writes\":" << startup.sipi_icr_writes

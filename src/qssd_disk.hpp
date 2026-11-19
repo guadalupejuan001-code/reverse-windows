@@ -4,6 +4,7 @@
 // Records contain literal guest bytes (or exact zero/pattern/reference encodings).
 // No simulated quantum hardware or arbitrary compression promises.
 #include "block_disk.hpp"
+#include "smp_workers.hpp"
 #include "qssd/state_bus.hpp"
 #include <algorithm>
 #include <array>
@@ -62,6 +63,10 @@ class QssdDisk final : public BlockDisk {
     std::uint64_t read_calls,read_bytes,write_calls,write_bytes,sync_calls;
     std::uint64_t read_ns,write_ns,sync_ns;
   };
+  struct ParallelIoStats {
+    std::uint64_t read_runs=0,write_transactions=0,read_bytes=0,write_bytes=0;
+    unsigned peak_workers=0;
+  };
   struct XorSummary {
     std::uint64_t revision=0,word=0,nonzero_blocks=0;
     unsigned parity=0;
@@ -98,12 +103,14 @@ class QssdDisk final : public BlockDisk {
   static constexpr std::uint64_t kFNVStart=14695981039346656037ULL;
   static constexpr std::uint64_t kFNVPrime=1099511628211ULL;
   static constexpr std::size_t kDigestLanes=4;
+  static constexpr std::size_t kBulkPagesPerWorker=64;
 
   static constexpr std::size_t kDedupWindow=4096;
   static constexpr std::size_t kReadCacheBlocks=128; // 512 KiB bounded data
   int fd_=-1;
   const Access access_;
   std::filesystem::path path_;
+  const std::shared_ptr<SmpWorkers> bulk_workers_;
   std::uint64_t capacity_=0, committed_end_=kHeader, generation_=0;
   bool rollback_pending_=false;
   bool journal_synced_=false;
@@ -131,6 +138,11 @@ class QssdDisk final : public BlockDisk {
     }
   };
   mutable IoCounters physical_reads_,physical_writes_,physical_syncs_;
+  struct ParallelCounters {
+    std::atomic<std::uint64_t> operations{0},bytes{0};
+  };
+  mutable ParallelCounters parallel_reads_,parallel_writes_;
+  mutable std::atomic<unsigned> bulk_peak_workers_{0};
 
 
   static std::uint32_t u32(const std::uint8_t* p) {
@@ -168,6 +180,40 @@ class QssdDisk final : public BlockDisk {
       d=(d^data[3][i])*kFNVPrime;
     }
     return {a,b,c,d};
+  }
+  template<class Address,class Store>
+  static void digest_range(std::size_t first,std::size_t end,std::size_t size,
+                           const Address& address,const Store& store) noexcept {
+    std::size_t index=first;
+    for(;end-index>=kDigestLanes;index+=kDigestLanes){
+      std::array<const std::uint8_t*,kDigestLanes> blocks{};
+      for(std::size_t lane=0;lane<kDigestLanes;++lane)blocks[lane]=address(index+lane);
+      const auto values=digest_four(blocks,size);
+      for(std::size_t lane=0;lane<kDigestLanes;++lane)store(index+lane,values[lane]);
+    }
+    for(;index<end;++index)store(index,digest(address(index),size));
+  }
+  template<class Work>
+  unsigned run_bulk(std::size_t pages,const Work& work) const {
+    const auto wanted=static_cast<unsigned>(pages/kBulkPagesPerWorker);
+    if(bulk_workers_&&wanted>=2){
+      const auto groups=(pages+kDigestLanes-1)/kDigestLanes;
+      const auto lanes=bulk_workers_->try_run(wanted,[&](unsigned lane,unsigned count){
+        const auto first=(groups*lane/count)*kDigestLanes;
+        const auto end=std::min(pages,(groups*(lane+1)/count)*kDigestLanes);
+        work(first,end);
+      });
+      if(lanes)return lanes;
+    }
+    work(0,pages);
+    return 1;
+  }
+  void record_parallel(ParallelCounters& counters,unsigned lanes,std::size_t bytes) const noexcept {
+    if(lanes<2)return;
+    counters.operations.fetch_add(1,std::memory_order_relaxed);
+    counters.bytes.fetch_add(bytes,std::memory_order_relaxed);
+    auto peak=bulk_peak_workers_.load(std::memory_order_relaxed);
+    while(peak<lanes&&!bulk_peak_workers_.compare_exchange_weak(peak,lanes,std::memory_order_relaxed)){}
   }
   static std::uint64_t fd_digest(int fd,std::uint64_t end,IoCounters* measurement=nullptr) {
     std::array<std::uint8_t,65536> page{};
@@ -416,23 +462,6 @@ class QssdDisk final : public BlockDisk {
     auto* record=bytes.data()+position;
     put64(record+length+8,digest(record,length));
   }
-  static void finish_raw_records(std::vector<std::uint8_t>& journal,
-                                 const std::vector<std::size_t>& positions) noexcept {
-    constexpr auto digested=kRecHeader+kBlockSize;
-    std::size_t i=0;
-    for(;positions.size()-i>=kDigestLanes;i+=kDigestLanes){
-      std::array<const std::uint8_t*,kDigestLanes> records{};
-      for(std::size_t lane=0;lane<kDigestLanes;++lane)
-        records[lane]=journal.data()+positions[i+lane];
-      const auto sums=digest_four(records,digested);
-      for(std::size_t lane=0;lane<kDigestLanes;++lane)
-        put64(journal.data()+positions[i+lane]+digested+8,sums[lane]);
-    }
-    for(;i<positions.size();++i){
-      auto* record=journal.data()+positions[i];
-      put64(record+digested+8,digest(record,digested));
-    }
-  }
   static std::uint64_t append_to(int fd,std::uint64_t at,Kind kind,std::uint64_t block,
                                  std::uint64_t hash,std::uint64_t reference,
                                  const std::vector<std::uint8_t>& payload) {
@@ -462,8 +491,9 @@ class QssdDisk final : public BlockDisk {
     cache_insert_locked(off,std::move(data));
   }
   bool read_cached_raw_run(std::uint64_t offset,std::size_t count,std::uint8_t* target) const {
+    if(count>kReadCacheBlocks)return false;
     std::lock_guard<std::mutex> guard(cache_mutex_);
-    std::array<const BlockData*,kMaxTransactionBlocks> pages;
+    std::array<const BlockData*,kReadCacheBlocks> pages;
     for(std::size_t i=0;i<count;++i){
       const auto found=read_cache_.find(offset+i*kRawRecordBytes);
       if(found==read_cache_.end())return false;
@@ -510,22 +540,25 @@ class QssdDisk final : public BlockDisk {
     buffer.resize(size);
     read_all(fd_,offset,buffer.data(),size,&physical_reads_);
 
-    for(std::size_t i=0;i<count;){
-      std::array<const std::uint8_t*,kDigestLanes> records{};
-      const auto batch=std::min(kDigestLanes,count-i);
-      for(std::size_t lane=0;lane<batch;++lane){
-        const auto* record=buffer.data()+(i+lane)*kRawRecordBytes;
-        if(u64(record+8)!=block+i+lane)
-          throw std::runtime_error("QSSD RAW record block address differs");
-        records[lane]=record;
+    const auto lanes=run_bulk(count,[&](std::size_t first,std::size_t end){
+      for(auto i=first;i<end;){
+        std::array<const std::uint8_t*,kDigestLanes> records{};
+        const auto batch=std::min(kDigestLanes,end-i);
+        for(std::size_t lane=0;lane<batch;++lane){
+          const auto* record=buffer.data()+(i+lane)*kRawRecordBytes;
+          if(u64(record+8)!=block+i+lane)
+            throw std::runtime_error("QSSD RAW record block address differs");
+          records[lane]=record;
+        }
+        verify_raw_batch(records,batch);
+        i+=batch;
       }
-      verify_raw_batch(records,batch);
-      i+=batch;
-    }
+    });
     // Copy only after the raw run has passed both checksum checks.
     for(std::size_t i=0;i<count;++i)
       std::memcpy(target+i*kBlockSize,buffer.data()+i*kRawRecordBytes+kRecHeader,kBlockSize);
     cache_misses_.fetch_add(count,std::memory_order_relaxed);
+    record_parallel(parallel_reads_,lanes,count*kBlockSize);
   }
 
   std::shared_ptr<const BlockData> cached_decode(std::uint64_t off,
@@ -941,8 +974,9 @@ class QssdDisk final : public BlockDisk {
     ::close(fd);
     (void)complete;
   }
-  explicit QssdDisk(const std::filesystem::path& path,Access access=Access::ReadWrite)
-      : access_(access),path_(path) {
+  explicit QssdDisk(const std::filesystem::path& path,Access access=Access::ReadWrite,
+                    std::shared_ptr<SmpWorkers> workers={})
+      : access_(access),path_(path),bulk_workers_(std::move(workers)) {
     check_path(path);
     const bool writable=access_==Access::ReadWrite;
     fd_=::open(path.c_str(),(writable?O_RDWR:O_RDONLY)|O_CLOEXEC|O_NOFOLLOW);
@@ -1016,6 +1050,13 @@ class QssdDisk final : public BlockDisk {
     }
     return true;
   }
+  ParallelIoStats parallel_io_stats() const noexcept {
+    return {parallel_reads_.operations.load(std::memory_order_relaxed),
+            parallel_writes_.operations.load(std::memory_order_relaxed),
+            parallel_reads_.bytes.load(std::memory_order_relaxed),
+            parallel_writes_.bytes.load(std::memory_order_relaxed),
+            bulk_peak_workers_.load(std::memory_order_relaxed)};
+  }
 
   bool read_bytes(std::uint64_t offset,std::uint8_t* target,std::size_t size) override {
     if((!target&&size)||offset>capacity_||size>capacity_-offset)return false;
@@ -1029,7 +1070,8 @@ class QssdDisk final : public BlockDisk {
         const auto n=std::min<std::size_t>(size-done,kBlockSize-start);
         const auto ref=locate(view->value->root,block);
         if(start==0&&ref.kind==Raw&&(size-done)/kBlockSize>=kDigestLanes){
-          const auto max_count=std::min(kMaxTransactionBlocks,(size-done)/kBlockSize);
+          const auto max_blocks=bulk_workers_?kMaxBulkTransactionBlocks:kMaxTransactionBlocks;
+          const auto max_count=std::min(max_blocks,(size-done)/kBlockSize);
           std::size_t count=1;
           for(;count<max_count;++count){
             const auto next=locate(view->value->root,block+count);
@@ -1093,6 +1135,18 @@ class QssdDisk final : public BlockDisk {
       raw_positions.reserve(block_count);
       std::vector<std::uint8_t> journal;
       journal.reserve(block_count*(kRecHeader+kBlockSize+kRecFooter)+kRecHeader+kRecFooter);
+      const auto head=std::min(total,std::size_t((kBlockSize-first%kBlockSize)%kBlockSize));
+      const auto full_pages=(total-head)/kBlockSize;
+      std::vector<std::uint64_t> full_hashes;
+      unsigned hash_lanes=1;
+      if(bulk_workers_&&full_pages>=2*kBulkPagesPerWorker){
+        full_hashes.resize(full_pages);
+        hash_lanes=run_bulk(full_pages,[&](std::size_t begin,std::size_t end){
+          digest_range(begin,end,kBlockSize,[&](std::size_t index){
+            return source+head+index*kBlockSize;
+          },[&](std::size_t index,std::uint64_t hash){full_hashes[index]=hash;});
+        });
+      }
       std::size_t done=0,digested_lane=kDigestLanes;
       std::array<std::uint64_t,kDigestLanes> content_digests{};
       while(done<total){
@@ -1103,14 +1157,18 @@ class QssdDisk final : public BlockDisk {
         auto hash=std::uint64_t{0};
         if(n==kBlockSize){
           std::memcpy(data.data(),source+done,n);
-          if(digested_lane==kDigestLanes&&total-done>=kDigestLanes*kBlockSize){
-            std::array<const std::uint8_t*,kDigestLanes> blocks{};
-            for(std::size_t lane=0;lane<kDigestLanes;++lane)
-              blocks[lane]=source+done+lane*kBlockSize;
-            content_digests=digest_four(blocks,kBlockSize);
-            digested_lane=0;
+          if(!full_hashes.empty()){
+            hash=full_hashes[(done-head)/kBlockSize];
+          }else{
+            if(digested_lane==kDigestLanes&&total-done>=kDigestLanes*kBlockSize){
+              std::array<const std::uint8_t*,kDigestLanes> blocks{};
+              for(std::size_t lane=0;lane<kDigestLanes;++lane)
+                blocks[lane]=source+done+lane*kBlockSize;
+              content_digests=digest_four(blocks,kBlockSize);
+              digested_lane=0;
+            }
+            hash=digested_lane<kDigestLanes?content_digests[digested_lane++]:digest(data.data(),n);
           }
-          hash=digested_lane<kDigestLanes?content_digests[digested_lane++]:digest(data.data(),n);
         }else{
           const auto ref=locate(old->value->root,block);
           if(ref.offset)data=*cached_decode(ref.offset,original_end);
@@ -1163,7 +1221,13 @@ class QssdDisk final : public BlockDisk {
         replacements.push_back({record_offset,word_xor,kind});
         done+=n;
       }
-      finish_raw_records(journal,raw_positions);
+      const auto footer_lanes=run_bulk(raw_positions.size(),[&](std::size_t begin,std::size_t end){
+        constexpr auto digested=kRecHeader+kBlockSize;
+        const auto record=[&](std::size_t index){return journal.data()+raw_positions[index];};
+        digest_range(begin,end,digested,record,[&](std::size_t index,std::uint64_t hash){
+          put64(record(index)+digested+8,hash);
+        });
+      });
       next.root=replace_contiguous(next.root,first/kBlockSize,index_levels_,
                                    replacements.data(),replacements.size());
       ++next.commits;
@@ -1175,6 +1239,7 @@ class QssdDisk final : public BlockDisk {
       if(sync_volume()!=0)throw std::system_error(errno,std::generic_category(),"QSSD transaction fsync");
       states_.publish(std::move(next),"guest-sector-commit",old);
       committed_end_=end;
+      record_parallel(parallel_writes_,std::max(hash_lanes,footer_lanes),total);
       // Dedup index is a disposable optimization; its allocation must never
       // turn a committed guest write into an acknowledged failure or rollback.
       try { for(const auto& entry:new_raw)remember(entry.hash,entry.offset); }

@@ -268,7 +268,7 @@ class PcMotherboardC06 {
   unsigned worker_limit_ = kMaxProcessors;
   unsigned next_cpu_ = 0;
   std::optional<unsigned> faulted_processor_;
-  std::unique_ptr<SmpWorkers> workers_;
+  std::shared_ptr<SmpWorkers> workers_;
   std::unique_ptr<EtherX86Sessions> ether_x86_sessions_;
   ThreadedSmpStats threaded_smp_stats_;
   std::uint64_t parallel_register_batches_ = 0, parallel_register_steps_ = 0;
@@ -1354,23 +1354,17 @@ class PcMotherboardC06 {
       }
       return ready;
     };
-    bool mixed = false;
     const auto prepare_mixed = [&] {
       // Projected register rounds can be cheaper than starting workers.
       // Give distinct RAM readers a full grant before paying for a mixed batch.
       if (!experimental_mixed_smp_ || limit < kMixedParallelLoopSteps) return 0U;
-      mixed = true;
       limit = kMixedParallelLoopSteps;
       return prepare(true);
     };
     auto job_count = candidate_count == active_count ? prepare(false) : 0U;
     if (job_count < active_count) job_count = prepare_mixed();
     if (job_count < 2) return 0;
-    if (!workers_) workers_ = std::make_unique<SmpWorkers>(host_workers_capacity());
-    const auto worker_count = workers_->prepare(job_count);
-    if (worker_count < 2) return 0;
-    job_count = worker_count < job_count && !mixed ? std::min(worker_count, prepare_mixed()) : worker_count;
-    if (job_count < 2) return 0;
+    if (!workers_) workers_ = std::make_shared<SmpWorkers>(host_workers_capacity());
 
     // A worker publishes register state to its own vCPU and can use the
     // rest of its grant on cached register blocks. Shared writes and device
@@ -1381,33 +1375,37 @@ class PcMotherboardC06 {
       unsigned steps = 0, ram_steps = 0, continuations = 0;
     };
     std::array<Progress, kMaxProcessors> progress{};
-    workers_->run(job_count, [&](unsigned job) {
-      const auto id = jobs[job];
-      auto& cpu = *apics_[id].cpu;
-      auto& block = work[job];
-      Progress result;
-      const bool measure = id == 0 && profile_bsp;
-      bool continued = false;
-      do {
-        const auto start = measure ? Clock::now() : Clock::time_point{};
-        block.run(deadline);
-        const auto elapsed = measure ? Clock::now() - start : Clock::duration{};
-        const auto completed = id == 0 ? pc_.retire_ether_loop(block, elapsed, true)
-                                       : cpu.retire_ether_arm64_loop(block);
-        if (!completed) break;
-        result.steps += completed;
-        if (block.reads_ram()) result.ram_steps += completed;
-        result.continuations += continued;
-        continued = result.steps < limit &&
-                    cpu.prepare_parallel_ether_arm64_register_block(limit - result.steps, block);
-      } while (continued);
-      progress[job] = result;
+    const auto lanes = workers_->try_run(std::min(job_count, host_workers_capacity()), [&](unsigned lane, unsigned count) {
+      for (unsigned job = lane; job < job_count; job += count) {
+        const auto id = jobs[job];
+        auto& cpu = *apics_[id].cpu;
+        auto& block = work[job];
+        auto& result = progress[job];
+        const bool measure = id == 0 && profile_bsp;
+        bool continued = false;
+        do {
+          const auto start = measure ? Clock::now() : Clock::time_point{};
+          block.run(deadline);
+          const auto elapsed = measure ? Clock::now() - start : Clock::duration{};
+          const auto completed = id == 0 ? pc_.retire_ether_loop(block, elapsed, true)
+                                         : cpu.retire_ether_arm64_loop(block);
+          if (!completed) break;
+          result.steps += completed;
+          if (block.reads_ram()) result.ram_steps += completed;
+          result.continuations += continued;
+          continued = result.steps < limit &&
+                      cpu.prepare_parallel_ether_arm64_register_block(limit - result.steps, block);
+        } while (continued);
+      }
     });
+    if (!lanes) return 0;
     unsigned total = 0, processors = 0, longest = 0, ram_steps = 0, bsp_steps = 0;
+    std::array<bool, kMaxProcessors> active_lanes{};
     std::array<bool, kMaxProcessors> serviced{};
     for (unsigned job = 0; job < job_count; ++job) {
       const auto& result = progress[job];
       serviced[jobs[job]] = result.steps != 0;
+      active_lanes[job % lanes] |= result.steps != 0;
       if (jobs[job] == 0) bsp_steps = result.steps;
       total += result.steps;
       processors += result.steps != 0;
@@ -1419,7 +1417,8 @@ class PcMotherboardC06 {
       pc_.finish_parallel_ether_work();
       advance_batch(bsp_steps);
     }
-    if (threaded_smp_enabled_) record_threaded_dispatch(processors, total);
+    if (threaded_smp_enabled_)
+      record_threaded_dispatch(std::count(active_lanes.begin(), active_lanes.begin() + lanes, true), total);
     if (processors > 1) {
       parallel_mixed_batches_ += experimental_mixed_smp_ && processors < active_count;
       if (ram_steps) {
@@ -1478,9 +1477,7 @@ class PcMotherboardC06 {
     const auto grant = std::min(budget / jobs, active_clock_running_ ? timed_grant : kSmpQuantum);
     if (jobs < 2 || grant < kSmpQuantum) return 0;
 
-    if (!workers_) workers_ = std::make_unique<SmpWorkers>(host_workers_capacity());
-    const auto workers = workers_->prepare(jobs);
-    if (workers < 2) return 0;
+    if (!workers_) workers_ = std::make_shared<SmpWorkers>(host_workers_capacity());
 
     // Each CPU stays on its worker for the dispatch. The bus protects RAM,
     // devices and IRQ delivery. Only native register work can drop the lock,
@@ -1488,7 +1485,7 @@ class PcMotherboardC06 {
     const cosmic_pc::MemoryFabric::ExclusiveRamReads exclusive(pc_.cpu.memory);
     std::mutex bus;
     std::array<std::uint64_t, kMaxProcessors> progress{};
-    workers_->run(workers, [&](unsigned worker) {
+    const auto lanes = workers_->try_run(std::min(jobs, host_workers_capacity()), [&](unsigned worker, unsigned workers) {
       for (unsigned job = worker; job < jobs; job += workers) {
         const auto id = ready[job];
         for (unsigned used = 0; used < grant;) {
@@ -1506,6 +1503,7 @@ class PcMotherboardC06 {
         }
       }
     });
+    if (!lanes) return 0;
     std::uint64_t retired = 0;
     unsigned active = 0;
     for (const auto steps : progress) {
@@ -1521,9 +1519,9 @@ class PcMotherboardC06 {
                             AtapiCdrom::Reader optical={}, std::uint64_t optical_bytes=0,
                             const std::filesystem::path& graphics_vram={},
                             BlockDisk* data_disk=nullptr, cosmic_pc::CpuTopology topology={},
-                            bool experimental_mixed_smp=false)
+                            bool experimental_mixed_smp=false, std::shared_ptr<SmpWorkers> workers={})
       :pc_(machine), processor_count_(topology.logical_processors()),
-       experimental_mixed_smp_(experimental_mixed_smp) {
+       experimental_mixed_smp_(experimental_mixed_smp), workers_(std::move(workers)) {
     if (!topology.valid()) throw std::invalid_argument("Invalid virtual processor topology");
     prior_topology_ = pc_.cpu.topology();
     prior_apic_id_ = pc_.cpu.apic_id();
@@ -1548,7 +1546,7 @@ class PcMotherboardC06 {
     if(optical)optical_=std::make_unique<AtapiCdrom>(
         std::move(optical),optical_bytes,[this](){signal_isa_irq(15);});
     if(!graphics_vram.empty())gpu_=std::make_unique<GuestGpuC08>(
-        pc_,graphics_vram,[this](auto address,auto data){return signal_pci_msi(address,data);});
+        pc_,graphics_vram,[this](auto address,auto data){return signal_pci_msi(address,data);},workers_);
     // The machine must be booted/mounted first. ACPI goes into reserved BIOS
     // memory and is never presented by E820 as allocatable guest RAM.
     prior_in_=pc_.cpu.in_hook;prior_out_=pc_.cpu.out_hook;
@@ -1668,7 +1666,7 @@ class PcMotherboardC06 {
   unsigned worker_count() const noexcept { return workers_ ? workers_->size() : 1; }
   unsigned host_workers_capacity() const noexcept { return std::min(worker_limit_, processor_count_); }
   void enable_threaded_smp(unsigned worker_limit = kMaxProcessors) noexcept {
-    if (!workers_) worker_limit_ = std::clamp(worker_limit, 1U, kMaxProcessors);
+    if (!workers_ || workers_->size() == 1) worker_limit_ = std::clamp(worker_limit, 1U, kMaxProcessors);
     threaded_smp_enabled_ = true;
   }
   bool threaded_smp_enabled() const noexcept { return threaded_smp_enabled_; }

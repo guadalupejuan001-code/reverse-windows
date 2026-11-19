@@ -6,6 +6,12 @@
 #include <ostream>
 
 namespace reverse_windows {
+inline void write_qssd_parallel_io(std::ostream& out,QssdDisk::ParallelIoStats io) {
+  out << "{\"read_runs\":" << io.read_runs << ",\"write_transactions\":" << io.write_transactions
+      << ",\"read_bytes\":" << io.read_bytes << ",\"write_bytes\":" << io.write_bytes
+      << ",\"peak_workers\":" << io.peak_workers << '}';
+}
+
 inline void write_storage_profile(std::ostream& out, const cosmic_pc::PcMachine& pc, const BiosHardDisk* bios,
                                   const AtaC07* ata, const QssdDisk* disk) {
   const auto b=bios?bios->transfers():BiosHardDisk::Transfers{};
@@ -33,6 +39,8 @@ inline void write_storage_profile(std::ostream& out, const cosmic_pc::PcMachine&
       << "},\"qssd_xor64\":{\"revision\":" << aggregate.revision
       << ",\"value\":\"" << cosmic_pc::PcMachine::hex64(aggregate.word) << "\""
       << ",\"bit_parity\":" << aggregate.parity
-      << ",\"nonzero_blocks\":" << aggregate.nonzero_blocks << "}}";
+      << ",\"nonzero_blocks\":" << aggregate.nonzero_blocks << "},\"qssd_parallel_io\":";
+  write_qssd_parallel_io(out,disk?disk->parallel_io_stats():QssdDisk::ParallelIoStats{});
+  out << '}';
 }
 }  // namespace reverse_windows

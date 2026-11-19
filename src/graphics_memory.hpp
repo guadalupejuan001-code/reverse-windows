@@ -37,7 +37,8 @@ class GpuVram {
     return offset <= kBytes && size <= kBytes - offset;
   }
 
-  explicit GpuVram(std::filesystem::path path) : path_(std::move(path)) {}
+  explicit GpuVram(std::filesystem::path path, std::shared_ptr<SmpWorkers> workers = {})
+      : path_(std::move(path)), bulk_workers_(std::move(workers)) {}
 
   // A view stays valid until this device's next cache update or reset.
   // The device and guest RAM are accessed by the same VM thread.
@@ -142,6 +143,9 @@ class GpuVram {
   std::size_t draw_resident_bytes() const noexcept { return draw_ ? kDrawResidentBytes : 0; }
   std::uint64_t draw_page_uploads() const noexcept { return draw_page_uploads_; }
   std::uint64_t draw_page_reuses() const noexcept { return draw_page_reuses_; }
+  QssdDisk::ParallelIoStats parallel_io_stats() const noexcept {
+    return disk_ ? disk_->parallel_io_stats() : QssdDisk::ParallelIoStats{};
+  }
   std::uint64_t commits() const { return disk_ ? disk_->stats().commits : 0; }
 
   std::uint64_t journal_bytes() const {
@@ -156,6 +160,7 @@ class GpuVram {
     std::uint64_t fence = 0;
   };
   std::filesystem::path path_;
+  std::shared_ptr<SmpWorkers> bulk_workers_;
   std::unique_ptr<QssdDisk> disk_;
   std::unique_ptr<std::uint8_t[]> resident_;
   std::array<std::uint64_t, kResidentBytes / kPageBytes> tags_{};
@@ -166,7 +171,7 @@ class GpuVram {
   QssdDisk& volume() {
     if (!disk_) {
       try {
-        disk_ = std::make_unique<QssdDisk>(path_);
+        disk_ = std::make_unique<QssdDisk>(path_, QssdDisk::Access::ReadWrite, bulk_workers_);
       } catch (const std::system_error& error) {
         if (error.code() != std::errc::no_such_file_or_directory) throw;
         try {
@@ -174,7 +179,7 @@ class GpuVram {
         } catch (const std::system_error& create_error) {
           if (create_error.code() != std::errc::file_exists) throw;
         }
-        disk_ = std::make_unique<QssdDisk>(path_);
+        disk_ = std::make_unique<QssdDisk>(path_, QssdDisk::Access::ReadWrite, bulk_workers_);
       }
       // Early C08 volumes rounded the file capacity to 112 GiB. All commands
       // still enforce the public 120,000,000,000-byte boundary.

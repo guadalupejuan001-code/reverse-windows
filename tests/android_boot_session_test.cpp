@@ -648,12 +648,12 @@ void verify_shared_ram(const std::filesystem::path& directory) {
     require(cpu.read32(base) == 0x003bd4a1, "A full BIOS transfer must publish its new bytes");
     if (policy == CachePolicy::Adaptive) {
       reverse_windows::SmpWorkers workers(2);
-      require(workers.prepare(2) == 2, "Shared QSSD test needs two readers");
       std::array<std::array<std::uint8_t, page>, 2> restored;
       original[0] = 1;
-      workers.run(2, [&](unsigned worker) {
+      const auto lanes = workers.try_run(2, [&](unsigned worker, unsigned) {
         ram.read_parallel_ram_block(base + page, restored[worker].data(), page);
       });
+      require(lanes == 2, "Shared QSSD test needs two readers");
       const auto shared = ram.metrics();
       require(restored[0] == original && restored[1] == original &&
                   shared.backing_reads == stats.backing_reads + 1 &&

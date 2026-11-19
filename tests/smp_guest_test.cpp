@@ -650,7 +650,7 @@ void test_parallel_register_continuations() {
               << " continuations=" << continuations << '\n';
 }
 
-void test_parallel_ram_vectors(bool shared) {
+void test_parallel_ram_vectors(bool shared, unsigned worker_limit = kProcessors) {
     if (!Cpu::ether_arm64_host()) return;
     constexpr unsigned words = 8192, logical_bytes = 40U << 20;
     constexpr auto vector_bytes = cosmic_pc::SparseRam::kPagesPerTable * cosmic_pc::SparseRam::kPageSize;
@@ -670,6 +670,7 @@ void test_parallel_ram_vectors(bool shared) {
     require(cpu.is_long_mode() && cpu.halted && !cpu.fault && cpu.cr3 == 0x1000,
             "BSP must provide the APs' long-mode page tables");
     PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {8, 2});
+    if (worker_limit < kProcessors) board.enable_threaded_smp(worker_limit);
     pc.enable_boot_acceleration();
     cpu.enable_page_translation_cache();
     cpu.enable_ether_arm64_blocks();
@@ -713,7 +714,10 @@ void test_parallel_ram_vectors(bool shared) {
         board.run(kProcessors * words * 5 + 8192, deadline);
         check_guest();
     }
-    require(reached(2) && board.worker_count() == kProcessors, "Each vCPU must finish on the SMP path");
+    require(reached(2) && board.worker_count() == worker_limit, "Each vCPU must finish on the bounded SMP path");
+    if (worker_limit < kProcessors)
+        require(board.threaded_smp_stats().peak_workers == worker_limit,
+                "Parallel dispatch telemetry must count lanes instead of vCPUs");
     const auto parallel = board.parallel_ram_steps() - before;
     require(parallel >= std::uint64_t(kProcessors) * words * 4 &&
                 cpu.memory.metrics().page_state_vectors >= (shared ? 2U : kProcessors + 1),
@@ -724,7 +728,7 @@ void test_parallel_ram_vectors(bool shared) {
                 "Parallel RAM loop changed the guest sum");
     }
     std::cout << "SMP_RAM_PASS workers=" << board.worker_count()
-              << " shared=" << shared << " parallel_steps=" << parallel << '\n';
+              << " vcpus=" << kProcessors << " shared=" << shared << " parallel_steps=" << parallel << '\n';
 }
 } // namespace
 
@@ -745,6 +749,7 @@ int main() {
         test_parallel_register_continuations();
         test_parallel_ram_vectors(false);
         test_parallel_ram_vectors(true);
+        test_parallel_ram_vectors(true, 8);
         std::cout << "SMP_PASS cores=8 logical_processors=16 aps_executed=15 atomic_shared_ram=1\n";
         return 0;
     } catch (const std::exception& error) {

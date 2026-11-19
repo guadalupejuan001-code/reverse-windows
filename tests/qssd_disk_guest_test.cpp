@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 #include <fcntl.h>
@@ -22,6 +23,48 @@ template<class Action> void rejects(Action action,const char* label) {
   bool failed=false;
   try{action();}catch(const std::exception&){failed=true;}
   need(failed,label);
+}
+
+void verify_parallel_io(const std::filesystem::path& path) {
+  using Disk=reverse_windows::QssdDisk;
+  constexpr auto first=1'000'000'000'000ULL+17;
+  constexpr auto bytes=520*Disk::kBlockSize+13;
+  constexpr auto retry_at=first+1024*Disk::kBlockSize;
+  Disk::create_bytes(path,Disk::kMaxLogicalBytes);
+  const auto workers=std::make_shared<reverse_windows::SmpWorkers>(8);
+  std::vector<std::uint8_t> payload(bytes),actual(bytes);
+  std::uint32_t rng=0x3608ac9d;
+  for(auto& byte:payload){
+    rng^=rng<<13;
+    rng^=rng>>17;
+    rng^=rng<<5;
+    byte=static_cast<std::uint8_t>(rng);
+  }
+  {
+    Disk volume(path,Disk::Access::ReadWrite,workers);
+    need(volume.write_bytes(first,bytes,payload.data()),"Parallel QSSD write failed");
+    need(volume.read_bytes(first,actual.data(),bytes)&&actual==payload,
+         "Parallel unaligned QSSD read changed the payload");
+    const auto parallel=volume.parallel_io_stats();
+    need(parallel.peak_workers==8&&parallel.write_transactions==1&&
+         parallel.write_bytes==bytes&&parallel.read_runs==1&&parallel.read_bytes>2*1024*1024,
+         "Large QSSD I/O did not use all eight workers");
+    bool stored=false;
+    const auto outer=workers->try_run(2,[&](unsigned lane,unsigned){
+      if(!lane)stored=volume.write_bytes(retry_at,bytes,payload.data());
+    });
+    need(outer==2&&stored&&volume.parallel_io_stats().write_transactions==1,
+         "QSSD inside an active SMP dispatch must complete using its caller");
+  }
+  {
+    Disk volume(path,Disk::Access::ReadOnly,workers);
+    need(volume.stats().commits==2&&volume.read_bytes(first,actual.data(),bytes)&&actual==payload&&
+         volume.read_bytes(retry_at,actual.data(),bytes)&&actual==payload,
+         "Replaying the journal changed an exact parallel or nested write");
+  }
+  std::filesystem::remove(path);
+  std::cout<<"PRIME_QSSD_PARALLEL_PASS offset="<<first<<" bytes="<<bytes
+           <<" workers=8 nested_serial=1 exact=1\n";
 }
 }
 
@@ -201,6 +244,7 @@ int main() {
     std::filesystem::remove(enormous+".rqix");
     rejects([&]{QssdDisk::create_bytes(enormous,max_bytes+QssdDisk::kBlockSize);},
             "QSSD accepted capacity above its supported range");
+    verify_parallel_io(enormous);
     // Full journal corruption MUST be rejected, not silently reinterpreted.
     reverse_windows::QssdDisk::create(corrupt,1);
     {

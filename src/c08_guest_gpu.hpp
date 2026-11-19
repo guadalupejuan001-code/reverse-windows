@@ -36,8 +36,9 @@ class GuestGpuC08 {
   static_assert(RWGPU_STAGE_OFFSET % 4 == 0 && RWGPU_STAGE_BYTES % 4 == 0);
 
   using Msi = std::function<bool(std::uint32_t, std::uint16_t)>;
-  GuestGpuC08(cosmic_pc::PcMachine& machine, const std::filesystem::path& vram, Msi msi = {})
-      : pc_(machine), memory_(vram), msi_(std::move(msi)) {}
+  GuestGpuC08(cosmic_pc::PcMachine& machine, const std::filesystem::path& vram, Msi msi = {},
+              std::shared_ptr<SmpWorkers> workers = {})
+      : pc_(machine), memory_(vram, std::move(workers)), msi_(std::move(msi)) {}
 
   void reset() noexcept {
     pci_command_ = 0;
@@ -177,8 +178,10 @@ class GuestGpuC08 {
   }
   std::uint64_t vram_journal_bytes() const { return memory_.journal_bytes(); }
   std::uint64_t resident_download_bytes() const noexcept { return resident_download_bytes_; }
+  QssdDisk::ParallelIoStats parallel_io_stats() const noexcept { return memory_.parallel_io_stats(); }
 
   void write_json(std::ostream& out) const {
+    const auto parallel = parallel_io_stats();
     out << "{\"logical_vram_bytes\":" << GpuVram::kBytes
         << ",\"qssd_backing_bytes\":" << memory_.journal_bytes()
         << ",\"qssd_vram_commits\":" << memory_.commits()
@@ -188,6 +191,9 @@ class GuestGpuC08 {
         << ",\"c13_geometry_cache_bytes\":" << memory_.draw_resident_bytes()
         << ",\"c13_geometry_page_uploads\":" << memory_.draw_page_uploads()
         << ",\"c13_geometry_page_reuses\":" << memory_.draw_page_reuses()
+        << ",\"parallel_qssd_read_bytes\":" << parallel.read_bytes
+        << ",\"parallel_qssd_write_bytes\":" << parallel.write_bytes
+        << ",\"parallel_qssd_peak_workers\":" << parallel.peak_workers
         << ",\"uploads\":" << commands_[RWGPU_UPLOAD] << ",\"downloads\":" << commands_[RWGPU_DOWNLOAD]
         << ",\"vram_copies\":" << commands_[RWGPU_COPY] << ",\"index_sums\":" << commands_[RWGPU_SUM_INDICES]
         << ",\"status\":" << status_ << ",\"ticket\":" << completed_

@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <unistd.h>
@@ -165,12 +166,13 @@ std::uint32_t submit(PcMachine& pc, unsigned op, std::uint64_t source, std::uint
 }
 
 void verify_coalesced_reads(const std::filesystem::path& path, std::vector<std::uint8_t>& actual,
-                            const std::vector<std::uint8_t>& expected, std::uint64_t last_epoch) {
+                            const std::vector<std::uint8_t>& expected, std::uint64_t last_epoch,
+                            const std::shared_ptr<reverse_windows::SmpWorkers>& workers) {
   using reverse_windows::QssdDisk;
   constexpr auto block_bytes = QssdDisk::kBlockSize;
   constexpr auto record_bytes = block_bytes + 40 + 16;
   {
-    QssdDisk volume(path, QssdDisk::Access::ReadOnly);
+    QssdDisk volume(path, QssdDisk::Access::ReadOnly, workers);
     const auto reads = volume.io_stats().read_calls;
     require(volume.read_bytes(kVram, actual.data(), kChunk) &&
             std::equal(actual.begin(), actual.begin() + kChunk, expected.begin()) &&
@@ -197,7 +199,7 @@ void verify_coalesced_reads(const std::filesystem::path& path, std::vector<std::
   require(rejected, "Batched replay accepted a corrupted payload");
 }
 
-void run_transfer_test(std::size_t payload, std::size_t chunk, unsigned passes) {
+void run_transfer_test(std::size_t payload, std::size_t chunk, unsigned passes, bool parallel) {
   TestDirectory directory;
   const auto path = directory.path / "windows.rqvd.vram.rqvd";
   PcMachine pc(payload + 16U * kMiB);
@@ -205,9 +207,10 @@ void run_transfer_test(std::size_t payload, std::size_t chunk, unsigned passes) 
   double upload = 0, reopened = 0, open = 0, warm = 0;
   std::uint64_t journal = 0, last_epoch = 64;
   const auto upload_commits = payload / chunk * passes;
+  const auto workers = parallel ? std::make_shared<reverse_windows::SmpWorkers>(8) : nullptr;
   {
     boot(pc);
-    PcMotherboardC06 board(pc,nullptr,{},0,path);
+    PcMotherboardC06 board(pc,nullptr,{},0,path,nullptr,{},false,workers);
     TransferGuest guest(pc);
     auto elapsed=Clock::duration::zero();
     guest.prepare(RWGPU_UPLOAD, payload, chunk);
@@ -224,6 +227,11 @@ void run_transfer_test(std::size_t payload, std::size_t chunk, unsigned passes) 
       elapsed+=Clock::now()-start;
     }
     upload = bandwidth(payload * passes, elapsed);
+    if (parallel) {
+      const auto io = gpu->parallel_io_stats();
+      require(io.peak_workers == 8 && io.write_bytes == payload * passes,
+              "PCI upload did not use the shared eight-worker QSSD path");
+    }
     journal = gpu->vram_journal_bytes();
     require(journal >= payload * passes && journal < 2 * payload * passes,
             "Journal did not store the dense benchmark payload");
@@ -269,7 +277,7 @@ void run_transfer_test(std::size_t payload, std::size_t chunk, unsigned passes) 
   }
   {
     boot(pc);
-    PcMotherboardC06 board(pc,nullptr,{},0,path);
+    PcMotherboardC06 board(pc,nullptr,{},0,path,nullptr,{},false,workers);
     TransferGuest guest(pc);
     guest.prepare(RWGPU_DOWNLOAD, payload, chunk);
     // Device reopen and index replay happen on this first read. The host OS
@@ -296,6 +304,11 @@ void run_transfer_test(std::size_t payload, std::size_t chunk, unsigned passes) 
     }
     require(gpu->resident_download_bytes() == prior, "Pressure did not disable the resident cache");
     open = bandwidth(payload * open_passes, elapsed);
+    if (parallel) {
+      const auto io = gpu->parallel_io_stats();
+      require(io.peak_workers == 8 && io.read_bytes >= payload * open_passes,
+              "PCI download did not use the shared eight-worker QSSD path");
+    }
 
     board.set_gpu_cache_enabled(true);
     const auto warm_offset = kVram + payload - kResidentPayload;
@@ -312,7 +325,7 @@ void run_transfer_test(std::size_t payload, std::size_t chunk, unsigned passes) 
             gpu->resident_download_bytes() - before == kResidentPayload * warm_passes,
             "Resident PCI transfers lost bytes or bypassed the direct path");
   }
-  verify_coalesced_reads(path, actual, expected, last_epoch);
+  verify_coalesced_reads(path, actual, expected, last_epoch, workers);
   std::cout<<"PRIME_C08_PRIMEVGC_VRAM_PASS logical_bytes=120000000000 last_byte=119999999999 "
            <<"reopened=1 exact_bytes="<<payload<<" journal_bytes="<<journal
            <<" command_bytes="<<chunk<<" upload_commits="<<upload_commits<<'\n'
@@ -325,10 +338,13 @@ void run_transfer_test(std::size_t payload, std::size_t chunk, unsigned passes) 
 int main(int argc, char** argv) {
   try {
     const std::string_view mode = argc == 2 ? argv[1] : "";
-    if (argc > 2 || (argc == 2 && mode != "--bulk" && mode != "--bulk-512k"))
-      throw std::invalid_argument("Usage: gpu-vram-transfer [--bulk | --bulk-512k]");
-    run_transfer_test(mode.empty() ? kResidentPayload : kBulkPayload,
-                      mode == "--bulk" ? GpuVram::kTransferBytes : kChunk, mode.empty() ? 3 : 1);
+    const bool verify = mode == "--verify-parallel";
+    const bool parallel = verify || mode == "--bulk-parallel";
+    if (argc > 2 || (argc == 2 && mode != "--bulk" && mode != "--bulk-512k" && !parallel))
+      throw std::invalid_argument("Usage: gpu-vram-transfer [--bulk | --bulk-512k | --bulk-parallel | --verify-parallel]");
+    run_transfer_test(mode.empty() || verify ? kResidentPayload : kBulkPayload,
+                      mode == "--bulk" || parallel ? GpuVram::kTransferBytes : kChunk,
+                      mode.empty() ? 3 : 1, parallel);
   } catch (const std::exception& error) {
     std::cerr<<"PRIME_C08_PRIMEVGC_VRAM_FAIL "<<error.what()<<'\n';
     return 1;
