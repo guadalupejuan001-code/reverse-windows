@@ -45,10 +45,10 @@ class GuestVbeFabric {
       const auto page_count = (info.byte_size + kPageBytes - 1) / kPageBytes;
       const auto dirty = full ? page_count : writes.pages().size();
       stats_.dirty_pages += dirty;
-      if (full || dirty > page_count / 2) {
-        scan(info, 0, info.byte_size, full);
+      if (full) {
+        scan(info, 0, info.byte_size, true);
       } else {
-        scan_pages(info, writes.pages());
+        scan_pages(info, writes);
       }
 
       auto plan = gpu_.plan(width, rows_);
@@ -99,19 +99,22 @@ class GuestVbeFabric {
     return static_cast<unsigned>((std::uint64_t(value) * to + from - 1) / from);
   }
 
-  void scan_pages(const cosmic_pc::PcVideoInfo& info, const std::vector<std::uint32_t>& pages) {
-    sorted_pages_ = pages;
-    std::sort(sorted_pages_.begin(), sorted_pages_.end());
-    auto it = sorted_pages_.begin();
-    while (it != sorted_pages_.end()) {
-      const auto begin = std::uint64_t(*it++) * kPageBytes;
-      auto end = begin + kPageBytes;
-      while (it != sorted_pages_.end() && std::uint64_t(*it) * kPageBytes == end) {
-        ++it;
-        end += kPageBytes;
+  void scan_pages(const cosmic_pc::PcVideoInfo& info, const cosmic_pc::MemoryFabric::WriteWatch& writes) {
+    sorted_pages_ = writes.pages();
+    if (!std::is_sorted(sorted_pages_.begin(), sorted_pages_.end()))
+      std::sort(sorted_pages_.begin(), sorted_pages_.end());
+    std::uint64_t begin = 0, end = 0;
+    for (const auto page : sorted_pages_) {
+      const auto offset = std::uint64_t(page) * kPageBytes;
+      const auto bounds = writes.bounds(page);
+      const auto next = offset + bounds.begin;
+      if (next != end) {
+        scan(info, begin, end, false);
+        begin = next;
       }
-      scan(info, begin, std::min(end, info.byte_size), false);
+      end = offset + bounds.end;
     }
+    scan(info, begin, end, false);
   }
 
   void scan(const cosmic_pc::PcVideoInfo& info, std::uint64_t begin, std::uint64_t end,
@@ -121,7 +124,7 @@ class GuestVbeFabric {
     const auto last_y = ceil_scale((end - 1) / info.pitch + 1, height_, info.height);
     for (unsigned y = first_y; y < last_y; ++y) {
       // Invert the same floor mapping as the full-frame sampler. Only read
-      // the destination samples whose source lies inside the dirty pages.
+      // the destination samples whose source pixel intersects the written bytes.
       const auto source_y = y * info.height / height_;
       const auto offset = std::uint64_t(source_y) * info.pitch;
       const auto first_source_x = begin > offset ? (begin - offset) / 4 : 0;

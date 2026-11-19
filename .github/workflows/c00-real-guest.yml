@@ -116,6 +116,32 @@ jobs:
           if [ "$(uname -m)" = "aarch64" ]; then
             grep -Eq '^ETHER_X86_MIXED_PASS mode=arm64 steps=110000001 native_steps=[1-9][0-9]* ' build/prime-x86-measure.log
           fi
+      - name: Compare mixed Windows vector stores with Prime 0.3.72
+        shell: bash
+        run: |
+          set -euo pipefail
+          reference=1154148d3194a7081bee80bff831e87292d33e68
+          old="$RUNNER_TEMP/mundo-prime-r097"
+          git -C deps/mundo-X fetch --no-tags --depth=1 https://github.com/guadalupejuan001-code/mundo-X.git "$reference"
+          git -C deps/mundo-X worktree add --detach "$old" "$reference"
+          driver=pc-android/native/tests/x86_ether_counter_loop_test.cpp
+          cp "deps/mundo-X/$driver" "$old/pc-android/native/tests/prime-vector-compare.cpp"
+          c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread \
+            -I"$old/pc-android/native" -I"$old/native/include" \
+            "$old/pc-android/native/tests/prime-vector-compare.cpp" -o build/prime-vector-r097
+          for trial in 1 2 3 4 5; do
+            order=(r097 r098)
+            if (( trial % 2 == 0 )); then order=(r098 r097); fi
+            for version in "${order[@]}"; do
+              binary=build/prime-x86-measure
+              if [[ $version == r097 ]]; then binary=build/prime-vector-r097; fi
+              "$binary" --measure-mixed-movntdq | sed "s/^/$version /"
+            done
+          done | tee build/prime-vector-stream.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prime-vector-stream-${{ matrix.architecture }}
+          path: build/prime-vector-stream.log
       - name: Compile native boot probe against actual x86/x64 CPU
         run: |
           sudo apt-get update -qq

@@ -532,7 +532,7 @@ class QssdDisk final : public BlockDisk {
         throw std::runtime_error("QSSD RAW record checksum corruption");
   }
   void read_raw_run(std::uint64_t offset,std::uint64_t block,std::size_t count,
-                    std::uint64_t limit,std::vector<std::uint8_t>& buffer,
+                    std::uint64_t limit,bool cache_request,std::vector<std::uint8_t>& buffer,
                     std::uint8_t* target) const {
     const auto size=count*kRawRecordBytes;
     if(offset>limit||size>limit-offset)
@@ -558,6 +558,18 @@ class QssdDisk final : public BlockDisk {
     // Copy only after the raw run has passed both checksum checks.
     for(std::size_t i=0;i<count;++i)
       std::memcpy(target+i*kBlockSize,buffer.data()+i*kRawRecordBytes+kRecHeader,kBlockSize);
+    if (cache_request) {
+      // Published offsets are immutable. Large streaming requests bypass admission.
+      try {
+        for (std::size_t i = 0; i < count; ++i) {
+          auto page = std::make_shared<BlockData>();
+          std::memcpy(page->data(), target + i * kBlockSize, kBlockSize);
+          cache_insert(offset + i * kRawRecordBytes, std::move(page));
+        }
+      } catch (const std::bad_alloc&) {
+        // The caller already has every verified byte.
+      }
+    }
     cache_misses_.fetch_add(count,std::memory_order_relaxed);
     record_parallel(parallel_reads_,lanes,count*kBlockSize);
   }
@@ -1080,7 +1092,8 @@ class QssdDisk final : public BlockDisk {
             if(next.kind!=Raw||next.offset!=ref.offset+count*kRawRecordBytes)break;
           }
           if(count>=kDigestLanes){
-            read_raw_run(ref.offset,block,count,view->value->end,raw_buffer,target+done);
+            read_raw_run(ref.offset,block,count,view->value->end,size<=kReadCacheBlocks*kBlockSize,
+                         raw_buffer,target+done);
             done+=count*kBlockSize;
             continue;
           }

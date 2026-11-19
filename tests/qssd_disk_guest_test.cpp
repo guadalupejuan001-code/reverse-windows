@@ -61,6 +61,23 @@ void verify_parallel_io(const std::filesystem::path& path) {
     need(volume.stats().commits==2&&volume.read_bytes(first,actual.data(),bytes)&&actual==payload&&
          volume.read_bytes(retry_at,actual.data(),bytes)&&actual==payload,
          "Replaying the journal changed an exact parallel or nested write");
+    constexpr auto offset = (first / Disk::kBlockSize + 16) * Disk::kBlockSize;
+    std::vector<std::uint8_t> reread(8 * Disk::kBlockSize);
+    const auto before = volume.io_stats().read_calls;
+    need(volume.read_bytes(offset, reread.data(), reread.size()) &&
+         std::equal(reread.begin(), reread.end(), payload.begin() + (offset - first)),
+         "Reopened contiguous RAW read changed bytes");
+    const auto cold = volume.io_stats().read_calls - before;
+    const auto hits = volume.cache_stats().hits;
+    std::fill(reread.begin(), reread.end(), 0);
+    need(volume.read_bytes(offset, reread.data(), reread.size()) &&
+         std::equal(reread.begin(), reread.end(), payload.begin() + (offset - first)),
+         "Cached contiguous RAW read changed bytes");
+    const auto warm = volume.io_stats().read_calls - before - cold;
+    need(cold == 1 && warm == 0 && volume.cache_stats().hits - hits == 8 &&
+         volume.cache_stats().resident_bytes <= 512 * 1024, "RAW read cache admission failed");
+    std::cout << "PRIME_QSSD_RAW_REREAD_PASS bytes=" << reread.size()
+              << " cold_reads=" << cold << " warm_reads=" << warm << '\n';
   }
   std::filesystem::remove(path);
   std::cout<<"PRIME_QSSD_PARALLEL_PASS offset="<<first<<" bytes="<<bytes

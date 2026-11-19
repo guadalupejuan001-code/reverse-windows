@@ -148,6 +148,8 @@ void correctness() {
   require(watch.pages().size() == 2, "The guest REP should cross two physical pages");
   require(apply(video.capture(w, h), w, h, canvas) == 4,
           "Four changed pixels must cross pages without sending other pixels");
+  require(metric(metrics(video), "read_bytes") - metric(first, "read_bytes") == 16,
+          "Four adjacent pixels must read exactly 16 bytes across the two pages");
   check(pc, w, h, canvas);
   const auto serial = metric(metrics(video), "qssd_graphics_serial");
   draw(pc, {222, 1, 4, 1}, 0x80996633);
@@ -160,6 +162,13 @@ void correctness() {
   draw(pc, {w - 1, h - 1, 1, 1}, 0);
   require(apply(video.capture(w, h), w, h, canvas) == 3, "Tiny and edge changes must all arrive");
   check(pc, w, h, canvas);
+  const auto before_sparse = metric(metrics(video), "read_bytes");
+  const auto address0 = pc.video_info().physical_address;
+  const auto pages = pc.video_info().byte_size / cosmic_pc::MemoryFabric::kPageSize;
+  for (unsigned i = 0; i < pages; ++i)
+    pc.cpu.write8(address0 + i * cosmic_pc::MemoryFabric::kPageSize + 3, 0x5a);
+  require(video.capture(w, h).empty() && metric(metrics(video), "read_bytes") - before_sparse == 4 * pages,
+          "One reserved byte on each page must inspect only the intersecting pixels");
   pc.cpu.write8(pc.video_info().physical_address + pc.video_info().byte_size, 0x11);
   require(!watch.pending(), "Offscreen memory must not schedule presentation");
 
