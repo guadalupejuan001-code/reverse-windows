@@ -15,6 +15,10 @@ Reglas del proyecto:
 
 Los cambios de arquitectura y el primer ejecutor de pruebas se desarrollan en ramas y PR independientes antes de su integración a `main`.
 
+## Tarjeta de vídeo Prime
+
+Prime r105 utiliza el estado compartido de Éter para seleccionar geometría y reutiliza los dibujos idénticos antes de llegar a GLES. La auditoría describe la ruta de vídeo de arranque, el controlador Windows, las capacidades actuales y las mediciones de imágenes y transferencias. [Auditoría y resultados de la GPU](docs/prime-r105-gpu.md)
+
 ## Correcciones de arranque
 
 Cada arreglo de un fallo de Windows amplía el componente de la máquina virtual que interviene en él con las técnicas de Éter, QSSD o GPU Virtual, según el componente. Junto con la corrección se verifica la mejora del componente y su comportamiento en el invitado.

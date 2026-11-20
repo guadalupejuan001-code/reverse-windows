@@ -12,24 +12,26 @@ final class VbePresentationStats {
     private Backend last;
     private long acceleratedDraws;
     private long softwareDraws;
-    private long recordedStripes;
+    private long recordedStripes, backgroundPixelsSkipped;
 
     synchronized void reset() {
         last = null;
-        acceleratedDraws = softwareDraws = recordedStripes = 0;
+        acceleratedDraws = softwareDraws = recordedStripes = backgroundPixelsSkipped = 0;
     }
 
-    synchronized void drawn(Backend backend, int recordings) {
+    synchronized void drawn(Backend backend, int recordings, long skipped) {
         last = backend;
         if (backend == Backend.SOFTWARE_CANVAS) ++softwareDraws;
         else ++acceleratedDraws;
         recordedStripes += recordings;
+        backgroundPixelsSkipped += skipped;
     }
 
     synchronized String json() {
         return "{\"last_backend\":" + (last == null ? "null" : "\"" + last.id + "\"")
                 + ",\"accelerated_canvas_draws\":" + acceleratedDraws
                 + ",\"software_canvas_draws\":" + softwareDraws
-                + ",\"stripe_recordings\":" + recordedStripes + "}";
+                + ",\"stripe_recordings\":" + recordedStripes
+                + ",\"background_pixels_skipped\":" + backgroundPixelsSkipped + "}";
     }
 }

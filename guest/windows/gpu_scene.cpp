@@ -263,6 +263,38 @@ void verify_primevgc(const std::array<std::uint32_t, checks.size()>& expected) {
                 static_cast<unsigned long>(size), checks.size(), static_cast<long long>(elapsed));
 }
 
+void verify_ether_mask() {
+    GuestGpu device;
+    constexpr std::uint64_t offset = RWGPU_LOGICAL_BYTES - 1;
+    RwGpuQuantumRequest load{offset, 0, RWGPU_ABI, RWGPU_QUANTUM_LOAD, 1, 0};
+    std::uint8_t original;
+    device.cmd(RWGPU_IOCTL_QUANTUM, &load, sizeof(load), &original, 1, 1);
+    const auto write_mask = [&](std::uint8_t value) {
+        struct { RwGpuQuantumRequest header; std::uint8_t byte; } packet{
+            {offset, 0, RWGPU_ABI, RWGPU_QUANTUM_STORE, 1, 0}, value};
+        device.cmd(RWGPU_IOCTL_QUANTUM, &packet, sizeof(packet.header) + 1, nullptr, 0, 0);
+    };
+    const DWORD bytes = width * height * 4;
+    std::vector<std::uint8_t> reference(bytes), actual(bytes);
+    struct { RwGpuDrawRequest header; std::array<RwGpuVertex, 6> vertices; } selected{
+        {RWGPU_ABI, width, height, clear, 6}, {}};
+    std::memcpy(selected.vertices.data(), scene.data() + 3, sizeof(selected.vertices));
+    device.cmd(RWGPU_IOCTL_DRAW, &selected, sizeof(selected), reference.data(), bytes, bytes);
+    struct { RwGpuDrawVramRequest header; decltype(scene) vertices; } full{
+        {offset, {RWGPU_ABI, width, height, clear, static_cast<unsigned>(scene.size())}, 0}, scene};
+    write_mask(6); // Preserve triangle order, omit the foreground red triangle.
+    try {
+        device.cmd(RWGPU_IOCTL_DRAW_ETHER_MASK, &full, sizeof(full.header) + sizeof(scene),
+                   actual.data(), bytes, bytes);
+        if (actual != reference) throw std::runtime_error("Ether mask changed the reference pixels");
+    } catch (...) {
+        write_mask(original);
+        throw;
+    }
+    write_mask(original);
+    std::puts("PRIME_C08_WINDOWS_ETHER_MASK_PASS input_triangles=3 selected=2 exact_pixels=307200");
+}
+
 void verify_reference(const std::array<std::uint32_t, checks.size()>& samples) {
     for (std::size_t i = 0; i < checks.size(); ++i) {
         if (samples[i] != checks[i][2]) {
@@ -284,6 +316,10 @@ int main(int argc, char** argv) {
                 save ? unsigned(RWGPU_QUANTUM_CHECKPOINT_STATE) : unsigned(RWGPU_QUANTUM_RESTORE_STATE), 0, 0};
             gpu.cmd(RWGPU_IOCTL_QUANTUM, &cmd, sizeof(cmd), nullptr, 0, 0);
             std::puts(save ? "Shared Ether state saved to qSSD" : "Shared Ether state restored from qSSD");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--ether-mask") {
+            verify_ether_mask();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--quantum") {
@@ -319,7 +355,7 @@ int main(int argc, char** argv) {
         if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--primevgc"))
             verify_primevgc(samples);
         else if (argc == 2 && std::string_view(argv[1]) == "--staged") verify_guest(samples);
-        else throw std::runtime_error("Usage: prime_gpu_scene [--reference | --primevgc | --staged | --wddm | --quantum | --quantum-checkpoint | --quantum-restore]");
+        else throw std::runtime_error("Usage: prime_gpu_scene [--reference | --primevgc | --staged | --wddm | --ether-mask | --quantum | --quantum-checkpoint | --quantum-restore]");
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());

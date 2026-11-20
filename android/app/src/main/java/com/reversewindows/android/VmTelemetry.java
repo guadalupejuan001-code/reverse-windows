@@ -39,7 +39,7 @@ final class VmTelemetry extends LinearLayout {
     private final TextView resident;
     private final TextView occupancy;
     private final ProgressBar meter;
-    private final LinearLayout[] rows = new LinearLayout[15];
+    private final LinearLayout[] rows = new LinearLayout[19];
     private final TextView[] keys = new TextView[rows.length];
     private final TextView[] values = new TextView[rows.length];
 
@@ -294,7 +294,14 @@ final class VmTelemetry extends LinearLayout {
         metric(13, "Estados compartidos guardados / restaurados", count(number(quantum, "state_saves"))
                 + " / " + count(number(quantum, "state_restores")));
         metric(14, "Último estado Éter transferido", storage(number(quantum, "last_state_bytes")));
-        showRows(15);
+        if (!gpu.has("backend_frames")) { showRows(15); return; }
+        metric(15, "Cuadros enviados a GLES / reutilizados", count(number(gpu, "backend_frames"))
+                + " / " + count(number(gpu, "replayed_frames")));
+        metric(16, "Lecturas de píxeles evitadas", storage(number(gpu, "avoided_readback_bytes")));
+        metric(17, "Triángulos omitidos por la máscara Éter", count(number(gpu, "ether_mask_rejected_triangles")));
+        if (host == null || !host.has("background_pixels_skipped")) { showRows(18); return; }
+        metric(18, "Píxeles de fondo omitidos bajo VBE", count(number(host, "background_pixels_skipped")));
+        showRows(19);
     }
 
     private void heading(String title, String value, String hint) {

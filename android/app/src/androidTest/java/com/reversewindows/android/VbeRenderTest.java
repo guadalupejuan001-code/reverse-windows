@@ -55,6 +55,31 @@ public final class VbeRenderTest extends Instrumentation {
             Bitmap software = Bitmap.createBitmap(WIDTH, HEIGHT, Bitmap.Config.ARGB_8888);
             runOnMainSync(() -> monitor.draw(new Canvas(software)));
             if (!matches(software, 0, 0, true)) throw new AssertionError("Software canvas pixels differ");
+            long skipped = new JSONObject(stats.json()).getLong("background_pixels_skipped");
+            if (skipped < (long)WIDTH * HEIGHT * 2) throw new AssertionError("Missing VBE clear savings");
+
+            // A partial first packet still needs its background. An odd outer width
+            // adds fractional letterbox edges to the next complete frame.
+            Bitmap letterbox = Bitmap.createBitmap(WIDTH + 13, HEIGHT, Bitmap.Config.ARGB_8888);
+            runOnMainSync(() -> {
+                monitor.reset();
+                monitor.layout(0, 0, WIDTH + 13, HEIGHT);
+                monitor.show(packet(4, 4, 8, 5, Color.BLUE));
+                monitor.draw(new Canvas(letterbox));
+                if (letterbox.getPixel(1, 10) != 0xff080b10 || letterbox.getPixel(25, 20) != 0xff080b10 ||
+                        letterbox.getPixel(13, 6) != Color.BLUE) throw new AssertionError("Partial-frame clear");
+                monitor.show(packet(0, 0, WIDTH, HEIGHT, Color.RED));
+                letterbox.eraseColor(Color.MAGENTA);
+                monitor.draw(new Canvas(letterbox));
+                for (int y = 0; y < HEIGHT; y++) {
+                    for (int x = 0; x < WIDTH + 13; x++) {
+                        if (x == 6 || x == WIDTH + 6) continue; // Android rounds half-pixel edges.
+                        int expected = x < 6 || x > WIDTH + 6 ? 0xff080b10 : Color.RED;
+                        if (letterbox.getPixel(x, y) != expected) throw new AssertionError("Letterbox pixel");
+                    }
+                }
+            });
+            letterbox.recycle();
             software.recycle();
             result.putString("stream", "VBE full and partial pixels match on HWUI and software Canvas.\n");
             finish(Activity.RESULT_OK, result);
