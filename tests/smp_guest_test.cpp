@@ -689,7 +689,9 @@ void measure_secondary_irq_work(SecondaryWork work, bool pending, unsigned grant
 #endif
     if (irq_during_scan) {
         const auto sampled = cpu.read32(0x1401c);
-        require(sampled >= 8192 && sampled < bytes, "IPI must observe unfinished scanning before EOI");
+        // The polling BSP gets its ordinary turn within the next 1024
+        // scanned bytes, even when other pairs can use wider register grants.
+        require(sampled >= 8192 && sampled <= 8192 + 1024, "IPI must observe the scan within its normal turn");
         std::cout << "SMP_SCAN_LIVE_IRQ_PASS bytes_at_entry=" << sampled << " total_bytes=" << bytes << " irq=1 eoi=1\n";
         return;
     }
@@ -699,14 +701,17 @@ void measure_secondary_irq_work(SecondaryWork work, bool pending, unsigned grant
         grouped = board.secondary_scan_steps();
         require(grouped > bytes * 3 && grouped <= bytes * 6, "secondary scan did not batch its guest work");
 #endif
-        std::uint64_t coop_blocks = 0, coop_steps = 0;
+        std::uint64_t coop_blocks = 0, coop_steps = 0, block_ns = 0, block_steps = 0;
 #if PRIME_HAS_R107_GRANTS
         coop_blocks = board.paired_loop_blocks();
         coop_steps = board.paired_loop_steps();
+        block_ns = board.loop_timing().last_ns;
+        block_steps = board.loop_timing().last_steps;
 #endif
         std::cout << "AP_SCAN_SAMPLE pending=" << pending << " grouped=" << grouped
                   << " grant=" << grant << " calls=" << calls << " cooperative_blocks=" << coop_blocks
                   << " cooperative_steps=" << coop_steps << " worker_dispatches=" << board.threaded_smp_stats().dispatches
+                  << " sampled_block_ns=" << block_ns << " sampled_block_steps=" << block_steps
                   << " bsp_steps=" << (cpu.instructions - bsp_start);
     } else {
         std::cout << "SMP_IRQ_SAMPLE work=" << (copy ? "rep" : "registers") << " pending=" << pending;

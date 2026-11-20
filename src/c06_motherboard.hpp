@@ -1519,7 +1519,10 @@ class PcMotherboardC06 {
   // The AP has reached a checked RAM or register loop. Commit one block
   // on the calling lane while it owns the bus, then service the BSP before
   // allowing another block. An IPI or an MMIO operation returns to dispatch.
-  unsigned run_paired_loop(unsigned id, unsigned budget, Clock::time_point deadline) {
+  unsigned run_paired_loop(unsigned id, unsigned budget, Clock::time_point deadline,
+                           bool& register_peer) {
+    const bool previous_register_peer = register_peer;
+    register_peer = false;
     auto& apic = apics_[id];
     auto& primary = pc_.cpu;
     if (!active_clock_running_ || !pc_.boot_acceleration_enabled() || !pc_.guest_execution_available() ||
@@ -1527,7 +1530,8 @@ class PcMotherboardC06 {
         !grouped_loop_candidate(*apic.cpu) || (primary.halted && primary.flag(cosmic_pc::Cpu::IF)))
       return 0;
     const bool parked = primary.halted;
-    const unsigned grant = parked ? std::min(65536U, budget) : std::min(kExtendedSmpQuantum, budget / 2);
+    const unsigned peer_limit = previous_register_peer ? 32768U : kExtendedSmpQuantum;
+    const unsigned grant = parked ? std::min(65536U, budget) : std::min(peer_limit, budget / 2);
     if (grant < kMinCooperativeGrant) return 0;
     apic.cpu->a20_enabled = primary.a20_enabled;
     update_secondary_timer(apic);
@@ -1537,10 +1541,26 @@ class PcMotherboardC06 {
     ++paired_loop_blocks_;
     paired_loop_steps_ += steps;
     const auto before = primary.instructions;
+    const auto start_ip = primary.eip;
+    const auto counters_before = pc_.boot_acceleration().counter_loop_steps;
     // A complete AP iteration may leave a few steps of its share. Use them
     // on the peer so the next call starts at the validated AP backedge.
     const unsigned peer = parked ? 1U : steps + std::min(2U * (grant - steps), 16U);
     run_bsp(std::min(budget - steps, peer), deadline);
+    // Widen the next pair only after the canonical BSP decoder has retired
+    // this same short register countdown for an entire share (at most two
+    // scalar boundary instructions). A polling loop that reads shared RAM
+    // keeps its normal turn, so it can send an IPI as its condition changes.
+    const auto peer_steps = primary.instructions - before;
+    const auto counter_steps = pc_.boot_acceleration().counter_loop_steps - counters_before;
+    if (budget - steps > peer_steps && counter_steps >= 128 && counter_steps + 2 >= peer_steps &&
+        primary.eip == start_ip && primary.is_long_mode() && !primary.halted &&
+        !primary.flag(cosmic_pc::Cpu::IF | cosmic_pc::Cpu::TF) && pc_.guest_execution_available()) {
+      if (!primary.counter_loop_batch_candidate()) run_bsp(1, deadline);
+      const auto& branch = primary.last_decoded_bytes();
+      register_peer = primary.counter_loop_batch_candidate() && branch.size() == 2 &&
+                      branch[0] == 0x75 && branch[1] >= 0xf9;
+    }
     return steps + unsigned(primary.instructions - before);
   }
 
@@ -2198,6 +2218,7 @@ class PcMotherboardC06 {
     }
     // The budget counts work across the whole VM. Small calls keep a rotating
     // position so that every runnable processor gets a turn.
+    bool register_peer = false;
     while (budget && !faulted_processor_ && !pc_.cpu.fault && !powered_off_ &&
            pc_.guest_restart() == cosmic_pc::PcMachine::GuestRestart::None) {
       if(timed&&Clock::now()>=deadline)return;
@@ -2226,19 +2247,21 @@ class PcMotherboardC06 {
           // here before waking workers for two running instruction streams.
           const auto grant = std::min(dispatch_budget / 2, 128U);
           const auto before = total_processor_steps();
+          register_peer = false;
           run_bsp(grant, deadline);
           if (!pc_.guest_execution_available() || powered_off_) return;
           run_secondary(id, grant, deadline, false);
           const auto retired = unsigned(total_processor_steps() - before);
           if (retired) { budget -= retired; continue; }
         }
-        if (const auto retired = run_paired_loop(runnable[1], dispatch_budget, deadline)) {
+        if (const auto retired = run_paired_loop(runnable[1], dispatch_budget, deadline, register_peer)) {
           budget -= retired;
           if (timed && pc_.cpu.halted && !pc_.cpu.flag(cosmic_pc::Cpu::IF) && budget < kMinCooperativeGrant &&
               grouped_loop_candidate(*apics_[runnable[1]].cpu)) return;
           continue;
         }
       }
+      register_peer = false;
       // In Android's host-clock mode a halted BSP still polls the devices.
       // If only one AP is awake, give it the unused guest-instruction budget.
       // Resample the BSP within one normal quantum so a new IRQ can wake it.
