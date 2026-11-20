@@ -102,6 +102,12 @@ jobs:
             -DANDROID_ABI="$ANDROID_ABI" -DANDROID_PLATFORM=android-26 -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
           cmake --build "$RUNNER_TEMP/ether-gpu-device" --target reverse_windows_prime_gpu_guest_test --parallel 2
+          readelf -lW "$RUNNER_TEMP/ether-gpu-device/reverse_windows_prime_gpu_guest_test" | python3 -c '
+          import sys
+          loads = [int(row[-1], 16) for row in map(str.split, sys.stdin) if row[:1] == ["LOAD"]]
+          print("GPU benchmark ELF segment alignments (bytes):", loads)
+          if not loads or min(loads) < 16384:
+              sys.exit("GPU benchmark needs 16 KB load alignment")'
       - uses: actions/upload-artifact@v4
         with:
           name: prime-r105-on-device-gpu-${{ matrix.abi }}
@@ -509,6 +515,21 @@ jobs:
           enable-hw-keyboard: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           script: bash "$RUNNER_TEMP/reverse-windows-adb-smoke.sh"
+      - name: Run the GPU measurement on Android with 16 KB pages
+        if: matrix.abi == 'x86_64' && steps.kvm.outputs.available == 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis_ps16k
+          arch: x86_64
+          avd-name: prime-gpu-16k
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: |
+            adb shell getconf PAGE_SIZE | grep -Fx 16384
+            adb push "$RUNNER_TEMP/ether-gpu-device/reverse_windows_prime_gpu_guest_test" /data/local/tmp/ether-gpu
+            adb shell chmod 755 /data/local/tmp/ether-gpu
+            adb shell 'TMPDIR=/data/local/tmp /data/local/tmp/ether-gpu --measure-ether' > "$RUNNER_TEMP/reverse-windows-x86_64/ether-gpu-16k.log"
+            cat "$RUNNER_TEMP/reverse-windows-x86_64/ether-gpu-16k.log"
       - name: Preserve Android x86_64 runtime evidence
         if: always() && matrix.abi == 'x86_64'
         uses: actions/upload-artifact@v4

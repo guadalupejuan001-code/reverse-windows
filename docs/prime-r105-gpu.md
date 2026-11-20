@@ -57,11 +57,31 @@ EGL_PLATFORM=surfaceless ./build/reverse_windows_prime_gpu_guest_test --measure-
 
 La integración continua conserva los resultados por arquitectura en `prime-r105-gpu-x86_64` y `prime-r105-gpu-aarch64`. El código de la ruta se encuentra en `src/c08_guest_gpu.hpp`, el contrato PCI en `src/c08_gpu_protocol.h`, el controlador en `guest/windows/gpu_transport.c` y la presentación en `android/app/src/main/java/com/reversewindows/android/GuestMonitor.java`.
 
+### Android con SwiftShader
+
+El emulador Android x86-64 ejecutó la misma prueba antes y después de fusionar la PR #94. Cada celda muestra la mediana de siete series de 24 cuadros, en milisegundos desde el envío de la orden hasta su finalización. En cada serie se compararon 294 912 píxeles.
+
+| Carga | PR #94, control → Éter | Versión fusionada `4a467c2`, control → Éter |
+| --- | ---: | ---: |
+| Escena idéntica | 135,22 → 77,02 ms | 161,50 → 61,52 ms |
+| Fondo cambiante, 8 de 64 triángulos visibles | 111,41 → 128,01 ms | 78,82 → 93,22 ms |
+
+En las dos ejecuciones, reutilizar la escena redujo las rasterizaciones de 24 a 1. Con el fondo cambiante, la máscara redujo los bytes de vértices de 92 160 a 11 520. Se siguieron leyendo 1 179 648 bytes del renderizador y aumentó el tiempo de la serie. SwiftShader ejecutó ambas cargas por software. El tiempo y el consumo de una GPU móvil requieren mediciones en ese chip. [Registro de la PR](https://github.com/guadalupejuan001-code/reverse-windows/actions/runs/44657372808/job/136026821939) · [Registro tras la fusión](https://github.com/guadalupejuan001-code/reverse-windows/actions/runs/44659411731/job/136033653307)
+
+### Medición en un teléfono ARM64
+
 El artefacto `prime-r105-on-device-gpu-arm64-v8a` contiene la misma prueba compilada con el NDK para el teléfono. Se ejecuta sin Windows y crea un disco de prueba temporal. Cada informe termina con el nombre GLES del dispositivo y el indicador de hardware. El emulador Android de CI ejecuta el binario equivalente para x86-64.
+
+Con el teléfono conectado por ADB, descomprime el artefacto y ejecuta estos comandos desde esa carpeta. El archivo `ether-gpu.txt` quedará en el equipo desde el que ejecutas ADB. Incluye el modelo, la versión de Android, el tamaño de página y el informe del renderizador.
 
 ```sh
 adb shell mkdir -p /data/local/tmp/reverse-prime-r105
 adb push reverse_windows_prime_gpu_guest_test /data/local/tmp/reverse-prime-r105/ether-gpu
 adb shell chmod 755 /data/local/tmp/reverse-prime-r105/ether-gpu
-adb shell 'TMPDIR=/data/local/tmp/reverse-prime-r105 /data/local/tmp/reverse-prime-r105/ether-gpu --measure-ether'
+adb shell getprop ro.product.model > ether-gpu.txt
+adb shell getprop ro.build.version.release >> ether-gpu.txt
+adb shell getconf PAGE_SIZE >> ether-gpu.txt
+adb shell 'TMPDIR=/data/local/tmp/reverse-prime-r105 /data/local/tmp/reverse-prime-r105/ether-gpu --measure-ether' >> ether-gpu.txt
 ```
+
+El ejecutable de medición usa segmentos de carga alineados a 16 KB para los dos ABI de 64 bits. La prueba en el emulador de 16 KB comprueba el tamaño de página antes de ejecutar las dos cargas. [Compatibilidad con páginas de 16 KB en Android](https://developer.android.com/guide/practices/page-sizes)
