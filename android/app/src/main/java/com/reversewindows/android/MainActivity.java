@@ -905,15 +905,56 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
 
     private void showDiagnosticDialog(String json) {
         if (json.isEmpty()) return;
+        boolean timingEnabled = false;
+        boolean timingKnown = false;
+        try {
+            JSONObject ram = new JSONObject(json).optJSONObject("ram_profile");
+            JSONObject pressure = ram == null ? null : ram.optJSONObject("access_pressure");
+            timingKnown = pressure != null && pressure.opt("backing_timing_enabled") instanceof Boolean;
+            timingEnabled = timingKnown && pressure.optBoolean("backing_timing_enabled", false);
+        } catch (org.json.JSONException ignored) {
+            // An old snapshot cannot report a measurement mode it did not expose.
+        }
+        final boolean enableTiming = !timingEnabled;
+        final boolean canChangeTiming = session && !pending && timingKnown;
+        LinearLayout title = column();
+        title.setPadding(dp(24), dp(20), dp(24), dp(8));
+        add(title, label("Último diagnóstico", 20, TEXT), 0);
+        String timingState = timingKnown ? (timingEnabled ? "activos" : "apagados") : "sin dato";
+        add(title, label("Cronómetros de lectura del respaldo: " + timingState
+                + " en este diagnóstico. Medir añade coste y puede reducir la velocidad.", 13, MUTED), 8);
+        String[] choices = canChangeTiming
+                ? new String[]{"Copiar texto", "Guardar archivo JSON", "Guardar archivo TXT",
+                        enableTiming ? "Activar cronómetros de lectura del respaldo"
+                                : "Desactivar cronómetros de lectura del respaldo"}
+                : new String[]{"Copiar texto", "Guardar archivo JSON", "Guardar archivo TXT"};
         new AlertDialog.Builder(this)
-                .setTitle("Último diagnóstico")
-                .setItems(new String[]{"Copiar texto", "Guardar archivo JSON", "Guardar archivo TXT"},
+                .setCustomTitle(title)
+                .setItems(choices,
                         (dialog, choice) -> {
                     if (choice == 0) copyEvidence(json);
-                    else saveEvidence(json, choice == 2);
+                    else if (choice < 3) saveEvidence(json, choice == 2);
+                    else changeRamTiming(enableTiming);
                 })
                 .setNegativeButton("Cerrar", null)
                 .show();
+    }
+
+    private void changeRamTiming(boolean enabled) {
+        if (!session || pending || requestingDiagnostic) return;
+        requestingDiagnostic = true;
+        evidence.setEnabled(false);
+        worker.setBackingReadTiming(enabled, json -> {
+            requestingDiagnostic = false;
+            updateControls();
+            if (json.isEmpty()) {
+                Toast.makeText(this, "No se pudo cambiar la medición de RAM de esta sesión.",
+                        Toast.LENGTH_LONG).show();
+                return;
+            }
+            lastJson = json;
+            showDiagnosticDialog(json);
+        });
     }
 
     private void copyEvidence(String json) {

@@ -57,6 +57,14 @@ std::uint64_t counter(const std::string& json, const char* name) {
   return std::stoull(json.substr(pos + key.size()));
 }
 
+std::string preparation_report(const std::string& json) {
+  const auto begin = json.find("\"reclaim_preparation\":{");
+  require(begin != std::string::npos, "Missing preparation diagnostics");
+  const auto end = json.find('}', begin);
+  require(end != std::string::npos, "Unterminated preparation diagnostics");
+  return json.substr(begin, end - begin + 1);
+}
+
 void verify_ram_profile() {
   constexpr std::uint64_t mib = 1024 * 1024;
   const auto modest = Session::ram_profile(768 * mib, 256 * mib, false);
@@ -109,6 +117,36 @@ void verify_ram_profile() {
     (void)Session::ram_profile(300 * mib, 256 * mib, true);
   } catch (const std::runtime_error&) { return; }
   throw std::runtime_error("Starting a VM with Android memory pressure must be rejected");
+}
+
+void verify_ram_timing_option(const std::filesystem::path& directory) {
+  constexpr std::uint64_t mib = 1024 * 1024;
+  const auto profile = Session::ram_profile(768 * mib, 256 * mib, false, true);
+  Session live({}, 0, Session::BootSource::SelfTest, -1, 0, profile, directory);
+  const auto initial = live.diagnostic(false);
+  require(initial.find("\"backing_timing_enabled\":false") != std::string::npos &&
+              counter(initial, "backing_timed_attempts") == 0,
+          "New sessions must leave detailed backing-read timers disabled");
+  live.step(32);
+  const auto before = live.diagnostic(false);
+  const auto steps = live.session_steps();
+  live.set_backing_read_timing_enabled(true);
+  require(live.diagnostic(false).find("\"backing_timing_enabled\":true") != std::string::npos,
+          "The owner must be able to enable backing timers between execution windows");
+  live.set_backing_read_timing_enabled(false);
+  const auto disabled = live.diagnostic(false);
+  require(disabled.find("\"backing_timing_enabled\":false") != std::string::npos &&
+              steps > 0 && live.session_steps() == steps &&
+              counter(disabled, "resident_bytes") == counter(before, "resident_bytes") &&
+              counter(disabled, "backing_budget_bytes") == counter(before, "backing_budget_bytes") &&
+              counter(disabled, "forced_reclaims") == counter(before, "forced_reclaims") &&
+              counter(disabled, "backing_read_attempts") == counter(before, "backing_read_attempts"),
+          "Disabling timers must preserve the guest, its budget and accumulated counters");
+  live.set_backing_read_timing_enabled(true);
+  Session next({}, 0, Session::BootSource::SelfTest, -1, 0, profile, directory);
+  require(next.diagnostic(false).find("\"backing_timing_enabled\":false") != std::string::npos,
+          "A new session must not inherit the previous session's measurement mode");
+  std::cout << "PRIME_RAM_TIMING_OPTION_PASS default_off=1 toggle=1 preserves_guest=1 next_session_off=1\n";
 }
 
 void verify_ram_spill(const std::filesystem::path& directory) {
@@ -640,8 +678,10 @@ void verify_shared_ram(const std::filesystem::path& directory) {
     if (policy == CachePolicy::Adaptive) {
       require(stats.backing_cache_bytes == rows * page &&
                   ram.adjust_payload_budget(16 * mib, 0) == Ram::BudgetAdjustment::Applied &&
-                  ram.backing_cache_bytes() == 0 && ram.metrics().backing_cache_capacity_bytes == 128 * 1024,
-              "Reducing the Android budget must release and bound the decoded cache");
+                  ram.backing_cache_bytes() > 0 && ram.backing_cache_bytes() <= 128 * 1024 &&
+                  ram.metrics().backing_cache_capacity_bytes == 128 * 1024 &&
+                  ram.allocated_bytes() + ram.backing_cache_bytes() <= ram.budget_bytes(),
+              "Reducing the Android budget must retain valid decoded pages within the smaller budget");
     }
     original[0] = 0xa1;
     require(cpu.try_write_ram_block(base, original.data(), page) &&
@@ -652,15 +692,17 @@ void verify_shared_ram(const std::filesystem::path& directory) {
       reverse_windows::SmpWorkers workers(2);
       std::array<std::array<std::uint8_t, page>, 2> restored;
       original[0] = 1;
+      const auto before_workers = ram.metrics();
       const auto lanes = workers.try_run(2, [&](unsigned worker, unsigned) {
         ram.read_parallel_ram_block(base + page, restored[worker].data(), page);
       });
       require(lanes == 2, "Shared QSSD test needs two readers");
       const auto shared = ram.metrics();
+      const auto worker_reads = shared.backing_reads - before_workers.backing_reads;
+      const auto worker_hits = shared.backing_cache_hits - before_workers.backing_cache_hits;
       require(restored[0] == original && restored[1] == original &&
-                  shared.backing_reads == stats.backing_reads + 1 &&
-                  shared.backing_cache_hits == stats.backing_cache_hits + 1,
-              "Both workers must reuse one real QSSD read and the exact decoded bytes");
+                  worker_reads <= 1 && worker_reads + worker_hits == 2,
+              "Both workers must share exact decoded bytes with at most one real QSSD read");
     }
     return {stats.backing_reads, stats.backing_cache_hits, us};
   };
@@ -887,12 +929,21 @@ void verify_late_prime_pressure(const std::filesystem::path& path) {
     result = live.step(50000);
   if (result != Session::Step::Halted)
     throw std::runtime_error("Prime pressure guest did not populate RAM: " + live.diagnostic());
+  require(!live.prepare_ram_reclaim(), "Preparation must wait for the first Android pressure sample");
   const auto before = live.diagnostic(false);
   const auto resident = counter(before, "resident_bytes");
   require(resident >= 64 * mib && counter(before, "spill_writes") == 0,
           "Prime pressure guest must start with a populated resident working set");
 
   live.sample_ram_pressure(threshold, threshold, true);
+  require(!live.prepare_ram_reclaim(), "Android pressure must take precedence over anticipatory work");
+  const auto skipped = preparation_report(live.diagnostic(false));
+  require(counter(skipped, "checks") == 2 && counter(skipped, "batches") == 0 &&
+              counter(skipped, "skipped_no_target") == 1 &&
+              counter(skipped, "skipped_low_memory") == 1 &&
+              skipped.find("\"last_reason\":\"android-low-memory\"") != std::string::npos &&
+              counter(skipped, "total_us") == 0,
+          "Preparation diagnostics must distinguish eligibility checks from performed batches");
   require(live.maintain_ram_budget(), "Foreground pressure must reclaim in bounded batches");
   auto partial = live.diagnostic(false);
   // A short grant can expire while searching through hot pages before its
@@ -936,6 +987,13 @@ void verify_late_prime_pressure(const std::filesystem::path& path) {
               counter(recovered, "usable_bytes") == Session::kPrimeRamBytes,
           "Recovering headroom must keep remaining guest pages and the original E820 map");
 
+  require(!live.prepare_ram_reclaim(), "Low occupancy must not trigger anticipatory backing writes");
+  const auto below = preparation_report(live.diagnostic(false));
+  require(counter(below, "skipped_below_threshold") == 1 && counter(below, "batches") == 0 &&
+              counter(below, "resident_bytes_at_check") < counter(below, "threshold_bytes") &&
+              below.find("\"last_reason\":\"below-threshold\"") != std::string::npos,
+          "An idle preparation check must explain its threshold and preserve the resident pages");
+
   live.sample_ram_pressure(threshold + 34 * mib, threshold, false);
   require(!live.maintain_ram_budget(), "Stable RAM budget must allow preparation before pressure");
   for (unsigned pass = 0; pass < 32; ++pass) {
@@ -943,10 +1001,19 @@ void verify_late_prime_pressure(const std::filesystem::path& path) {
     if (counter(live.diagnostic(false), "compact_up_to_2k")) break;
   }
   const auto prepared = live.diagnostic(false);
+  const auto preparation = preparation_report(prepared);
   require(counter(prepared, "compact_up_to_2k") > 0 &&
               counter(prepared, "resident_bytes") < counter(recovered, "resident_bytes") &&
               counter(prepared, "usable_bytes") == Session::kPrimeRamBytes,
           "The live preparation route must compact 40-word pages before pressure");
+  require(counter(preparation, "batches") > 0 && counter(preparation, "checks") >
+              counter(preparation, "batches") && counter(preparation, "goal_pages") > 0 &&
+              counter(preparation, "deficit_pages") == counter(preparation, "goal_pages") -
+                  std::min(counter(preparation, "goal_pages"), counter(preparation, "clean_pages_after")) &&
+              counter(preparation, "resident_bytes_at_check") >= counter(preparation, "threshold_bytes") &&
+              counter(preparation, "total_us") >= counter(preparation, "last_us") &&
+              counter(preparation, "empty_batches") <= counter(preparation, "batches"),
+          "Prepared copies, reserve deficit and preparation time must describe the actual batch");
 
   live.sample_ram_pressure(UINT64_MAX, 0, false);
   require(!live.maintain_ram_budget() &&
@@ -1197,6 +1264,7 @@ int main(int argc, char** argv) {
     verify_ram_profile();
     require(argc == 2 || argc == 3, "Pass the synthetic BIOS fixture and optional evidence path");
     const TestDiskDirectory dir;
+    verify_ram_timing_option(dir.path);
     verify_ram_spill(dir.path);
     verify_packed_ram64(dir.path);
     verify_deferred_ram_reclaim(dir.path);

@@ -31,6 +31,14 @@ En **Prime r107**, una vCPU secundaria puede completar un bloque validado de RAM
 
 Cada arreglo de un fallo de Windows amplía el componente de la máquina virtual que interviene en él con las técnicas de Éter, QSSD o GPU Virtual, según el componente. Junto con la corrección se verifica la mejora del componente y su comportamiento en el invitado.
 
+## Gestión y diagnóstico de RAM
+
+La preparación vuelve a comprobar su elegibilidad mientras corre el invitado y
+al reanudarlo. La caché conserva páginas válidas al cambiar de tamaño. El panel
+**Telemetría → RAM** y el diagnóstico exportado separan el coste de conseguir
+espacio durante una escritura y el de recuperar datos del respaldo.
+[Comportamiento, contadores y límites de las mediciones](docs/ram-pressure-cycles.md)
+
 ## Dependencias de compilación
 
 Desde la raíz del repositorio, ejecuta `python3 scripts/verify_deps.py --checkout` para sincronizar las revisiones exactas del archivo de dependencias. Después puedes compilar con CMake o desde el proyecto `android/`. Ambos builds verifican la revisión de Mundo X al configurar y recompilar. El diagnóstico de Éter ARM64 incluye el SHA que se compiló y los contadores de reutilización de páginas de código.

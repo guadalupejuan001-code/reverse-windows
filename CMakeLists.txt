@@ -124,7 +124,12 @@ if(BUILD_TESTING)
     COMMAND reverse_windows_android_boot_session_test "${android_boot_fixture}"
       "${CMAKE_CURRENT_BINARY_DIR}/c03-boot-evidence.json")
   set_tests_properties(reverse_windows_android_bios_iso_qssd PROPERTIES
-    FIXTURES_REQUIRED android_boot_iso TIMEOUT 60)
+    FIXTURES_REQUIRED android_boot_iso FIXTURES_SETUP ram_pressure_report TIMEOUT 60)
+  add_test(NAME reverse_windows_android_ram_pressure_diagnostic
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ram_pressure_diagnostic.py"
+      "${CMAKE_CURRENT_BINARY_DIR}/c03-boot-evidence.json")
+  set_tests_properties(reverse_windows_android_ram_pressure_diagnostic PROPERTIES
+    FIXTURES_REQUIRED ram_pressure_report)
   add_test(NAME reverse_windows_prime_boot_profile
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/prime_boot_profile.py"
       "$<TARGET_FILE:reverse_windows_boot_probe>"
@@ -155,7 +160,7 @@ if(BUILD_TESTING)
   foreach(cpu_test IN ITEMS x86_long_mode x86_long_null_ss x86_far_transfer64 x86_system64
                             x86_ether_rep_batch x86_ether_shift_loop x86_ether_counter_loop
                             x86_ram_backing pc_video
-                            pc_bios_keyboard boot_hotspots sparse_ram pc_memory pc_memory_fabric)
+                            pc_bios_keyboard boot_hotspots sparse_ram sparse_ram_pressure pc_memory pc_memory_fabric)
     add_executable(reverse_windows_${cpu_test}_test
       "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/${cpu_test}_test.cpp")
     target_link_libraries(reverse_windows_${cpu_test}_test PRIVATE reverse_windows_component_headers)
