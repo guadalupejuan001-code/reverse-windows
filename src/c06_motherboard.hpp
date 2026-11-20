@@ -69,6 +69,10 @@ class PcMotherboardC06 {
     std::uint32_t irq8_redirection_low;
     std::uint64_t irq8_delivered;
   };
+  struct LoopTiming {
+    std::uint64_t samples = 0, last_ns = 0;
+    unsigned last_steps = 0;
+  };
   struct ThreadedSmpStats {
     std::uint64_t dispatches = 0, guest_steps = 0;
     unsigned last_workers = 0, peak_workers = 0;
@@ -323,6 +327,10 @@ class PcMotherboardC06 {
   std::uint64_t secondary_rep_elements_ = 0, secondary_rep_bytes_ = 0;
   std::uint64_t secondary_scan_steps_ = 0;
   std::uint64_t secondary_shift_steps_ = 0, secondary_zero_steps_ = 0, secondary_multiply_steps_ = 0;
+  std::uint64_t paired_loop_blocks_ = 0, paired_loop_steps_ = 0;
+  std::uint64_t worker_loop_blocks_ = 0, worker_loop_steps_ = 0;
+  std::uint64_t loop_timing_attempts_ = 0;
+  LoopTiming loop_timing_{};
   unsigned longest_parallel_register_slice_ = 0;
   bool prior_local_apic_=false;
   const std::uint64_t* prior_clock_ = nullptr;
@@ -394,6 +402,9 @@ class PcMotherboardC06 {
     secondary_rep_elements_ = secondary_rep_bytes_ = 0;
     secondary_scan_steps_ = 0;
     secondary_shift_steps_ = secondary_zero_steps_ = secondary_multiply_steps_ = 0;
+    paired_loop_blocks_ = paired_loop_steps_ = worker_loop_blocks_ = worker_loop_steps_ = 0;
+    loop_timing_attempts_ = 0;
+    loop_timing_ = {};
     longest_parallel_register_slice_ = 0;
     ioapic_select_=0;
     ioapic_id_=std::uint8_t(AcpiC06::ioapic_id(processor_count_));
@@ -1444,6 +1455,115 @@ class PcMotherboardC06 {
     return limit;
   }
 
+  static bool grouped_loop_candidate(const cosmic_pc::Cpu& cpu) {
+    return cpu.scan_loop_batch_candidate() || cpu.shift_loop_batch_candidate() ||
+           cpu.zero_loop_batch_candidate() || cpu.wide_multiply_loop_batch_candidate();
+  }
+
+  unsigned retire_secondary_loop(cosmic_pc::Cpu& cpu, unsigned limit) {
+    if (cpu.scan_loop_batch_candidate()) {
+      const auto steps = cpu.try_scan_loop_batch(limit);
+      secondary_scan_steps_ += steps;
+      return steps;
+    }
+    if (cpu.shift_loop_batch_candidate()) {
+      const auto steps = cpu.try_shift_loop_batch(limit);
+      secondary_shift_steps_ += steps;
+      return steps;
+    }
+    if (cpu.zero_loop_batch_candidate()) {
+      const auto steps = cpu.try_zero_loop_batch(limit);
+      secondary_zero_steps_ += steps;
+      return steps;
+    }
+    if (!cpu.wide_multiply_loop_batch_candidate()) return 0;
+    const auto steps = unsigned(cpu.try_counter_loop_batch(limit));
+    secondary_multiply_steps_ += steps;
+    return steps;
+  }
+
+  unsigned shared_loop_limit(unsigned budget) const {
+    auto limit = batch_limit(budget);
+    for (unsigned id = 1; id < processor_count_; ++id) {
+      const auto& apic = apics_[id];
+      if (apic.init_pending || apic.startup_vector) return 1;
+      if (!apic.started || !apic.cpu->flag(cosmic_pc::Cpu::IF)) continue;
+      if (deliverable_lapic_vector(apic)) return 1;
+      if (local_timer_irq_armed(apic)) {
+        const auto elapsed = ticks_ - apic.last_tick;
+        if (elapsed >= apic.timer_cycles) return 1;
+        limit = unsigned(std::min<std::uint64_t>(limit, apic.timer_cycles - elapsed));
+      }
+    }
+    return limit;
+  }
+
+  static constexpr unsigned kMinCooperativeGrant = 12; // Two iterations of the six-instruction scan.
+
+  unsigned run_shared_loop(cosmic_pc::Cpu& cpu, unsigned grant) {
+    const auto limit = shared_loop_limit(grant);
+    if (limit < kMinCooperativeGrant) return 0;
+    // Calls hold the shared bus. Sample execution time separately from the
+    // time spent waiting for a lane; failed candidates publish no latency.
+    const bool sample = (loop_timing_attempts_++ & 63U) == 0;
+    const auto start = sample ? Clock::now() : Clock::time_point{};
+    const auto steps = retire_secondary_loop(cpu, limit);
+    if (sample && steps) {
+      ++loop_timing_.samples;
+      loop_timing_.last_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+      loop_timing_.last_steps = steps;
+    }
+    return steps;
+  }
+
+  // The AP has reached a checked RAM or register loop. Commit one block
+  // on the calling lane while it owns the bus, then service the BSP before
+  // allowing another block. An IPI or an MMIO operation returns to dispatch.
+  unsigned run_paired_loop(unsigned id, unsigned budget, Clock::time_point deadline,
+                           bool& register_peer) {
+    const bool previous_register_peer = register_peer;
+    register_peer = false;
+    auto& apic = apics_[id];
+    auto& primary = pc_.cpu;
+    if (!active_clock_running_ || !pc_.boot_acceleration_enabled() || !pc_.guest_execution_available() ||
+        !apic.started || apic.init_pending || apic.startup_vector || apic.cpu->halted ||
+        !grouped_loop_candidate(*apic.cpu) || (primary.halted && primary.flag(cosmic_pc::Cpu::IF)))
+      return 0;
+    const bool parked = primary.halted;
+    const unsigned peer_limit = previous_register_peer ? 32768U : kExtendedSmpQuantum;
+    const unsigned grant = parked ? std::min(65536U, budget) : std::min(peer_limit, budget / 2);
+    if (grant < kMinCooperativeGrant) return 0;
+    apic.cpu->a20_enabled = primary.a20_enabled;
+    update_secondary_timer(apic);
+    const cosmic_pc::MemoryFabric::ExclusiveRamReads exclusive(primary.memory);
+    const auto steps = run_shared_loop(*apic.cpu, grant);
+    if (!steps) return 0;
+    ++paired_loop_blocks_;
+    paired_loop_steps_ += steps;
+    const auto before = primary.instructions;
+    const auto start_ip = primary.eip;
+    const auto counters_before = pc_.boot_acceleration().counter_loop_steps;
+    // A complete AP iteration may leave a few steps of its share. Use them
+    // on the peer so the next call starts at the validated AP backedge.
+    const unsigned peer = parked ? 1U : steps + std::min(2U * (grant - steps), 16U);
+    run_bsp(std::min(budget - steps, peer), deadline);
+    // Widen the next pair only after the canonical BSP decoder has retired
+    // this same short register countdown for an entire share (at most two
+    // scalar boundary instructions). A polling loop that reads shared RAM
+    // keeps its normal turn, so it can send an IPI as its condition changes.
+    const auto peer_steps = primary.instructions - before;
+    const auto counter_steps = pc_.boot_acceleration().counter_loop_steps - counters_before;
+    if (budget - steps > peer_steps && counter_steps >= 128 && counter_steps + 2 >= peer_steps &&
+        primary.eip == start_ip && primary.is_long_mode() && !primary.halted &&
+        !primary.flag(cosmic_pc::Cpu::IF | cosmic_pc::Cpu::TF) && pc_.guest_execution_available()) {
+      if (!primary.counter_loop_batch_candidate()) run_bsp(1, deadline);
+      const auto& branch = primary.last_decoded_bytes();
+      register_peer = primary.counter_loop_batch_candidate() && branch.size() == 2 &&
+                      branch[0] == 0x75 && branch[1] >= 0xf9;
+    }
+    return steps + unsigned(primary.instructions - before);
+  }
+
   void run_secondary(unsigned id, unsigned budget, Clock::time_point deadline,
                      bool preserve_ether_loop_entry, std::unique_lock<std::mutex>* bus = nullptr) {
     using Clock = cosmic_pc::PcMachine::RunClock;
@@ -1482,33 +1602,11 @@ class PcMotherboardC06 {
           continue;
         }
       }
-      // The scan reads shared RAM and publishes a count. Keep it inside
-      // this vCPU's bus grant and stop at the same device edges as REP.
-      if (pc_.boot_acceleration_enabled() && cpu.scan_loop_batch_candidate()) {
-        if (const auto steps = cpu.try_scan_loop_batch(secondary_batch_limit(apic, remaining))) {
-          secondary_scan_steps_ += steps;
+      if (pc_.boot_acceleration_enabled() && grouped_loop_candidate(cpu)) {
+        if (const auto steps = retire_secondary_loop(cpu, secondary_batch_limit(apic, remaining))) {
           used += steps;
-          continue;
-        }
-      }
-      if (pc_.boot_acceleration_enabled() && cpu.shift_loop_batch_candidate()) {
-        if (const auto steps = cpu.try_shift_loop_batch(secondary_batch_limit(apic, remaining))) {
-          secondary_shift_steps_ += steps;
-          used += steps;
-          continue;
-        }
-      }
-      if (pc_.boot_acceleration_enabled() && cpu.zero_loop_batch_candidate()) {
-        if (const auto steps = cpu.try_zero_loop_batch(secondary_batch_limit(apic, remaining))) {
-          secondary_zero_steps_ += steps;
-          used += steps;
-          continue;
-        }
-      }
-      if (pc_.boot_acceleration_enabled() && cpu.wide_multiply_loop_batch_candidate()) {
-        if (const auto steps = cpu.try_counter_loop_batch(secondary_batch_limit(apic, remaining))) {
-          secondary_multiply_steps_ += steps;
-          used += static_cast<unsigned>(steps);
+          // Leave a validated backedge intact for the next bus grant.
+          if (active_clock_running_ && budget - used < kMinCooperativeGrant && grouped_loop_candidate(cpu)) return;
           continue;
         }
       }
@@ -1744,8 +1842,26 @@ class PcMotherboardC06 {
           std::unique_lock<std::mutex> lock(bus);
           if (faulted_processor_ || !pc_.guest_execution_available() ||
               (deadline != Clock::time_point::max() && Clock::now() >= deadline)) return;
+          const auto remaining = grant - used;
+          auto& apic = apics_[id];
+          if (id && remaining > bus_steps && active_clock_running_ && pc_.boot_acceleration_enabled() &&
+              apic.started && !apic.init_pending && !apic.startup_vector && !apic.cpu->halted &&
+              grouped_loop_candidate(*apic.cpu)) {
+            sync_active_clock();
+            update_secondary_timer(apic);
+            apic.cpu->a20_enabled = pc_.cpu.a20_enabled;
+            // Other ready CPUs retain their shares. Only a validated, non-I/O
+            // operation can hold the bus past its ordinary 64-step slice.
+            if (const auto bulk = run_shared_loop(*apic.cpu, remaining)) {
+              ++worker_loop_blocks_;
+              worker_loop_steps_ += bulk;
+              progress[worker] += bulk;
+              used += bulk;
+              continue;
+            }
+          }
           const auto before = processor_steps(id);
-          const auto steps = std::min(bus_steps, grant - used);
+          const auto steps = std::min(bus_steps, remaining);
           // The next dispatch can admit a complete cached loop when a
           // short remainder would otherwise leave its vCPU inside it.
           const bool preserve = preserve_loop_entries && used + steps == grant;
@@ -1753,8 +1869,10 @@ class PcMotherboardC06 {
           else pc_.run(steps, deadline, preserve, &lock);
           const auto retired = processor_steps(id) - before;
           progress[worker] += retired;
-          if (retired < steps) break;
-          used += steps;
+          if (!retired) break;
+          used += unsigned(retired);
+          if (retired < steps && !(id && steps < remaining && active_clock_running_ &&
+                                  grouped_loop_candidate(*apic.cpu))) break;
         }
       }
     });
@@ -1872,7 +1990,7 @@ class PcMotherboardC06 {
       if(prior_tick_)prior_tick_();
       poll();
       if (target_projection_hook_ && pc_.cpu.halted && !pc_.cpu.flag(cosmic_pc::Cpu::IF) &&
-          !secondary_can_run()) pc_.yield_after_instruction();
+          (!secondary_can_run() || (active_clock_running_ && !prior_tick_))) pc_.yield_after_instruction();
       // A guest can enter and leave protected mode inside a single Android slice.
       observe_guest_clock_mode(pc_.cpu);
     };
@@ -1988,6 +2106,11 @@ class PcMotherboardC06 {
   std::uint64_t secondary_zero_steps() const noexcept { return secondary_zero_steps_; }
   std::uint64_t secondary_multiply_steps() const noexcept { return secondary_multiply_steps_; }
   std::uint64_t parallel_mixed_batches() const noexcept { return parallel_mixed_batches_; }
+  std::uint64_t paired_loop_blocks() const noexcept { return paired_loop_blocks_; }
+  std::uint64_t paired_loop_steps() const noexcept { return paired_loop_steps_; }
+  const LoopTiming& loop_timing() const noexcept { return loop_timing_; }
+  std::uint64_t worker_loop_blocks() const noexcept { return worker_loop_blocks_; }
+  std::uint64_t worker_loop_steps() const noexcept { return worker_loop_steps_; }
   unsigned longest_parallel_register_slice() const noexcept { return longest_parallel_register_slice_; }
   const cosmic_pc::Cpu* faulted_cpu() const noexcept {
     return faulted_processor_ ? apics_[*faulted_processor_].cpu : nullptr;
@@ -2095,6 +2218,7 @@ class PcMotherboardC06 {
     }
     // The budget counts work across the whole VM. Small calls keep a rotating
     // position so that every runnable processor gets a turn.
+    bool register_peer = false;
     while (budget && !faulted_processor_ && !pc_.cpu.fault && !powered_off_ &&
            pc_.guest_restart() == cosmic_pc::PcMachine::GuestRestart::None) {
       if(timed&&Clock::now()>=deadline)return;
@@ -2115,6 +2239,29 @@ class PcMotherboardC06 {
       // their unused grants to runnable processors and poll again within the
       // original per-processor quantum, including when only the BSP is awake.
       const auto dispatch_budget = sleeping ? std::min(budget, count * kSmpQuantum) : budget;
+      if (count == 2 && !sleeping) {
+        const auto id = runnable[1];
+        if (active_clock_running_ && pc_.boot_acceleration_enabled() && apics_[id].startup_vector &&
+            dispatch_budget >= 2 * kSmpQuantum && pc_.guest_execution_available()) {
+          // A SIPI starts in 16-bit firmware. Service its first bounded slice
+          // here before waking workers for two running instruction streams.
+          const auto grant = std::min(dispatch_budget / 2, 128U);
+          const auto before = total_processor_steps();
+          register_peer = false;
+          run_bsp(grant, deadline);
+          if (!pc_.guest_execution_available() || powered_off_) return;
+          run_secondary(id, grant, deadline, false);
+          const auto retired = unsigned(total_processor_steps() - before);
+          if (retired) { budget -= retired; continue; }
+        }
+        if (const auto retired = run_paired_loop(runnable[1], dispatch_budget, deadline, register_peer)) {
+          budget -= retired;
+          if (timed && pc_.cpu.halted && !pc_.cpu.flag(cosmic_pc::Cpu::IF) && budget < kMinCooperativeGrant &&
+              grouped_loop_candidate(*apics_[runnable[1]].cpu)) return;
+          continue;
+        }
+      }
+      register_peer = false;
       // In Android's host-clock mode a halted BSP still polls the devices.
       // If only one AP is awake, give it the unused guest-instruction budget.
       // Resample the BSP within one normal quantum so a new IRQ can wake it.

@@ -16,6 +16,12 @@ using cosmic_pc::PcMachine;
 using reverse_windows::AcpiC06;
 using reverse_windows::PcMotherboardC06;
 
+#if !defined(PRIME_R106_BASELINE) && !defined(PRIME_R105_BASELINE) && !defined(PRIME_R103_BASELINE) && !defined(PRIME_R102_BASELINE) && !defined(PRIME_R101_BASELINE)
+#define PRIME_HAS_R107_GRANTS 1
+#else
+#define PRIME_HAS_R107_GRANTS 0
+#endif
+
 namespace {
 constexpr auto kLapic = PcMotherboardC06::kLocalApic;
 constexpr unsigned kProcessors = 16;
@@ -526,7 +532,7 @@ void start_long_mode_smp_guest(Cpu& cpu) {
 enum class SecondaryWork { Registers, Copy, Scan };
 
 // A fixed IPI gives each version the same request, independent of host speed.
-void measure_secondary_irq_work(SecondaryWork work, bool pending) {
+void measure_secondary_irq_work(SecondaryWork work, bool pending, unsigned grant = 8192, bool irq_during_scan = false) {
     const bool copy = work == SecondaryWork::Copy;
     const bool scan = work == SecondaryWork::Scan;
     constexpr unsigned vector = 0xd1, handler = 0x18000, idt = 0x15000;
@@ -558,18 +564,25 @@ void measure_secondary_irq_work(SecondaryWork work, bool pending) {
         0x50, 0x8b,0x04,0x25,0,0x40,1,0, 0x89,0x04,0x25,4,0x40,1,0,
         0xc7,0x83,0xb0,0,0,0,0,0,0,0, 0x58,0x48,0xcf
     };
-    cpu.memory.write_block(handler, irq, sizeof(irq));
+    if (irq_during_scan) {
+        // Capture the AP's published scan count at interrupt entry and EOI.
+        constexpr std::uint8_t observe[]{0x50,0x8b,0x04,0x25,0xd8,0x2e,1,0,
+            0x89,0x04,0x25,0x1c,0x40,1,0,0xc7,0x83,0xb0,0,0,0,0,0,0,0,0x58,0x48,0xcf};
+        cpu.memory.write_block(handler, observe, sizeof(observe));
+    } else {
+        cpu.memory.write_block(handler, irq, sizeof(irq));
+    }
     std::vector<std::uint8_t> program{
         0xbc,0,0,0x1f,0,                         // MOV ESP,1F0000h.
         0x0f,0x01,0x1c,0x25,0x80,0x51,0,0,       // LIDT [5180h].
         0xbb,0,0,0xe0,0xfe,                      // EBX = LAPIC MMIO base.
         0xc7,0x83,0xf0,0,0,0,0xff,1,0,0,        // Enable the LAPIC.
-        0xc7,0x83,0x80,0,0,0,0xf0,0,0,0         // TPR = F0h masks D1h.
+        0xc7,0x83,0x80,0,0,0,std::uint8_t(irq_during_scan ? 0 : 0xf0),0,0,0  // AP interrupt priority.
     };
     const auto emit = [&](std::initializer_list<std::uint8_t> code) {
         program.insert(program.end(), code);
     };
-    if (pending) emit({0xc7,0x83,0,3,0,0,0xd1,0,4,0});  // Send D1h to self.
+    if (pending && !irq_during_scan) emit({0xc7,0x83,0,3,0,0,0xd1,0,4,0});  // Send D1h to self.
     emit({0xfb,0x90,0x31,0xd2});                           // STI; NOP; XOR EDX,EDX.
     std::uint32_t expected = 0;
     std::vector<std::uint8_t> pattern;
@@ -609,7 +622,13 @@ void measure_secondary_irq_work(SecondaryWork work, bool pending) {
     install_long_mode_smp_guest(cpu, program.data(), program.size());
     start_long_mode_smp_guest(cpu);
     cpu.eip = 0x7000;
-    if (scan) {
+    if (irq_during_scan) {
+        // Wait for at least 8192 bytes, then send a directed IPI from the BSP.
+        constexpr std::uint8_t sender[]{
+            0x81,0x3c,0x25,0xd8,0x2e,1,0,0,0x20,0,0,0x72,0xf3,0xbf,0,0,0xe0,0xfe,
+            0xc7,0x87,0x10,3,0,0,0,0,0,1,0xc7,0x87,0,3,0,0,0xd1,0,0,0,0xf4};
+        cpu.memory.write_block(0x7000, sender, sizeof(sender));
+    } else if (scan) {
         // A fixed amount of register work keeps the BSP runnable alongside the AP.
         constexpr std::uint8_t bsp[]{0xb9,0,0,2,0, 0xff,0xc9,0x75,0xfc,0xf4};
         cpu.memory.write_block(0x7000, bsp, sizeof(bsp));
@@ -619,17 +638,27 @@ void measure_secondary_irq_work(SecondaryWork work, bool pending) {
     const auto bsp_start = cpu.instructions;
     const auto begin = PcMachine::RunClock::now();
     const auto deadline = begin + std::chrono::seconds(15);
+    unsigned calls = 0;
     while ((board.secondary_can_run() || (scan && !cpu.halted)) && PcMachine::RunClock::now() < deadline &&
            !board.faulted_cpu() && !cpu.fault) {
-        board.run(8192, std::min(deadline, PcMachine::RunClock::now() + std::chrono::milliseconds(8)));
+        ++calls;
+        board.run(grant, std::min(deadline, PcMachine::RunClock::now() + std::chrono::milliseconds(8)));
     }
     const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         PcMachine::RunClock::now() - begin).count();
     if (const auto* fault = board.faulted_cpu()) throw std::runtime_error(fault->fault->describe());
     const auto flags = cpu.read32(0x14008);
+    bool dispatched = board.threaded_smp_stats().dispatches != 0;
+#if PRIME_HAS_R107_GRANTS
+    // A parked BSP has only its HLT to retire. The AP can run on the
+    // calling lane after SIPI without waking a second physical worker.
+    const bool single_active_ap = !scan && cpu.halted && !cpu.flag(Cpu::IF) &&
+                                  cpu.instructions == bsp_start + 1 && board.startup_ipis().sipi_targets_applied == 1;
+    dispatched = dispatched || (scan && board.paired_loop_blocks()) || single_active_ap;
+#endif
     require(!cpu.fault && board.processors_started() == 2 && !board.secondary_can_run() &&
-            board.threaded_smp_stats().dispatches && cpu.read32(0x14000) == 2 &&
-            cpu.read32(0x14004) == unsigned(pending) && board.evidence().apic_irqs == unsigned(pending) &&
+            dispatched && cpu.read32(0x14000) == 2 &&
+            cpu.read32(0x14004) == unsigned(pending && !irq_during_scan) && board.evidence().apic_irqs == unsigned(pending) &&
             cpu.read32(0x1400c) == expected && cpu.read32(0x14010) == 0 &&
             (flags & (Cpu::IF | Cpu::ZF)) == (Cpu::IF | Cpu::ZF),
             "AP arithmetic, retirement boundary or deferred IPI changed");
@@ -643,7 +672,7 @@ void measure_secondary_irq_work(SecondaryWork work, bool pending) {
         for (const auto byte : result) checksum = (checksum ^ byte) * 16777619U;
     }
     if (scan) {
-        require(cpu.halted && cpu.regs[Cpu::ECX] == 0 && cpu.instructions - bsp_start == 2 * bytes + 2 &&
+        require(cpu.halted && (irq_during_scan || (cpu.regs[Cpu::ECX] == 0 && cpu.instructions - bsp_start == 2 * bytes + 2)) &&
                 cpu.read32(scan_count) == bytes && cpu.read32(0x14014) == bytes &&
                 cpu.read32(0x14018) == bytes && cpu.read8(scan_count - 1) == 0xa6 &&
                 cpu.read8(scan_count + 4) == 0x5b, "secondary scan changed RAM or registers");
@@ -658,13 +687,31 @@ void measure_secondary_irq_work(SecondaryWork work, bool pending) {
     if (work == SecondaryWork::Registers && Cpu::ether_arm64_host())
         require(native > iterations * 4, "inactive AP ARM64 route with IF set");
 #endif
+    if (irq_during_scan) {
+        const auto sampled = cpu.read32(0x1401c);
+        // The polling BSP gets its ordinary turn within the next 1024
+        // scanned bytes, even when other pairs can use wider register grants.
+        require(sampled >= 8192 && sampled <= 8192 + 1024, "IPI must observe the scan within its normal turn");
+        std::cout << "SMP_SCAN_LIVE_IRQ_PASS bytes_at_entry=" << sampled << " total_bytes=" << bytes << " irq=1 eoi=1\n";
+        return;
+    }
     if (scan) {
         std::uint64_t grouped = 0;
 #if !defined(PRIME_R105_BASELINE) && !defined(PRIME_R103_BASELINE) && !defined(PRIME_R102_BASELINE) && !defined(PRIME_R101_BASELINE)
         grouped = board.secondary_scan_steps();
         require(grouped > bytes * 3 && grouped <= bytes * 6, "secondary scan did not batch its guest work");
 #endif
+        std::uint64_t coop_blocks = 0, coop_steps = 0, block_ns = 0, block_steps = 0;
+#if PRIME_HAS_R107_GRANTS
+        coop_blocks = board.paired_loop_blocks();
+        coop_steps = board.paired_loop_steps();
+        block_ns = board.loop_timing().last_ns;
+        block_steps = board.loop_timing().last_steps;
+#endif
         std::cout << "AP_SCAN_SAMPLE pending=" << pending << " grouped=" << grouped
+                  << " grant=" << grant << " calls=" << calls << " cooperative_blocks=" << coop_blocks
+                  << " cooperative_steps=" << coop_steps << " worker_dispatches=" << board.threaded_smp_stats().dispatches
+                  << " sampled_block_ns=" << block_ns << " sampled_block_steps=" << block_steps
                   << " bsp_steps=" << (cpu.instructions - bsp_start);
     } else {
         std::cout << "SMP_IRQ_SAMPLE work=" << (copy ? "rep" : "registers") << " pending=" << pending;
@@ -674,6 +721,65 @@ void measure_secondary_irq_work(SecondaryWork work, bool pending) {
               << " rep=" << rep << " checksum=" << checksum << " flags=" << flags
               << " deliveries=" << board.evidence().apic_irqs << '\n';
 }
+
+#if PRIME_HAS_R107_GRANTS
+// Three APs scan independent dense ranges across guest pages on two host
+// lanes. Each publishes its first match and a count to its own RAM record.
+void test_multi_ap_scans() {
+    constexpr unsigned cores = 4, bytes = 65536, job_base = 0x40000;
+    PcMachine pc(4U << 20);
+    pc.boot_long_mode_demo();
+    pc.run(4000);
+    auto& cpu = pc.cpu;
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {cores, 1}, true);
+    pc.enable_boot_acceleration();
+    cpu.enable_page_translation_cache();
+    cpu.enable_ether_arm64_blocks();
+    board.enable_active_clock();
+    board.enable_threaded_smp(2);
+    board.enable_execution_target();
+    constexpr std::uint8_t program[]{
+        0xb8,1,0,0,0,0x0f,0xa2,0xc1,0xeb,0x18,              // CPUID -> APIC ID in EBX.
+        0xc1,0xe3,4,0x8d,0xbb,0,0,4,0,                     // EDI = job_base + 16 * id.
+        0x8b,0x17,0x44,0x8b,0x4f,4,0x31,0xc0,0x31,0xc9,    // Cursor, output base and count.
+        0x44,0x8d,0x40,1,0x48,0xff,0xc2,0x41,0x8b,0xc0,
+        0x41,0x89,0x81,0xd8,0x2e,0,0,0x80,0x3a,0xe8,0x75,0xea,
+        0x89,0x57,8,0x44,0x89,0x47,12,0xfa,0xf4
+    };
+    install_long_mode_smp_guest(cpu, program, sizeof(program));
+    for (unsigned id=1; id<cores; ++id) {
+        const unsigned start = 0x80000 + id * 0x20000 + 4090;
+        const unsigned match = bytes - 257 * id;
+        const unsigned job = job_base + 16 * id;
+        std::vector<std::uint8_t> data(bytes, 0);
+        for (unsigned i=0; i<bytes; ++i) data[i] = std::uint8_t((i * 29 + id) & 127);
+        data[match] = data[match + 1] = 0xe8;
+        cpu.memory.write_block(start, data.data(), bytes);
+        cpu.write32(job, start - 1);
+        cpu.write32(job + 4, 0x60000 + 8 * id - 0x2ed8);
+        cpu.write64(0x60000 + 8 * id, UINT64_MAX);
+    }
+    start_long_mode_smp_guest(cpu);
+    cpu.write8(0x7000, 0xf4);
+    cpu.eip = 0x7000;
+    for (unsigned turn=0; turn<1000 && board.secondary_can_run(); ++turn)
+        board.run(8192, PcMachine::RunClock::now() + std::chrono::milliseconds(8));
+    require(!board.secondary_can_run() && !board.faulted_cpu() && !cpu.fault &&
+            board.processors_started()==cores, "all dense scans must finish");
+    for (unsigned id=1; id<cores; ++id) {
+        const auto job = job_base + 16 * id;
+        const unsigned match = bytes - 257 * id;
+        require(cpu.read32(job + 8) == cpu.read32(job) + match + 1 &&
+                cpu.read32(job + 12) == match + 1 && cpu.read32(0x60000 + 8 * id) == match + 1 &&
+                cpu.read32(0x60004 + 8 * id) == UINT32_MAX, "first match, count or adjacent RAM changed");
+    }
+    require(board.worker_loop_blocks() && board.worker_loop_steps() > bytes &&
+            board.threaded_smp_stats().peak_workers == 2 && board.loop_timing().samples &&
+            board.loop_timing().last_steps, "checked scans must execute on the bounded workers");
+    std::cout << "SMP_DENSE_SCAN_PASS aps=3 host_workers=2 first_match=1 worker_steps="
+              << board.worker_loop_steps() << '\n';
+}
+#endif
 
 void test_secondary_streaming_stores(bool threaded) {
     constexpr unsigned source = 0xa000, destination = 0xb000, rounds = 16;
@@ -1342,6 +1448,12 @@ int main(int argc, char** argv) {
             measure_secondary_irq_work(SecondaryWork::Copy, true);
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--measure-ap-scan-grants") {
+            for (const unsigned grant : {8192U, 0x7fffffffU}) {
+                for (bool pending : {false, true}) measure_secondary_irq_work(SecondaryWork::Scan, pending, grant);
+            }
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--measure-ap-scan") {
             measure_secondary_irq_work(SecondaryWork::Scan, false);
             measure_secondary_irq_work(SecondaryWork::Scan, true);
@@ -1397,6 +1509,10 @@ int main(int argc, char** argv) {
         test_mixed_parallel_and_shared_writes(2, false, true);
         test_mixed_parallel_and_shared_writes(0, true, false);
         test_parallel_register_continuations();
+#if PRIME_HAS_R107_GRANTS
+        test_multi_ap_scans();
+        measure_secondary_irq_work(SecondaryWork::Scan, true, 8192, true);
+#endif
         test_parallel_ram_vectors(false);
         test_parallel_ram_vectors(true);
         test_parallel_ram_vectors(true, 8);

@@ -741,7 +741,14 @@ class AndroidBootSession final {
         << ",\"secondary_scan_loop_steps\":" << board_->secondary_scan_steps()
         << ",\"secondary_shift_loop_steps\":" << board_->secondary_shift_steps()
         << ",\"secondary_zero_loop_steps\":" << board_->secondary_zero_steps()
-        << ",\"secondary_wide_multiply_loop_steps\":" << board_->secondary_multiply_steps();
+        << ",\"secondary_wide_multiply_loop_steps\":" << board_->secondary_multiply_steps()
+        << ",\"cooperative_loop_blocks\":" << board_->paired_loop_blocks()
+        << ",\"cooperative_loop_steps\":" << board_->paired_loop_steps()
+        << ",\"worker_loop_blocks\":" << board_->worker_loop_blocks()
+        << ",\"worker_loop_steps\":" << board_->worker_loop_steps()
+        << ",\"loop_time_samples\":" << board_->loop_timing().samples
+        << ",\"loop_last_ns\":" << board_->loop_timing().last_ns
+        << ",\"loop_last_steps\":" << board_->loop_timing().last_steps;
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     const auto ether = pc_.cpu.ether_next_stats();
     out << ",\"neon_requested\":" << (pc_.cpu.ether_next_enabled() ? "true" : "false")
