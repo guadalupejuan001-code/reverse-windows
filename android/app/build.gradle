@@ -5,7 +5,7 @@ plugins {
 }
 
 def etherPreview = providers.gradleProperty('etherPreview').map { it == 'true' }.getOrElse(false)
-def appVersion = '0.3.82'
+def appVersion = '0.3.83'
 def dependencyLock = rootProject.layout.projectDirectory.file('../config/dependencies.lock.json')
 def dependencies = new JsonSlurper().parseText(providers.fileContents(dependencyLock).asText.get())
 def mundoXSha = dependencies.components.find { it.key == 'mundo_x' }?.commit
@@ -13,16 +13,23 @@ if (!(mundoXSha ==~ /[0-9a-f]{40}/)) {
     throw new GradleException('A full Mundo X commit is required in config/dependencies.lock.json')
 }
 
+def componentAssets = layout.buildDirectory.dir('generated/pinnedComponentAssets')
+def copyPinnedComponents = tasks.register('copyPinnedComponents', Sync) {
+    from(dependencyLock)
+    into(componentAssets)
+}
+
 android {
+    sourceSets.main.assets.srcDir(componentAssets)
     namespace 'com.reversewindows.android'
     compileSdk 35
     ndkVersion '27.2.12479018'
 
     defaultConfig {
-        applicationId(etherPreview ? 'com.reversewindows.android.prime.smp.r107' : 'com.reversewindows.android')
+        applicationId(etherPreview ? 'com.reversewindows.android.prime.smp.r108' : 'com.reversewindows.android')
         minSdk 26
         targetSdk 35
-        versionCode 112
+        versionCode 113
         versionName appVersion
         testInstrumentationRunner 'com.reversewindows.android.VbeRenderTest'
         manifestPlaceholders = [appLabel: etherPreview ? 'REVERSE Windows Prime ' + appVersion : 'REVERSE Windows']
@@ -52,4 +59,8 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+}
+
+tasks.named('preBuild').configure {
+    dependsOn(copyPinnedComponents)
 }

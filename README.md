@@ -23,6 +23,8 @@ En **Prime r106**, los procesadores secundarios agrupan búsquedas, desplazamien
 
 El dispositivo PCI acepta circuitos Clifford de 1 a 64 puertas sobre el estado cuántico compartido por CPU y VRAM. El invitado puede enviarlos mediante `RWGPU_QUANTUM_BLOCK` o mediante DMA con `RWGPU_DMA_QUANTUM_BLOCK`. Los controles y destinos se expresan como posiciones de bits. Un registro inválido rechaza el circuito completo. [Formato de los registros](src/c08_gpu_protocol.h) · [Protocolo DMA](src/c08_gpu_dma.h)
 
+En **Prime r108**, las vCPU ARM64 ejecutan en paralelo bucles x86 que leen o escriben palabras de RAM en direcciones estables. Cada trabajador captura sus entradas, libera el bus y conserva sus escrituras hasta validar los datos, el código y las traducciones. Si hay conflicto, el motor vuelve a ejecutar desde el último estado confirmado. La placa conserva el orden de las interrupciones y el acceso a dispositivos. **Telemetría → CPU** muestra pasos fuera del bus, conflictos y espera muestreada. El APK incluye las revisiones de sus cuatro componentes en `assets/dependencies.lock.json`.
+
 En **Prime r107**, una vCPU secundaria puede completar un bloque validado de RAM bajo el mismo turno del bus. La placa respeta la prioridad de las interrupciones y los temporizadores de los otros procesadores. **Telemetría → CPU** muestra la duración real y los pasos del último bloque muestreado. La comparación de versiones mide aparte el trabajo completo de dos vCPU, incluido el arranque de la secundaria y la entrega de la interrupción.
 
 ## Correcciones de arranque

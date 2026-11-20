@@ -636,6 +636,12 @@ class AndroidBootSession final {
         << ",\"phase_ether_arm64_steps\":" << execution.ether_steps
         << ",\"phase_projected_steps\":" << execution.projected_steps
         << ",\"vcpus_with_projected_steps\":" << execution.processors_with_projected_steps
+        << ",\"off_bus_ram_blocks\":" << execution.ram_views.blocks
+        << ",\"off_bus_ram_steps\":" << execution.ram_views.steps
+        << ",\"ram_view_conflicts\":" << execution.ram_views.conflicts
+        << ",\"sampled_bus_grants\":" << execution.bus_samples
+        << ",\"sampled_bus_contentions\":" << execution.bus_contended
+        << ",\"sampled_bus_wait_ns\":" << execution.bus_wait_ns
         << ",\"parallel_register_batches\":" << board_->parallel_register_batches()
         << ",\"parallel_register_steps\":" << board_->parallel_register_steps()
         << ",\"parallel_register_continuations\":" << board_->parallel_register_continuations()
@@ -652,6 +658,15 @@ class AndroidBootSession final {
       out << ",\"states_by_logical_processor\":[";
       for (unsigned id = 0; id < topology.logical_processors(); ++id)
         out << (id ? "," : "") << '"' << board_->processor_state(id) << '"';
+      out << "],\"bus_by_logical_processor\":[";
+      for (unsigned id = 0; id < topology.logical_processors(); ++id) {
+        const auto& wait = board_->processor_bus_wait(id);
+        const auto views = board_->processor_ram_views(id);
+        out << (id ? "," : "") << "{\"grants\":" << wait.grants << ",\"samples\":" << wait.samples
+            << ",\"contended\":" << wait.contended << ",\"wait_ns\":" << wait.wait_ns
+            << ",\"max_ns\":" << wait.max_ns << ",\"off_bus_ram_steps\":" << views.steps
+            << ",\"ram_view_conflicts\":" << views.conflicts << '}';
+      }
       out << "],\"steps_by_logical_processor\":[";
       for (unsigned id = 0; id < topology.logical_processors(); ++id)
         out << (id ? "," : "") << board_->processor_steps(id);

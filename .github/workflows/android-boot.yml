@@ -150,6 +150,7 @@ jobs:
           mkdir -p "$out"
           apk_name="REVERSE-Windows-Prime-$ANDROID_VERSION-$ANDROID_ABI.apk"
           cp "$apk" "$out/$apk_name"
+          unzip -p "$apk" assets/dependencies.lock.json | cmp - config/dependencies.lock.json
           "$tools/apksigner" verify --verbose --print-certs "$apk" | tee "$out/signature.txt"
           grep -Fxq 'Number of signers: 1' "$out/signature.txt"
           signer_sha256=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$out/signature.txt")
@@ -167,6 +168,9 @@ jobs:
           entry="lib/$ANDROID_ABI/libreverse_windows_android.so"
           unzip -p "$apk" "$entry" > "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq "$MUNDO_X_SHA" "$RUNNER_TEMP/reverse-windows-android.so"
+          for field in off_bus_ram_steps ram_view_conflicts bus_by_logical_processor sampled_bus_wait_ns; do
+            grep -aFq "$field" "$RUNNER_TEMP/reverse-windows-android.so"
+          done
           grep -aFq 'code_version_hits' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'code_byte_checks' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'code_bytes_read' "$RUNNER_TEMP/reverse-windows-android.so"
@@ -248,10 +252,12 @@ jobs:
           apk=android/app/build/outputs/apk/debug/app-debug.apk
           log="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/android-runtime.log"
           trap 'adb logcat -d > "$log"' EXIT
-          device_dir=/data/local/tmp/reverse-prime-r107
+          device_dir=/data/local/tmp/reverse-prime-r108
           adb shell mkdir -p "$device_dir"
           adb push "$RUNNER_TEMP/ether-gpu-device/reverse_windows_smp_guest_test" "$device_dir/ether-smp"
           adb shell chmod 755 "$device_dir/ether-smp"
+          adb shell "TMPDIR=$device_dir $device_dir/ether-smp --measure-ram-views" | tee "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ram-views.log"
+          test "$(grep -c '^RAM_VIEW_SAMPLE ' "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ram-views.log")" = 3
           adb shell "TMPDIR=$device_dir $device_dir/ether-smp --measure-ap-scan-grants" | tee "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ap-scan-grants.log"
           test "$(grep -c '^AP_SCAN_SAMPLE ' "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ap-scan-grants.log")" = 4
           adb push "$RUNNER_TEMP/ether-gpu-device/reverse_windows_prime_gpu_guest_test" "$device_dir/ether-gpu"

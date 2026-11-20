@@ -73,6 +73,17 @@ class PcMotherboardC06 {
     std::uint64_t samples = 0, last_ns = 0;
     unsigned last_steps = 0;
   };
+  struct RamViewStats {
+    std::uint64_t blocks = 0, steps = 0, conflicts = 0;
+    void add(const RamViewStats& other) noexcept {
+      blocks += other.blocks;
+      steps += other.steps;
+      conflicts += other.conflicts;
+    }
+  };
+  struct alignas(64) BusWaitStats {
+    std::uint64_t grants = 0, samples = 0, contended = 0, wait_ns = 0, max_ns = 0;
+  };
   struct ThreadedSmpStats {
     std::uint64_t dispatches = 0, guest_steps = 0;
     unsigned last_workers = 0, peak_workers = 0;
@@ -305,6 +316,8 @@ class PcMotherboardC06 {
   std::array<std::unique_ptr<cosmic_pc::Cpu>, kMaxProcessors> secondary_cpus_{};
   std::array<LocalApic, kMaxProcessors> apics_;
   std::array<LapicVectorStats, 256> lapic_vectors_{};
+  std::array<RamViewStats, kMaxProcessors> ram_views_before_init_{};
+  std::array<BusWaitStats, kMaxProcessors> bus_wait_{};
   std::array<std::uint64_t, kMaxProcessors> retired_before_init_{};
   std::array<std::uint64_t, kMaxProcessors> ether_steps_before_init_{};
   std::array<std::uint64_t, kMaxProcessors> state_vector_steps_before_init_{};
@@ -386,6 +399,8 @@ class PcMotherboardC06 {
       secondary_cpus_[id]->reset(0, 0);
       apics_[id] = LocalApic{secondary_cpus_[id].get()};
     }
+    ram_views_before_init_.fill({});
+    bus_wait_.fill({});
     retired_before_init_.fill(0);
     ether_steps_before_init_.fill(0);
     state_vector_steps_before_init_.fill(0);
@@ -1407,6 +1422,7 @@ class PcMotherboardC06 {
     if (apic.init_pending) {
       const auto id = cpu.apic_id();
       const auto sipi = apic.startup_vector;
+      ram_views_before_init_[id] = processor_ram_views(id);
       retired_before_init_[id] += cpu.instructions;
       ether_steps_before_init_[id] += cpu.ether_arm64_stats().steps;
       const auto& interpreter = cpu.state_vector_interpreter_stats();
@@ -1828,8 +1844,8 @@ class PcMotherboardC06 {
     if (!workers_) workers_ = std::make_shared<SmpWorkers>(host_workers_capacity());
 
     // Each CPU stays on its worker for the dispatch. The bus protects RAM,
-    // devices and IRQ delivery. Only native register work can drop the lock,
-    // and it validates its code again before committing the private frame.
+    // devices and IRQ delivery. Native blocks can release it for private
+    // registers or a validated private view of fixed-address RAM words.
     const cosmic_pc::MemoryFabric::ExclusiveRamReads exclusive(pc_.cpu.memory);
     std::mutex bus;
     std::array<std::uint64_t, kMaxProcessors> progress{};
@@ -1839,7 +1855,21 @@ class PcMotherboardC06 {
       for (unsigned position = worker; position < jobs; position += workers) {
         const auto id = ready[rotate_smp_job(position, jobs, rotation)];
         for (unsigned used = 0; used < grant;) {
-          std::unique_lock<std::mutex> lock(bus);
+          std::unique_lock<std::mutex> lock(bus, std::defer_lock);
+          auto& wait = bus_wait_[id];
+          if ((wait.grants++ & 63U) == 0) {
+            ++wait.samples;
+            if (!lock.try_lock()) {
+              const auto started = Clock::now();
+              lock.lock();
+              const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started).count();
+              ++wait.contended;
+              wait.wait_ns += ns;
+              wait.max_ns = std::max(wait.max_ns, std::uint64_t(ns));
+            }
+          } else {
+            lock.lock();
+          }
           if (faulted_processor_ || !pc_.guest_execution_available() ||
               (deadline != Clock::time_point::max() && Clock::now() >= deadline)) return;
           const auto remaining = grant - used;
@@ -2173,6 +2203,13 @@ class PcMotherboardC06 {
   std::uint64_t processor_steps(unsigned id) const noexcept {
     return apics_[id].cpu->instructions + retired_before_init_[id];
   }
+  const BusWaitStats& processor_bus_wait(unsigned id) const noexcept { return bus_wait_[id]; }
+  RamViewStats processor_ram_views(unsigned id) const noexcept {
+    auto result = ram_views_before_init_[id];
+    const auto& cpu = apics_[id].cpu->ether_arm64_stats();
+    result.add({cpu.off_bus_ram_blocks, cpu.off_bus_ram_steps, cpu.ram_view_conflicts});
+    return result;
+  }
   std::uint64_t processor_ether_arm64_steps(unsigned id) const noexcept {
     return apics_[id].cpu->ether_arm64_stats().steps + ether_steps_before_init_[id];
   }
@@ -2188,10 +2225,17 @@ class PcMotherboardC06 {
     std::uint64_t guest_steps = 0, ether_steps = 0, projected_steps = 0;
     std::uint64_t state_vector_interpreter_steps = 0;
     unsigned processors_with_projected_steps = 0;
+    RamViewStats ram_views;
+    std::uint64_t bus_samples = 0, bus_contended = 0, bus_wait_ns = 0;
   };
   CpuExecutionTotals cpu_execution_totals() const noexcept {
     CpuExecutionTotals totals;
     for (unsigned id = 0; id < processor_count_; ++id) {
+      totals.ram_views.add(processor_ram_views(id));
+      const auto& wait = bus_wait_[id];
+      totals.bus_samples += wait.samples;
+      totals.bus_contended += wait.contended;
+      totals.bus_wait_ns += wait.wait_ns;
       const auto projected = processor_state_vector_steps(id);
       totals.guest_steps += processor_steps(id);
       totals.ether_steps += processor_ether_arm64_steps(id);
