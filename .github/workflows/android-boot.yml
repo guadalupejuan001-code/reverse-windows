@@ -8,6 +8,7 @@ on:
       - "tests/**"
       - "config/dependencies.lock.json"
       - "scripts/verify_deps.py"
+      - "scripts/prepare_quantum_ram_compat.py"
       - "cmake/**"
       - "CMakeLists.txt"
       - ".github/workflows/android-boot.yml"
@@ -18,6 +19,7 @@ on:
       - "tests/**"
       - "config/dependencies.lock.json"
       - "scripts/verify_deps.py"
+      - "scripts/prepare_quantum_ram_compat.py"
       - "cmake/**"
       - "CMakeLists.txt"
       - ".github/workflows/android-boot.yml"
@@ -68,6 +70,7 @@ jobs:
             -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" \
             -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
           cmake --build build --target reverse_windows_android_boot_session_test \
+            reverse_windows_quantum_ram_authority_test reverse_windows_ether_state_ram_integration_test reverse_windows_ether_state_ram_test \
             reverse_windows_ether_core_rules_test reverse_windows_prime_ether_arm64_test reverse_windows_sparse_ram_test \
             reverse_windows_sparse_ram_pressure_test \
             reverse_windows_atapi_cdrom_guest_test reverse_windows_c06_motherboard_guest_test \
@@ -83,7 +86,7 @@ jobs:
             reverse_windows_x86_x87_state_test reverse_windows_c09r1_fxstate_test \
             reverse_windows_x86_ether_counter_loop_test --parallel 2
           ctest --test-dir build --output-on-failure \
-            -R '^(reverse_windows_android_|reverse_windows_ether_core_rules$|reverse_windows_prime_ether_arm64$|reverse_windows_sparse_ram(_pressure)?$|reverse_windows_pc_video$|reverse_windows_c04_real_guest_idt$|reverse_windows_c06_real_motherboard$|reverse_windows_smp_guest$|reverse_windows_protected_entry_stack$|reverse_windows_protected_real_transition$|reverse_windows_cpu_profile$|reverse_windows_lock_rmw$|reverse_windows_x64_optical_qssd$|reverse_windows_x86_(far_transfer64|system64|long_mode|long_null_ss|sse|mmx|x87|ether_counter_loop$)|reverse_windows_x86_c09r1_stage5_cvt_fxsr$|reverse_windows_c09r1_x87_fxsave_context$)'
+            -R '^(reverse_windows_android_|reverse_windows_quantum_ram_authority$|reverse_windows_ether_state_ram(_integration)?$|reverse_windows_ether_core_rules$|reverse_windows_prime_ether_arm64$|reverse_windows_sparse_ram(_pressure)?$|reverse_windows_pc_video$|reverse_windows_c04_real_guest_idt$|reverse_windows_c06_real_motherboard$|reverse_windows_smp_guest$|reverse_windows_protected_entry_stack$|reverse_windows_protected_real_transition$|reverse_windows_cpu_profile$|reverse_windows_lock_rmw$|reverse_windows_x64_optical_qssd$|reverse_windows_x86_(far_transfer64|system64|long_mode|long_null_ss|sse|mmx|x87|ether_counter_loop$)|reverse_windows_x86_c09r1_stage5_cvt_fxsr$|reverse_windows_c09r1_x87_fxsave_context$)'
       - name: Install Android command-line tools and pinned packages
         uses: android-actions/setup-android@v3
         with:
@@ -115,7 +118,7 @@ jobs:
               sys.exit("GPU benchmark needs 16 KB load alignment")'
       - uses: actions/upload-artifact@v4
         with:
-          name: prime-r105-on-device-gpu-${{ matrix.abi }}
+          name: prime-r109-on-device-gpu-${{ matrix.abi }}
           path: ${{ runner.temp }}/ether-gpu-device/reverse_windows_prime_gpu_guest_test
           if-no-files-found: error
       - name: Read Prime APK identity from Gradle
@@ -170,6 +173,8 @@ jobs:
           entry="lib/$ANDROID_ABI/libreverse_windows_android.so"
           unzip -p "$apk" "$entry" > "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq "$MUNDO_X_SHA" "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'memory_backend' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'ether-state-ram' "$RUNNER_TEMP/reverse-windows-android.so"
           for field in off_bus_ram_steps ram_view_conflicts bus_by_logical_processor sampled_bus_wait_ns; do
             grep -aFq "$field" "$RUNNER_TEMP/reverse-windows-android.so"
           done
@@ -254,7 +259,7 @@ jobs:
           apk=android/app/build/outputs/apk/debug/app-debug.apk
           log="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/android-runtime.log"
           trap 'adb logcat -d > "$log"' EXIT
-          device_dir=/data/local/tmp/reverse-prime-r108
+          device_dir=/data/local/tmp/reverse-prime-r109
           adb shell mkdir -p "$device_dir"
           adb push "$RUNNER_TEMP/ether-gpu-device/reverse_windows_smp_guest_test" "$device_dir/ether-smp"
           adb shell chmod 755 "$device_dir/ether-smp"
@@ -316,6 +321,15 @@ jobs:
 
           report = json.loads(pathlib.Path(sys.argv[1]).read_text())
           ram = report["ram_profile"]
+          assert ram["memory_backend"] == "ether-state-ram", ram
+          quantum_probe = report["quantum_ram_probe"]
+          assert quantum_probe["passed"], quantum_probe
+          assert quantum_probe["memory_backend"] == "ether-state-ram", quantum_probe
+          assert quantum_probe["logical_bytes"] == 64 << 30, quantum_probe
+          assert quantum_probe["phase_interference"] and quantum_probe["rejects_unmeasured"], quantum_probe
+          assert quantum_probe["bound_bytes"] == 2 and quantum_probe["guest_steps"] == 4, quantum_probe
+          assert quantum_probe["loaded_value"] == 41, quantum_probe
+          assert quantum_probe["stored_value"] == 42, quantum_probe
           assert ram["usable_bytes"] == 64 << 30, ram
           assert ram["resident_bytes"] <= ram["backing_budget_bytes"], ram
           assert ram["spilled_bytes"] == 0 and ram["spill_writes"] == 0, ram
@@ -474,6 +488,7 @@ jobs:
           assert topology["guest_tsc_hz"] == 4_500_000_000_000
           assert report["irq"]["clock_source"] == "host-active-monotonic" and report["irq"]["active_clock_ticks"] > 0
           assert report["ram_profile"]["usable_bytes"] == 64 << 30, report["ram_profile"]
+          assert report["ram_profile"]["memory_backend"] == "ether-state-ram", report["ram_profile"]
           assert report["ram_profile"]["ram_clock_hz"] == 4_500_000_000_000
           ether = report["ether_arm64"]
           assert ether["mundo_x_source_sha"] == os.environ["MUNDO_X_SHA"]

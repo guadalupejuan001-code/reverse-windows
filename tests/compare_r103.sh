@@ -8,7 +8,7 @@ flags=(-std=c++17 -O2 -DNDEBUG -frounding-math -pthread
   -Ideps/Virtual-qSSD-/include -Ideps/GPU-VIRTUAL/include)
 c++ "${flags[@]}" -I"$base/src" -DPRIME_R102_BASELINE tests/smp_guest_test.cpp -lz -o "$output/idle-r102"
 c++ "${flags[@]}" -I"$base/src" -DPRIME_R102_BASELINE tests/vram_partial_bench.cpp -lz -o "$output/vram-r102"
-c++ "${flags[@]}" -Isrc tests/vram_partial_bench.cpp -lz -o "$output/vram-r103"
+bash scripts/build_current_native.sh reverse_windows_vram_partial_bench "$output/vram-r103"
 # The preceding IRQ regression compiled this very revision with the same flags.
 test -x "$output/smp-after"
 for trial in 1 2 3 4 5 6 7; do

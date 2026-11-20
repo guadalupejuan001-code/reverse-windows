@@ -2,7 +2,7 @@
 
 Emulador de PC x86/x64 para arrancar Windows 10 como sistema invitado real.
 
-**Estado:** reconstrucción técnica iniciada el 12 de noviembre de 2026. No se afirma que Windows 10 ya arranque ni que exista un escritorio compatible.
+**Versión de esta rama: Prime r109 · 0.3.84 (114).** Integra la RAM Éter de estados en la máquina x86 y conserva los avances de RAM, GPU, disco y vCPU de las revisiones recientes. El arranque completo de Windows 10 todavía necesita una prueba con una ISO real; el proyecto no incluye esa imagen.
 
 Reglas del proyecto:
 
@@ -32,6 +32,13 @@ En **Prime r107**, una vCPU secundaria puede completar un bloque validado de RAM
 Cada arreglo de un fallo de Windows amplía el componente de la máquina virtual que interviene en él con las técnicas de Éter, QSSD o GPU Virtual, según el componente. Junto con la corrección se verifica la mejora del componente y su comportamiento en el invitado.
 
 ## Gestión y diagnóstico de RAM
+
+Prime r109 selecciona `EtherStateRam` al construir la máquina, antes del BIOS.
+El espacio de RAM de 64 GiB usa estados de base compactos; las celdas vinculadas
+al motor cuántico tienen una única autoridad vectorial. CPU, DMA y accesos de
+bloques consultan la misma memoria. La prueba de equipo ejecuta instrucciones
+x86 que leen 41 y escriben 42 en celdas del motor real, después de comprobar
+interferencia de fase. [Arquitectura, pruebas y límites](docs/prime-r109-state-ram.md)
 
 La preparación vuelve a comprobar su elegibilidad mientras corre el invitado y
 al reanudarlo. La caché conserva páginas válidas al cambiar de tamaño. El panel

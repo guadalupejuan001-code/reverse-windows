@@ -9,7 +9,7 @@ flags=(-std=c++17 -O2 -DNDEBUG -frounding-math -pthread
   -Ideps/mundo-X/pc-android/native -Ideps/mundo-X/native/include
   -Ideps/Virtual-qSSD-/include -Ideps/GPU-VIRTUAL/include)
 c++ "${flags[@]}" -I"$baseline/src" -DPRIME_R101_BASELINE=1 tests/smp_guest_test.cpp -lz -o "$output/smp-before"
-c++ "${flags[@]}" -Isrc tests/smp_guest_test.cpp -lz -o "$output/smp-after"
+bash scripts/build_current_native.sh reverse_windows_smp_guest_test "$output/smp-after"
 
 for trial in 1 2 3 4 5 6 7; do
   order=(before after)

@@ -22,9 +22,12 @@ find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 include(cmake/VerifyMundoX.cmake)
 reverse_windows_pin_mundo_x("${CMAKE_CURRENT_SOURCE_DIR}/config/dependencies.lock.json" "${REVERSE_MUNDO_X_ROOT}")
+include(cmake/QuantumRam.cmake)
+reverse_windows_add_quantum_ram("${CMAKE_CURRENT_SOURCE_DIR}")
 add_library(reverse_windows_component_headers INTERFACE)
 add_dependencies(reverse_windows_component_headers reverse_windows_verify_mundo_x)
 target_compile_definitions(reverse_windows_component_headers INTERFACE
+  MUNDO_X_PC_STATE_RAM=1
   REVERSE_MUNDO_X_SOURCE_SHA="${REVERSE_MUNDO_X_SOURCE_SHA}")
 target_include_directories(reverse_windows_component_headers INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -32,7 +35,8 @@ target_include_directories(reverse_windows_component_headers INTERFACE
   "${REVERSE_MUNDO_X_ROOT}/native/include"
   "${REVERSE_QSSD_ROOT}/include"
   "${REVERSE_GPU_VIRTUAL_ROOT}/include")
-target_link_libraries(reverse_windows_component_headers INTERFACE Threads::Threads ZLIB::ZLIB)
+target_link_libraries(reverse_windows_component_headers INTERFACE
+  Threads::Threads ZLIB::ZLIB reverse_windows_quantum_ram)
 option(REVERSE_WINDOWS_GLES_GUEST "Compile the REgraphics EGL/GLES2 guest renderer" ON)
 if(REVERSE_WINDOWS_GLES_GUEST)
   find_path(REVERSE_EGL_INCLUDE EGL/egl.h)
@@ -76,6 +80,21 @@ endif()
 include(CTest)
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  foreach(ram_test IN ITEMS quantum_ram_authority ether_state_ram_integration)
+    add_executable(reverse_windows_${ram_test}_test tests/${ram_test}_test.cpp)
+    target_link_libraries(reverse_windows_${ram_test}_test PRIVATE reverse_windows_component_headers)
+    add_test(NAME reverse_windows_${ram_test} COMMAND reverse_windows_${ram_test}_test)
+    set_tests_properties(reverse_windows_${ram_test} PROPERTIES TIMEOUT 120)
+  endforeach()
+  # Current-version comparison binaries use the same memory selection and
+  # isolated vector provider as the APK. Historical baselines stay separate.
+  foreach(bench IN ITEMS prime_execution boot_segment vram_partial)
+    add_executable(reverse_windows_${bench}_bench tests/${bench}_bench.cpp)
+    target_link_libraries(reverse_windows_${bench}_bench PRIVATE reverse_windows_component_headers)
+  endforeach()
+  add_executable(reverse_windows_pc_group6_iso_test
+    "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/pc_group6_iso_test.cpp")
+  target_link_libraries(reverse_windows_pc_group6_iso_test PRIVATE reverse_windows_component_headers)
   find_package(Java 11 QUIET COMPONENTS Development)
   if(Java_FOUND)
     set(riso_classes "${CMAKE_CURRENT_BINARY_DIR}/riso-host")
@@ -160,7 +179,7 @@ if(BUILD_TESTING)
   foreach(cpu_test IN ITEMS x86_long_mode x86_long_null_ss x86_far_transfer64 x86_system64
                             x86_ether_rep_batch x86_ether_shift_loop x86_ether_counter_loop
                             x86_ram_backing pc_video
-                            pc_bios_keyboard boot_hotspots sparse_ram sparse_ram_pressure pc_memory pc_memory_fabric)
+                            pc_bios_keyboard boot_hotspots sparse_ram sparse_ram_pressure ether_state_ram pc_memory pc_memory_fabric)
     add_executable(reverse_windows_${cpu_test}_test
       "${REVERSE_MUNDO_X_ROOT}/pc-android/native/tests/${cpu_test}_test.cpp")
     target_link_libraries(reverse_windows_${cpu_test}_test PRIVATE reverse_windows_component_headers)

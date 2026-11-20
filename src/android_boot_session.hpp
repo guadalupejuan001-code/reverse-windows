@@ -8,6 +8,8 @@
 #include "ether_x86_check.hpp"
 #include "guest_vbe_fabric.hpp"
 #include "qssd_disk.hpp"
+#include "quantum_ram_authority.hpp"
+#include "quantum_ram_probe.hpp"
 #include "riso_reader.hpp"
 #include "storage_profile.hpp"
 #include <algorithm>
@@ -229,6 +231,7 @@ class AndroidBootSession final {
       : source_(source), pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_), vbe_(pc_) {
     if (disk.empty() && (create_gib || source != BootSource::SelfTest))
       throw std::invalid_argument("Selecciona o crea un disco QSSD para iniciar.");
+    attach_state_ram(pc_);
     pc_.cpu.use_windows_x64_profile(source != BootSource::SelfTest);
     if (high_ram_profile(profile.physical_bytes))
       pc_.reserve_pci_mmio(true); // Match the installed RAM profile even without a graphics device.
@@ -246,6 +249,7 @@ class AndroidBootSession final {
         break;
       case BootSource::SelfTest:
         pc_.boot_demo();
+        quantum_ram_probe_ = run_quantum_ram_guest_probe();
         break;
       default:
         throw std::invalid_argument("Origen de arranque desconocido.");
@@ -298,6 +302,8 @@ class AndroidBootSession final {
                                     const std::filesystem::path& ram_cache={},
                                     cosmic_pc::CpuTopology topology={}) {
     cosmic_pc::PcMachine pc(profile.physical_bytes, profile.backing_bytes);
+    attach_state_ram(pc);
+    const auto quantum_probe = run_quantum_ram_guest_probe();
     if (profile.physical_bytes > cosmic_pc::PcMachine::kLegacyPhysicalLimit) pc.reserve_pci_mmio(true);
     const auto spill = configure_spill(pc, ram_cache);
     pc.boot_demo();
@@ -399,6 +405,7 @@ class AndroidBootSession final {
         << ",\"cpu_lahf_sahf\":" << flag(extended[cosmic_pc::Cpu::ECX],0)
         << ",\"cpu_prefetchw\":" << flag(extended[cosmic_pc::Cpu::ECX],8)
         << ",\"ether_quantum_block\":" << check_quantum_block(*pc.quantum_session)
+        << ",\"quantum_ram_guest\":" << quantum_probe.passed
         << ",\"lapic\":" << local_apic << ",\"ram\":" << ram
         << ",\"pci_ide\":" << pci_ide << ",\"vga\":" << vga << ",\"iso_boot\":";
     if (has_iso) out << optical_issue.empty(); else out << "null";
@@ -411,6 +418,8 @@ class AndroidBootSession final {
         << ",\"logical_processors\":" << ((basic[cosmic_pc::Cpu::EBX] >> 16) & 255U)
         << "},\"ram_profile\":";
     write_ram_profile(out, pc, spill);
+    out << ",\"quantum_ram_probe\":";
+    quantum_probe.write_json(out);
     if (x86_sessions.requested_jobs) {
       out << ",\"ether_x86_sessions\":{\"passed\":" << x86_sessions.passed()
           << ",\"owners\":" << x86_sessions.owners << ",\"host_workers\":" << x86_sessions.host_workers
@@ -743,6 +752,10 @@ class AndroidBootSession final {
     }
     out << ",\"ram_profile\":";
     write_ram_profile(out, pc_, spill_, &pressure_);
+    if (quantum_ram_probe_) {
+      out << ",\"quantum_ram_probe\":";
+      quantum_ram_probe_->write_json(out);
+    }
     const auto gate_work = pc_.quantum_session->gate_work_stats();
     const auto& boot_work = pc_.boot_acceleration();
     const auto batched_steps = boot_work.rep_elements + boot_work.shift_loop_steps +
@@ -1019,6 +1032,8 @@ class AndroidBootSession final {
     const auto raw_backing_capacity = resident_cap + std::min(usable - resident_cap, spill.limit);
     using Adjustment = cosmic_pc::SparseRam::BudgetAdjustment;
     out << "{\"address_space_bytes\":" << pc.cpu.memory.size()
+        << ",\"memory_backend\":" << cosmic_pc::PcMachine::quote(pc.cpu.memory.backend_name())
+        << ",\"quantum_state_bytes\":" << pc.cpu.memory.quantum_state_bytes()
         << ",\"usable_bytes\":" << usable
         << ",\"ram_clock_hz\":" << PcMotherboardC06::kRamClockHz
         << ",\"backing_budget_bytes\":" << pc.cpu.memory.budget_bytes()
@@ -1352,11 +1367,19 @@ class AndroidBootSession final {
   }
 
   enum class KeyRoute : std::uint8_t { None, Bios, Ps2 };
+  static void attach_state_ram(cosmic_pc::PcMachine& pc) {
+    QuantumRamAuthority::Limits limits;
+    // Guest physical addresses include the PCI hole above usable installed RAM.
+    limits.logical_bytes = pc.cpu.memory.size();
+    pc.cpu.memory.attach_quantum_authority(std::make_shared<QuantumRamAuthority>(limits));
+  }
+
   BootSource source_;
   std::array<KeyRoute, 512> key_routes_{};
   std::optional<BootProfile> boot_profile_;
   std::optional<std::string> previous_boot_profile_;
   cosmic_pc::PcMachine pc_;
+  std::optional<QuantumRamProbeResult> quantum_ram_probe_;
   SpillInfo spill_;
   RamPressure pressure_;
   std::shared_ptr<SmpWorkers> workers_ = std::make_shared<SmpWorkers>(kPrimeHostWorkers);

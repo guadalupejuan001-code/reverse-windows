@@ -59,6 +59,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             {"cpu_lahf_sahf", "LAHF/SAHF"}, {"cpu_prefetchw", "PREFETCHW"}, {"cpu_fxsr", "FXSR"},
             {"lapic", "Controlador local de interrupciones (xAPIC)"},
             {"ether_quantum_block", "Bloque cuántico Éter · par de Bell"},
+            {"quantum_ram_guest", "RAM Éter · lectura y escritura x86"},
             {"ram", "RAM"}, {"pci_ide", "Controlador PCI IDE"}, {"vga", "Video VGA"},
             {"iso_boot", "Arranque desde ISO"}, {"qssd", "Archivo QSSD"},
             {"qssd_ata", "Capacidad QSSD por ATA"},
@@ -517,6 +518,13 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
                     String spillError = ram.optString("spill_error");
                     if (!spillError.isEmpty()) result.append('\n').append(spillError);
                 }
+            }
+            JSONObject quantumRam = preflight.optJSONObject("quantum_ram_probe");
+            if (quantumRam != null && quantumRam.optBoolean("passed")) {
+                result.append(String.format(Locale.getDefault(),
+                        "\nPrueba RAM Éter: %d → %d · %d instrucciones x86",
+                        quantumRam.optInt("loaded_value"), quantumRam.optInt("stored_value"),
+                        quantumRam.optLong("guest_steps")));
             }
             for (String[] check : HARDWARE_CHECKS) {
                 String key = check[0];

@@ -20,13 +20,15 @@ endforeach()
 find_package(Threads REQUIRED)
 include("${REVERSE_WINDOWS_ROOT}/cmake/VerifyMundoX.cmake")
 reverse_windows_pin_mundo_x("${REVERSE_WINDOWS_ROOT}/config/dependencies.lock.json" "${REVERSE_MUNDO_X_ROOT}")
+include("${REVERSE_WINDOWS_ROOT}/cmake/QuantumRam.cmake")
+reverse_windows_add_quantum_ram("${REVERSE_WINDOWS_ROOT}")
 add_library(reverse_windows_android SHARED
     native_machine.cpp
     "${REVERSE_MUNDO_X_ROOT}/native/src/ether_transform.cpp"
     "${REVERSE_MUNDO_X_ROOT}/native/src/ether_neon.cpp")
 target_compile_features(reverse_windows_android PRIVATE cxx_std_17)
 add_dependencies(reverse_windows_android reverse_windows_verify_mundo_x)
-target_compile_definitions(reverse_windows_android PRIVATE MUNDO_X_PC_ETHER_NEXT=1 REVERSE_WINDOWS_GLES_GUEST=1
+target_compile_definitions(reverse_windows_android PRIVATE MUNDO_X_PC_ETHER_NEXT=1 MUNDO_X_PC_STATE_RAM=1 REVERSE_WINDOWS_GLES_GUEST=1
     REVERSE_MUNDO_X_SOURCE_SHA="${REVERSE_MUNDO_X_SOURCE_SHA}")
 target_include_directories(reverse_windows_android PRIVATE
     "${REVERSE_WINDOWS_ROOT}/src"
@@ -35,6 +37,6 @@ target_include_directories(reverse_windows_android PRIVATE
     "${REVERSE_QSSD_ROOT}/include"
     "${REVERSE_GPU_VIRTUAL_ROOT}/include"
     "${REVERSE_REGRAPHICS_ROOT}/src")
-target_link_libraries(reverse_windows_android PRIVATE Threads::Threads EGL GLESv2 z)
+target_link_libraries(reverse_windows_android PRIVATE Threads::Threads reverse_windows_quantum_ram EGL GLESv2 z)
 target_compile_options(reverse_windows_android PRIVATE -fvisibility=hidden -frounding-math
     $<$<CONFIG:Debug>:-O2>)

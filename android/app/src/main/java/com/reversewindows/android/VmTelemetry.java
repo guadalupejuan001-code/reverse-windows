@@ -169,9 +169,11 @@ final class VmTelemetry extends LinearLayout {
         long used = number(ram, "resident_bytes", number(machine, "ram_allocated_bytes"));
         long limit = number(ram, "backing_budget_bytes", number(machine, "ram_budget_bytes"));
         long rawCapacity = number(ram, "raw_backing_capacity_bytes");
+        boolean etherRam = ram != null && "ether-state-ram".equals(ram.optString("memory_backend"));
         boolean knownOccupancy = used >= 0 && limit > 0;
         double ratio = knownOccupancy ? (double) used / limit : 0;
-        heading("RAM utilizable por el invitado", units(usable >= 0 ? usable : logical, GIB, "GiB", 2),
+        heading(etherRam ? "RAM Éter del invitado" : "RAM utilizable por el invitado",
+                units(usable >= 0 ? usable : logical, GIB, "GiB", 2),
                 rawCapacity >= 0 ? "Capacidad estimada sin comprimir · " + units(rawCapacity, GIB, "GiB", 2) : "");
         put(resident, formatted(used, MIB, 1) + " / " + formatted(limit, MIB, 1) + " MiB");
         put(occupancy, knownOccupancy ? String.format(Locale.getDefault(), "%.1f %%", ratio * 100) : "");
@@ -181,7 +183,8 @@ final class VmTelemetry extends LinearLayout {
         metric(0, "Datos lógicos en respaldo", units(number(ram, "spilled_bytes"), MIB, "MiB", 1));
         metric(1, "Datos en el archivo temporal", storage(number(ram, "spill_file_payload_bytes")));
         metric(2, "Metadatos de RAM", storage(number(ram, "resident_metadata_bytes")));
-        metric(3, "Vectores de páginas", count(number(ram, "page_state_vectors")));
+        metric(3, etherRam ? "Páginas con estado" : "Tablas de páginas",
+                count(number(ram, "page_state_vectors")));
         metric(4, "Proceso Android (PSS)", pssKiB > 0 ? units(pssKiB, KIB, "MiB", 1) : UNKNOWN);
         metric(5, "Reloj de la RAM virtual", frequency(number(ram, "ram_clock_hz")));
         JSONObject pressure = ram == null ? null : ram.optJSONObject("access_pressure");

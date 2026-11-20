@@ -1,4 +1,5 @@
 build/
+build-quantum-ram/
 cmake-build*/
 deps/
 evidence/local/

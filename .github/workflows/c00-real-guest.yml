@@ -125,7 +125,7 @@ jobs:
               tests/prime_execution_bench.cpp -lz -o "$2"
           }
           compile_engine "$baseline" build/engine-before "$RUNNER_TEMP/prime-0.3.66"
-          compile_engine deps/mundo-X build/engine-after .
+          bash scripts/build_current_native.sh reverse_windows_prime_execution_bench build/engine-after
           for trial in 1 2 3 4 5 6 7; do
             order=(before after)
             if (( trial % 2 == 0 )); then order=(after before); fi
@@ -147,7 +147,7 @@ jobs:
               -Ideps/Virtual-qSSD-/include -Ideps/GPU-VIRTUAL/include tests/android_boot_session_test.cpp -lz -o "$output"
           }
           compile_window "$RUNNER_TEMP/prime-0.3.66" "$RUNNER_TEMP/ether-0.3.66" build/window-before -DPRIME_PREVIOUS_ENGINE_WINDOW=1
-          compile_window . deps/mundo-X build/window-after
+          bash scripts/build_current_native.sh reverse_windows_android_boot_session_test build/window-after
           for trial in 1 2 3 4 5; do
             order=(before after)
             if (( trial % 2 == 0 )); then order=(after before); fi
@@ -173,10 +173,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build
-          c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread \
-            -I deps/mundo-X/pc-android/native -I deps/mundo-X/native/include \
-            deps/mundo-X/pc-android/native/tests/x86_ether_counter_loop_test.cpp \
-            -o build/prime-x86-measure
+          bash scripts/build_current_native.sh reverse_windows_x86_ether_counter_loop_test build/prime-x86-measure
           ./build/prime-x86-measure | tee build/prime-x86-measure.log
           grep -q '^ETHER_ACCUMULATOR_64BIT_BUDGET_PASS equivalent_steps=369000000000000 ' build/prime-x86-measure.log
           grep -q '^ETHER_WIDE_MULTIPLY_LOOP_PASS ' build/prime-x86-measure.log
@@ -253,7 +250,7 @@ jobs:
               tests/prime_vbe_guest_test.cpp -lz -o "$3"
           }
           compile_display "$old_app" "$RUNNER_TEMP/mundo-prime-r097" build/vbe-r097
-          compile_display . deps/mundo-X build/vbe-r098
+          bash scripts/build_current_native.sh reverse_windows_prime_vbe_guest_test build/vbe-r098
           for trial in 1 2 3 4 5; do
             order=(r097 r098)
             if (( trial % 2 == 0 )); then order=(r098 r097); fi
@@ -689,7 +686,7 @@ jobs:
           grep -q 'REVERSE_WINDOWS_C09_HARDWARE_TRACE_PASS' build/c09-hardware-trace.log
       - name: Replay protected16 group-6 through real El Torito synthetic ISO
         run: |
-          g++ -std=c++17 -O0 -pthread -Ideps/mundo-X/native/include deps/mundo-X/pc-android/native/tests/pc_group6_iso_test.cpp -o build/iso-protected16-group6
+          bash scripts/build_current_native.sh reverse_windows_pc_group6_iso_test build/iso-protected16-group6
           ./build/iso-protected16-group6
       - name: Generate machine-state evidence from actual x64 interpreter
         run: |

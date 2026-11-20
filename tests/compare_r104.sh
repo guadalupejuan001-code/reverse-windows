@@ -5,6 +5,13 @@ old_engine=$2
 output=$3
 mkdir -p "$output"
 for version in r103 r104; do
+  if [[ "$version" == r104 ]]; then
+    bash scripts/build_current_native.sh \
+      reverse_windows_boot_segment_bench "$output/segment-$version" \
+      reverse_windows_prime_vbe_guest_test "$output/vbe-$version" \
+      reverse_windows_smp_guest_test "$output/bsp-$version"
+    continue
+  fi
   src=src
   engine=deps/mundo-X
   extra=()
