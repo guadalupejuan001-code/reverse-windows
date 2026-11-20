@@ -2,7 +2,7 @@
 
 Emulador de PC x86/x64 para arrancar Windows 10 como sistema invitado real.
 
-**Versión de esta rama: Prime r109 · 0.3.84 (114).** Integra la RAM Éter de estados en la máquina x86 y conserva los avances de RAM, GPU, disco y vCPU de las revisiones recientes. El arranque completo de Windows 10 todavía necesita una prueba con una ISO real; el proyecto no incluye esa imagen.
+**Versión de esta rama: Prime r110 · 0.3.85 (115).** Reúne la RAM Éter de estados de r109, la gestión de presión de RAM y la corrección de reparto de CPU y despertares IRQ de la PR #99. El arranque completo de Windows 10 todavía necesita una prueba con una ISO real; el proyecto no incluye esa imagen.
 
 Reglas del proyecto:
 
@@ -14,6 +14,15 @@ Reglas del proyecto:
 - Nunca publicar ni distribuir imágenes ISO privadas o con derechos de terceros. Las ISO del usuario permanecen en su dispositivo.
 
 Los cambios de arquitectura y el primer ejecutor de pruebas se desarrollan en ramas y PR independientes antes de su integración a `main`.
+
+## Integración acumulativa r110
+
+La APK incorpora ambas líneas de trabajo en un único commit de integración.
+`assets/integration-manifest.json` registra las revisiones de origen y
+`assets/dependencies.lock.json` fija los cuatro componentes compilados.
+La CI exige que esas revisiones sean antecesoras del build, comprueba los
+manifiestos dentro de la APK y ejecuta las regresiones CPU/IRQ sobre
+`EtherStateRam` también en Android. [Contenido y comprobaciones](docs/prime-r110-integrated-ram-cpu-irq.md).
 
 ## Tarjeta de vídeo Prime
 

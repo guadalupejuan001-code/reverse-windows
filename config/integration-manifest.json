@@ -1,0 +1,32 @@
+{
+  "schema": "reverse-windows-integration-v1",
+  "revision": "r110",
+  "version_name": "0.3.85",
+  "version_code": 115,
+  "application_id": "com.reversewindows.android.prime.smp.r110",
+  "memory_backend": "ether-state-ram",
+  "source_commits": {
+    "state_ram_r109": "063b4546be106adc135f95a2c258fc01a6b4c5dd",
+    "cpu_irq_pr99": "6f22f5c0fc9ae25c7faf93f8d232705483e8637e",
+    "ram_pressure_pr100": "82718583fe628dc06355dba5cd0fca3582223128"
+  },
+  "components_lock": "dependencies.lock.json",
+  "capabilities": [
+    "ether-state-ram",
+    "quantum-ram-authority",
+    "ram-pressure-maintenance",
+    "ready-vcpu-budget",
+    "parked-vcpu-irq-wake"
+  ],
+  "validation": {
+    "android_cpu_irq_modes": [
+      "--test-ready-budget",
+      "--test-idle-irq-dispatch",
+      "--test-parked-timer",
+      "--test-parked-timer-boundary",
+      "--test-parked-timer-transition"
+    ],
+    "required_smp_backend": "ether-state-ram",
+    "windows_full_installation": "requires-real-guest-validation"
+  }
+}

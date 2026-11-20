@@ -7,6 +7,7 @@ on:
       - "src/**"
       - "tests/**"
       - "config/dependencies.lock.json"
+      - "config/integration-manifest.json"
       - "scripts/verify_deps.py"
       - "scripts/prepare_quantum_ram_compat.py"
       - "cmake/**"
@@ -18,6 +19,7 @@ on:
       - "src/**"
       - "tests/**"
       - "config/dependencies.lock.json"
+      - "config/integration-manifest.json"
       - "scripts/verify_deps.py"
       - "scripts/prepare_quantum_ram_compat.py"
       - "cmake/**"
@@ -44,6 +46,22 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          fetch-depth: 0
+      - name: Verify cumulative state RAM and CPU IRQ source revisions
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          import subprocess
+          from pathlib import Path
+
+          manifest = json.loads(Path('config/integration-manifest.json').read_text())
+          assert manifest['schema'] == 'reverse-windows-integration-v1'
+          for feature, sha in manifest['source_commits'].items():
+              assert re.fullmatch(r'[0-9a-f]{40}', sha), (feature, sha)
+              subprocess.run(['git', 'merge-base', '--is-ancestor', sha, 'HEAD'], check=True)
+              print(f'INTEGRATED_SOURCE {feature} {sha}')
+          PY
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -118,7 +136,7 @@ jobs:
               sys.exit("GPU benchmark needs 16 KB load alignment")'
       - uses: actions/upload-artifact@v4
         with:
-          name: prime-r109-on-device-gpu-${{ matrix.abi }}
+          name: prime-r110-on-device-gpu-${{ matrix.abi }}
           path: ${{ runner.temp }}/ether-gpu-device/reverse_windows_prime_gpu_guest_test
           if-no-files-found: error
       - name: Read Prime APK identity from Gradle
@@ -129,6 +147,7 @@ jobs:
           import os
           from pathlib import Path
           import re
+          import subprocess
 
           path = Path('android/app/build/outputs/apk/debug/output-metadata.json')
           metadata = json.loads(path.read_text())
@@ -141,10 +160,14 @@ jobs:
               or not re.fullmatch(r'\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?', version)
               or type(code) is not int or code < 1):
               raise SystemExit('Unexpected Prime debug APK metadata')
+          integration = json.loads(Path('config/integration-manifest.json').read_text())
+          assert (app_id, version, code) == (integration['application_id'], integration['version_name'], integration['version_code'])
+          source_sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          assert re.fullmatch(r'[0-9a-f]{40}', source_sha)
           with Path(os.environ['GITHUB_ENV']).open('a') as env:
-              env.write(f'ANDROID_APP_ID={app_id}\nANDROID_VERSION={version}\nANDROID_VERSION_CODE={code}\n')
+              env.write(f'ANDROID_APP_ID={app_id}\nANDROID_VERSION={version}\nANDROID_VERSION_CODE={code}\nSOURCE_SHA={source_sha}\n')
           with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
-              output.write(f'version={version}\n')
+              output.write(f'version={version}\nsource_short={source_sha[:12]}\n')
           PY
       - name: Verify APK signature, manifest and native ABI
         shell: bash
@@ -153,9 +176,10 @@ jobs:
           tools="$ANDROID_HOME/build-tools/35.0.0"
           out="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI"
           mkdir -p "$out"
-          apk_name="REVERSE-Windows-Prime-$ANDROID_VERSION-$ANDROID_ABI.apk"
+          apk_name="REVERSE-Windows-Prime-$ANDROID_VERSION-${SOURCE_SHA:0:12}-$ANDROID_ABI.apk"
           cp "$apk" "$out/$apk_name"
           unzip -p "$apk" assets/dependencies.lock.json | cmp - config/dependencies.lock.json
+          unzip -p "$apk" assets/integration-manifest.json | cmp - config/integration-manifest.json
           "$tools/apksigner" verify --verbose --print-certs "$apk" | tee "$out/signature.txt"
           grep -Fxq 'Number of signers: 1' "$out/signature.txt"
           signer_sha256=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$out/signature.txt")
@@ -227,13 +251,13 @@ jobs:
             printf 'android_abi=%s\n' "$ANDROID_ABI"
             printf 'android_ndk=27.2.12479018\n'
           } > "$out/build.txt"
-          cp config/dependencies.lock.json "$out/"
+          cp config/dependencies.lock.json config/integration-manifest.json "$out/"
           (cd "$out" && sha256sum "$apk_name" > SHA256SUMS)
       - name: Publish ARM64 APK and verification
         if: matrix.abi == 'arm64-v8a'
         uses: actions/upload-artifact@v4
         with:
-          name: REVERSE-Windows-Prime-${{ steps.apk_metadata.outputs.version }}-ARM64
+          name: REVERSE-Windows-Prime-${{ steps.apk_metadata.outputs.version }}-${{ steps.apk_metadata.outputs.source_short }}-ARM64
           path: ${{ runner.temp }}/reverse-windows-arm64-v8a
           if-no-files-found: error
       - name: Enable KVM for Android runtime smoke test
@@ -241,9 +265,8 @@ jobs:
         if: matrix.abi == 'x86_64'
         run: |
           if [[ ! -c /dev/kvm ]]; then
-            printf 'Android emulator smoke skipped because this runner lacks /dev/kvm.\n' | tee -a "$GITHUB_STEP_SUMMARY"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            printf 'The integrated APK requires Android runtime validation; /dev/kvm is unavailable.\n' | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -259,10 +282,22 @@ jobs:
           apk=android/app/build/outputs/apk/debug/app-debug.apk
           log="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/android-runtime.log"
           trap 'adb logcat -d > "$log"' EXIT
-          device_dir=/data/local/tmp/reverse-prime-r109
+          device_dir=/data/local/tmp/reverse-prime-r110
           adb shell mkdir -p "$device_dir"
           adb push "$RUNNER_TEMP/ether-gpu-device/reverse_windows_smp_guest_test" "$device_dir/ether-smp"
           adb shell chmod 755 "$device_dir/ether-smp"
+          for regression in ready-budget idle-irq-dispatch parked-timer parked-timer-boundary parked-timer-transition; do
+            regression_log="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/c06-$regression.log"
+            adb shell "TMPDIR=$device_dir $device_dir/ether-smp --test-$regression" | tee "$regression_log"
+            case "$regression" in
+              ready-budget) marker=C06_READY_BUDGET_SAMPLE ;;
+              idle-irq-dispatch) marker=C06_IDLE_IRQ_DISPATCH_SAMPLE ;;
+              parked-timer-boundary) marker=C06_PARKED_TIMER_BOUNDARY_SAMPLE ;;
+              *) marker=C06_PARKED_TIMER_SAMPLE ;;
+            esac
+            grep -q "^$marker " "$regression_log"
+          done
+          grep -Fxq 'C06_READY_WAKE_BACKEND ether-state-ram' "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/c06-ready-budget.log"
           adb shell "TMPDIR=$device_dir $device_dir/ether-smp --measure-ram-views" | tee "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ram-views.log"
           test "$(grep -c '^RAM_VIEW_SAMPLE ' "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ram-views.log")" = 3
           adb shell "TMPDIR=$device_dir $device_dir/ether-smp --measure-ap-scan-grants" | tee "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ap-scan-grants.log"
