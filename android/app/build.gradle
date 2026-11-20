@@ -1,0 +1,55 @@
+import groovy.json.JsonSlurper
+
+plugins {
+    id 'com.android.application'
+}
+
+def etherPreview = providers.gradleProperty('etherPreview').map { it == 'true' }.getOrElse(false)
+def appVersion = '0.3.79'
+def dependencyLock = rootProject.layout.projectDirectory.file('../config/dependencies.lock.json')
+def dependencies = new JsonSlurper().parseText(providers.fileContents(dependencyLock).asText.get())
+def mundoXSha = dependencies.components.find { it.key == 'mundo_x' }?.commit
+if (!(mundoXSha ==~ /[0-9a-f]{40}/)) {
+    throw new GradleException('A full Mundo X commit is required in config/dependencies.lock.json')
+}
+
+android {
+    namespace 'com.reversewindows.android'
+    compileSdk 35
+    ndkVersion '27.2.12479018'
+
+    defaultConfig {
+        applicationId(etherPreview ? 'com.reversewindows.android.prime.smp.r104' : 'com.reversewindows.android')
+        minSdk 26
+        targetSdk 35
+        versionCode 109
+        versionName appVersion
+        testInstrumentationRunner 'com.reversewindows.android.VbeRenderTest'
+        manifestPlaceholders = [appLabel: etherPreview ? 'REVERSE Windows Prime ' + appVersion : 'REVERSE Windows']
+        buildConfigField 'String', 'MUNDO_X_SHA', "\"${mundoXSha}\""
+
+        externalNativeBuild {
+            cmake { arguments '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON' }
+        }
+
+        ndk {
+            abiFilters providers.gradleProperty('androidAbi').getOrElse('arm64-v8a')
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path 'src/main/cpp/CMakeLists.txt'
+            version '3.22.1'
+        }
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

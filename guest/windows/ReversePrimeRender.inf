@@ -1,0 +1,63 @@
+[Version]
+Signature = "$WINDOWS NT$"
+Class = Display
+ClassGuid = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider = %Provider%
+DriverVer = 11/15/2026,0.8.4.0
+CatalogFile = ReversePrimeRender.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+Miniport = 12
+UserMode = 11
+
+[SourceDisksNames]
+1 = %Media%,,,
+
+[SourceDisksFiles]
+ReversePrimeRender.sys = 1
+ReversePrimeRenderUmd.dll = 1
+
+[Manufacturer]
+%Provider% = Models,NTamd64.10.0
+
+[Models.NTamd64.10.0]
+%Device% = Install,PCI\VEN_1B36&DEV_C083
+
+[Install.NT]
+CopyFiles = Miniport,UserMode
+AddReg = AdapterSettings
+FeatureScore = F6
+
+[Install.NT.HW]
+AddReg = InterruptSettings
+
+[InterruptSettings]
+HKR,Interrupt Management\MessageSignaledInterruptProperties,MSISupported,0x00010001,1
+HKR,Interrupt Management\MessageSignaledInterruptProperties,MessageNumberLimit,0x00010001,1
+
+[Miniport]
+ReversePrimeRender.sys
+
+[UserMode]
+ReversePrimeRenderUmd.dll
+
+[AdapterSettings]
+HKR,,InstalledDisplayDrivers,0x00010000,ReversePrimeRenderUmd
+HKR,,UserModeDriverName,0x00010000,ReversePrimeRenderUmd.dll,ReversePrimeRenderUmd.dll,ReversePrimeRenderUmd.dll,ReversePrimeRenderUmd.dll
+HKR,,VgaCompatible,0x00010001,0
+
+[Install.NT.Services]
+AddService = ReversePrimeRender,0x00000002,Service
+
+[Service]
+DisplayName = %Device%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %12%\ReversePrimeRender.sys
+
+[Strings]
+Provider = "REVERSE"
+Device = "REVERSE PrimeVGC render bridge (experimental)"
+Media = "REVERSE PrimeVGC Driver Development"

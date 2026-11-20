@@ -1,0 +1,50 @@
+[Version]
+Signature = "$WINDOWS NT$"
+Class = System
+ClassGuid = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider = %Provider%
+DriverVer = 11/14/2026,0.8.1.0
+CatalogFile = ReversePrimeGpu.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DriverCopy = 12
+
+[SourceDisksNames]
+1 = %Media%,,,
+
+[SourceDisksFiles]
+ReversePrimeGpu.sys = 1
+
+[Manufacturer]
+%Provider% = Devices,NTamd64.10.0
+
+[Devices.NTamd64.10.0]
+%Device% = Install,PCI\VEN_1B36&DEV_C083
+
+[Install.NT]
+CopyFiles = DriverCopy
+
+[DriverCopy]
+ReversePrimeGpu.sys
+
+[Install.NT.HW]
+AddReg = Protection
+
+[Protection]
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[Install.NT.Services]
+AddService = ReversePrimeGpu,0x00000002,Service
+
+[Service]
+DisplayName = %Device%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %12%\ReversePrimeGpu.sys
+
+[Strings]
+Provider = "REVERSE"
+Device = "REVERSE Prime GPU command transport"
+Media = "REVERSE Prime GPU SDK"

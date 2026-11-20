@@ -1,0 +1,499 @@
+name: REVERSE Windows Android boot
+
+on:
+  push:
+    paths:
+      - "android/**"
+      - "src/**"
+      - "tests/**"
+      - "config/dependencies.lock.json"
+      - "scripts/verify_deps.py"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/android-boot.yml"
+  pull_request:
+    paths:
+      - "android/**"
+      - "src/**"
+      - "tests/**"
+      - "config/dependencies.lock.json"
+      - "scripts/verify_deps.py"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/android-boot.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: Prime Android ${{ matrix.abi }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, x86_64]
+    env:
+      ANDROID_ABI: ${{ matrix.abi }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Verify Android guest rate and thermal pacing
+        if: matrix.abi == 'arm64-v8a'
+        run: |
+          sources=android/app/src/main/java/com/reversewindows/android
+          mkdir -p "$RUNNER_TEMP/worker-tests"
+          javac -d "$RUNNER_TEMP/worker-tests" "$sources"/{VmHostPacing,VmStepRate}.java tests/{VmHostPacingTest,VmStepRateTest}.java
+          java -cp "$RUNNER_TEMP/worker-tests" com.reversewindows.android.VmHostPacingTest
+          java -cp "$RUNNER_TEMP/worker-tests" com.reversewindows.android.VmStepRateTest
+      - name: Checkout exact component revisions
+        run: |
+          python3 scripts/verify_deps.py --checkout
+          printf 'MUNDO_X_SHA=%s\n' "$(git -C deps/mundo-X rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Verify synthetic ISO boot, CPU exceptions, keyboard and QSSD reboot
+        if: matrix.abi == 'arm64-v8a'
+        run: |
+          cmake -S . -B build \
+            -DREVERSE_MUNDO_X_ROOT="$PWD/deps/mundo-X" \
+            -DREVERSE_QSSD_ROOT="$PWD/deps/Virtual-qSSD-" \
+            -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" \
+            -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+          cmake --build build --target reverse_windows_android_boot_session_test \
+            reverse_windows_ether_core_rules_test reverse_windows_prime_ether_arm64_test reverse_windows_sparse_ram_test \
+            reverse_windows_atapi_cdrom_guest_test reverse_windows_c06_motherboard_guest_test \
+            reverse_windows_smp_guest_test reverse_windows_c04_guest_idt \
+            reverse_windows_protected_entry_test reverse_windows_protected_real_transition_test \
+            reverse_windows_cpu_profile_test reverse_windows_lock_rmw_test \
+            reverse_windows_x86_long_mode_test reverse_windows_x86_long_null_ss_test reverse_windows_pc_video_test \
+            reverse_windows_x86_far_transfer64_test \
+            reverse_windows_x86_system64_test reverse_windows_x64_optical_qssd_test \
+            reverse_windows_x86_sse_fp32_test reverse_windows_x86_sse2_packed_oracle_test \
+            reverse_windows_x86_c09r1_stage5_cvt_fxsr_test reverse_windows_x86_sse_legacy_forms_test \
+            reverse_windows_x86_mmx_test reverse_windows_x86_x87_arithmetic_oracle_test \
+            reverse_windows_x86_x87_state_test reverse_windows_c09r1_fxstate_test \
+            reverse_windows_x86_ether_counter_loop_test --parallel 2
+          ctest --test-dir build --output-on-failure \
+            -R '^(reverse_windows_android_|reverse_windows_ether_core_rules$|reverse_windows_prime_ether_arm64$|reverse_windows_sparse_ram$|reverse_windows_pc_video$|reverse_windows_c04_real_guest_idt$|reverse_windows_c06_real_motherboard$|reverse_windows_smp_guest$|reverse_windows_protected_entry_stack$|reverse_windows_protected_real_transition$|reverse_windows_cpu_profile$|reverse_windows_lock_rmw$|reverse_windows_x64_optical_qssd$|reverse_windows_x86_(far_transfer64|system64|long_mode|long_null_ss|sse|mmx|x87|ether_counter_loop$)|reverse_windows_x86_c09r1_stage5_cvt_fxsr$|reverse_windows_c09r1_x87_fxsave_context$)'
+      - name: Install Android command-line tools and pinned packages
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: "11076708"
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018 cmake;3.22.1"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build signed debug APK
+        working-directory: android
+        run: |
+          args=(--no-daemon --stacktrace "-PandroidAbi=$ANDROID_ABI" -PetherPreview=true :app:assembleDebug)
+          if [[ "$ANDROID_ABI" == x86_64 ]]; then args+=(:app:assembleDebugAndroidTest); fi
+          ./gradlew "${args[@]}" || ./gradlew --refresh-dependencies "${args[@]}"
+      - name: Read Prime APK identity from Gradle
+        id: apk_metadata
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          path = Path('android/app/build/outputs/apk/debug/output-metadata.json')
+          metadata = json.loads(path.read_text())
+          artifact, = metadata['elements']
+          app_id = metadata['applicationId']
+          version = artifact['versionName']
+          code = artifact['versionCode']
+          if (artifact['outputFile'] != 'app-debug.apk'
+              or not re.fullmatch(r'com\.reversewindows\.android\.prime\.smp\.r\d+', app_id)
+              or not re.fullmatch(r'\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?', version)
+              or type(code) is not int or code < 1):
+              raise SystemExit('Unexpected Prime debug APK metadata')
+          with Path(os.environ['GITHUB_ENV']).open('a') as env:
+              env.write(f'ANDROID_APP_ID={app_id}\nANDROID_VERSION={version}\nANDROID_VERSION_CODE={code}\n')
+          with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
+              output.write(f'version={version}\n')
+          PY
+      - name: Verify APK signature, manifest and native ABI
+        shell: bash
+        run: |
+          apk=android/app/build/outputs/apk/debug/app-debug.apk
+          tools="$ANDROID_HOME/build-tools/35.0.0"
+          out="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI"
+          mkdir -p "$out"
+          apk_name="REVERSE-Windows-Prime-$ANDROID_VERSION-$ANDROID_ABI.apk"
+          cp "$apk" "$out/$apk_name"
+          "$tools/apksigner" verify --verbose --print-certs "$apk" | tee "$out/signature.txt"
+          grep -Fxq 'Number of signers: 1' "$out/signature.txt"
+          signer_sha256=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$out/signature.txt")
+          [[ "$signer_sha256" =~ ^[[:xdigit:]]{64}$ ]]
+          "$tools/zipalign" -c -P 16 -v 4 "$apk" > "$out/alignment.txt"
+          "$tools/aapt" dump badging "$apk" > "$out/manifest.txt"
+          grep -Fq "package: name='$ANDROID_APP_ID' versionCode='$ANDROID_VERSION_CODE' versionName='$ANDROID_VERSION'" "$out/manifest.txt"
+          grep -Fxq "application-label:'REVERSE Windows Prime $ANDROID_VERSION'" "$out/manifest.txt"
+          "$tools/aapt" dump xmltree "$apk" AndroidManifest.xml > "$RUNNER_TEMP/reverse-windows-app-manifest.txt"
+          "$tools/aapt" dump resources "$apk" > "$RUNNER_TEMP/reverse-windows-app-resources.txt"
+          icon_id=$(sed -n 's/.*A: android:icon([^)]*)=@\(0x[[:xdigit:]]\{8\}\).*/\1/p' "$RUNNER_TEMP/reverse-windows-app-manifest.txt")
+          [[ "$icon_id" =~ ^0x[[:xdigit:]]{8}$ ]]
+          grep -Eq "resource $icon_id [^ :]+:mipmap/ic_launcher:" "$RUNNER_TEMP/reverse-windows-app-resources.txt"
+          grep -Fxq "native-code: '$ANDROID_ABI'" "$out/manifest.txt"
+          entry="lib/$ANDROID_ABI/libreverse_windows_android.so"
+          unzip -p "$apk" "$entry" > "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq "$MUNDO_X_SHA" "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'code_version_hits' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'code_byte_checks' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'code_bytes_read' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'staged_ram_blocks' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'coalesced_ram_writes' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'rotate_guest_steps' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'variable_rotate_guest_steps' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'boot_affine_ram_rotate_steps' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'resident_policy' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'cpuid_vendor' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'GenuineIntel' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'boot_counter_loop_steps' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'interrupt_origin' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'idt_bulk_reads' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'instruction_page_reuses' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'sampled_arm64_execute_ns' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'sampled_profile_ns' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'pattern_delta_pages' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'spill_deferred_staged_pages' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'state_vector_interpreter_steps_by_logical_processor' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'boot_rep_direct_page_copy_bytes' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'wbinvd_retired' "$RUNNER_TEMP/reverse-windows-android.so"
+          readelf -h -lW "$RUNNER_TEMP/reverse-windows-android.so" > "$out/native-elf.txt"
+          if [[ "$ANDROID_ABI" == arm64-v8a ]]; then
+            grep -Fq 'AArch64' "$out/native-elf.txt"
+            python3 - "$out/native-elf.txt" <<'PY'
+          import pathlib
+          import sys
+
+          lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+          load = [line.split()[-1] for line in lines if line.split()[:1] == ["LOAD"]]
+          assert load and all(int(value, 16) >= 16384 for value in load), load
+          PY
+          else
+            grep -Fq 'X86-64' "$out/native-elf.txt"
+          fi
+          {
+            printf 'source_sha=%s\n' "$(git rev-parse HEAD)"
+            printf 'mundo_x_sha=%s\n' "$MUNDO_X_SHA"
+            printf 'android_application_id=%s\n' "$ANDROID_APP_ID"
+            printf 'android_version=%s\n' "$ANDROID_VERSION"
+            printf 'android_version_code=%s\n' "$ANDROID_VERSION_CODE"
+            printf 'android_signer_sha256=%s\n' "$signer_sha256"
+            printf 'android_abi=%s\n' "$ANDROID_ABI"
+            printf 'android_ndk=27.2.12479018\n'
+          } > "$out/build.txt"
+          cp config/dependencies.lock.json "$out/"
+          (cd "$out" && sha256sum "$apk_name" > SHA256SUMS)
+      - name: Publish ARM64 APK and verification
+        if: matrix.abi == 'arm64-v8a'
+        uses: actions/upload-artifact@v4
+        with:
+          name: REVERSE-Windows-Prime-${{ steps.apk_metadata.outputs.version }}-ARM64
+          path: ${{ runner.temp }}/reverse-windows-arm64-v8a
+          if-no-files-found: error
+      - name: Enable KVM for Android runtime smoke test
+        id: kvm
+        if: matrix.abi == 'x86_64'
+        run: |
+          if [[ ! -c /dev/kvm ]]; then
+            printf 'Android emulator smoke skipped because this runner lacks /dev/kvm.\n' | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          echo "available=true" >> "$GITHUB_OUTPUT"
+      - name: Prepare Android runtime check
+        if: matrix.abi == 'x86_64' && steps.kvm.outputs.available == 'true'
+        run: |
+          cat > "$RUNNER_TEMP/reverse-windows-adb-smoke.sh" <<'BASH'
+          set -euo pipefail
+          apk=android/app/build/outputs/apk/debug/app-debug.apk
+          log="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/android-runtime.log"
+          trap 'adb logcat -d > "$log"' EXIT
+          adb shell settings put secure immersive_mode_confirmations confirmed
+          adb install -r "$apk"
+          adb install -r android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          adb shell am instrument -w -r "$ANDROID_APP_ID.test/com.reversewindows.android.VbeRenderTest" \
+            | tee "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/vbe-display-test.log"
+          grep -Fxq 'INSTRUMENTATION_CODE: -1' "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/vbe-display-test.log"
+          adb shell am force-stop "$ANDROID_APP_ID"
+          adb logcat -c
+          adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity" --ez com.reversewindows.android.SELF_TEST true
+          build_fields="\"app_version\":\"$ANDROID_VERSION\",\"app_version_code\":$ANDROID_VERSION_CODE,\"application_id\":\"$ANDROID_APP_ID\",\"mundo_x_sha\":\"$MUNDO_X_SHA\""
+          snapshot="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ultimo-diagnostico.json"
+          wait_for_state() {
+            local expected="$1"
+            for attempt in {1..50}; do
+              if adb exec-out run-as "$ANDROID_APP_ID" cat files/ultimo-diagnostico.json > "$snapshot" &&
+                grep -Fq "$build_fields,\"schema\":\"reverse-windows-android-session-v1\",\"source\":\"self-test\",\"status\":\"$expected\"" "$snapshot"; then
+                return 0
+              fi
+              sleep 1
+            done
+            cat "$snapshot"
+            return 1
+          }
+          wait_for_window_focus() {
+            local expected="$1" focus
+            for attempt in {1..30}; do
+              focus=$(adb shell dumpsys window | sed -n '/mCurrentFocus=Window{/p')
+              if [[ -n "$focus" ]]; then
+                if [[ "$expected" == guest && "$focus" == *" $ANDROID_APP_ID/"* ]]; then
+                  return 0
+                fi
+                if [[ "$expected" == other && "$focus" != *" $ANDROID_APP_ID/"* ]]; then
+                  return 0
+                fi
+              fi
+              sleep 1
+            done
+            printf 'Window focus did not reach %s: %s\n' "$expected" "$focus" >&2
+            return 1
+          }
+          wait_for_state waiting_key
+          python3 - "$snapshot" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          ram = report["ram_profile"]
+          assert ram["usable_bytes"] == 64 << 30, ram
+          assert ram["resident_bytes"] <= ram["backing_budget_bytes"], ram
+          assert ram["spilled_bytes"] == 0 and ram["spill_writes"] == 0, ram
+          assert ram["spill_mode"] in {"file", "disabled", "unavailable"}, ram
+          if ram["spill_mode"] == "file":
+              assert ram["spill_backend"] == "qssd-transient", ram
+              assert ram["spill_limit_bytes"] > 0 and not ram["spill_error"], ram
+          elif ram["spill_mode"] == "unavailable":
+              assert ram["spill_limit_bytes"] == 0 and ram["spill_error"], ram
+          PY
+          # Home and Activity launch return before Android moves window focus.
+          # Verify both transitions so the Enter key reaches the resumed guest.
+          wait_for_window_focus guest
+          adb shell input keyevent KEYCODE_HOME
+          wait_for_window_focus other
+          adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity"
+          wait_for_window_focus guest
+          adb shell input keyevent KEYCODE_ENTER
+          wait_for_state halted
+          adb shell am force-stop "$ANDROID_APP_ID"
+          python3 - "$snapshot" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          snapshot = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert snapshot["status"] == "halted" and snapshot["source"] == "self-test", snapshot
+          assert snapshot["machine"]["instructions"] > 0 and snapshot["elapsed_ms"] >= 0, snapshot
+          assert snapshot["boot_progress"]["session_steps"] == snapshot["machine"]["instructions"]
+          assert snapshot["iso_read_us"] == 0
+          assert snapshot["ram_profile"]["spill_read_us"] == snapshot["ram_profile"]["spill_write_us"] == 0
+          timing = snapshot["worker_timing"]
+          assert timing["step_us"] > 0
+          assert 0 <= timing["last_slice_steps_completed"] <= timing["last_slice_steps_requested"], timing
+          cpu_us = timing["host_thread_cpu_us"]
+          assert cpu_us is None or cpu_us > 0
+          thermal = snapshot["android_thermal_status"]
+          assert thermal is None or 0 <= thermal <= 6
+          assert snapshot["cpu_topology"]["guest_tsc_hz"] == 4_500_000_000_000
+          host = snapshot["host_cpu"]
+          assert host["hint_threads"] == 0, "Android hints must close when the guest stops"
+          if host["readable_policies"]:
+              assert 0 < host["min_reported_khz"] <= host["max_reported_khz"]
+          else:
+              assert host["min_reported_khz"] is None and host["max_reported_khz"] is None
+          ether = snapshot["ether_arm64"]
+          assert ether["staged_ram_blocks"] == ether["staged_ram_steps"] == ether["coalesced_ram_writes"] == 0
+          assert snapshot["machine"]["page_translation_hits"] == 0
+          assert snapshot["ether_next"]["boot_paged_rep_elements"] == 0
+          PY
+          adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity" --ez com.reversewindows.android.SELF_TEST true
+          wait_for_state waiting_key
+          python3 tests/android_rgb_console.py key
+          wait_for_state halted
+          echo "PRIME_RGB_GUEST_KEY_PASS physical=iso-es-n-tilde bios=halted"
+          adb shell am force-stop "$ANDROID_APP_ID"
+          adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity"
+          python3 tests/android_rgb_console.py console
+
+          tap_visible() {
+            local field="$1" label="$2" scroll="${3:-}" point
+            for attempt in {1..12}; do
+              adb shell uiautomator dump /sdcard/reverse-windows-window.xml >/dev/null
+              adb exec-out cat /sdcard/reverse-windows-window.xml > "$RUNNER_TEMP/reverse-windows-window.xml"
+              point=$(python3 - "$RUNNER_TEMP/reverse-windows-window.xml" "$field" "$label" "$scroll" <<'PY'
+          import re
+          import sys
+          import xml.etree.ElementTree as xml
+          path, field, label, scroll = sys.argv[1:]
+          nodes = list(xml.parse(path).iter("node"))
+          for node in nodes:
+              if node.get(field) == label and node.get("enabled") == "true":
+                  left, top, right, bottom = map(int, re.findall(r"\d+", node.get("bounds")))
+                  if right > left and bottom > top:
+                      print((left + right) // 2, (top + bottom) // 2)
+                      break
+          else:
+              if scroll:
+                  for node in nodes:
+                      if node.get("class") == "android.widget.ScrollView" and node.get("scrollable") == "true":
+                          left, top, right, bottom = map(int, re.findall(r"\d+", node.get("bounds")))
+                          x = (left + right) // 2
+                          top_y = top + (bottom - top) // 5
+                          bottom_y = bottom - (bottom - top) // 5
+                          start_y, end_y = (bottom_y, top_y) if scroll == "down" else (top_y, bottom_y)
+                          print(x, start_y, x, end_y)
+                          break
+          PY
+              )
+              if [[ "$point" =~ ^[0-9]+\ [0-9]+$ ]]; then
+                read -r x y <<< "$point"
+                adb shell input tap "$x" "$y"
+                return
+              fi
+              if [[ "$point" =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+$ ]]; then
+                read -r x1 y1 x2 y2 <<< "$point"
+                adb shell input swipe "$x1" "$y1" "$x2" "$y2" 240
+              fi
+              sleep 1
+            done
+            echo "Could not find enabled Android control $label" >&2
+            cat "$RUNNER_TEMP/reverse-windows-window.xml" >&2
+            return 1
+          }
+          iso=reverse-windows-test.iso
+          python3 tests/c10_android_boot_iso.py "$RUNNER_TEMP/$iso" --engine-check
+          adb push "$RUNNER_TEMP/$iso" "/sdcard/Download/$iso"
+          tap_visible resource-id "$ANDROID_APP_ID:id/vm_select_iso"
+          tap_visible text "$iso"
+
+          # Mount the optional data drive through its normal Android control.
+          tap_visible resource-id "$ANDROID_APP_ID:id/vm_create_data_disk" down
+          tap_visible resource-id android:id/button1
+          for attempt in {1..20}; do
+            if adb shell run-as "$ANDROID_APP_ID" test -f files/windows-data.rqvd; then
+              break
+            fi
+            sleep 1
+          done
+          adb shell run-as "$ANDROID_APP_ID" test -f files/windows-data.rqvd
+          tap_visible resource-id "$ANDROID_APP_ID:id/vm_boot_iso" up
+
+          snapshot="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/iso-diagnostic.json"
+          for attempt in {1..30}; do
+            if adb exec-out run-as "$ANDROID_APP_ID" cat files/ultimo-diagnostico.json > "$snapshot" &&
+              grep -Fq '"source":"iso","status":"waiting_key"' "$snapshot"; then
+              break
+            fi
+            sleep 1
+          done
+          python3 - "$snapshot" "$RUNNER_TEMP/$iso" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          report = json.loads(Path(sys.argv[1]).read_text())
+          assert report["source"] == "iso" and report["status"] == "waiting_key", report
+          assert report["iso_bytes"] == Path(sys.argv[2]).stat().st_size
+          assert report["disk"]["logical_bytes"] == 64 * 1024**3 and report["disk"]["initial_commits"] == 0
+          assert report["data_disk"]["logical_bytes"] == 8 << 50 and report["data_disk"]["physical_bytes"] == 64
+          assert report["guest_gpu"]["logical_vram_bytes"] == 120_000_000_000
+          assert report["ata"]["identify_data_transfers"] == 1
+          assert report["boot_progress"]["handed_off"] and report["boot_profile"]["checkpoint_interval_steps"] == 50_000_000
+          assert report["boot_progress"]["checkpoint_interval_steps"] == 50_000_000
+          timing = report["worker_timing"]
+          assert timing["max_steps_per_slice"] == 36_000_000_000 and timing["target_slice_us"] == 8_000, timing
+          window = report["ether_execution"]
+          assert window["target_virtual_cycles_per_second"] == 4_500_000_000_000
+          assert window["last_requested_steps"] == timing["max_steps_per_slice"]
+          assert window["last_retired_steps"] == timing["last_slice_steps_completed"]
+          assert 0 <= timing["last_slice_steps_completed"] <= timing["last_slice_steps_requested"] <= timing["max_steps_per_slice"], timing
+          assert 0 < timing["next_slice_steps_requested"] <= timing["max_steps_per_slice"], timing
+          assert timing["diagnostic_save_interval_ms"] == 5_000
+          topology = report["cpu_topology"]
+          assert (topology["cores"], topology["threads_per_core"], topology["logical_processors"]) == (8, 2, 16)
+          assert topology["guest_tsc_hz"] == 4_500_000_000_000
+          assert report["irq"]["clock_source"] == "host-active-monotonic" and report["irq"]["active_clock_ticks"] > 0
+          assert report["ram_profile"]["usable_bytes"] == 64 << 30, report["ram_profile"]
+          assert report["ram_profile"]["ram_clock_hz"] == 4_500_000_000_000
+          ether = report["ether_arm64"]
+          assert ether["mundo_x_source_sha"] == os.environ["MUNDO_X_SHA"]
+          assert ether["protected32_guest_steps"] == 0
+          assert ether["code_version_hits"] == ether["code_byte_checks"] == ether["code_bytes_read"] == 0
+          projected = report["ether_coverage"]["state_vector_interpreter_steps"]
+          assert projected > 0, report["ether_coverage"]
+          assert report["boot_progress"]["session_steps"] >= 6_000_000_000
+          assert report["boot_hotspots"]["register_batch_steps"] > (1 << 32)
+          print(f"PRIME_ANDROID_ENGINE_PASS counted_steps=6000000000 projected_steps={projected} "
+                f"max_retired_in_one_window={timing['peak_slice_steps_completed']}")
+          print("PRIME_ANDROID_ISO_PICKER_PASS boot=el-torito ram_gib=64 qssd_boot_gib=64 qssd_data_pib=8",
+                f"protected32_tsc_hz={topology['guest_tsc_hz']}")
+          PY
+          python3 tests/android_rgb_console.py settings
+          for rate in 4581817600 4500000000000; do
+            tap_visible resource-id "$ANDROID_APP_ID:id/vm_experimental_clock" down
+            live="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/iso-clock-$rate.json"
+            for attempt in {1..20}; do
+              if adb exec-out run-as "$ANDROID_APP_ID" cat files/ultimo-diagnostico.json > "$live" &&
+                  grep -Fq "\"guest_tsc_hz\":$rate}" "$live"; then
+                break
+              fi
+              sleep 1
+            done
+            python3 - "$snapshot" "$live" "$rate" <<'PY'
+          import json, sys
+          from pathlib import Path
+          before, after = [json.loads(Path(path).read_text()) for path in sys.argv[1:3]]
+          assert after["cpu_topology"]["guest_tsc_hz"] == int(sys.argv[3])
+          assert after["ether_execution"]["target_virtual_cycles_per_second"] == 4_500_000_000_000
+          assert after["source"] == "iso" and after["status"] == "waiting_key"
+          assert after["boot_progress"]["session_steps"] == before["boot_progress"]["session_steps"] > 0
+          assert after["irq"]["active_clock_elapsed_ns"] == before["irq"]["active_clock_elapsed_ns"]
+          print("PRIME_ANDROID_LIVE_CLOCK_PASS same_session=1 guest_tsc_hz=" + sys.argv[3])
+          PY
+          done
+          # A second optical guest reads the actual PS/2 packets from the Android controls.
+          as --32 tests/rgb_pointer_guest.S -o "$RUNNER_TEMP/rgb-pointer.o"
+          objcopy -O binary -j .text "$RUNNER_TEMP/rgb-pointer.o" "$RUNNER_TEMP/rgb-pointer.bin"
+          python3 tests/android_rgb_console.py fixture "$RUNNER_TEMP/rgb-pointer.bin" "$RUNNER_TEMP/rgb-pointer.iso"
+          adb push "$RUNNER_TEMP/rgb-pointer.iso" /sdcard/Download/rgb-pointer.iso
+          adb shell am force-stop "$ANDROID_APP_ID"
+          adb shell am start -W -n "$ANDROID_APP_ID/com.reversewindows.android.MainActivity"
+          python3 tests/android_rgb_console.py settings
+          tap_visible resource-id "$ANDROID_APP_ID:id/vm_select_iso" down
+          tap_visible text rgb-pointer.iso
+          tap_visible resource-id "$ANDROID_APP_ID:id/vm_boot_iso" down
+          python3 tests/android_rgb_console.py pointer
+          BASH
+      - name: Run BIOS, keyboard and synthetic ISO from Downloads on Android
+        if: matrix.abi == 'x86_64' && steps.kvm.outputs.available == 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          enable-hw-keyboard: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: bash "$RUNNER_TEMP/reverse-windows-adb-smoke.sh"
+      - name: Preserve Android x86_64 runtime evidence
+        if: always() && matrix.abi == 'x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: REVERSE-Windows-Android-x86_64-smoke
+          path: ${{ runner.temp }}/reverse-windows-x86_64
+          if-no-files-found: warn

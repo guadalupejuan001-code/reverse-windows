@@ -1,0 +1,9 @@
+# Prime C03 · CPU Éter
+
+Éter traduce a ARM64 bloques frecuentes de instrucciones x86-64 en modo largo con paginación. Este ciclo cubre MOV y CMP de 32 y 64 bits, con registros o memoria mediante base más desplazamiento, y saltos relativos directos. Las condiciones de paridad, los prefijos y los direccionamientos que quedan fuera de ese conjunto se ejecutan en el intérprete. El ALU x86 canónico fija los flags del último CMP, incluidos AF y PF.
+
+La caché es por CPU. Una reutilización valida el mapeo de ejecución, CR3, privilegio y bytes del código. Las direcciones de datos se resuelven con las traducciones de la CPU y la memoria de Éter. Las cargas de dispositivos, los accesos entre páginas, los accesos que necesitan modificar bits A/D y los fallos vuelven al intérprete. Una escritura ordinaria cierra el bloque. El presupuesto de instrucciones, los límites de muestreo de C02 y la próxima observación de la placa limitan cada lote.
+
+En ARM64 Linux y Android, la sesión nativa activa esta ruta cuando el sistema acepta el mapeo de código. El diagnóstico informa `ether_arm64` con las traducciones, las reutilizaciones, los pasos ejecutados, las invalidaciones y los retornos al intérprete por accesos de datos. El sondeo nativo admite `--ether-arm64` con `--profile-every`. El código generado se escribe en una página que pasa a solo lectura y ejecución antes de llamarlo.
+
+La prueba `reverse_windows_prime_ether_arm64` usa un invitado sintético construido a partir de los tipos de MOV, CMP y saltos que aparecieron en el diagnóstico del Galaxy. Compara el mismo número de pasos, registros, flags, RAM, fallos de página e interrupciones. El informe de CI mide la primera pasada y la mediana de siete pasadas con el código en caché. Las cifras describen ese tramo sintético. La prueba de la sesión nativa arranca otro invitado desde QSSD y confirma la ruta seleccionada mediante el diagnóstico.

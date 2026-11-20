@@ -1,0 +1,703 @@
+name: REVERSE Windows Ether boot, RAM and QSSD regressions
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-real-guest:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: x86_64
+          - runner: ubuntu-24.04-arm
+            architecture: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    steps:
+      - name: Checkout REVERSE Windows
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Checkout and verify exact component revisions from the lock
+        run: |
+          test "$(uname -m)" = "${{ matrix.architecture }}"
+          git rev-parse HEAD
+          python3 scripts/verify_deps.py --checkout
+      - name: Compare r103 and r104 on identical GS, boot video and AP workloads
+        shell: bash
+        run: |
+          baseline=af88b12d41f72a67f4a5ccd4287a58efe3e50878
+          old_engine=cdf7b70ce23b4129c4d4f4404a76c49264182057
+          git fetch --depth=1 origin "$baseline"
+          git worktree add --detach "$RUNNER_TEMP/prime-r103" "$baseline"
+          git -C deps/mundo-X fetch --depth=1 https://github.com/guadalupejuan001-code/mundo-X.git "$old_engine"
+          git -C deps/mundo-X worktree add --detach "$RUNNER_TEMP/ether-r103" "$old_engine"
+          bash tests/compare_r104.sh "$RUNNER_TEMP/prime-r103" "$RUNNER_TEMP/ether-r103" build/r104 | tee build-r104.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prime-r104-measurements-${{ matrix.architecture }}
+          path: build-r104.log
+      - name: Measure ARM64 dispatch and REP with an IRQ held by priority
+        shell: bash
+        run: |
+          baseline=9e6baec677e7a90f7b593e2a5651cc7623300dc9
+          git fetch --no-tags --depth=1 origin "$baseline"
+          git worktree add --detach "$RUNNER_TEMP/prime-r101-irq" "$baseline"
+          bash tests/compare_smp_irq.sh "$RUNNER_TEMP/prime-r101-irq" build
+      - name: Measure partial VRAM and vCPU grants against r102
+        shell: bash
+        run: |
+          baseline=702edd72455ad1242a4d9de53f21a57773dcc5ec
+          git fetch --no-tags --depth=1 origin "$baseline"
+          git worktree add --detach "$RUNNER_TEMP/prime-r102-vram" "$baseline"
+          bash tests/compare_r103.sh "$RUNNER_TEMP/prime-r102-vram" build | tee build/r103-summary.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prime-r103-measurements-${{ matrix.architecture }}
+          path: build/r103-summary.log
+      - name: Compare 0.3.65 and current engines on equal guest work
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous=73146f88beb8c2bcdeca157b1939bffa4a6da546
+          baseline="$RUNNER_TEMP/prime-previous-engine"
+          previous_prime=a08f47ce18e170a5d6fb3e3ff515924e8ce422c9
+          git fetch --no-tags --depth=1 origin "$previous_prime"
+          git worktree add --detach "$RUNNER_TEMP/prime-0.3.66" "$previous_prime"
+          if ! git -C deps/mundo-X cat-file -e "$previous^{commit}" 2>/dev/null; then
+            git -C deps/mundo-X fetch --no-tags --depth=1 https://github.com/guadalupejuan001-code/mundo-X.git "$previous"
+          fi
+          git -C deps/mundo-X worktree add --detach "$baseline" "$previous"
+          mkdir -p build
+          compile_engine() {
+            c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread -I"$3/src" \
+              -I"$1/pc-android/native" -I"$1/native/include" \
+              -Ideps/Virtual-qSSD-/include -Ideps/GPU-VIRTUAL/include \
+              tests/prime_execution_bench.cpp -lz -o "$2"
+          }
+          compile_engine "$baseline" build/engine-before "$RUNNER_TEMP/prime-0.3.66"
+          compile_engine deps/mundo-X build/engine-after .
+          for trial in 1 2 3 4 5 6 7; do
+            order=(before after)
+            if (( trial % 2 == 0 )); then order=(after before); fi
+            for version in "${order[@]}"; do "./build/engine-$version" "$version"; done
+          done | tee build/prime-execution.log
+          python3 tests/compare_execution.py build/prime-execution.log | tee -a build/prime-execution.log
+      - name: Measure the execution target with the production Android session
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_engine=18f2c012c9dee2cedb3c18089c4d8ae05f2917e1
+          git -C deps/mundo-X fetch --no-tags --depth=1 https://github.com/guadalupejuan001-code/mundo-X.git "$previous_engine"
+          git -C deps/mundo-X worktree add --detach "$RUNNER_TEMP/ether-0.3.66" "$previous_engine"
+          compile_window() {
+            local app="$1" engine="$2" output="$3"
+            shift 3
+            c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread "$@" -I"$app/src" \
+              -I"$engine/pc-android/native" -I"$engine/native/include" \
+              -Ideps/Virtual-qSSD-/include -Ideps/GPU-VIRTUAL/include tests/android_boot_session_test.cpp -lz -o "$output"
+          }
+          compile_window "$RUNNER_TEMP/prime-0.3.66" "$RUNNER_TEMP/ether-0.3.66" build/window-before -DPRIME_PREVIOUS_ENGINE_WINDOW=1
+          compile_window . deps/mundo-X build/window-after
+          for trial in 1 2 3 4 5; do
+            order=(before after)
+            if (( trial % 2 == 0 )); then order=(after before); fi
+            for version in "${order[@]}"; do
+              for argument in --measure-engine-window --measure-engine-mix; do
+                ./build/window-"$version" "$argument" | sed "s/^/$version /"
+              done
+            done
+            ./build/window-after --sustain-engine-window | sed 's/^/after /'
+          done | tee build/prime-engine-window.log
+          python3 tests/compare_execution.py --windows build/prime-engine-window.log
+      - name: Save paired execution window measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: prime-engine-window-${{ matrix.architecture }}
+          path: build/prime-engine-window.log
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Measure exact x86 loops and individually executed instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread \
+            -I deps/mundo-X/pc-android/native -I deps/mundo-X/native/include \
+            deps/mundo-X/pc-android/native/tests/x86_ether_counter_loop_test.cpp \
+            -o build/prime-x86-measure
+          ./build/prime-x86-measure | tee build/prime-x86-measure.log
+          grep -q '^ETHER_ACCUMULATOR_64BIT_BUDGET_PASS equivalent_steps=369000000000000 ' build/prime-x86-measure.log
+          grep -q '^ETHER_WIDE_MULTIPLY_LOOP_PASS ' build/prime-x86-measure.log
+          grep -q '^ETHER_ROTATE_XOR_PASS ' build/prime-x86-measure.log
+          grep -q '^ETHER_TIMED_ROTATE_XOR_PASS steps=2000000$' build/prime-x86-measure.log
+          grep -q '^ETHER_AFFINE_RAM_ROTATE_PASS cases=12 changing_ram=1 mmio=1 device_clock=1$' build/prime-x86-measure.log
+          ./build/prime-x86-measure --measure-wide-multiply | tee -a build/prime-x86-measure.log
+          ./build/prime-x86-measure --measure-mixed | tee -a build/prime-x86-measure.log
+          grep -q '^ETHER_X86_MIXED_PASS mode=interpreter steps=110000001 native_steps=0 ' build/prime-x86-measure.log
+          if [ "$(uname -m)" = "aarch64" ]; then
+            grep -Eq '^ETHER_X86_MIXED_PASS mode=arm64 steps=110000001 native_steps=[1-9][0-9]* ' build/prime-x86-measure.log
+          fi
+      - name: Compare mixed Windows vector stores with Prime 0.3.72
+        shell: bash
+        run: |
+          set -euo pipefail
+          reference=1154148d3194a7081bee80bff831e87292d33e68
+          old="$RUNNER_TEMP/mundo-prime-r097"
+          git -C deps/mundo-X fetch --no-tags --depth=1 https://github.com/guadalupejuan001-code/mundo-X.git "$reference"
+          git -C deps/mundo-X worktree add --detach "$old" "$reference"
+          driver=pc-android/native/tests/x86_ether_counter_loop_test.cpp
+          cp "deps/mundo-X/$driver" "$old/pc-android/native/tests/prime-vector-compare.cpp"
+          c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread \
+            -I"$old/pc-android/native" -I"$old/native/include" \
+            "$old/pc-android/native/tests/prime-vector-compare.cpp" -o build/prime-vector-r097
+          for trial in 1 2 3 4 5; do
+            order=(r097 r098)
+            if (( trial % 2 == 0 )); then order=(r098 r097); fi
+            for version in "${order[@]}"; do
+              binary=build/prime-x86-measure
+              if [[ $version == r097 ]]; then binary=build/prime-vector-r097; fi
+              "$binary" --measure-mixed-movntdq | sed "s/^/$version /"
+            done
+          done | tee build/prime-vector-stream.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prime-vector-stream-${{ matrix.architecture }}
+          path: build/prime-vector-stream.log
+      - name: Compare disp32 vector stores with Prime 0.3.74
+        shell: bash
+        run: |
+          set -euo pipefail
+          reference=43cc1adef7921a8dbd82c2c539ac9a4297145916
+          old="$RUNNER_TEMP/mundo-prime-r099"
+          git -C deps/mundo-X fetch --no-tags --depth=1 https://github.com/guadalupejuan001-code/mundo-X.git "$reference"
+          git -C deps/mundo-X worktree add --detach "$old" "$reference"
+          driver=pc-android/native/tests/x86_ether_counter_loop_test.cpp
+          cp "deps/mundo-X/$driver" "$old/$driver"
+          c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread \
+            -I"$old/pc-android/native" -I"$old/native/include" "$old/$driver" -o build/prime-x86-r099
+          for trial in 1 2 3 4 5; do
+            order=(prime-x86-r099 prime-x86-measure)
+            if (( trial % 2 == 0 )); then order=(prime-x86-measure prime-x86-r099); fi
+            for binary in "${order[@]}"; do
+              "build/$binary" --measure-disp32-movntdq | sed "s/^/$binary /"
+            done
+          done | tee build/prime-disp32.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prime-disp32-${{ matrix.architecture }}
+          path: build/prime-disp32.log
+      - name: Compare full and partial VBE frames with identical guest writes
+        shell: bash
+        run: |
+          set -euo pipefail
+          old_app="$RUNNER_TEMP/prime-r097"
+          reference=67f385fa63a1cb56f8f19c7d61d19273075f841e
+          git fetch --no-tags --depth=1 origin "$reference"
+          git worktree add --detach "$old_app" "$reference"
+          compile_display() {
+            c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread -I"$1/src" \
+              -I"$2/pc-android/native" -I"$2/native/include" \
+              -Ideps/Virtual-qSSD-/include -Ideps/GPU-VIRTUAL/include \
+              tests/prime_vbe_guest_test.cpp -lz -o "$3"
+          }
+          compile_display "$old_app" "$RUNNER_TEMP/mundo-prime-r097" build/vbe-r097
+          compile_display . deps/mundo-X build/vbe-r098
+          for trial in 1 2 3 4 5; do
+            order=(r097 r098)
+            if (( trial % 2 == 0 )); then order=(r098 r097); fi
+            for version in "${order[@]}"; do
+              "build/vbe-$version" --measure | sed "s/^/$version /"
+            done
+          done | tee build/prime-vbe-compare.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prime-vbe-compare-${{ matrix.architecture }}
+          path: build/prime-vbe-compare.log
+      - name: Compile native boot probe against actual x86/x64 CPU
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri zlib1g-dev
+          cmake -S . -B build -DREVERSE_MUNDO_X_ROOT="$PWD/deps/mundo-X" -DREVERSE_QSSD_ROOT="$PWD/deps/Virtual-qSSD-" -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+      - name: Verify PrimeVGC guest transfers and measure bulk QSSD bandwidth
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build --parallel 2 --target reverse_windows_primevgc_transfer_test reverse_windows_primevgc_compute_test
+          for sample in 1 2 3; do
+            ./build/reverse_windows_primevgc_transfer_test
+          done | tee build/primevgc-transfer.log
+          grep -q '^PRIME_C08_PRIMEVGC_VRAM_PASS logical_bytes=120000000000 last_byte=119999999999' build/primevgc-transfer.log
+          for sample in 1 2 3; do
+            ./build/reverse_windows_primevgc_transfer_test --bulk-512k
+            ./build/reverse_windows_primevgc_transfer_test --bulk
+          done | tee build/primevgc-bulk.log
+          grep -q 'exact_bytes=268435456 .*command_bytes=524288 upload_commits=512' build/primevgc-bulk.log
+          grep -q 'exact_bytes=268435456 .*command_bytes=8388608 upload_commits=32' build/primevgc-bulk.log
+          ./build/reverse_windows_primevgc_compute_test | tee build/primevgc-compute.log
+      - name: Build the remaining native regressions
+        run: |
+          cmake --build build --parallel 2
+      - name: Execute real x86 and long-mode x64 guest demos
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: ctest --test-dir build --output-on-failure
+      - name: Compare the guest clocks on sixteen vCPUs with identical arithmetic
+        shell: bash
+        run: ./build/reverse_windows_smp_guest_test --measure-cpu-clock | tee build/prime-smp-clock.log
+      - name: Verify Prime C08 PCI, QSSD VRAM, and REgraphics rasterization
+        env:
+          EGL_PLATFORM: surfaceless
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sample in 1 2 3 4; do
+            ./build/reverse_windows_prime_gpu_guest_test
+          done | tee build/prime-c08-gpu.log
+          grep -q '^PRIME_C08_REGRAPHICS_PASS .*"vram_draw_requests":1.*"ram_draw_requests":3.*"color_dma_reads":2.*"submitted_triangles":3' build/prime-c08-gpu.log
+          grep -q '^PRIME_C08_BGRA_DMA_PASS alpha_ticket=18 vbe_stores=0 .*"alpha_draw_ticket":18' build/prime-c08-gpu.log
+          grep -q '^PRIME_C08_SINGLE_DMA_PASS bytes=1228800 legacy_commands=6 commands=1' build/prime-c08-gpu.log
+          grep -q '^PRIME_C08_SCHEDULED_DMA_PASS msi=6 fence=104 fault=105 preempt=205 pixels=4096 .* high_dma=1$' build/prime-c08-gpu.log
+          grep -q '^PRIME_C08_PCI_VRAM_PASS logical_bytes=120000000000 last_byte=119999999999 .* exact=1' build/prime-c08-gpu.log
+          grep -q '^PRIME_C08_VRAM_BATCH_PASS bytes=7864320 .* commits=128 .* exact=1' build/prime-c08-gpu.log
+      - name: Record Prime BIOS keyboard and PS/2 regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir build --output-on-failure -V \
+            -R '^reverse_windows_(pc_bios_keyboard|android_bios_iso_qssd|c06_real_motherboard)$' \
+            | tee build/prime-bios-keyboard.log
+          grep -q 'PRIME_C03_NATIVE_SESSION_PASS translated_steps=' build/prime-bios-keyboard.log
+          grep -q 'PRIME_C10_WBINVD_SESSION_PASS count=1 resume=1' build/prime-bios-keyboard.log
+          grep -q 'PRIME_RAM64_QSSD_PACKED_PASS guest_bytes=68719476736 .*guest_test_bytes=65536 qssd_test_bytes=32768 ' build/prime-bios-keyboard.log
+          grep -q 'PRIME_UNIFIED_SESSION_PASS ram=68719476736 vram=120000000000 ' build/prime-bios-keyboard.log
+          grep -q 'C06_TIMED_ROTATE_XOR_PASS steps=32000028 ' build/prime-bios-keyboard.log
+          grep -q 'PRIME_IOAPIC_ID_X64_PASS paged=1 version=1 arbitration=1 reset=1' build/prime-bios-keyboard.log
+      - name: Measure InfiniteCore through x86 memory operands
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_pc_memory_fabric_test | tee build/prime-infinitecore.log
+          grep -q '^PRIME_C09_ETHER_INFINITECORE_PASS iterations=1024 ' build/prime-infinitecore.log
+      - name: Verify Prime C02 timing and checkpoint evidence
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          report = json.load(open('build/prime-c02-boot-profile.json'))
+          assert report['host_architecture'] == '${{ matrix.architecture }}'
+          assert report['matching_guest_states'] and report['matching_long_mode_state']
+          assert report['repeat_count'] == 3
+          print('Prime C02', report['host_architecture'], report['fixture_sha256'],
+                report['guest_state']['current']['steps'], report['timing'])
+          PY
+      - name: Verify and measure Prime C03 native ARM64 blocks
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_prime_ether_arm64_test | tee build/prime-c03-ether-arm64.log
+          if [ "$(uname -m)" = "aarch64" ]; then
+            grep -q '^PRIME_C03_ARM64_PASS ' build/prime-c03-ether-arm64.log
+            grep -q '^PRIME_ETHER_ROTATION_PASS cases=96 flags=1 stack=1 exact_steps=1$' build/prime-c03-ether-arm64.log
+            grep -q '^PRIME_ETHER_VARIABLE_ROTATION_PASS cases=144 flags=1 ram=1$' build/prime-c03-ether-arm64.log
+            grep -q '^PRIME_ARM64_PROTECTED32_PASS ' build/prime-c03-ether-arm64.log
+            grep -q '^PRIME_ARM64_BYTE_COPY_PASS ' build/prime-c03-ether-arm64.log
+            grep -q '^PRIME_ETHER_INTEGER_PASS mode=protected32 ' build/prime-c03-ether-arm64.log
+            grep -q '^PRIME_ETHER_INTEGER_PASS mode=long64 ' build/prime-c03-ether-arm64.log
+            grep -q '^PRIME_ETHER_RIP_RELATIVE_PASS$' build/prime-c03-ether-arm64.log
+            grep -q '^PRIME_ETHER_SIGNED_BOOT_PASS ' build/prime-c03-ether-arm64.log
+            grep -q '^PRIME_ETHER_RMW_BOOT_PASS ' build/prime-c03-ether-arm64.log
+            sed -n 's/^PRIME_C03_ARM64_BENCH //p' build/prime-c03-ether-arm64.log > build/prime-c03-ether-arm64.json
+            python3 -m json.tool build/prime-c03-ether-arm64.json >/dev/null
+          else
+            grep -q '^PRIME_C03_ARM64_FALLBACK_PASS ' build/prime-c03-ether-arm64.log
+          fi
+      - name: Record Prime C04 RAM, address map and pressure evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir build --output-on-failure -V \
+            -R '^reverse_windows_(sparse_ram|pc_memory|pc_memory_fabric|x86_long_mode|x86_ether_rep_batch|android_bios_iso_qssd)$' \
+            | tee build/prime-c04-ram.log
+          for marker in SPARSE_WORD TRANSLATION REP_FILL ANDROID_PRESSURE SHARED_RAM; do
+            grep -q "PRIME_C04_${marker}_PASS" build/prime-c04-ram.log
+          done
+      - name: Capture BIOS disk boot and guest VGA evidence
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_bios_disk_test | tee build/c03-bios-disk.log
+          grep -q C03_BIOS_CD_QSSD_DISCOVERY_PASS build/c03-bios-disk.log
+          python3 tests/c03_render_vga.py build/c03-boot-evidence.json build/c03-qssd-vga.svg
+      - name: Verify x64 transfers through optical boot data and QSSD reboot
+        run: |
+          set -euo pipefail
+          ctest --test-dir build --output-on-failure -V \
+            -R '^(reverse_windows_x64_optical_qssd|reverse_windows_x86_(far_transfer64|system64|long_null_ss))$'
+      - name: Capture C02 MMX, SSE, x87 and FXSR conformance evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -m | tee build/c02-cpu-conformance.log
+          lscpu | sed -n '/^Vendor ID:/p; /^Model name:/p' | tee -a build/c02-cpu-conformance.log
+          git -C deps/mundo-X rev-parse HEAD | tee -a build/c02-cpu-conformance.log
+          ctest --test-dir build -V -R \
+            '^(reverse_windows_x86_(mmx|sse_legacy_forms|x87_arithmetic_oracle|x87_state)|reverse_windows_c09r1_x87_(fxsave_context|deferred_mf)|reverse_windows_c05_real_cpl3_tss)$' \
+            | tee -a build/c02-cpu-conformance.log
+      - name: Capture authentic C06 PCI PIC PIT APIC ACPI guest evidence
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_c06_motherboard_guest_test | tee build/reverse-windows-c06-motherboard.log
+          grep -q 'C06_PIC_PIT_GUEST_IRQ_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'C02_X87_LEGACY_FERR_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'C03_ATAPI_IRQ15_STI_HLT_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'ETHER_BOOT_IRQ_TIMING_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'C06_PCI_ACPI_CMOS_REAL_GUEST_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'C06_IOAPIC_LAPIC_MMIO_IRQ_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'C06_APIC_NESTED_HLT_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'C06_APIC_DIVISOR_MSR_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'C06_APIC_TSC_HLT_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'C06_CR8_LAPIC_TPR_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'PRIME_C05_PCI_ENUMERATION_PASS profiles=4 slots=32' build/reverse-windows-c06-motherboard.log
+          grep -q 'PRIME_C05_ACPI_SCI_PASS route=pic' build/reverse-windows-c06-motherboard.log
+          grep -q 'PRIME_C05_ACPI_SCI_PASS route=ioapic' build/reverse-windows-c06-motherboard.log
+          grep -q 'PRIME_C05_PIT_CALIBRATION_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'PRIME_C05_BIOS_CLOCK_PASS' build/reverse-windows-c06-motherboard.log
+          grep -q 'REVERSE_WINDOWS_C06_MOTHERBOARD_PASS' build/reverse-windows-c06-motherboard.log
+      - name: Verify real C07 guest PCI ATA PIO IRQ14 and durable QSSD replay
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_c07_ata_guest_test | tee build/reverse-windows-c07-ata.log
+          for marker in C07_REAL_GUEST_PCI_ATA_PIO_IRQ_PASS \
+            C03_QSSD_IDENTIFY_DEVICE_PASS \
+            C07_LBA48_HIGH_SPARSE_GUEST_PASS \
+            C07_ATA_PIO_MULTI_SECTOR_PASS \
+            C07_ATA_COMMAND_ERRORS_PASS \
+            C07_ATA_PARTIAL_RESET_PASS \
+            C07_SAME_MACHINE_REBOOT_PASS \
+            C07_QSSD_DURABILITY_REOPEN_PASS \
+            C07_BIOS_ATA_SINGLE_QSSD_PASS \
+            C07_QSSD_CORRUPT_REJECT_TORN_RECOVER_PASS \
+            REVERSE_WINDOWS_C07_REAL_ATA_PASS; do
+            grep -q "$marker" build/reverse-windows-c07-ata.log
+          done
+      - name: Verify C08 checkpoint, corruption, crash, compact and C07 ATA compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_c08_maintenance_test | tee build/reverse-windows-c08-maintenance.log
+          grep -q 'C08_ATOMIC_COMPACTION_PASS' build/reverse-windows-c08-maintenance.log
+          grep -q 'C08_CHECKPOINT_CRASH_REPLAY_PASS' build/reverse-windows-c08-maintenance.log
+          grep -q 'REVERSE_WINDOWS_C08_MAINTENANCE_PASS' build/reverse-windows-c08-maintenance.log
+      - name: Measure Prime C06 BIOS, ATA and physical journal operation
+        shell: bash
+        run: |
+          set -euo pipefail
+          for pass in 1 2 3 4; do
+            echo "PRIME_C06_SAMPLE pass=$pass"
+            ./build/reverse_windows_prime_qssd_guest_test
+          done | tee build/prime-c06-qssd.log
+          grep -q 'PRIME_C06_QSSD_ROUTE mode=ata_multiple.*commits=128' build/prime-c06-qssd.log
+          grep -q 'PRIME_C06_BIOS_ATA_SHARED_PASS' build/prime-c06-qssd.log
+          grep -q 'PRIME_C06_QSSD_RECOVERY_PASS' build/prime-c06-qssd.log
+          grep -q 'PRIME_C06_QSSD_XOR_PASS logical_bytes=17592186044416.*root_pread=0' build/prime-c06-qssd.log
+      - name: Verify and measure Prime C07 exact guest VBE updates
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_pc_video_test | tee build/prime-c07-vram.log
+          grep -q '^PRIME_C07_VRAM_WATCH_PASS ' build/prime-c07-vram.log
+          for pass in 1 2 3 4; do
+            echo "PRIME_C07_SAMPLE pass=$pass"
+            ./build/reverse_windows_prime_vbe_guest_test
+          done | tee build/prime-c07-vbe.log
+          grep -q '^PRIME_C07_VBE_EXACT_PASS ' build/prime-c07-vbe.log
+          grep -q '^PRIME_C07_ANDROID_VBE_PASS .* pixels=exact' build/prime-c07-vbe.log
+          grep -q '^PRIME_C07_VBE_BENCH .* pixels=exact' build/prime-c07-vbe.log
+      - name: Measure RAW vs QSSD with equal fsync semantics (no performance threshold)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_c08_benchmark | tee build/reverse-windows-c08-benchmark.jsonl
+          grep -q 'REVERSE_WINDOWS_C08_BENCHMARK_PASS' build/reverse-windows-c08-benchmark.jsonl
+          python3 - <<'PY'
+          import json,math,pathlib
+          output=pathlib.Path("build/reverse-windows-c08-benchmark.jsonl")
+          line=next(x for x in output.read_text().splitlines() if x.startswith("{"))
+          metrics=json.loads(line)
+          assert metrics["schema"]=="reverse-windows-c08-benchmark-v1"
+          assert metrics["raw_fsync_after_every_write"] and metrics["qssd_fsync_after_every_commit"]
+          assert metrics["warm_cache_not_dropped"] and metrics["single_run_not_a_speed_claim"]
+          for key in ("raw_write_ms","qssd_write_ms","raw_read_ms",
+                      "qssd_read_ms","qssd_full_open_ms","qssd_index_open_ms",
+                      "checkpoint_build_ms","compact_ms"):
+              assert math.isfinite(metrics[key]) and metrics[key]>=0, key
+          assert metrics["qssd_journal_after"]<=metrics["qssd_journal_before"]
+          assert metrics["qssd_cache_resident_bytes"]<=512*1024
+          assert not metrics["windows_booted"]
+          pathlib.Path("build/c08-measured-results.json").write_text(json.dumps(metrics,indent=2)+"\n")
+          print("C08_BENCHMARK_JSON_VALIDATED results_are_host_specific=1")
+          PY
+      - name: Smoke test offline maintenance CLI without Windows ISO
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_boot_probe --demo-x64 --steps 200000 \
+            --ram-mib 2048 --resident-mib 256 \
+            --qssd-disk build/c08-cli-smoke.rqvd --create-qssd-gib 1 > /dev/null
+          ./build/reverse_windows_boot_probe --qssd-checkpoint \
+            --qssd-disk build/c08-cli-smoke.rqvd | tee build/c08-cli-checkpoint.json
+          ./build/reverse_windows_boot_probe --qssd-compact \
+            --qssd-disk build/c08-cli-smoke.rqvd | tee build/c08-cli-compact.json
+          grep -q '"qssd_maintenance":"checkpoint"' build/c08-cli-checkpoint.json
+          grep -q '"qssd_maintenance":"compact"' build/c08-cli-compact.json
+          test -f build/c08-cli-smoke.rqvd.rqix
+          echo C08_CLI_OFFLINE_MAINTENANCE_PASS
+      - name: Verify C09R-1 stage4 SSE2, MXCSR and x87
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_c09r1_daz_ftz_test | tee build/reverse_windows_c09r1_daz_ftz_test.log
+          grep -Fq 'C09R1_STAGE4_DAZ_FTZ_PASS' build/reverse_windows_c09r1_daz_ftz_test.log
+          ./build/reverse_windows_c09r1_stage4_mxcsr_test | tee build/reverse_windows_c09r1_stage4_mxcsr_test.log
+          grep -Fq 'REVERSE_WINDOWS_C09R1_STAGE4_MXCSR_PASS' build/reverse_windows_c09r1_stage4_mxcsr_test.log
+          ./build/reverse_windows_c09r1_stage4_x87_test | tee build/reverse_windows_c09r1_stage4_x87_test.log
+          grep -Fq 'REVERSE_WINDOWS_C09R1_STAGE4_X87_PASS' build/reverse_windows_c09r1_stage4_x87_test.log
+          ./build/reverse_windows_c09r1_stage4_packed_cvt_test | tee build/reverse_windows_c09r1_stage4_packed_cvt_test.log
+          grep -Fq 'REVERSE_WINDOWS_C09R1_STAGE4_PACKED_CVT_PASS' build/reverse_windows_c09r1_stage4_packed_cvt_test.log
+          ./build/reverse_windows_c09r1_stage4_sse2_misc_test | tee build/reverse_windows_c09r1_stage4_sse2_misc_test.log
+          grep -Fq 'REVERSE_WINDOWS_C09R1_STAGE4_SSE2_MISC_PASS' build/reverse_windows_c09r1_stage4_sse2_misc_test.log
+      - name: Prove C09R-1 stage3 XMM/x87/SSE2/IDT and Ring3 context without Windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in \
+            reverse_windows_c09r1_sse2_fp_test \
+            reverse_windows_c09r1_ring3_fpu_test \
+            reverse_windows_c09r1_exact_x87_test \
+            reverse_windows_c09r1_x87_mf_test; do
+            ./build/"$target" | tee "build/${target}.log"
+          done
+          grep -q 'C09R1_SSE2_IDT_XM_UD_FXSTATE_PASS' \
+            build/reverse_windows_c09r1_sse2_fp_test.log
+          grep -q 'REVERSE_WINDOWS_C09R1_RING3_FPU_PASS' \
+            build/reverse_windows_c09r1_ring3_fpu_test.log
+          grep -q 'C09R1_X87_EXACT_IEEE_TO_EXT80_ORACLE_PASS' \
+            build/reverse_windows_c09r1_exact_x87_test.log
+          grep -q 'C09R1_X87_DEFERRED_MF_FNCLEX_CONTEXT_PASS' \
+            build/reverse_windows_c09r1_x87_mf_test.log
+          echo C09R1_STAGE3_REAL_GUEST_CONTEXT_AND_EXCEPTION_PASS
+      - name: Audit REAL owner-connected hardware without ISO or Windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_c09r_hardware_preflight --self-test | tee build/c09r-hardware-audit.jsonl
+          python3 - <<'PY'
+          import json,pathlib
+          lines=pathlib.Path('build/c09r-hardware-audit.jsonl').read_text().splitlines()
+          report=json.loads(next(s for s in lines if s.startswith('{')))
+          assert report['schema']=='reverse-windows-c09r-readiness-v1'
+          assert not report['iso_loaded'] and not report['windows_executed']
+          assert not report['ready_for_windows10_install']
+          assert report['guest_ram_logical_bytes']==2*1024**3
+          assert report['qssd_logical_bytes']==64*1024**3
+          assert report['pc_cpu_cx16'] and report['pc_cpu_pae'] and report['pc_cpu_nx']
+          assert report['pc_cpu_lahf_sahf'] and report['pc_cpu_prefetchw']
+          assert all(report[f'pc_cpu_{feature}'] for feature in ('mmx','fxsr','sse','sse2'))
+          assert not report['pc_cpu_x87']
+          assert report['pci_ata_guest_detected']
+          assert report['ether_xi_memory_aperture']
+          assert report['gpu_virtual_vga_delta']
+          assert report['gpu_virtual_compute_words']==2**32
+          assert int(report['gpu_virtual_compute_sum_u64'])==(2**32-1)*2**31
+          assert report['gpu_virtual_compute_evaluated_words']==0
+          assert report['gpu_virtual_xi_bits']==1024
+          assert report['gpu_vga_delta_upload_bytes']==4
+          assert report['gpu_full_frame_bytes']==4000
+          assert report['qssd_graphics_serial']==3
+          assert 'REVERSE_WINDOWS_C09R_READINESS_PASS' in lines[-1]
+          print('C09R_USER_TECH_REAL_HARDWARE_AUDIT_PASS windows_ran=false')
+          PY
+      - name: Trace authentic CPU and BIOS execution from a SYNTHETIC El Torito ISO
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/c09_synthetic_iso.py build/c09-synthetic.iso
+          ./build/reverse_windows_boot_probe --iso build/c09-synthetic.iso \
+            --qssd-disk build/c09-trace.rqvd --create-qssd-gib 1 \
+            --steps 1000 --ram-mib 16 --resident-mib 16 \
+            --trace build/c09-iso-trace.jsonl --trace-max-events 15000 \
+            --evidence build/c09-iso-boot-evidence.json \
+            > build/c09-iso-probe.stdout.json
+          python3 tests/c09_assert_trace.py build/c09-iso-trace.jsonl iso
+          python3 - <<'PY'
+          import json,pathlib
+          report=json.loads(pathlib.Path("build/c09-iso-boot-evidence.json").read_text())
+          assert report["source"]=="original-Mundo-X-PcMachine"
+          assert report["guest_kind"]=="user-ISO"
+          assert report["c09_trace"]["enabled"]
+          assert not report["windows10_boot_verified"]
+          assert not report["c09_trace"]["windows_pe_verified"]
+          assert report["ide_c07"]["attached"]
+          assert report["ide_c07"]["ata_commands"]>=1
+          assert report["bios_fixed_disks"]==1 and report["atapi_cdrom"]
+          assert report["machine"]["cpu_mode"]=="protected16"
+          assert report["machine"]["status"]=="halted"
+          print("C09_PROBE_COHERENT_WITH_TRACE_PASS windows_pe=false")
+          PY
+      - name: Exercise terminal fault, truncated quota and invalid ISO rejection
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/c09_synthetic_iso.py --fault-disk build/c09-unsupported.rvdisk
+          set +e
+          ./build/reverse_windows_boot_probe --boot-hdd \
+            --disk build/c09-unsupported.rvdisk \
+            --steps 128 --ram-mib 16 --resident-mib 16 \
+            --trace build/c09-fault-trace.jsonl --trace-max-events 3 \
+            > build/c09-fault-probe.stdout.json
+          actual=$?
+          set -e
+          test "$actual" -eq 2
+          python3 tests/c09_assert_trace.py build/c09-fault-trace.jsonl fault
+          ./build/reverse_windows_boot_probe --iso build/c09-synthetic.iso \
+            --qssd-disk build/c09-trace.rqvd \
+            --steps 1000 --ram-mib 16 --resident-mib 16 \
+            --trace build/c09-quota-trace.jsonl --trace-max-events 3 \
+            > build/c09-quota-probe.stdout.json
+          python3 tests/c09_assert_trace.py build/c09-quota-trace.jsonl quota
+          python3 tests/c09_synthetic_iso.py --bad-catalog build/c09-bad-catalog.iso
+          set +e
+          ./build/reverse_windows_boot_probe --iso build/c09-bad-catalog.iso \
+            --ram-mib 16 --resident-mib 16 \
+            > build/c09-bad-catalog.out 2> build/c09-bad-catalog.err
+          actual=$?
+          set -e
+          test "$actual" -eq 2
+          grep -q 'El Torito validation checksum' build/c09-bad-catalog.err
+          sha256sum build/c09-synthetic.iso > build/c09-iso-before.sha256
+          set +e
+          ./build/reverse_windows_boot_probe --iso build/c09-synthetic.iso \
+            --trace build/c09-synthetic.iso --steps 20 \
+            --ram-mib 16 --resident-mib 16 \
+            > build/c09-trace-refused.out 2> build/c09-trace-refused.err
+          actual=$?
+          set -e
+          test "$actual" -eq 2
+          grep -q 'refuse overwrite' build/c09-trace-refused.err
+          sha256sum --check build/c09-iso-before.sha256
+          echo C09_UNMODIFIED_ISO_AND_NO_FALSE_BOOT_PASS
+      - name: Diagnose trace and retain first observable blocker without inventing WinPE
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/c09_diagnose_trace.py build/c09-iso-trace.jsonl \
+            --output build/c09-iso-diagnosis.json > build/c09-iso-diagnosis.pretty
+          python3 scripts/c09_diagnose_trace.py build/c09-fault-trace.jsonl \
+            --output build/c09-fault-diagnosis.json > build/c09-fault-diagnosis.pretty
+          python3 scripts/c09_diagnose_trace.py build/c09-quota-trace.jsonl \
+            --output build/c09-quota-diagnosis.json > build/c09-quota-diagnosis.pretty
+          python3 - <<'PY'
+          import json,pathlib
+          root=pathlib.Path("build")
+          iso=json.loads((root/"c09-iso-diagnosis.json").read_text())
+          fault=json.loads((root/"c09-fault-diagnosis.json").read_text())
+          quota=json.loads((root/"c09-quota-diagnosis.json").read_text())
+          assert iso["reached_cs_0050_ip_0854"]
+          assert iso["checkpoint_opcode_bytes"]=="0f00d8"
+          assert iso["bios_int13_ah42_reads"]==1
+          assert iso["ata_identify_commands"]==1
+          assert iso["pci_cfg_out_cf8"]>=1 and iso["pci_cfg_in_cfc"]>=1
+          assert iso["first_terminal_blocker"]["type"]=="guest_halt"
+          assert fault["first_terminal_blocker"]["type"]=="terminal_instruction_fault"
+          assert fault["first_terminal_blocker"]["first_observed"]["decoded"]=="f090"
+          assert fault["truncated"] and quota["truncated"]
+          assert quota["first_terminal_blocker"]["type"]=="no_terminal_fault_observed_with_truncated_trace"
+          for report in (iso,fault,quota):
+              assert not report["windows_10_boot_verified"]
+              assert not report["winpe_boot_verified"]
+              assert not report["guest_image_identity_verified"]
+          print("C09_FIRST_OBSERVABLE_BLOCKER_DIAGNOSIS_PASS identity_unverified=1")
+          PY
+      - name: Capture actual guest APIC MMIO and ATA IRQ14 trace integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/reverse_windows_c09_hardware_trace_test | tee build/c09-hardware-trace.log
+          grep -q 'C09_HARDWARE_IRQ14_MMIO_QSSD_TRACE_PASS' build/c09-hardware-trace.log
+          grep -q 'REVERSE_WINDOWS_C09_HARDWARE_TRACE_PASS' build/c09-hardware-trace.log
+      - name: Replay protected16 group-6 through real El Torito synthetic ISO
+        run: |
+          g++ -std=c++17 -O0 -pthread -Ideps/mundo-X/native/include deps/mundo-X/pc-android/native/tests/pc_group6_iso_test.cpp -o build/iso-protected16-group6
+          ./build/iso-protected16-group6
+      - name: Generate machine-state evidence from actual x64 interpreter
+        run: |
+          ./build/reverse_windows_boot_probe --demo-x64 --steps 200000 --ram-mib 2048 --resident-mib 256 --evidence build/reverse-windows-x64.json
+          python3 tests/check_evidence.py build/reverse-windows-x64.json
+      - name: Preserve execution evidence
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: reverse-windows-c08-${{ matrix.architecture }}-evidence
+          path: |
+            build/reverse-windows-x64.json
+            build/reverse-windows-c06-motherboard.log
+            build/prime-bios-keyboard.log
+            build/prime-c02-boot-profile.json
+            build/prime-x86-measure.log
+            build/prime-smp-clock.log
+            build/smp-irq-samples.log
+            build/smp-irq-summary.log
+            build/prime-execution.log
+            build/prime-c03-ether-arm64.log
+            build/prime-c03-ether-arm64.json
+            build/prime-c04-ram.log
+            build/prime-c06-qssd.log
+            build/prime-c07-vram.log
+            build/prime-c07-vbe.log
+            build/prime-c08-gpu.log
+            build/prime-infinitecore.log
+            build/primevgc-transfer.log
+            build/primevgc-bulk.log
+            build/primevgc-compute.log
+            build/reverse-windows-c07-ata.log
+            build/reverse-windows-c08-maintenance.log
+            build/reverse-windows-c08-benchmark.jsonl
+            build/c08-measured-results.json
+            build/c08-cli-checkpoint.json
+            build/c08-cli-compact.json
+            build/c09-iso-trace.jsonl
+            build/c09-iso-boot-evidence.json
+            build/c09-iso-probe.stdout.json
+            build/c09-fault-trace.jsonl
+            build/c09-quota-trace.jsonl
+            build/c09-bad-catalog.err
+            build/c09-iso-diagnosis.json
+            build/c09-fault-diagnosis.json
+            build/c09-quota-diagnosis.json
+            build/c09-hardware-trace.log
+            build/c09r-hardware-audit.jsonl
+            build/c02-cpu-conformance.log
+            build/c03-boot-evidence.json
+            build/c03-bios-disk.log
+            build/c03-qssd-vga.svg
+            build/reverse_windows_c09r1_sse2_fp_test.log
+            build/reverse_windows_c09r1_ring3_fpu_test.log
+            build/reverse_windows_c09r1_exact_x87_test.log
+            build/reverse_windows_c09r1_x87_mf_test.log
+            build/reverse_windows_c09r1_daz_ftz_test.log
+            build/reverse_windows_c09r1_stage4_mxcsr_test.log
+            build/reverse_windows_c09r1_stage4_x87_test.log
+            build/reverse_windows_c09r1_stage4_packed_cvt_test.log
+            build/reverse_windows_c09r1_stage4_sse2_misc_test.log
+          if-no-files-found: warn
