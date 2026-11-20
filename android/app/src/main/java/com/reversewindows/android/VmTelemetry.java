@@ -216,7 +216,14 @@ final class VmTelemetry extends LinearLayout {
         metric(6, "CPU física reportada", range);
         long threads = number(host, "hint_threads", 0);
         metric(7, "Solicitud a Android", threads == 0 ? "Inactiva" : count(threads) + " hilos");
-        showRows(8);
+        JSONObject loops = snapshot.optJSONObject("ether_next");
+        if (number(loops, "loop_time_samples", 0) > 0) {
+            metric(8, "Último bloque Éter muestreado", units(number(loops, "loop_last_ns"), 1_000_000, "ms", 6)
+                    + " · " + count(number(loops, "loop_last_steps")) + " pasos");
+            showRows(9);
+        } else {
+            showRows(8);
+        }
     }
 
     private static String formatRate(long stepsPerSecond) {

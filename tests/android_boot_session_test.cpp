@@ -1316,7 +1316,8 @@ int main(int argc, char** argv) {
                                  "\"irq8_redirection_low\":65536", "\"lapic_vectors\":[]",
                                  "\"secondary_rep_elements\":0", "\"secondary_rep_bytes\":0",
                                  "\"secondary_scan_loop_steps\":0", "\"secondary_shift_loop_steps\":0",
-                                 "\"secondary_zero_loop_steps\":0", "\"secondary_wide_multiply_loop_steps\":0"})
+                                 "\"secondary_zero_loop_steps\":0", "\"secondary_wide_multiply_loop_steps\":0",
+                                 "\"cooperative_loop_blocks\":0", "\"worker_loop_steps\":0"})
         require(progress.find(marker) != std::string::npos, marker);
       const auto text = screen(frame);
       require(progress.find("\"data_disk\":{\"logical_bytes\":9007199254740992,\"physical_bytes\":64,") !=

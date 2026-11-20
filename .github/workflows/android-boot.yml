@@ -102,6 +102,9 @@ jobs:
             -DANDROID_ABI="$ANDROID_ABI" -DANDROID_PLATFORM=android-26 -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
           cmake --build "$RUNNER_TEMP/ether-gpu-device" --target reverse_windows_prime_gpu_guest_test --parallel 2
+          if [[ "$ANDROID_ABI" == x86_64 ]]; then
+            cmake --build "$RUNNER_TEMP/ether-gpu-device" --target reverse_windows_smp_guest_test --parallel 2
+          fi
           readelf -lW "$RUNNER_TEMP/ether-gpu-device/reverse_windows_prime_gpu_guest_test" | python3 -c '
           import sys
           loads = [int(row[-1], 16) for row in map(str.split, sys.stdin) if row[:1] == ["LOAD"]]
@@ -176,6 +179,7 @@ jobs:
           grep -aFq 'cpuid_vendor' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'GenuineIntel' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'boot_counter_loop_steps' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'cooperative_loop_steps' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'secondary_scan_loop_steps' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'ether_quantum_block' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'interrupt_origin' "$RUNNER_TEMP/reverse-windows-android.so"
@@ -244,8 +248,12 @@ jobs:
           apk=android/app/build/outputs/apk/debug/app-debug.apk
           log="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/android-runtime.log"
           trap 'adb logcat -d > "$log"' EXIT
-          device_dir=/data/local/tmp/reverse-prime-r106
+          device_dir=/data/local/tmp/reverse-prime-r107
           adb shell mkdir -p "$device_dir"
+          adb push "$RUNNER_TEMP/ether-gpu-device/reverse_windows_smp_guest_test" "$device_dir/ether-smp"
+          adb shell chmod 755 "$device_dir/ether-smp"
+          adb shell "TMPDIR=$device_dir $device_dir/ether-smp --measure-ap-scan-grants" | tee "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ap-scan-grants.log"
+          test "$(grep -c '^AP_SCAN_SAMPLE ' "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ap-scan-grants.log")" = 4
           adb push "$RUNNER_TEMP/ether-gpu-device/reverse_windows_prime_gpu_guest_test" "$device_dir/ether-gpu"
           adb shell chmod 755 "$device_dir/ether-gpu"
           adb shell "TMPDIR=$device_dir $device_dir/ether-gpu --measure-ether" | tee "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ether-gpu-device.log"
