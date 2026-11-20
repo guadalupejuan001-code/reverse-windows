@@ -220,6 +220,95 @@ void enable_gpu_msi(Guest32& driver) {
   driver.write(PcMachine::kLocalApicAddress + 0xf0, 0x1ff);
 }
 
+void verify_quantum_block_irq(const std::filesystem::path& volume) {
+  PcMachine pc(PcMachine::high_ram_address_space(4ULL << 30, true), 64 * MiB);
+  pc.boot_graphics_demo(width, height);
+  PcMotherboardC06 board(pc, nullptr, {}, 0, volume);
+  graphics_boot(pc);
+  install_gpu_msi_handler(pc);
+  auto& cpu = pc.cpu;
+  constexpr unsigned ram = 0x410000, fence = 73;
+  struct Packet {
+    RwGpuDmaHeader header;
+    std::array<RwGpuQuantumGate, 8> gates;
+  };
+  const Packet packet{{RWGPU_DMA_QUANTUM_BLOCK, sizeof(Packet)}, {{
+    {RWGPU_GATE_X,0,8,0}, {RWGPU_GATE_H,0,0,0}, {RWGPU_GATE_X,0,8,0}, {RWGPU_GATE_CX,0,0,1},
+    {RWGPU_GATE_Y,0,9,0}, {RWGPU_GATE_CZ,0,10,11}, {RWGPU_GATE_Y,0,9,0}, {RWGPU_GATE_CZ,0,10,11}
+  }}};
+  static_assert(sizeof(Packet) == sizeof(RwGpuDmaHeader) + 8 * sizeof(RwGpuQuantumGate));
+  cpu.memory.write_block(ram, reinterpret_cast<const std::uint8_t*>(&packet), sizeof(packet));
+
+  Guest32 issue;
+  issue.cfg_write(0x10, moved_bar);
+  issue.cfg_write(4, 6);
+  enable_gpu_msi(issue);
+  issue.write(PcMachine::kLocalApicAddress + 0x80, 0xf0);
+  issue.emit({0xfb,0x90}); // STI; NOP. Only the guest priority holds the MSI.
+  issue.direct_command(RWGPU_SUBMIT_DMA, 1, ram, fence, sizeof(packet));
+  const auto epoch = pc.quantum_session->epoch();
+  issue.run(pc);
+  const auto a = std::to_string(PcMachine::kEtherMemoryLogicalByteBase * 8);
+  const auto b = std::to_string(PcMachine::kEtherMemoryLogicalByteBase * 8 + 1);
+  const auto observe = [&] {
+    return pc.quantum_session->query_batch({{1,{{a,'X'},{b,'X'}}}, {1,{{a,'Z'},{b,'Z'}}},
+                                            {1,{{a,'Z'}}}}).values;
+  };
+  const std::vector<double> bell{1,1,0};
+  const auto work = pc.quantum_session->gate_work_stats();
+  require((cpu.read32(moved_bar + RWGPU_REG_CAPS) & RWGPU_CAP_QUANTUM_BLOCK) &&
+          cpu.read32(moved_bar + RWGPU_REG_QUANTUM_MAX_GATES) == RWGPU_QUANTUM_MAX_GATES &&
+          cpu.read32(moved_bar + RWGPU_REG_STATUS) == RWGPU_OK &&
+          cpu.read32(moved_bar + RWGPU_REG_FENCE_LAST) == fence &&
+          pc.quantum_session->epoch() == epoch + 1 && observe() == bell &&
+          work.input_gates == 8 && work.executed_gates == 2 && work.cancelled_gates == 6 &&
+          board.interrupt_state().pending == msi_vector && !board.lapic_vector_stats()[msi_vector].deliveries,
+          "the complete Bell circuit and fence must be visible while the MSI waits");
+
+  Guest32 unmask;
+  unmask.write(PcMachine::kLocalApicAddress + 0x80, 0);
+  unmask.emit({0x90,0xfa}); // Deliver on the first eligible instruction, before CLI.
+  unmask.run(pc);
+  const auto& irq = board.lapic_vector_stats()[msi_vector];
+  require(irq.deliveries == 1 && irq.eois == 1 && cpu.read32(msi_receipt + 20) == 1 &&
+          cpu.read32(msi_receipt + 4) == fence && !board.interrupt_state().pending,
+          "a deferred quantum MSI must acknowledge its original fence exactly once");
+
+  unsigned ticket = 1;
+  const auto staged = [&](const auto& gates, unsigned bytes, unsigned expected) {
+    cpu.memory.write_block(ram, reinterpret_cast<const std::uint8_t*>(gates.data()), sizeof(gates));
+    Guest32 driver;
+    driver.copy(moved_bar + RWGPU_STAGE_OFFSET, ram, sizeof(gates));
+    driver.direct_command(RWGPU_QUANTUM_BLOCK, ++ticket, 0, 0, bytes);
+    driver.run(pc);
+    require(cpu.read32(moved_bar + RWGPU_REG_STATUS) == expected &&
+            cpu.read32(moved_bar + RWGPU_REG_COMPLETED) == ticket, "staged quantum block status");
+  };
+  std::array<RwGpuQuantumGate, 2> inverse{{{RWGPU_GATE_CX,0,0,1}, {RWGPU_GATE_H,0,0,0}}};
+  auto invalid = inverse;
+  invalid.back().reserved = 1;
+  staged(invalid, sizeof(invalid), RWGPU_INVALID);
+  invalid.back() = {RWGPU_GATE_CX,0,1,1};
+  staged(invalid, sizeof(invalid), RWGPU_INVALID);
+  invalid.back() = {RWGPU_GATE_H,0,RWGPU_LOGICAL_BYTES * 8,0};
+  staged(invalid, sizeof(invalid), RWGPU_INVALID);
+  staged(inverse, sizeof(inverse)-1, RWGPU_INVALID);
+  staged(inverse, 0, RWGPU_INVALID);
+  staged(inverse, (RWGPU_QUANTUM_MAX_GATES + 1) * sizeof(RwGpuQuantumGate), RWGPU_INVALID);
+  require(pc.quantum_session->epoch() == epoch + 1 && observe() == bell,
+          "a rejected block must leave its entire prefix unapplied");
+  staged(inverse, sizeof(inverse), RWGPU_OK);
+  require(cpu.read8(PcMachine::kEtherMemoryPhysicalBase) == 0 && pc.quantum_session->epoch() == epoch + 2,
+          "CPU aperture must see the inverse Bell circuit");
+  std::array<RwGpuQuantumGate, RWGPU_QUANTUM_MAX_GATES> full{};
+  full.fill({RWGPU_GATE_X,0,7,0});
+  staged(full, sizeof(full), RWGPU_OK);
+  require(pc.quantum_session->gate_work_stats().cancelled_gates == full.size() &&
+          cpu.read8(PcMachine::kEtherMemoryPhysicalBase) == 0, "maximum circuit must preserve its identity");
+  std::cout << "PRIME_QUANTUM_BLOCK_IRQ_PASS gates=8 executed=2 cancelled=6 bell_xx=1 bell_zz=1"
+            << " masked_msi=1 delivered=1 eoi=1 fence=73 invalid_atomic=1 max_gates=64\n";
+}
+
 #ifdef REVERSE_WINDOWS_GLES_GUEST
 void verify_scheduled_dma(PcMachine& pc, PcMotherboardC06& board,
                           const RwGpuVertex* vertices, unsigned count,
@@ -929,6 +1018,10 @@ int main(int argc, char** argv) {
       ~RemoveDirectory() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
     } remove{name};
     if (argc > 1) {
+      if (argc == 2 && std::string_view(argv[1]) == "--quantum-block") {
+        verify_quantum_block_irq(remove.path / "circuit.rqvd");
+        return 0;
+      }
 #ifdef REVERSE_WINDOWS_GLES_GUEST
       if (argc == 2 && std::string_view(argv[1]) == "--measure-ether") {
         verify_ether_draws(remove.path / "ether-draw.rqvd");
@@ -945,6 +1038,7 @@ int main(int argc, char** argv) {
 #endif
     verify(remove.path / "gpu.rqvd");
     verify_quantum_vram(remove.path / "quantum.rqvd");
+    verify_quantum_block_irq(remove.path / "circuit.rqvd");
     verify_quantum_state_restart(remove.path / "joint-state.rqvd");
     verify_c13_residency(remove.path / "c13.rqvd");
     measure_vram(remove.path / "large-vram.rqvd");

@@ -58,6 +58,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             {"cpu_pae", "PAE"}, {"cpu_nx", "NX"}, {"cpu_cx16", "CMPXCHG16B"},
             {"cpu_lahf_sahf", "LAHF/SAHF"}, {"cpu_prefetchw", "PREFETCHW"}, {"cpu_fxsr", "FXSR"},
             {"lapic", "Controlador local de interrupciones (xAPIC)"},
+            {"ether_quantum_block", "Bloque cuántico Éter · par de Bell"},
             {"ram", "RAM"}, {"pci_ide", "Controlador PCI IDE"}, {"vga", "Video VGA"},
             {"iso_boot", "Arranque desde ISO"}, {"qssd", "Archivo QSSD"},
             {"qssd_ata", "Capacidad QSSD por ATA"},
@@ -113,6 +114,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private String lastJson = "";
     private String diagnosticToExport = "";
     private final VmStepRate executionRate = new VmStepRate();
+    private final VmStepRate motorRate = new VmStepRate();
 
     @Override
     public void onCreate(Bundle savedState) {
@@ -426,6 +428,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         terminal = false;
         blankTextFrame = false;
         executionRate.reset();
+        motorRate.reset();
         liveMetrics.clear();
         console.dismissInputs();
         console.keyboard.resetGuest();
@@ -571,6 +574,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         if (detailed && !json.isEmpty()) lastJson = json;
         if (!session) {
             executionRate.reset();
+            motorRate.reset();
             status.setTextColor(TEXT);
             status.setText("Máquina apagada");
             source.setText(BuildConfig.VERSION_NAME + " · Invitado x86-64");
@@ -641,12 +645,14 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         long sessionSteps = boot == null ? steps : boot.optLong("session_steps", steps);
         JSONObject workerTiming = diagnostic.optJSONObject("worker_timing");
         long sampleUs = workerTiming == null ? -1 : workerTiming.optLong("sample_elapsed_us", -1);
-        long stepsPerSecond = executionRate.sample(session && running &&
-                "running".equals(diagnostic.optString("status")), sessionSteps, sampleUs);
+        boolean executing = session && running && "running".equals(diagnostic.optString("status"));
+        long stepsPerSecond = executionRate.sample(executing, sessionSteps, sampleUs);
+        long motorUs = workerTiming == null ? -1 : workerTiming.optLong("step_us", -1);
+        long motorStepsPerSecond = motorRate.sample(executing, sessionSteps, motorUs);
         if (session) {
             liveMetrics.signal(diagnostic);
             telemetry.update(diagnostic, machine, modeName(machine.optString("cpu_mode")),
-                    sessionSteps, stepsPerSecond);
+                    sessionSteps, stepsPerSecond, motorStepsPerSecond);
             sessionSummary.setText(VmTelemetry.summary(diagnostic, machine, sessionSteps));
             sessionSummary.setVisibility(View.VISIBLE);
         }

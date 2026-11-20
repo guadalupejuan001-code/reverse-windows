@@ -13,6 +13,16 @@
 #define RWGPU_STAGE_BYTES (256u * 1024u)
 // The quantum plane aliases the CPU Ether aperture for its first 256 bytes.
 #define RWGPU_QUANTUM_TRANSFER_BYTES 256u
+// One block is one atomic Clifford circuit on the shared CPU/VRAM state.
+#define RWGPU_QUANTUM_MAX_GATES 64u
+typedef struct RwGpuQuantumGate {
+  uint32_t opcode, reserved;
+  uint64_t first, second; // Bit offsets within the quantum VRAM plane.
+} RwGpuQuantumGate;
+enum RwGpuGateOpcode {
+  RWGPU_GATE_H = 'H', RWGPU_GATE_S = 'S', RWGPU_GATE_X = 'X', RWGPU_GATE_Y = 'Y',
+  RWGPU_GATE_Z = 'Z', RWGPU_GATE_CX = 'C', RWGPU_GATE_CZ = 'D'
+};
 #define RWGPU_PAGE_BYTES 4096u
 #define RWGPU_VRAM_BATCH_BYTES (15u * RWGPU_PAGE_BYTES)
 #define RWGPU_DIRECT_TRANSFER_BYTES (2048u * RWGPU_PAGE_BYTES)
@@ -41,7 +51,7 @@ enum RwGpuRegister {
   RWGPU_REG_FENCE_FAULT = 0x78, RWGPU_REG_SCHEDULED_DRAW_TICKET = 0x7c,
   RWGPU_REG_PREEMPT_LAST = 0x80, RWGPU_REG_ENGINE_RESET = 0x84,
   RWGPU_REG_QUANTUM_MAX = 0x88, RWGPU_REG_QUANTUM_BASE_LO = 0x8c,
-  RWGPU_REG_QUANTUM_BASE_HI = 0x90
+  RWGPU_REG_QUANTUM_BASE_HI = 0x90, RWGPU_REG_QUANTUM_MAX_GATES = 0x94
 };
 // UPLOAD, DOWNLOAD and COPY use OFFSET as source and AUX as destination.
 // RAM addresses are physical and require PCI bus mastering. VRAM addresses
@@ -67,7 +77,9 @@ enum RwGpuCommand {
   RWGPU_QUANTUM_CHECKPOINT_STATE = 21, RWGPU_QUANTUM_RESTORE_STATE = 22,
   // Staged triangles, OFFSET = shared Ether mask byte offset, AUX = draw flags.
   // Bit i (LSB first) enables triangle i. All mask bytes must have a definite basis value.
-  RWGPU_DRAW_ETHER_MASK = 23
+  RWGPU_DRAW_ETHER_MASK = 23,
+  // Staged RwGpuQuantumGate records, LENGTH in bytes, OFFSET and AUX zero.
+  RWGPU_QUANTUM_BLOCK = 24
 };
 enum RwGpuStatus { RWGPU_IDLE = 0, RWGPU_OK = 1, RWGPU_BAD_COMMAND = 2,
                   RWGPU_INVALID = 3, RWGPU_UNAVAILABLE = 4, RWGPU_FAILED = 5,
@@ -77,7 +89,7 @@ enum RwGpuCaps {
   RWGPU_CAP_SUM_INDICES = 8, RWGPU_CAP_DRAW_VRAM = 16, RWGPU_CAP_COLOR_DMA = 32,
   RWGPU_CAP_DRAW_RAM = 64, RWGPU_CAP_COLOR_ALPHA = 128, RWGPU_CAP_DRAW_READBACK = 256,
   RWGPU_CAP_WDDM_SCHEDULER = 512, RWGPU_CAP_QUANTUM_VRAM = 1024, RWGPU_CAP_QUANTUM_STATE = 2048,
-  RWGPU_CAP_ETHER_MASK = 4096
+  RWGPU_CAP_ETHER_MASK = 4096, RWGPU_CAP_QUANTUM_BLOCK = 8192
 };
 enum RwGpuIrq { RWGPU_IRQ_COMPLETE = 1, RWGPU_IRQ_PREEMPT = 2, RWGPU_IRQ_FAULT = 4 };
 #define RWGPU_PCI_MSI_CAP 0x50u

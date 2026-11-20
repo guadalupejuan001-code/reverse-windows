@@ -100,8 +100,9 @@ class PcMotherboardC06 {
       else mask=v;
     }
     std::uint8_t status() const {return read_isr?isr:irr;}
-    std::uint8_t pending() const {
-      const auto candidates=unsigned(irr&~mask);
+    std::uint8_t pending() const { return pending(irr); }
+    std::uint8_t pending(std::uint8_t requests) const {
+      const auto candidates=unsigned(requests&~mask);
       if(!candidates)return 0;
       for(unsigned n=0;n<8;++n)if(candidates&(1u<<n)){
         // A currently serviced IRQ blocks requests at equal/lower priority.
@@ -320,6 +321,8 @@ class PcMotherboardC06 {
   std::uint64_t parallel_mixed_batches_ = 0;
   std::uint64_t secondary_store_batches_ = 0, secondary_store_steps_ = 0;
   std::uint64_t secondary_rep_elements_ = 0, secondary_rep_bytes_ = 0;
+  std::uint64_t secondary_scan_steps_ = 0;
+  std::uint64_t secondary_shift_steps_ = 0, secondary_zero_steps_ = 0, secondary_multiply_steps_ = 0;
   unsigned longest_parallel_register_slice_ = 0;
   bool prior_local_apic_=false;
   const std::uint64_t* prior_clock_ = nullptr;
@@ -389,6 +392,8 @@ class PcMotherboardC06 {
     parallel_mixed_batches_ = 0;
     secondary_store_batches_ = secondary_store_steps_ = 0;
     secondary_rep_elements_ = secondary_rep_bytes_ = 0;
+    secondary_scan_steps_ = 0;
+    secondary_shift_steps_ = secondary_zero_steps_ = secondary_multiply_steps_ = 0;
     longest_parallel_register_slice_ = 0;
     ioapic_select_=0;
     ioapic_id_=std::uint8_t(AcpiC06::ioapic_id(processor_count_));
@@ -909,6 +914,9 @@ class PcMotherboardC06 {
     return true;
   }
   static bool lapic_on(const LocalApic& apic){return apic.cpu->apic_global_enabled()&&(apic.svr&0x100U);}
+  static bool local_timer_irq_armed(const LocalApic& apic) {
+    return apic.timer_cycles && !(apic.lvt[kTimer] & kLvtMasked) && lapic_on(apic);
+  }
   bool pic_connected() const {
     const auto& apic = bsp();
     const auto lint=apic.lvt[kLint0];
@@ -920,8 +928,14 @@ class PcMotherboardC06 {
     if(!vector)return 0;
     return (vector&0xf0U)>(processor_priority(apic)&0xf0U)?vector:0;
   }
-  bool interrupt_pending()const {
-    return (pic_connected()&&master_.pending())||deliverable_lapic_vector(bsp());
+  std::uint8_t cascaded_pic_requests(unsigned slave_irq) const {
+    constexpr std::uint8_t cascade = 1U << 2;
+    if (slave_irq) return master_.irr | cascade;
+    return master_.isr & cascade ? master_.irr : std::uint8_t(master_.irr & ~cascade);
+  }
+  bool interrupt_pending() const {
+    return deliverable_lapic_vector(bsp()) ||
+           (pic_connected() && master_.pending(cascaded_pic_requests(slave_.pending())));
   }
   static bool lapic_destination(const LocalApic& apic, std::uint32_t command,std::uint32_t destination) {
     const auto id=destination>>24;
@@ -1257,8 +1271,7 @@ class PcMotherboardC06 {
     // The slave's INT output reaches the master independently of CPU IF or
     // LAPIC acceptance. The guest can read both IRRs with interrupts disabled.
     const auto slave_irq=slave_.pending();
-    if(slave_irq)master_.irr|=std::uint8_t(1U<<2);
-    else if(!(master_.isr&(1U<<2)))master_.irr&=std::uint8_t(~(1U<<2));
+    master_.irr = cascaded_pic_requests(slave_irq);
     if(cpu.fault||!cpu.flag(cosmic_pc::Cpu::IF))return;
     if (deliver_lapic_irq(bsp())) return;
     // 8259 cascade: a pending slave IRQ presents IRQ2 at the master PIC.
@@ -1294,7 +1307,7 @@ class PcMotherboardC06 {
     if (pit_.enabled) edge = std::min<std::uint64_t>(edge, pit_.counter*kPitClockDivider-pit_phase_);
     if ((rtc_b_ & kRtcPeriodic) && !(rtc_c_ & kRtcIrq))
       edge = std::min(edge, rtc_next_periodic_tick_-ticks_);
-    if (bsp().timer_cycles && !(bsp().lvt[kTimer] & kLvtMasked) && lapic_on(bsp()))
+    if (local_timer_irq_armed(bsp()))
       edge = std::min<std::uint64_t>(edge, bsp().timer_cycles);
     if (!edge) return std::min(1U, steps);
     if (!active_clock_running_) edge = edge * cpu_clock_ratio_ - cpu_cycle_phase_;
@@ -1413,8 +1426,8 @@ class PcMotherboardC06 {
     for (unsigned slot = 0; slot < count; ++slot) {
       const auto& apic = apics_[runnable[slot]];
       const auto& cpu = *apic.cpu;
-      if (!apic.started || apic.init_pending || apic.startup_vector || apic.timer_cycles ||
-          apic.pending.highest() || cpu.halted || cpu.flag(cosmic_pc::Cpu::IF | cosmic_pc::Cpu::TF) ||
+      if (!apic.started || apic.init_pending || apic.startup_vector || local_timer_irq_armed(apic) ||
+          cpu.halted || cpu.flag(cosmic_pc::Cpu::IF | cosmic_pc::Cpu::TF) ||
           !cpu.is_long_mode() || !cpu.ether_arm64_block_candidate()) return kSmpQuantum;
     }
     return std::max(kSmpQuantum, batch_limit(kExtendedSmpQuantum));
@@ -1426,7 +1439,7 @@ class PcMotherboardC06 {
     // interrupt priority or issue an EOI without returning to the device bus.
     if (accepts_irq && deliverable_lapic_vector(apic)) return 1;
     auto limit = device_batch_limit(remaining);
-    if (accepts_irq && apic.timer_cycles && !(apic.lvt[kTimer] & kLvtMasked) && lapic_on(apic))
+    if (accepts_irq && local_timer_irq_armed(apic))
       limit = unsigned(std::min<std::uint64_t>(limit, apic.timer_cycles));
     return limit;
   }
@@ -1466,6 +1479,36 @@ class PcMotherboardC06 {
           secondary_rep_elements_ += elements;
           secondary_rep_bytes_ += cpu.last_rep_batch_bytes();
           used += elements;
+          continue;
+        }
+      }
+      // The scan reads shared RAM and publishes a count. Keep it inside
+      // this vCPU's bus grant and stop at the same device edges as REP.
+      if (pc_.boot_acceleration_enabled() && cpu.scan_loop_batch_candidate()) {
+        if (const auto steps = cpu.try_scan_loop_batch(secondary_batch_limit(apic, remaining))) {
+          secondary_scan_steps_ += steps;
+          used += steps;
+          continue;
+        }
+      }
+      if (pc_.boot_acceleration_enabled() && cpu.shift_loop_batch_candidate()) {
+        if (const auto steps = cpu.try_shift_loop_batch(secondary_batch_limit(apic, remaining))) {
+          secondary_shift_steps_ += steps;
+          used += steps;
+          continue;
+        }
+      }
+      if (pc_.boot_acceleration_enabled() && cpu.zero_loop_batch_candidate()) {
+        if (const auto steps = cpu.try_zero_loop_batch(secondary_batch_limit(apic, remaining))) {
+          secondary_zero_steps_ += steps;
+          used += steps;
+          continue;
+        }
+      }
+      if (pc_.boot_acceleration_enabled() && cpu.wide_multiply_loop_batch_candidate()) {
+        if (const auto steps = cpu.try_counter_loop_batch(secondary_batch_limit(apic, remaining))) {
+          secondary_multiply_steps_ += steps;
+          used += static_cast<unsigned>(steps);
           continue;
         }
       }
@@ -1517,8 +1560,8 @@ class PcMotherboardC06 {
                                     cosmic_pc::PcMachine::RunClock::time_point deadline) {
     if (budget < 2 * kMinParallelLoopSteps || !cosmic_pc::Cpu::ether_arm64_host() ||
         !pc_.boot_acceleration_enabled() || !pc_.guest_execution_available() ||
-        (pc_.cpu.flag(cosmic_pc::Cpu::IF) && pic_connected() && slave_.pending()) ||
-        (sci_active_ && (io_redir_low_[AcpiC06::sci_irq] & 0x8000U))) return 0;
+        (sci_active_ && (io_redir_low_[AcpiC06::sci_irq] & 0x18000U) == 0x8000U &&
+         !io_remote_targets_[AcpiC06::sci_irq])) return 0;
 
     auto limit = budget;
     std::array<unsigned, kMaxProcessors> candidates{};
@@ -1534,7 +1577,7 @@ class PcMotherboardC06 {
       const auto& cpu = *apic.cpu;
       if (apic.init_pending || apic.startup_vector ||
           (cpu.flag(cosmic_pc::Cpu::IF) && deliverable_lapic_vector(apic))) return 0;
-      if (cpu.apic_global_enabled() && apic.timer_cycles) {
+      if (local_timer_irq_armed(apic)) {
         const auto elapsed = ticks_ - apic.last_tick;
         if (elapsed >= apic.timer_cycles) return 0;
         limit = static_cast<unsigned>(std::min<std::uint64_t>(limit, apic.timer_cycles - elapsed - 1));
@@ -1940,6 +1983,10 @@ class PcMotherboardC06 {
   std::uint64_t secondary_store_steps() const noexcept { return secondary_store_steps_; }
   std::uint64_t secondary_rep_elements() const noexcept { return secondary_rep_elements_; }
   std::uint64_t secondary_rep_bytes() const noexcept { return secondary_rep_bytes_; }
+  std::uint64_t secondary_scan_steps() const noexcept { return secondary_scan_steps_; }
+  std::uint64_t secondary_shift_steps() const noexcept { return secondary_shift_steps_; }
+  std::uint64_t secondary_zero_steps() const noexcept { return secondary_zero_steps_; }
+  std::uint64_t secondary_multiply_steps() const noexcept { return secondary_multiply_steps_; }
   std::uint64_t parallel_mixed_batches() const noexcept { return parallel_mixed_batches_; }
   unsigned longest_parallel_register_slice() const noexcept { return longest_parallel_register_slice_; }
   const cosmic_pc::Cpu* faulted_cpu() const noexcept {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "c08_gpu_dma.h"
+#include "ether_quantum_block.hpp"
 #include "graphics_memory.hpp"
 #include "quantum_vram_backing.hpp"
 #include "guest_triangle_work.hpp"
@@ -50,6 +51,7 @@ class GuestGpuC08 {
     state_saves_ = state_restores_ = state_payload_ = 0;
     quantum_hits_ = quantum_loads_ = quantum_stores_ = 0;
     quantum_saved_ = quantum_restored_ = quantum_gates_ = quantum_unavailable_ = 0;
+    quantum_blocks_ = 0;
     pci_command_ = 0;
     bar_ = pci_window_start;
     params_.fill(0);
@@ -222,7 +224,7 @@ class GuestGpuC08 {
         << ",\"max_transfer_bytes\":" << RWGPU_QUANTUM_TRANSFER_BYTES
         << ",\"engine_reads\":" << quantum_loads_ << ",\"cache_hits\":" << quantum_hits_
         << ",\"engine_writes\":" << quantum_stores_ << ",\"gates\":" << quantum_gates_
-        << ",\"unavailable\":" << quantum_unavailable_
+        << ",\"gate_blocks\":" << quantum_blocks_ << ",\"unavailable\":" << quantum_unavailable_
         << ",\"saved_bytes\":" << quantum_saved_ << ",\"restored_bytes\":" << quantum_restored_
         << ",\"state_saves\":" << state_saves_ << ",\"state_restores\":" << state_restores_
         << ",\"last_state_bytes\":" << state_payload_ << '}'
@@ -296,16 +298,18 @@ class GuestGpuC08 {
   std::uint64_t power_on_tick_ = 0;
   static constexpr auto quantum_base = cosmic_pc::PcMachine::kEtherMemoryLogicalByteBase;
   static_assert(RWGPU_QUANTUM_TRANSFER_BYTES == mundo_x::InfiniteSession::pc_window_bytes);
+  static_assert(sizeof(RwGpuQuantumGate) == 24 && RWGPU_QUANTUM_MAX_GATES * sizeof(RwGpuQuantumGate) <= RWGPU_STAGE_BYTES);
   std::array<std::uint8_t, RWGPU_QUANTUM_TRANSFER_BYTES> quantum_cache_{};
   std::size_t quantum_cached_size_ = 0;
   std::uint64_t quantum_cached_at_ = 0, quantum_cached_epoch_ = 0;
   std::uint64_t quantum_hits_ = 0, quantum_loads_ = 0, quantum_stores_ = 0;
   std::uint64_t quantum_gates_ = 0, quantum_saved_ = 0, quantum_restored_ = 0, quantum_unavailable_ = 0;
+  std::uint64_t quantum_blocks_ = 0;
   bool quantum_cache_enabled_ = true;
   xgpu::GuestTriangleWork planner_;
   using RenderPlan = std::shared_ptr<const xgpu::GuestTrianglePlan>;
   qssd::GraphicsWorkMemory<RenderPlan> work_;
-  std::array<std::uint64_t, RWGPU_DRAW_ETHER_MASK + 1> commands_{};
+  std::array<std::uint64_t, RWGPU_QUANTUM_BLOCK + 1> commands_{};
   // Session work counters span guest resets, just like draws_ and the PCI command counts.
   std::uint64_t backend_frames_ = 0, replayed_frames_ = 0, readback_bytes_ = 0, avoided_readback_bytes_ = 0;
   std::uint64_t uploaded_vertex_bytes_ = 0, avoided_vertex_bytes_ = 0, mask_triangles_ = 0, mask_rejected_ = 0;
@@ -364,7 +368,8 @@ class GuestGpuC08 {
       case RWGPU_REG_LOGICAL_LO: return static_cast<std::uint32_t>(GpuVram::kBytes);
       case RWGPU_REG_LOGICAL_HI: return static_cast<std::uint32_t>(GpuVram::kBytes >> 32);
       case RWGPU_REG_CAPS:
-        return RWGPU_CAP_VRAM | RWGPU_CAP_DIRECT_VRAM | RWGPU_CAP_SUM_INDICES | RWGPU_CAP_QUANTUM_VRAM | RWGPU_CAP_QUANTUM_STATE
+        return RWGPU_CAP_VRAM | RWGPU_CAP_DIRECT_VRAM | RWGPU_CAP_SUM_INDICES | RWGPU_CAP_QUANTUM_VRAM |
+               RWGPU_CAP_QUANTUM_STATE | RWGPU_CAP_QUANTUM_BLOCK
 #ifdef REVERSE_WINDOWS_GLES_GUEST
             | RWGPU_CAP_ETHER_MASK | RWGPU_CAP_TRIANGLES | RWGPU_CAP_DRAW_VRAM | RWGPU_CAP_COLOR_DMA |
               RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_ALPHA | RWGPU_CAP_DRAW_READBACK |
@@ -380,6 +385,7 @@ class GuestGpuC08 {
       case RWGPU_REG_QUANTUM_MAX: return RWGPU_QUANTUM_TRANSFER_BYTES;
       case RWGPU_REG_QUANTUM_BASE_LO: return std::uint32_t(quantum_base);
       case RWGPU_REG_QUANTUM_BASE_HI: return std::uint32_t(quantum_base >> 32);
+      case RWGPU_REG_QUANTUM_MAX_GATES: return RWGPU_QUANTUM_MAX_GATES;
       case RWGPU_REG_DIRECT_MAX: return GpuVram::kTransferBytes;
       case RWGPU_REG_BUS_MASTER: return (pci_command_ & 4U) != 0;
       case RWGPU_REG_FENCE_LAST: return fence_last_;
@@ -427,6 +433,10 @@ class GuestGpuC08 {
         case RWGPU_QUANTUM_SAVE: case RWGPU_QUANTUM_RESTORE:
         case RWGPU_QUANTUM_H: case RWGPU_QUANTUM_CX:
           status_ = quantum_command(op, offset, auxiliary, count);
+          break;
+        case RWGPU_QUANTUM_BLOCK:
+          status_ = offset || auxiliary || count > stage_.size() ? unsigned(RWGPU_INVALID) :
+              quantum_block(stage_.data(), std::size_t(count));
           break;
         case RWGPU_QUANTUM_CHECKPOINT_STATE: case RWGPU_QUANTUM_RESTORE_STATE: {
           if (offset || auxiliary || count) { status_ = RWGPU_INVALID; break; }
@@ -636,6 +646,17 @@ class GuestGpuC08 {
     return value;
   }
 
+  unsigned quantum_block(const std::uint8_t* records, std::size_t bytes) {
+    const auto status = apply_quantum_block(*pc_.quantum_session, records, bytes);
+    if (status == RWGPU_OK) {
+      quantum_gates_ += bytes / sizeof(RwGpuQuantumGate);
+      ++quantum_blocks_;
+    } else if (status == RWGPU_QUANTUM_UNAVAILABLE) {
+      ++quantum_unavailable_;
+    }
+    return status;
+  }
+
   unsigned execute_dma(std::uint64_t address, std::uint64_t fence, std::uint64_t bytes) {
     if (!(pci_command_ & 4U) || !msi_) return RWGPU_UNAVAILABLE;
     if (irq_status_ & RWGPU_IRQ_FAULT) return RWGPU_FAILED;
@@ -677,6 +698,8 @@ class GuestGpuC08 {
       }
       case RWGPU_DMA_DRAW:
         return scheduled_draw(header, record);
+      case RWGPU_DMA_QUANTUM_BLOCK:
+        return quantum_block(record + sizeof(header), header.record_bytes - sizeof(header));
       default:
         return RWGPU_BAD_COMMAND;
     }
