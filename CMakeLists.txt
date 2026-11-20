@@ -226,6 +226,10 @@ if(BUILD_TESTING)
   add_executable(reverse_windows_prime_gpu_guest_test tests/prime_gpu_guest_test.cpp)
   target_link_libraries(reverse_windows_prime_gpu_guest_test PRIVATE reverse_windows_component_headers)
   target_compile_options(reverse_windows_prime_gpu_guest_test PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/O2,-O2>)
+  if(ANDROID AND CMAKE_ANDROID_ARCH_ABI MATCHES "^(arm64-v8a|x86_64)$")
+    target_link_options(reverse_windows_prime_gpu_guest_test PRIVATE
+      "-Wl,-z,max-page-size=16384" "-Wl,-z,common-page-size=16384")
+  endif()
   add_test(NAME reverse_windows_prime_gpu_guest COMMAND reverse_windows_prime_gpu_guest_test)
   set_tests_properties(reverse_windows_prime_gpu_guest PROPERTIES TIMEOUT 60
     ENVIRONMENT "EGL_PLATFORM=surfaceless")
