@@ -53,6 +53,7 @@ jobs:
           git worktree add --detach "$RUNNER_TEMP/prime-r101-irq" "$baseline"
           bash tests/compare_smp_irq.sh "$RUNNER_TEMP/prime-r101-irq" build
       - name: Compare r105 and r106 with the same AP scan and interrupt
+        shell: bash
         run: |
           baseline=73d7932858735e2789d3b3221a75348624886214
           git fetch --no-tags --depth=1 origin "$baseline"

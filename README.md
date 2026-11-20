@@ -19,6 +19,10 @@ Los cambios de arquitectura y el primer ejecutor de pruebas se desarrollan en ra
 
 Prime r105 utiliza el estado compartido de Éter para seleccionar geometría y reutiliza los dibujos idénticos antes de llegar a GLES. La auditoría describe la ruta de vídeo de arranque, el controlador Windows, las capacidades actuales y las mediciones de imágenes y transferencias. [Auditoría y resultados de la GPU](docs/prime-r105-gpu.md)
 
+En **Prime r106**, los procesadores secundarios agrupan búsquedas, desplazamientos, puestas a cero y multiplicaciones hasta el siguiente evento que pueda afectar al invitado. El panel de Android muestra los pasos por segundo en tiempo real y durante la ejecución del motor. En **Equipo → Comprobar equipo virtual** se puede verificar un par de Bell en una máquina temporal.
+
+El dispositivo PCI acepta circuitos Clifford de 1 a 64 puertas sobre el estado cuántico compartido por CPU y VRAM. El invitado puede enviarlos mediante `RWGPU_QUANTUM_BLOCK` o mediante DMA con `RWGPU_DMA_QUANTUM_BLOCK`. Los controles y destinos se expresan como posiciones de bits. Un registro inválido rechaza el circuito completo. [Formato de los registros](src/c08_gpu_protocol.h) · [Protocolo DMA](src/c08_gpu_dma.h)
+
 ## Correcciones de arranque
 
 Cada arreglo de un fallo de Windows amplía el componente de la máquina virtual que interviene en él con las técnicas de Éter, QSSD o GPU Virtual, según el componente. Junto con la corrección se verifica la mejora del componente y su comportamiento en el invitado.

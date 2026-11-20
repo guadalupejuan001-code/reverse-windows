@@ -9,7 +9,8 @@ def main(before, after):
     executables = [("r105", before), ("r106", after)]
     expected = {}
     for trial in range(7):
-        for name, path in executables[::1 if trial % 2 == 0 else -1]:
+        order = executables if trial % 2 == 0 else reversed(executables)
+        for name, path in order:
             lines = subprocess.check_output([path, "--measure-ap-scan"], text=True).splitlines()
             for line in lines:
                 if not line.startswith("AP_SCAN_SAMPLE "):
