@@ -163,6 +163,11 @@ void verify_ether_draws(const std::filesystem::path& path) {
   guest.issue(RWGPU_DRAW, RWGPU_DRAW_PRESENT_VBE, 0, 0);
   require(cpu.read32(fb) == pixel && guest.counter("replayed_frames") == before + 2,
           "replay did not restore guest-written framebuffer");
+  const auto accumulated = guest.counter("backend_frames") + guest.counter("replayed_frames");
+  guest.pc.reset();
+  require(guest.counter("ticket") == 0 &&
+          guest.counter("backend_frames") + guest.counter("replayed_frames") == accumulated &&
+          guest.counter("draws") == accumulated, "device reset mixed session and per-boot GPU work counts");
   std::cout << "PRIME_ETHER_DRAW_PASS changes=4 reset=1 pressure=1 bell_inverse=1 multiwindow=257 dma=1 vbe=1\n";
 }
 

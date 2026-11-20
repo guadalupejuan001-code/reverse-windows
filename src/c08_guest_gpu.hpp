@@ -65,8 +65,6 @@ class GuestGpuC08 {
     msi_address_ = msi_data_ = 0;
     msi_enabled_ = false;
     reset_engine();
-    backend_frames_ = replayed_frames_ = readback_bytes_ = avoided_readback_bytes_ = 0;
-    uploaded_vertex_bytes_ = avoided_vertex_bytes_ = mask_triangles_ = mask_rejected_ = 0;
     gpu_ns_.reset();
     renderer_name_.clear();
     hardware_ = false;
@@ -308,6 +306,7 @@ class GuestGpuC08 {
   using RenderPlan = std::shared_ptr<const xgpu::GuestTrianglePlan>;
   qssd::GraphicsWorkMemory<RenderPlan> work_;
   std::array<std::uint64_t, RWGPU_DRAW_ETHER_MASK + 1> commands_{};
+  // Session work counters span guest resets, just like draws_ and the PCI command counts.
   std::uint64_t backend_frames_ = 0, replayed_frames_ = 0, readback_bytes_ = 0, avoided_readback_bytes_ = 0;
   std::uint64_t uploaded_vertex_bytes_ = 0, avoided_vertex_bytes_ = 0, mask_triangles_ = 0, mask_rejected_ = 0;
   std::uint64_t draws_ = 0, source_triangles_ = 0, drawn_triangles_ = 0;

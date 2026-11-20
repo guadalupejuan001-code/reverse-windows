@@ -56,3 +56,12 @@ EGL_PLATFORM=surfaceless ./build/reverse_windows_prime_gpu_guest_test --measure-
 ```
 
 La integración continua conserva los resultados por arquitectura en `prime-r105-gpu-x86_64` y `prime-r105-gpu-aarch64`. El código de la ruta se encuentra en `src/c08_guest_gpu.hpp`, el contrato PCI en `src/c08_gpu_protocol.h`, el controlador en `guest/windows/gpu_transport.c` y la presentación en `android/app/src/main/java/com/reversewindows/android/GuestMonitor.java`.
+
+El artefacto `prime-r105-on-device-gpu-arm64-v8a` contiene la misma prueba compilada con el NDK para el teléfono. Se ejecuta sin Windows y crea un disco de prueba temporal. Cada informe termina con el nombre GLES del dispositivo y el indicador de hardware. El emulador Android de CI ejecuta el binario equivalente para x86-64.
+
+```sh
+adb shell mkdir -p /data/local/tmp/reverse-prime-r105
+adb push reverse_windows_prime_gpu_guest_test /data/local/tmp/reverse-prime-r105/ether-gpu
+adb shell chmod 755 /data/local/tmp/reverse-prime-r105/ether-gpu
+adb shell 'TMPDIR=/data/local/tmp/reverse-prime-r105 /data/local/tmp/reverse-prime-r105/ether-gpu --measure-ether'
+```
