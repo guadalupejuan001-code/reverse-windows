@@ -379,7 +379,7 @@ void measure_sleeping_bsp(bool threaded) {
     const auto bsp_before = cpu.instructions;
     cpu.write32(kLapic+0x300,0x40051); // Fixed IPI to self, pending while halted.
     board.run(256);
-    require(!cpu.fault && !cpu.halted && cpu.instructions>bsp_before && board.lapic_vector_stats()[0x51].deliveries==1,
+    require(!cpu.fault && !cpu.halted && cpu.instructions>bsp_before && board.evidence().irq_delivered == 1,
             "BSP did not wake on exactly one pending IPI");
     std::cout << "PRIME_IDLE_BSP_PASS threaded=" << threaded << " grant=" << budget
               << " retired=" << retired << " wake_irq=1\n";
