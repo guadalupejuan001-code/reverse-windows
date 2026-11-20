@@ -49,6 +49,7 @@ final class VmTelemetry extends LinearLayout {
     private String mode;
     private long steps;
     private long stepRate;
+    private long motorRate;
 
     VmTelemetry(MainActivity activity) {
         super(activity);
@@ -129,12 +130,13 @@ final class VmTelemetry extends LinearLayout {
     }
 
     void update(JSONObject diagnostic, JSONObject guest, String modeName,
-                long instructions, long instructionsPerSecond) {
+                long instructions, long instructionsPerSecond, long motorInstructionsPerSecond) {
         snapshot = diagnostic;
         machine = guest;
         mode = modeName;
         steps = instructions;
         stepRate = instructionsPerSecond;
+        motorRate = motorInstructionsPerSecond;
         if (isShown()) render();
     }
 
@@ -191,8 +193,9 @@ final class VmTelemetry extends LinearLayout {
         long elapsed = number(snapshot, "elapsed_ms");
         long sessionRate = elapsed > 0 && steps >= 0 ? Math.round(steps * 1000.0 / elapsed) : -1;
         if (stepRate >= 0) {
-            heading("Pasos/s durante las tandas", formatRate(stepRate),
-                    "Desde el inicio " + formatRate(sessionRate) + " pasos/s · " + mode);
+            String active = motorRate >= 0 ? "Dentro del motor " + formatRate(motorRate) + " pasos/s · " : "";
+            heading("Pasos/s en tiempo real", formatRate(stepRate),
+                    active + "Desde el inicio " + formatRate(sessionRate) + " pasos/s · " + mode);
         } else {
             heading("Pasos/s desde el inicio", formatRate(sessionRate), mode);
         }

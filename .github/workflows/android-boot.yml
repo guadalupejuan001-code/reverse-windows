@@ -176,6 +176,8 @@ jobs:
           grep -aFq 'cpuid_vendor' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'GenuineIntel' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'boot_counter_loop_steps' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'secondary_scan_loop_steps' "$RUNNER_TEMP/reverse-windows-android.so"
+          grep -aFq 'ether_quantum_block' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'interrupt_origin' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'idt_bulk_reads' "$RUNNER_TEMP/reverse-windows-android.so"
           grep -aFq 'instruction_page_reuses' "$RUNNER_TEMP/reverse-windows-android.so"
@@ -242,12 +244,14 @@ jobs:
           apk=android/app/build/outputs/apk/debug/app-debug.apk
           log="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/android-runtime.log"
           trap 'adb logcat -d > "$log"' EXIT
-          device_dir=/data/local/tmp/reverse-prime-r105
+          device_dir=/data/local/tmp/reverse-prime-r106
           adb shell mkdir -p "$device_dir"
           adb push "$RUNNER_TEMP/ether-gpu-device/reverse_windows_prime_gpu_guest_test" "$device_dir/ether-gpu"
           adb shell chmod 755 "$device_dir/ether-gpu"
           adb shell "TMPDIR=$device_dir $device_dir/ether-gpu --measure-ether" | tee "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ether-gpu-device.log"
           grep -q '^PRIME_ETHER_DRAW_RENDERER ' "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ether-gpu-device.log"
+          adb shell "TMPDIR=$device_dir $device_dir/ether-gpu --quantum-block" | tee "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/quantum-block.log"
+          grep -q '^PRIME_QUANTUM_BLOCK_IRQ_PASS ' "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/quantum-block.log"
           adb shell settings put secure immersive_mode_confirmations confirmed
           adb install -r "$apk"
           adb install -r android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk

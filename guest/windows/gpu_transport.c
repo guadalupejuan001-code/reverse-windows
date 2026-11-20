@@ -235,13 +235,20 @@ static BOOLEAN valid_vram(RwGpuDevice* state, uint64_t offset, ULONG size) {
 static NTSTATUS quantum_request(RwGpuDevice* state, PUCHAR data, ULONG input, ULONG output, ULONG* written) {
     if (!data || input < sizeof(RwGpuQuantumRequest)) return STATUS_INVALID_PARAMETER;
     const RwGpuQuantumRequest cmd = *(const RwGpuQuantumRequest*)data;
+    const BOOLEAN block = cmd.operation == RWGPU_QUANTUM_BLOCK;
+    const BOOLEAN staged = block || cmd.operation == RWGPU_QUANTUM_STORE;
     if (cmd.version != RWGPU_ABI || cmd.reserved || cmd.operation < RWGPU_QUANTUM_STORE ||
-        cmd.operation > RWGPU_QUANTUM_RESTORE_STATE || cmd.bytes > RWGPU_QUANTUM_TRANSFER_BYTES ||
-        input != sizeof(cmd) + (cmd.operation == RWGPU_QUANTUM_STORE ? cmd.bytes : 0) ||
+        (cmd.operation > RWGPU_QUANTUM_RESTORE_STATE && !block) ||
+        cmd.bytes > (block ? RWGPU_QUANTUM_MAX_GATES * sizeof(RwGpuQuantumGate) : RWGPU_QUANTUM_TRANSFER_BYTES) ||
+        input != sizeof(cmd) + (staged ? cmd.bytes : 0) ||
         output != (cmd.operation == RWGPU_QUANTUM_LOAD ? cmd.bytes : 0)) return STATUS_INVALID_PARAMETER;
     if (!state->bar) return STATUS_DEVICE_NOT_READY;
     if (!(reg_read(state, RWGPU_REG_CAPS) & RWGPU_CAP_QUANTUM_VRAM)) return STATUS_NOT_SUPPORTED;
-    if (cmd.operation >= RWGPU_QUANTUM_CHECKPOINT_STATE) {
+    if (block) {
+        if (!(reg_read(state, RWGPU_REG_CAPS) & RWGPU_CAP_QUANTUM_BLOCK)) return STATUS_NOT_SUPPORTED;
+        if (cmd.offset || cmd.auxiliary || !cmd.bytes || cmd.bytes % sizeof(RwGpuQuantumGate))
+            return STATUS_INVALID_PARAMETER;
+    } else if (cmd.operation >= RWGPU_QUANTUM_CHECKPOINT_STATE) {
         if (!(reg_read(state, RWGPU_REG_CAPS) & RWGPU_CAP_QUANTUM_STATE)) return STATUS_NOT_SUPPORTED;
         if (cmd.bytes || cmd.offset || cmd.auxiliary) return STATUS_INVALID_PARAMETER;
     } else if (cmd.operation >= RWGPU_QUANTUM_H) {
@@ -253,7 +260,7 @@ static NTSTATUS quantum_request(RwGpuDevice* state, PUCHAR data, ULONG input, UL
         return STATUS_INVALID_PARAMETER;
     }
     PUCHAR staging = state->bar + RWGPU_STAGE_OFFSET;
-    if (cmd.operation == RWGPU_QUANTUM_STORE)
+    if (staged)
         WRITE_REGISTER_BUFFER_UCHAR(staging, data + sizeof(cmd), cmd.bytes);
     const NTSTATUS status = transfer(state, cmd.operation, cmd.offset, cmd.auxiliary, cmd.bytes);
     if (NT_SUCCESS(status) && cmd.operation == RWGPU_QUANTUM_LOAD) {

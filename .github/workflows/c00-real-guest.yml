@@ -52,6 +52,20 @@ jobs:
           git fetch --no-tags --depth=1 origin "$baseline"
           git worktree add --detach "$RUNNER_TEMP/prime-r101-irq" "$baseline"
           bash tests/compare_smp_irq.sh "$RUNNER_TEMP/prime-r101-irq" build
+      - name: Compare r105 and r106 with the same AP scan and interrupt
+        shell: bash
+        run: |
+          baseline=73d7932858735e2789d3b3221a75348624886214
+          git fetch --no-tags --depth=1 origin "$baseline"
+          git worktree add --detach "$RUNNER_TEMP/prime-r105-scan" "$baseline"
+          c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread -DPRIME_R105_BASELINE=1 \
+            -I"$RUNNER_TEMP/prime-r105-scan/src" -Ideps/mundo-X/pc-android/native -Ideps/mundo-X/native/include \
+            -Ideps/Virtual-qSSD-/include -Ideps/GPU-VIRTUAL/include tests/smp_guest_test.cpp -lz -o build/smp-r105
+          python3 tests/compare_ap_scan.py build/smp-r105 build/smp-after | tee build/ap-scan.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prime-r106-ap-scan-${{ matrix.architecture }}
+          path: build/ap-scan.log
       - name: Measure partial VRAM and vCPU grants against r102
         shell: bash
         run: |

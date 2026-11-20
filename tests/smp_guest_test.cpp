@@ -523,11 +523,15 @@ void start_long_mode_smp_guest(Cpu& cpu) {
     cpu.write32(kLapic + 0x300, 0x000c0600 | kStartupVector);
 }
 
-// Run the public board scheduler with one application processor. A fixed IPI
-// lets both versions see exactly one request independent of the host's speed.
-void measure_secondary_irq_work(bool copy, bool pending) {
+enum class SecondaryWork { Registers, Copy, Scan };
+
+// A fixed IPI gives each version the same request, independent of host speed.
+void measure_secondary_irq_work(SecondaryWork work, bool pending) {
+    const bool copy = work == SecondaryWork::Copy;
+    const bool scan = work == SecondaryWork::Scan;
     constexpr unsigned vector = 0xd1, handler = 0x18000, idt = 0x15000;
     constexpr unsigned source = 0x100000, destination = 0x150000, bytes = 0x20000;
+    constexpr unsigned scan_count = 0x10000 + 0x2ed8;
     constexpr unsigned iterations = 65536;
     PcMachine pc(4U << 20);
     pc.boot_long_mode_demo();
@@ -576,6 +580,18 @@ void measure_secondary_irq_work(bool copy, bool pending) {
         cpu.memory.write_block(source, pattern.data(), bytes);
         cpu.write8(destination - 1, 0xa6);
         cpu.write8(destination + bytes, 0x5b);
+    } else if (scan) {
+        emit({0xba,0xff,0xff,0x0f,0, 0x41,0xb9,0,0,1,0,    // RDX=source-1, R9=10000h.
+              0x31,0xc0,0x31,0xc9,                          // Clear EAX and ECX.
+              0x44,0x8d,0x40,1, 0x48,0xff,0xc2, 0x41,0x8b,0xc0,
+              0x41,0x89,0x81,0xd8,0x2e,0,0, 0x80,0x3a,0xe8, 0x75,0xea,
+              0x89,0x04,0x25,0x14,0x40,1,0,                 // Save EAX and R8D.
+              0x44,0x89,0x04,0x25,0x18,0x40,1,0});
+        expected = source + bytes - 1;
+        cpu.memory.fill(source, 0x8c, bytes);
+        cpu.write8(expected, 0xe8);
+        cpu.write8(scan_count - 1, 0xa6);
+        cpu.write8(scan_count + 4, 0x5b);
     } else {
         emit({0xb9,0,0,1,0,                               // ECX = 65536.
               0x01,0xca, 0x81,0xf2,0xdf,0x9b,0x57,0x13,  // ADD EDX,ECX; XOR EDX,13579BDFh.
@@ -593,10 +609,17 @@ void measure_secondary_irq_work(bool copy, bool pending) {
     install_long_mode_smp_guest(cpu, program.data(), program.size());
     start_long_mode_smp_guest(cpu);
     cpu.eip = 0x7000;
-    cpu.write8(0x7000, 0xf4); // Halt just the BSP.
+    if (scan) {
+        // A fixed amount of register work keeps the BSP runnable alongside the AP.
+        constexpr std::uint8_t bsp[]{0xb9,0,0,2,0, 0xff,0xc9,0x75,0xfc,0xf4};
+        cpu.memory.write_block(0x7000, bsp, sizeof(bsp));
+    } else {
+        cpu.write8(0x7000, 0xf4);
+    }
+    const auto bsp_start = cpu.instructions;
     const auto begin = PcMachine::RunClock::now();
     const auto deadline = begin + std::chrono::seconds(15);
-    while (board.secondary_can_run() && PcMachine::RunClock::now() < deadline &&
+    while ((board.secondary_can_run() || (scan && !cpu.halted)) && PcMachine::RunClock::now() < deadline &&
            !board.faulted_cpu() && !cpu.fault) {
         board.run(8192, std::min(deadline, PcMachine::RunClock::now() + std::chrono::milliseconds(8)));
     }
@@ -619,6 +642,12 @@ void measure_secondary_irq_work(bool copy, bool pending) {
         checksum = 2166136261U;
         for (const auto byte : result) checksum = (checksum ^ byte) * 16777619U;
     }
+    if (scan) {
+        require(cpu.halted && cpu.regs[Cpu::ECX] == 0 && cpu.instructions - bsp_start == 2 * bytes + 2 &&
+                cpu.read32(scan_count) == bytes && cpu.read32(0x14014) == bytes &&
+                cpu.read32(0x14018) == bytes && cpu.read8(scan_count - 1) == 0xa6 &&
+                cpu.read8(scan_count + 4) == 0x5b, "secondary scan changed RAM or registers");
+    }
     const auto native = board.processor_ether_arm64_steps(1);
     std::uint64_t rep = 0;
 #ifndef PRIME_R101_BASELINE
@@ -626,10 +655,21 @@ void measure_secondary_irq_work(bool copy, bool pending) {
     require(board.lapic_vector_stats()[vector].eois == unsigned(pending) &&
             board.rtc_evidence().irq8_delivered == 0, "self IPI attribution");
     if (copy) require(rep > bytes / 2 && rep == board.secondary_rep_bytes(), "inactive AP REP route");
-    if (!copy && Cpu::ether_arm64_host())
+    if (work == SecondaryWork::Registers && Cpu::ether_arm64_host())
         require(native > iterations * 4, "inactive AP ARM64 route with IF set");
 #endif
-    std::cout << "SMP_IRQ_SAMPLE work=" << (copy ? "rep" : "registers") << " pending=" << pending
+    if (scan) {
+        std::uint64_t grouped = 0;
+#if !defined(PRIME_R105_BASELINE) && !defined(PRIME_R103_BASELINE) && !defined(PRIME_R102_BASELINE) && !defined(PRIME_R101_BASELINE)
+        grouped = board.secondary_scan_steps();
+        require(grouped > bytes * 3 && grouped <= bytes * 6, "secondary scan did not batch its guest work");
+#endif
+        std::cout << "AP_SCAN_SAMPLE pending=" << pending << " grouped=" << grouped
+                  << " bsp_steps=" << (cpu.instructions - bsp_start);
+    } else {
+        std::cout << "SMP_IRQ_SAMPLE work=" << (copy ? "rep" : "registers") << " pending=" << pending;
+    }
+    std::cout
               << " wall_ns=" << ns << " steps=" << board.processor_steps(1) << " native=" << native
               << " rep=" << rep << " checksum=" << checksum << " flags=" << flags
               << " deliveries=" << board.evidence().apic_irqs << '\n';
@@ -951,7 +991,7 @@ void test_parallel_register_continuations() {
               << " continuations=" << continuations << '\n';
 }
 
-void test_parallel_ram_vectors(bool shared, unsigned worker_limit = kProcessors) {
+void test_parallel_ram_vectors(bool shared, unsigned worker_limit = kProcessors, bool masked_cascade = false) {
     if (!Cpu::ether_arm64_host()) return;
     constexpr unsigned words = 8192, logical_bytes = 40U << 20;
     constexpr auto vector_bytes = cosmic_pc::SparseRam::kPagesPerTable * cosmic_pc::SparseRam::kPageSize;
@@ -1009,10 +1049,10 @@ void test_parallel_ram_vectors(bool shared, unsigned worker_limit = kProcessors)
     }
     require(reached(1) && board.processors_started() == kProcessors, "All readers must be ready");
     if (shared) {
-        // IRQ8 latched in the legacy PIC while LAPIC LINT0 has ExtINT masked.
-        // The guest can read IRR, even though this route cannot interrupt the BSP.
+        // Latch IRQ8 with either LINT0 disconnected or the master PIC cascade masked.
         cpu.write32(kLapic + 0xf0, 0x1ff);
-        cpu.out_hook(0x21, 1, 0xfb);
+        if (masked_cascade) cpu.write32(kLapic + 0x350, 0x700);
+        cpu.out_hook(0x21, 1, masked_cascade ? 0xff : 0xfb);
         cpu.out_hook(0xa1, 1, 0xfe);
         cpu.out_hook(0x70, 1, 0x0b);
         cpu.out_hook(0x71, 1, 0x42);
@@ -1044,7 +1084,8 @@ void test_parallel_ram_vectors(bool shared, unsigned worker_limit = kProcessors)
                 "Parallel RAM loop changed the guest sum");
     }
     std::cout << "SMP_RAM_PASS workers=" << board.worker_count()
-              << " vcpus=" << kProcessors << " shared=" << shared << " parallel_steps=" << parallel << '\n';
+              << " vcpus=" << kProcessors << " shared=" << shared << " masked_cascade=" << masked_cascade
+              << " parallel_steps=" << parallel << '\n';
 }
 void check_cpu_clock(PcMotherboardC06::CpuClock profile, unsigned ratio) {
     PcMachine pc(4U << 20);
@@ -1296,9 +1337,14 @@ void measure_smp_clock(PcMotherboardC06::CpuClock profile) {
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--measure-irq-work") {
-            measure_secondary_irq_work(false, false);
-            measure_secondary_irq_work(false, true);
-            measure_secondary_irq_work(true, true);
+            measure_secondary_irq_work(SecondaryWork::Registers, false);
+            measure_secondary_irq_work(SecondaryWork::Registers, true);
+            measure_secondary_irq_work(SecondaryWork::Copy, true);
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--measure-ap-scan") {
+            measure_secondary_irq_work(SecondaryWork::Scan, false);
+            measure_secondary_irq_work(SecondaryWork::Scan, true);
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--measure-idle-bsp") {
@@ -1335,6 +1381,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         test_eight_cores_sixteen_threads(false);
+        measure_secondary_irq_work(SecondaryWork::Scan, true);
         test_eight_cores_sixteen_threads(true);
         test_eight_cores_sixteen_threads(true, 8);
         test_secondary_interrupts(false);
@@ -1353,6 +1400,7 @@ int main(int argc, char** argv) {
         test_parallel_ram_vectors(false);
         test_parallel_ram_vectors(true);
         test_parallel_ram_vectors(true, 8);
+        test_parallel_ram_vectors(true, 8, true);
         std::cout << "SMP_PASS cores=8 logical_processors=16 aps_executed=15 atomic_shared_ram=1\n";
         return 0;
     } catch (const std::exception& error) {

@@ -369,6 +369,7 @@ class AndroidBootSession final {
         << ",\"cpu_cx16\":" << flag(basic[cosmic_pc::Cpu::ECX],13)
         << ",\"cpu_lahf_sahf\":" << flag(extended[cosmic_pc::Cpu::ECX],0)
         << ",\"cpu_prefetchw\":" << flag(extended[cosmic_pc::Cpu::ECX],8)
+        << ",\"ether_quantum_block\":" << check_quantum_block(*pc.quantum_session)
         << ",\"lapic\":" << local_apic << ",\"ram\":" << ram
         << ",\"pci_ide\":" << pci_ide << ",\"vga\":" << vga << ",\"iso_boot\":";
     if (has_iso) out << optical_issue.empty(); else out << "null";
@@ -697,7 +698,8 @@ class AndroidBootSession final {
     const auto batched_steps = boot_work.rep_elements + boot_work.shift_loop_steps +
         boot_work.zero_loop_steps + boot_work.scan_loop_steps + boot_work.counter_loop_steps +
         boot_work.affine_ram_rotate_steps + boot_work.movntdq_store_steps + board_->secondary_store_steps() +
-        board_->secondary_rep_elements() + execution.state_vector_interpreter_steps;
+        board_->secondary_rep_elements() + board_->secondary_scan_steps() + board_->secondary_shift_steps() +
+        board_->secondary_zero_steps() + board_->secondary_multiply_steps() + execution.state_vector_interpreter_steps;
     const auto accelerated_steps = execution.ether_steps + batched_steps;
     out << ",\"ether_coverage\":{\"phase_steps\":" << execution.guest_steps
         << ",\"translated_steps\":" << execution.ether_steps
@@ -735,7 +737,11 @@ class AndroidBootSession final {
         << ",\"secondary_movntdq_store_batches\":" << board_->secondary_store_batches()
         << ",\"secondary_movntdq_store_steps\":" << board_->secondary_store_steps()
         << ",\"secondary_rep_elements\":" << board_->secondary_rep_elements()
-        << ",\"secondary_rep_bytes\":" << board_->secondary_rep_bytes();
+        << ",\"secondary_rep_bytes\":" << board_->secondary_rep_bytes()
+        << ",\"secondary_scan_loop_steps\":" << board_->secondary_scan_steps()
+        << ",\"secondary_shift_loop_steps\":" << board_->secondary_shift_steps()
+        << ",\"secondary_zero_loop_steps\":" << board_->secondary_zero_steps()
+        << ",\"secondary_wide_multiply_loop_steps\":" << board_->secondary_multiply_steps();
 #if defined(MUNDO_X_PC_ETHER_NEXT)
     const auto ether = pc_.cpu.ether_next_stats();
     out << ",\"neon_requested\":" << (pc_.cpu.ether_next_enabled() ? "true" : "false")
@@ -1052,6 +1058,22 @@ class AndroidBootSession final {
         << ",\"decode_sparse\":" << codec.decode_sparse
         << ",\"encode_wall_ns\":" << codec.encode.wall_ns
         << ",\"decode_wall_ns\":" << codec.decode.wall_ns << "}}";
+  }
+
+  static bool check_quantum_block(mundo_x::InfiniteSession& session) {
+    // check_hardware owns a fresh machine. Its circuit never touches a live guest or disk.
+    const std::array<RwGpuQuantumGate, 4> circuit{{
+      {RWGPU_GATE_X,0,2,0}, {RWGPU_GATE_H,0,0,0}, {RWGPU_GATE_X,0,2,0}, {RWGPU_GATE_CX,0,0,1}
+    }};
+    const auto previous = session.epoch();
+    if (apply_quantum_block(session, reinterpret_cast<const std::uint8_t*>(circuit.data()),
+                            sizeof(circuit)) != RWGPU_OK) return false;
+    constexpr auto first = cosmic_pc::PcMachine::kEtherMemoryLogicalByteBase * 8;
+    const auto a = std::to_string(first), b = std::to_string(first + 1);
+    const auto observed = session.query_batch({{1,{{a,'X'},{b,'X'}}}, {1,{{a,'Z'},{b,'Z'}}}, {1,{{a,'Z'}}}});
+    const auto work = session.gate_work_stats();
+    return observed.epoch == previous + 1 && observed.values == std::vector<double>{1,1,0} &&
+           work.executed_gates == 2 && work.cancelled_gates == 2;
   }
 
   static void check_ata_identify(cosmic_pc::PcMachine& pc, QssdDisk& volume) {
