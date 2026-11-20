@@ -529,6 +529,107 @@ void start_long_mode_smp_guest(Cpu& cpu) {
     cpu.write32(kLapic + 0x300, 0x000c0600 | kStartupVector);
 }
 
+#if PRIME_HAS_R107_GRANTS
+enum class RamWork { Independent, Readers, Counter };
+
+void measure_ram_views(RamWork work) {
+    constexpr unsigned workers = 7, rounds = 12288, data = 0x30000;
+    constexpr unsigned vector = 0xd1, handler = 0x18000;
+    PcMachine pc(4U << 20);
+    pc.boot_long_mode_demo();
+    pc.run(4000);
+    auto& cpu = pc.cpu;
+    require(cpu.is_long_mode() && cpu.halted && !cpu.fault, "RAM view guest entry");
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {8,2}, true, {},
+                           PcMotherboardC06::CpuClock::Experimental4_5THz);
+    pc.enable_boot_acceleration();
+    cpu.enable_page_translation_cache();
+    cpu.enable_ether_arm64_blocks();
+    board.enable_threaded_smp(workers);
+    board.enable_active_clock();
+    board.enable_execution_target();
+    std::vector<std::uint8_t> guest{
+        0xb8,1,0,0,0, 0x0f,0xa2, 0xc1,0xeb,0x18,                       // EBX = vCPU ID.
+        0x89,0xdf, 0xc1,0xe7,3, 0x81,0xc7,0,0,3,0,                    // EDI = data + 8 * id.
+        0xb9,0,0x30,0,0, 0x31,0xc0, 0x85,0xdb, 0x75,2, 0xfb,0x90      // 12288 rounds, BSP enables IRQs.
+    };
+    if (work == RamWork::Counter) {
+        guest.insert(guest.end(), {0xbf,0,0,3,0, 0xba,1,0,0,0,              // Same physical counter.
+            0x48,0x29,0x17, 0x83,0xe9,1, 0x75,0xf8});                   // SUB [RDI],RDX; SUB ECX,1; JNZ.
+    } else {
+        if (work == RamWork::Readers) guest.insert(guest.end(), {0xbe,0,0,3,0});   // Shared source.
+        else guest.insert(guest.end(), {0x89,0xfe});                              // Independent source.
+        guest.insert(guest.end(), {0x03,0x06, 0x89,0x47,4, 0xff,0xc9, 0x75,0xf7}); // ADD, store, DEC, JNZ.
+    }
+    guest.insert(guest.end(), {0xfa,0xf4});
+    install_long_mode_smp_guest(cpu, guest.data(), guest.size());
+    cpu.write64(0x2000 + 3 * 8, 0x6003);
+    cpu.write64(0x6000 + ((kLapic >> 21) & 511) * 8, kLapic | 0x83);
+    cpu.idtr = {0x0fff, 0x15000};
+    cpu.write64(cpu.idtr.base + vector * 16, (handler & 0xffffU) | (0x18ULL << 16) |
+                                              (0x8eULL << 40) | (std::uint64_t(handler >> 16) << 48));
+    cpu.write64(cpu.idtr.base + vector * 16 + 8, 0);
+    cpu.regs[Cpu::ESP] = 0x1f0000;
+    constexpr std::uint8_t isr[]{0x50,0xff,4,0x25,0x80,0,3,0, 0xb8,0xb0,0,0xe0,0xfe,
+                                  0xc7,0,0,0,0,0, 0x58,0x48,0xcf}; // Count, EOI, IRETQ.
+    cpu.memory.write_block(handler, isr, sizeof(isr));
+    for (unsigned id = 0; id < workers; ++id) cpu.write32(data + 8 * id, id + 1);
+    constexpr std::uint64_t initial = 1000000;
+    if (work == RamWork::Counter) cpu.write64(data, initial);
+    cpu.write32(kLapic + 0xf0, 0x1ff);
+    cpu.eip = kSmpEntry;
+    cpu.eflags = 2;
+    cpu.halted = false;
+    for (unsigned id = 1; id < workers; ++id) {
+        cpu.write32(kLapic + 0x310, id << 24);
+        cpu.write32(kLapic + 0x300, 0xc500);
+        cpu.write32(kLapic + 0x300, 0x8500);
+        cpu.write32(kLapic + 0x300, 0x0600 | kStartupVector);
+    }
+    using Clock = PcMachine::RunClock;
+    const auto before = board.total_processor_steps();
+    const auto start = Clock::now();
+    bool sent = false;
+    while (!cpu.fault && !board.faulted_cpu() && (!cpu.halted || board.secondary_can_run())) {
+        const auto now = Clock::now();
+        require(now - start < std::chrono::seconds(10), "RAM view guest timed out");
+        board.run(sent ? UINT32_MAX : 2048U, now + std::chrono::milliseconds(8));
+        if (!sent && (work == RamWork::Counter ? cpu.read64(data) < initial : cpu.read32(data + 4) > 0)) {
+            require(!cpu.halted, "BSP must still be running when the test raises D1");
+            cpu.write32(kLapic + 0x300, 0x40000 | vector);
+            sent = true;
+        }
+    }
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+    require(!cpu.fault && !board.faulted_cpu() && board.processors_started() == workers, "RAM view CPU state");
+    if (work == RamWork::Counter) {
+        require(cpu.read64(data) == initial - workers * rounds, "shared counter lost a read-modify-write");
+    } else {
+        for (unsigned id = 0; id < workers; ++id)
+            require(cpu.read32(data + 8 * id + 4) == (work == RamWork::Readers ? 1 : id + 1) * rounds,
+                    "wrong accumulator on a shared page");
+    }
+    const auto& irq = board.lapic_vector_stats()[vector];
+    require(sent && irq.deliveries == 1 && irq.eois == 1 && cpu.read32(data + 0x80) == 1, "D1 delivery and EOI");
+    std::uint64_t off_bus = 0, conflicts = 0;
+    unsigned participating = 0;
+#if !defined(PRIME_R107_BASELINE)
+    for (unsigned id = 0; id < workers; ++id) {
+        const auto view = board.processor_ram_views(id);
+        off_bus += view.steps;
+        conflicts += view.conflicts;
+        participating += view.steps != 0;
+    }
+    require(board.cpu_execution_totals().bus_samples > 0, "missing bus samples");
+    if (Cpu::ether_arm64_host()) require(participating >= 2, "two vCPUs must execute private RAM views");
+#endif
+    std::cout << "RAM_VIEW_SAMPLE " << (work == RamWork::Counter ? "counter" :
+                 work == RamWork::Readers ? "readers" : "independent") << " ns=" << ns
+              << " steps=" << board.total_processor_steps() - before << " irq=1 eoi=1 vcpus=" << participating
+              << " off_bus=" << off_bus << " conflicts=" << conflicts << '\n';
+}
+#endif
+
 enum class SecondaryWork { Registers, Copy, Scan };
 
 // A fixed IPI gives each version the same request, independent of host speed.
@@ -1442,6 +1543,12 @@ void measure_smp_clock(PcMotherboardC06::CpuClock profile) {
 
 int main(int argc, char** argv) {
     try {
+#if PRIME_HAS_R107_GRANTS
+        if (argc == 2 && std::string(argv[1]) == "--measure-ram-views") {
+            for (auto work : {RamWork::Independent, RamWork::Readers, RamWork::Counter}) measure_ram_views(work);
+            return 0;
+        }
+#endif
         if (argc == 2 && std::string(argv[1]) == "--measure-irq-work") {
             measure_secondary_irq_work(SecondaryWork::Registers, false);
             measure_secondary_irq_work(SecondaryWork::Registers, true);
@@ -1510,6 +1617,7 @@ int main(int argc, char** argv) {
         test_mixed_parallel_and_shared_writes(0, true, false);
         test_parallel_register_continuations();
 #if PRIME_HAS_R107_GRANTS
+        for (auto work : {RamWork::Independent, RamWork::Readers, RamWork::Counter}) measure_ram_views(work);
         test_multi_ap_scans();
         measure_secondary_irq_work(SecondaryWork::Scan, true, 8192, true);
 #endif

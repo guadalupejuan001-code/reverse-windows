@@ -217,13 +217,25 @@ final class VmTelemetry extends LinearLayout {
         long threads = number(host, "hint_threads", 0);
         metric(7, "Solicitud a Android", threads == 0 ? "Inactiva" : count(threads) + " hilos");
         JSONObject loops = snapshot.optJSONObject("ether_next");
+        int row = 8;
         if (number(loops, "loop_time_samples", 0) > 0) {
-            metric(8, "Último bloque Éter muestreado", units(number(loops, "loop_last_ns"), 1_000_000, "ms", 6)
+            metric(row++, "Último bloque Éter muestreado", units(number(loops, "loop_last_ns"), 1_000_000, "ms", 6)
                     + " · " + count(number(loops, "loop_last_steps")) + " pasos");
-            showRows(9);
-        } else {
-            showRows(8);
         }
+        if (number(topology, "off_bus_ram_steps") >= 0) {
+            metric(row++, "Pasos de RAM ejecutados fuera del bus", count(number(topology, "off_bus_ram_steps")));
+            metric(row++, "Bloques de RAM descartados por conflicto", count(number(topology, "ram_view_conflicts")));
+        }
+        long samples = number(topology, "sampled_bus_grants", 0);
+        if (samples > 0) {
+            long busy = number(topology, "sampled_bus_contentions", 0);
+            metric(row++, "Intentos con bus ocupado (muestra)", count(busy) + " / " + count(samples));
+            if (busy > 0) {
+                metric(row++, "Espera media al encontrar el bus ocupado",
+                        units(number(topology, "sampled_bus_wait_ns") / busy, 1_000_000, "ms", 6));
+            }
+        }
+        showRows(row);
     }
 
     private static String formatRate(long stepsPerSecond) {
