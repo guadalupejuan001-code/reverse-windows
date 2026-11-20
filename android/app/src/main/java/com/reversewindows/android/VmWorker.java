@@ -71,7 +71,6 @@ final class VmWorker {
     private static final long RAM_SAMPLE_INTERVAL_MS = 10_000;
     private static final long RAM_RECLAIM_SAMPLE_INTERVAL_MS = 1_000;
     private static final long RAM_RECLAIM_INTERVAL_MS = 16;
-    private static final long RAM_PREPARE_INTERVAL_MS = 50;
     private static final String DIAGNOSTIC_FILE = "ultimo-diagnostico.json";
 
     private final Context context;
@@ -174,6 +173,28 @@ final class VmWorker {
                 Log.w(TAG, "No se pudo actualizar el diagnóstico", error);
             }
             final String result = json.isEmpty() ? persistedDiagnostic : json;
+            send(() -> ready.accept(result));
+        });
+    }
+
+    void setBackingReadTiming(boolean enabled, Consumer<String> ready) {
+        final long requestedHandle = handle;
+        worker.post(() -> {
+            // An action queued for a closed session must not configure its replacement.
+            if (released || requestedHandle == 0 || handle != requestedHandle) {
+                send(() -> ready.accept(""));
+                return;
+            }
+            String json = "";
+            try {
+                NativeMachine.setBackingReadTiming(requestedHandle, enabled);
+                publishState(true);
+                json = lastDiagnostic;
+            } catch (RuntimeException | LinkageError error) {
+                // Optional instrumentation must not stop a healthy guest on failure.
+                Log.w(TAG, "No se pudo cambiar la medición detallada de RAM", error);
+            }
+            final String result = json;
             send(() -> ready.accept(result));
         });
     }
@@ -286,7 +307,8 @@ final class VmWorker {
                 reclaimRam = false;
                 reclaimPending = false;
                 nextRamSample = 0;
-                if (foreground) scheduleRam(RAM_SAMPLE_INTERVAL_MS);
+                if (foreground)
+                    scheduleRam(VmRamMaintenance.delayMillis(running, false, RAM_SAMPLE_INTERVAL_MS));
                 requestFrame();
                 enqueueSlice(0);
             } catch (IOException | RuntimeException | LinkageError | OutOfMemoryError error) {
@@ -348,7 +370,11 @@ final class VmWorker {
             running = resume;
             if (!resume) cpuPerformance.pause();
             worker.removeCallbacks(slice);
-            if (running) enqueueSlice(0);
+            if (running) {
+                // Pausing may have left only the next ten-second pressure sample queued.
+                if (foreground) scheduleRam(0);
+                enqueueSlice(0);
+            }
             try {
                 requestFrame();
                 publishState(true);
@@ -450,7 +476,7 @@ final class VmWorker {
             } else if (foreground) {
                 final boolean preparing = running && NativeMachine.prepareRamReclaim(handle);
                 final long untilSample = Math.max(0, nextRamSample - SystemClock.uptimeMillis());
-                scheduleRam(preparing ? Math.min(RAM_PREPARE_INTERVAL_MS, untilSample) : untilSample);
+                scheduleRam(VmRamMaintenance.delayMillis(running, preparing, untilSample));
             }
         } catch (RuntimeException | LinkageError error) {
             Log.w(TAG, "No se pudo ajustar el respaldo de RAM", error);

@@ -167,16 +167,34 @@ class AndroidBootSession final {
     using Adjustment = cosmic_pc::SparseRam::BudgetAdjustment;
     auto& memory = pc_.cpu.memory;
     const auto budget = memory.budget_bytes();
-    if (!spill_.file || !high_ram_profile(memory.size()) || !pressure_.target ||
-        pressure_.low_memory || pressure_.status != Adjustment::Applied ||
-        memory.allocated_bytes() < budget - budget / 4) return false;
+    auto& prep = pressure_.preparation;
+    ++prep.checks;
     const auto goal = std::min(kPrimeCleanReservePages, memory.allocated_pages() / 16);
-    if (memory.clean_backing_pages() >= goal) return false;
+    prep.goal_pages = goal;
+    prep.clean_pages_before = memory.clean_backing_pages();
+    prep.clean_pages_after = prep.clean_pages_before;
+    prep.deficit_pages = goal - std::min<std::uint64_t>(goal, prep.clean_pages_before);
+    prep.threshold_bytes = budget - budget / 4;
+    prep.resident_bytes_at_check = memory.allocated_bytes();
+    prep.last_time = {};
+    const auto skip = [&](std::uint64_t& counter, const char* reason) {
+      ++counter;
+      prep.last_reason = reason;
+      return false;
+    };
+    if (!spill_.file) return skip(prep.skipped_no_backing, "no-backing");
+    if (!high_ram_profile(memory.size())) return skip(prep.skipped_non_prime, "non-prime");
+    if (!pressure_.target) return skip(prep.skipped_no_target, "no-pressure-sample");
+    if (pressure_.low_memory) return skip(prep.skipped_low_memory, "android-low-memory");
+    if (pressure_.status != Adjustment::Applied)
+      return skip(prep.skipped_adjustment, "budget-adjustment");
+    if (prep.resident_bytes_at_check < prep.threshold_bytes)
+      return skip(prep.skipped_below_threshold, "below-threshold");
+    if (prep.clean_pages_before >= goal) return skip(prep.skipped_reserve_ready, "reserve-ready");
 
     const auto start = Clock::now();
     const auto progress = memory.prepare_reclaim(goal, start + kRamPrepareWindow);
     const auto elapsed = Clock::now() - start;
-    auto& prep = pressure_.preparation;
     ++prep.batches;
     prep.backed_pages += progress.backed_pages;
     prep.compact_up_to_2k += progress.compact_up_to_2k;
@@ -184,9 +202,20 @@ class AndroidBootSession final {
     prep.dense_pages += progress.dense_pages;
     prep.released_bytes += progress.released_bytes;
     prep.failures += progress.backing_failed;
+    prep.last_time = elapsed;
+    prep.total_time += elapsed;
     prep.max_time = std::max(prep.max_time, elapsed);
     if (elapsed > kRamPrepareWindow) ++prep.overruns;
-    return !progress.backing_failed && elapsed <= kRamPrepareWindow && memory.clean_backing_pages() < goal;
+    // A scan may advance its cursor or clear second chances without preparing a
+    // copy. Count that separately from useful page releases and prepared pages.
+    if (!progress.backed_pages && !progress.released_bytes) ++prep.empty_batches;
+    prep.clean_pages_after = memory.clean_backing_pages();
+    prep.deficit_pages = goal - std::min<std::uint64_t>(goal, prep.clean_pages_after);
+    prep.last_reason = progress.backing_failed ? "backing-failed" :
+                       elapsed > kRamPrepareWindow ? "window-overrun" :
+                       !prep.deficit_pages ? "reserve-ready" :
+                       !progress.backed_pages && !progress.released_bytes ? "scanning" : "preparing";
+    return !progress.backing_failed && elapsed <= kRamPrepareWindow && prep.deficit_pages != 0;
   }
 
   AndroidBootSession(std::filesystem::path disk, unsigned create_gib,
@@ -445,6 +474,12 @@ class AndroidBootSession final {
   }
 
   void set_experimental_tsc(bool enabled) { board_->set_experimental_tsc(enabled); }
+
+  // The owner calls this between execution windows, after parallel readers join.
+  // Changing measurement mode preserves all accumulated counters and timings.
+  void set_backing_read_timing_enabled(bool enabled) noexcept {
+    pc_.cpu.memory.set_backing_read_timing_enabled(enabled);
+  }
 
   void configure_ether_x86_sessions(unsigned workers, unsigned max_sessions_per_vcpu) {
     board_->configure_ether_x86_sessions(workers, max_sessions_per_vcpu);
@@ -911,9 +946,18 @@ class AndroidBootSession final {
       std::uint64_t first_released_bytes = 0;
     } latency;
     struct Preparation {
+      std::uint64_t checks = 0;
       std::uint64_t batches = 0, backed_pages = 0, failures = 0, overruns = 0;
       std::uint64_t compact_up_to_2k = 0, compact_up_to_3k = 0, dense_pages = 0, released_bytes = 0;
-      std::chrono::steady_clock::duration max_time{};
+      std::uint64_t empty_batches = 0;
+      std::uint64_t skipped_no_backing = 0, skipped_non_prime = 0, skipped_no_target = 0;
+      std::uint64_t skipped_low_memory = 0, skipped_adjustment = 0;
+      std::uint64_t skipped_below_threshold = 0, skipped_reserve_ready = 0;
+      // Snapshot of the most recent eligibility check, not live memory totals.
+      std::uint64_t goal_pages = 0, clean_pages_before = 0, clean_pages_after = 0, deficit_pages = 0;
+      std::uint64_t threshold_bytes = 0, resident_bytes_at_check = 0;
+      const char* last_reason = "not-checked";
+      std::chrono::steady_clock::duration max_time{}, last_time{}, total_time{};
     } preparation;
     std::uint64_t target = 0;
     std::uint64_t available = 0, threshold = 0, reserve = 0;
@@ -966,6 +1010,7 @@ class AndroidBootSession final {
   static void write_ram_profile(std::ostream& out, const cosmic_pc::PcMachine& pc,
                                 const SpillInfo& spill, const RamPressure* pressure = nullptr) {
     const auto metrics = pc.cpu.memory.metrics();
+    const auto access_pressure = pc.cpu.memory.pressure_metrics();
     const auto compaction = pc.ram_compaction_stats();
     const auto codec = spill.file ? spill.file->codec_stats() : AndroidRamBacking::CodecStats{};
     const auto deferred = spill.file ? spill.file->staging_stats() : AndroidRamBacking::StagingStats{};
@@ -991,7 +1036,33 @@ class AndroidBootSession final {
         << ",\"pattern_delta_bytes\":" << metrics.pattern_delta_bytes
         << ",\"compaction_passes\":" << compaction.passes
         << ",\"compaction_pages\":" << compaction.pages_compacted
-        << ",\"compaction_interval_steps\":" << compaction.interval_steps;
+        << ",\"compaction_interval_steps\":" << compaction.interval_steps
+        // These cumulative durations overlap; they are not additive parts of
+        // elapsed session time. See docs/ram-pressure-cycles.md for scopes.
+        << ",\"access_pressure\":{\"schema_version\":1"
+        << ",\"forced_reclaims\":" << access_pressure.forced_reclaims
+        << ",\"forced_failures\":" << access_pressure.forced_failures
+        << ",\"requested_pages\":" << access_pressure.requested_pages
+        << ",\"reclaimed_bytes\":" << access_pressure.reclaimed_bytes
+        << ",\"forced_reclaim_ns\":" << access_pressure.forced_reclaim_ns
+        << ",\"forced_reclaim_max_ns\":" << access_pressure.forced_reclaim_max_ns
+        << ",\"selection_ns\":" << access_pressure.selection_ns
+        << ",\"compact_attempts\":" << access_pressure.compact_attempts
+        << ",\"compacted_pages\":" << access_pressure.compacted_pages
+        << ",\"compact_ns\":" << access_pressure.compact_ns
+        << ",\"spilled_pages\":" << access_pressure.spilled_pages
+        << ",\"spill_ns\":" << access_pressure.spill_ns
+        << ",\"clean_reclaims\":" << access_pressure.clean_reclaims
+        << ",\"write_promotion_attempts\":" << access_pressure.write_promotion_attempts
+        << ",\"write_promotions\":" << access_pressure.write_promotions
+        << ",\"write_promotion_ns\":" << access_pressure.write_promotion_ns
+        << ",\"backing_read_attempts\":" << access_pressure.backing_read_attempts
+        << ",\"backing_read_failures\":" << access_pressure.backing_read_failures
+        << ",\"backing_timing_enabled\":" << (access_pressure.backing_timing_enabled ? "true" : "false")
+        << ",\"backing_timed_attempts\":" << access_pressure.backing_timed_attempts
+        << ",\"backing_read_ns\":" << access_pressure.backing_read_ns
+        << ",\"backing_read_max_ns\":" << access_pressure.backing_read_max_ns
+        << ",\"backing_lock_wait_ns\":" << access_pressure.backing_lock_wait_ns << '}';
     if (pressure && pressure->target) {
       const auto status = pressure->status == Adjustment::Applied ? "applied" :
                           pressure->status == Adjustment::Reclaiming ? "reclaiming" : "blocked";
@@ -1027,6 +1098,21 @@ class AndroidBootSession final {
         out << std::chrono::duration_cast<std::chrono::microseconds>(*time).count();
       else out << "null";
       out << ",\"reclaim_preparation\":{\"batches\":" << pressure->preparation.batches
+          << ",\"checks\":" << pressure->preparation.checks
+          << ",\"last_reason\":" << cosmic_pc::PcMachine::quote(pressure->preparation.last_reason)
+          << ",\"goal_pages\":" << pressure->preparation.goal_pages
+          << ",\"clean_pages_before\":" << pressure->preparation.clean_pages_before
+          << ",\"clean_pages_after\":" << pressure->preparation.clean_pages_after
+          << ",\"deficit_pages\":" << pressure->preparation.deficit_pages
+          << ",\"threshold_bytes\":" << pressure->preparation.threshold_bytes
+          << ",\"resident_bytes_at_check\":" << pressure->preparation.resident_bytes_at_check
+          << ",\"skipped_no_backing\":" << pressure->preparation.skipped_no_backing
+          << ",\"skipped_non_prime\":" << pressure->preparation.skipped_non_prime
+          << ",\"skipped_no_target\":" << pressure->preparation.skipped_no_target
+          << ",\"skipped_low_memory\":" << pressure->preparation.skipped_low_memory
+          << ",\"skipped_adjustment\":" << pressure->preparation.skipped_adjustment
+          << ",\"skipped_below_threshold\":" << pressure->preparation.skipped_below_threshold
+          << ",\"skipped_reserve_ready\":" << pressure->preparation.skipped_reserve_ready
           << ",\"backed_pages\":" << pressure->preparation.backed_pages
           << ",\"released_bytes\":" << pressure->preparation.released_bytes
           << ",\"compact_up_to_2k\":" << pressure->preparation.compact_up_to_2k
@@ -1034,6 +1120,11 @@ class AndroidBootSession final {
           << ",\"dense_pages\":" << pressure->preparation.dense_pages
           << ",\"failures\":" << pressure->preparation.failures
           << ",\"overruns\":" << pressure->preparation.overruns
+          << ",\"empty_batches\":" << pressure->preparation.empty_batches
+          << ",\"total_us\":"
+          << std::chrono::duration_cast<std::chrono::microseconds>(pressure->preparation.total_time).count()
+          << ",\"last_us\":"
+          << std::chrono::duration_cast<std::chrono::microseconds>(pressure->preparation.last_time).count()
           << ",\"window_us\":"
           << std::chrono::duration_cast<std::chrono::microseconds>(kRamPrepareWindow).count()
           << ",\"max_us\":"

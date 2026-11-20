@@ -184,7 +184,19 @@ final class VmTelemetry extends LinearLayout {
         metric(3, "Vectores de páginas", count(number(ram, "page_state_vectors")));
         metric(4, "Proceso Android (PSS)", pssKiB > 0 ? units(pssKiB, KIB, "MiB", 1) : UNKNOWN);
         metric(5, "Reloj de la RAM virtual", frequency(number(ram, "ram_clock_hz")));
-        showRows(6);
+        JSONObject pressure = ram == null ? null : ram.optJSONObject("access_pressure");
+        if (pressure == null) { showRows(6); return; }
+        metric(6, "Escrituras que necesitaron espacio", count(number(pressure, "forced_reclaims")));
+        metric(7, "Tiempo consiguiendo espacio · total",
+                units(number(pressure, "forced_reclaim_ns"), 1_000_000, "ms", 3));
+        metric(8, "Mayor demora al conseguir espacio",
+                units(number(pressure, "forced_reclaim_max_ns"), 1_000_000, "ms", 3));
+        metric(9, "Lecturas del respaldo", count(number(ram, "spill_reads")));
+        metric(10, "Aciertos de caché del respaldo", count(number(ram, "spill_cache_hits")));
+        metric(11, "Caché del respaldo · usada / límite",
+                storage(number(ram, "spill_cache_bytes")) + " / "
+                + storage(number(ram, "spill_cache_capacity_bytes")));
+        showRows(12);
     }
 
     private void renderCpu() {

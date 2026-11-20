@@ -188,6 +188,18 @@ JNIEXPORT void JNICALL Java_com_reversewindows_android_NativeMachine_setExperime
     });
 }
 
+JNIEXPORT void JNICALL Java_com_reversewindows_android_NativeMachine_setBackingReadTiming(
+        JNIEnv* env, jclass, jlong handle, jboolean enabled) {
+    call(env, false, [&] {
+        // session() shares the execution mutex with step(), so no guest reader
+        // is in flight while its owner changes the detailed measurement mode.
+        return session(handle, [=](Session& machine) {
+            machine.set_backing_read_timing_enabled(enabled == JNI_TRUE);
+            return true;
+        });
+    });
+}
+
 JNIEXPORT jintArray JNICALL Java_com_reversewindows_android_NativeMachine_cpuThreadIds(
         JNIEnv* env, jclass, jlong handle) {
     return call<jintArray>(env, nullptr, [&] {
