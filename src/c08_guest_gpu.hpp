@@ -195,6 +195,9 @@ class GuestGpuC08 {
   }
 
   void set_vram_cache_enabled(bool enabled) noexcept {
+#ifdef REVERSE_WINDOWS_GLES_GUEST
+    if (!enabled) previous_plan_.reset();
+#endif
     quantum_cache_enabled_ = enabled;
     quantum_cached_size_ = 0;
     memory_.set_cache_enabled(enabled);
@@ -243,7 +246,7 @@ class GuestGpuC08 {
         << ",\"status\":" << status_ << ",\"ticket\":" << completed_
         << ",\"writes\":" << commands_[RWGPU_WRITE] << ",\"reads\":" << commands_[RWGPU_READ]
         << ",\"draw_requests\":" << commands_[RWGPU_DRAW] + commands_[RWGPU_DRAW_VRAM] +
-                                     commands_[RWGPU_DRAW_RAM] + commands_[RWGPU_DRAW_READBACK]
+                                     commands_[RWGPU_DRAW_RAM] + commands_[RWGPU_DRAW_READBACK] + commands_[RWGPU_DRAW_ETHER_MASK]
         << ",\"vram_draw_requests\":" << commands_[RWGPU_DRAW_VRAM]
         << ",\"ram_draw_requests\":" << commands_[RWGPU_DRAW_RAM] << ",\"draws\":" << draws_
         << ",\"alpha_draw_ticket\":" << alpha_draw_ticket_
@@ -259,8 +262,18 @@ class GuestGpuC08 {
         << ",\"scheduler_upload_bytes\":" << paging_upload_bytes_
         << ",\"scheduler_download_bytes\":" << paging_download_bytes_
         << ",\"scheduler_msi\":" << msi_messages_
-        << ",\"source_triangles\":" << source_triangles_ << ",\"submitted_triangles\":" << drawn_triangles_
+        << ",\"source_triangles\":" << source_triangles_ << ",\"submitted_triangles\":" << vertex_bytes_ / sizeof(RwGpuVertex) / 3
         << ",\"vertex_bytes\":" << vertex_bytes_ << ",\"presented_bytes\":" << presented_bytes_
+        << ",\"planned_triangles\":" << drawn_triangles_
+        << ",\"backend_frames\":" << backend_frames_
+        << ",\"replayed_frames\":" << replayed_frames_
+        << ",\"backend_readback_bytes\":" << readback_bytes_
+        << ",\"avoided_readback_bytes\":" << avoided_readback_bytes_
+        << ",\"backend_vertex_bytes\":" << uploaded_vertex_bytes_
+        << ",\"replay_avoided_vertex_bytes\":" << avoided_vertex_bytes_
+        << ",\"ether_mask_requests\":" << commands_[RWGPU_DRAW_ETHER_MASK]
+        << ",\"ether_mask_triangles\":" << mask_triangles_
+        << ",\"ether_mask_rejected_triangles\":" << mask_rejected_
         << ",\"graphics_serial\":" << work_.snapshot()->serial
         << ",\"renderer_ready_at_power_on\":" << (renderer_ready_at_power_on_ ? "true" : "false")
         << ",\"renderer_prepare_ns\":" << renderer_prepare_ns_
@@ -292,7 +305,10 @@ class GuestGpuC08 {
   xgpu::GuestTriangleWork planner_;
   using RenderPlan = std::shared_ptr<const xgpu::GuestTrianglePlan>;
   qssd::GraphicsWorkMemory<RenderPlan> work_;
-  std::array<std::uint64_t, RWGPU_PREEMPT + 1> commands_{};
+  std::array<std::uint64_t, RWGPU_DRAW_ETHER_MASK + 1> commands_{};
+  // Session work counters span guest resets, just like draws_ and the PCI command counts.
+  std::uint64_t backend_frames_ = 0, replayed_frames_ = 0, readback_bytes_ = 0, avoided_readback_bytes_ = 0;
+  std::uint64_t uploaded_vertex_bytes_ = 0, avoided_vertex_bytes_ = 0, mask_triangles_ = 0, mask_rejected_ = 0;
   std::uint64_t draws_ = 0, source_triangles_ = 0, drawn_triangles_ = 0;
   std::uint64_t vertex_bytes_ = 0, presented_bytes_ = 0, host_ns_ = 0, backend_ns_ = 0;
   std::uint64_t result_ = 0, resident_download_bytes_ = 0;
@@ -317,6 +333,9 @@ class GuestGpuC08 {
   std::vector<std::uint8_t> stage_, transfer_, dma_commands_;
 #ifdef REVERSE_WINDOWS_GLES_GUEST
   regraphics::GuestRenderer renderer_;
+  RenderPlan previous_plan_;
+  unsigned previous_width_ = 0, previous_height_ = 0, previous_clear_ = 0;
+  bool previous_alpha_ = false;
   std::vector<std::uint8_t> bgrx_, color_;
   std::vector<xgpu::GuestVertex> vertices_;
 #endif
@@ -347,7 +366,7 @@ class GuestGpuC08 {
       case RWGPU_REG_CAPS:
         return RWGPU_CAP_VRAM | RWGPU_CAP_DIRECT_VRAM | RWGPU_CAP_SUM_INDICES | RWGPU_CAP_QUANTUM_VRAM | RWGPU_CAP_QUANTUM_STATE
 #ifdef REVERSE_WINDOWS_GLES_GUEST
-            | RWGPU_CAP_TRIANGLES | RWGPU_CAP_DRAW_VRAM | RWGPU_CAP_COLOR_DMA |
+            | RWGPU_CAP_ETHER_MASK | RWGPU_CAP_TRIANGLES | RWGPU_CAP_DRAW_VRAM | RWGPU_CAP_COLOR_DMA |
               RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_ALPHA | RWGPU_CAP_DRAW_READBACK |
               (msi_ ? RWGPU_CAP_WDDM_SCHEDULER : 0)
 #endif
@@ -385,14 +404,14 @@ class GuestGpuC08 {
     if (ticket != next_ticket) { status_ = RWGPU_INVALID; return; }
     result_ = 0;
     try {
-      if (op >= RWGPU_WRITE && op <= RWGPU_PREEMPT) ++commands_[op];
+      if (op >= RWGPU_WRITE && op < commands_.size()) ++commands_[op];
       const auto offset = wide(params_[0], params_[1]);
       const auto auxiliary = wide(direct_params_[0], direct_params_[1]);
       const auto count = wide(params_[2], direct_params_[2]);
       switch (op) {
         case RWGPU_WRITE: case RWGPU_READ: status_ = staged_transfer(op, offset, params_[2]); break;
         case RWGPU_DRAW: status_ = draw(op, offset, params_[2], 0); break;
-        case RWGPU_DRAW_VRAM: case RWGPU_DRAW_RAM:
+        case RWGPU_DRAW_VRAM: case RWGPU_DRAW_RAM: case RWGPU_DRAW_ETHER_MASK:
           status_ = count > UINT32_MAX ? unsigned(RWGPU_INVALID) : draw(op, auxiliary, params_[2], offset);
           break;
         case RWGPU_DRAW_READBACK:
@@ -455,6 +474,9 @@ class GuestGpuC08 {
   }
 
   void reset_engine() noexcept {
+#ifdef REVERSE_WINDOWS_GLES_GUEST
+    previous_plan_.reset();
+#endif
     fence_last_ = fence_preempt_ = preempt_last_ = fence_fault_ = irq_status_ = scheduled_draw_ticket_ = 0;
   }
 
@@ -789,20 +811,32 @@ class GuestGpuC08 {
     if (op == RWGPU_DRAW_RAM && !(pci_command_ & 4U)) return RWGPU_UNAVAILABLE;
     if ((op == RWGPU_DRAW_RAM && !ordinary_ram(offset, bytes)) ||
         (op == RWGPU_DRAW_VRAM && !GpuVram::valid_range(offset, bytes)) ||
-        (op == RWGPU_DRAW && bytes > stage_.size())) return RWGPU_INVALID;
+        ((op == RWGPU_DRAW || op == RWGPU_DRAW_ETHER_MASK) && bytes > stage_.size())) return RWGPU_INVALID;
     const auto pixels = std::size_t(width) * height * 4;
     if (dma_out && !ordinary_ram(*dma_out, pixels)) return RWGPU_INVALID;
-    vertices_.resize(bytes / sizeof(RwGpuVertex));
-    auto* vertex_data = reinterpret_cast<std::uint8_t*>(vertices_.data());
-    if (op == RWGPU_DRAW_RAM) {
-      pc_.cpu.memory.read_block(offset, vertex_data, bytes);
-    } else if (op == RWGPU_DRAW_VRAM) {
-      const auto read = memory_.read_draw(offset, vertex_data, bytes);
-      if (read != GpuVram::Result::Complete) return result_status(read);
-    } else if (bytes) {
-      std::memcpy(vertices_.data(), stage_.data(), bytes);
+    const auto triangles = bytes / (3 * sizeof(RwGpuVertex));
+    const bool masked = op == RWGPU_DRAW_ETHER_MASK;
+    if (masked) {
+      const auto status = select_ether_triangles(offset, triangles);
+      if (status != RWGPU_OK) return status;
+    } else {
+      vertices_.resize(triangles * 3);
+      auto* vertex_data = reinterpret_cast<std::uint8_t*>(vertices_.data());
+      if (op == RWGPU_DRAW_RAM) {
+        pc_.cpu.memory.read_block(offset, vertex_data, bytes);
+      } else if (op == RWGPU_DRAW_VRAM) {
+        const auto read = memory_.read_draw(offset, vertex_data, bytes);
+        if (read != GpuVram::Result::Complete) return result_status(read);
+      } else if (bytes) {
+        std::memcpy(vertex_data, stage_.data(), bytes);
+      }
     }
-    return render_frame(width, height, clear, present, alpha, dma_out, {});
+    const auto complete = render_frame(width, height, clear, present, alpha, dma_out, {});
+    if (masked && complete == RWGPU_OK) {
+      mask_triangles_ += triangles;
+      mask_rejected_ += triangles - vertices_.size() / 3;
+    }
+    return complete;
 #else
     (void)op; (void)flags; (void)bytes; (void)offset; (void)dma_out;
     return RWGPU_UNAVAILABLE;
@@ -810,6 +844,42 @@ class GuestGpuC08 {
   }
 
 #ifdef REVERSE_WINDOWS_GLES_GUEST
+  unsigned select_ether_triangles(std::uint64_t offset, std::size_t triangles) {
+    const auto bytes = (triangles + 7) / 8;
+    if (!GpuVram::valid_range(offset, bytes)) return RWGPU_INVALID;
+    vertices_.clear();
+    if (!bytes) return RWGPU_OK;
+    std::array<std::uint8_t, (RWGPU_MAX_VERTICES / 3 + 7) / 8> mask;
+    const auto epoch = pc_.quantum_session->epoch();
+    try {
+      for (std::size_t at = 0; at < bytes; at += RWGPU_QUANTUM_TRANSFER_BYTES) {
+        read_quantum(offset + at, mask.data() + at,
+                     std::min<std::size_t>(bytes - at, RWGPU_QUANTUM_TRANSFER_BYTES));
+      }
+    } catch (const std::runtime_error&) {
+      ++quantum_unavailable_;
+      return RWGPU_QUANTUM_UNAVAILABLE;
+    }
+    // A multi-window draw must see one coherent, non-destructive observation.
+    if (epoch != pc_.quantum_session->epoch()) {
+      ++quantum_unavailable_;
+      return RWGPU_QUANTUM_UNAVAILABLE;
+    }
+    // Only copy selected contiguous runs from the BAR into the canonical planner.
+    const auto enabled = [&](std::size_t i) { return mask[i / 8] & (1u << (i % 8)); };
+    for (std::size_t first = 0; first < triangles;) {
+      if (!enabled(first)) { ++first; continue; }
+      auto end = first + 1;
+      while (end < triangles && enabled(end)) ++end;
+      const auto old_size = vertices_.size(), added = 3 * (end - first);
+      vertices_.resize(old_size + added);
+      std::memcpy(vertices_.data() + old_size, stage_.data() + first * 3 * sizeof(RwGpuVertex),
+                  added * sizeof(RwGpuVertex));
+      first = end;
+    }
+    return RWGPU_OK;
+  }
+
   unsigned render_frame(unsigned width, unsigned height, unsigned clear, bool present, bool alpha,
                         std::optional<std::uint64_t> dma_out, std::optional<std::uint64_t> vram_out) {
     const auto start = std::chrono::steady_clock::now();
@@ -819,20 +889,49 @@ class GuestGpuC08 {
     const auto pins = pc_.cpu.memory.pin_writes();
     if (dma_out) pc_.cpu.memory.prepare_write(*dma_out, pixels);
     const auto plan = std::make_shared<const xgpu::GuestTrianglePlan>(planner_.plan(vertices_));
-    auto receipt = renderer_.render(*plan, width, height, clear, bgrx_, alpha);
-    if (bgrx_.size() != pixels) return RWGPU_FAILED;
-    // Return the actual readback to the canonical guest display. C07 observes
-    // this physical write the same way as BIOS or ordinary guest pixel stores.
-    if (present) pc_.cpu.memory.write_block(pc_.video_info().physical_address, bgrx_.data(), bgrx_.size());
+    const auto& vertices = plan->vertices;
+    const bool replay = previous_plan_ && previous_width_ == width && previous_height_ == height &&
+        previous_clear_ == clear && previous_alpha_ == alpha && color_.size() == pixels &&
+        previous_plan_->vertices.size() == vertices.size() &&
+        (vertices.empty() || std::memcmp(previous_plan_->vertices.data(), vertices.data(),
+                                          vertices.size() * sizeof(xgpu::GuestVertex)) == 0);
+    std::optional<regraphics::GuestRenderReceipt> receipt;
+    if (!replay) {
+      receipt = renderer_.render(*plan, width, height, clear, bgrx_, alpha);
+      if (bgrx_.size() != pixels) return RWGPU_FAILED;
+      ++backend_frames_;
+      readback_bytes_ += pixels;
+      uploaded_vertex_bytes_ += receipt->vertex_bytes;
+    }
+    const auto& image = replay ? color_ : bgrx_;
+    if (present) pc_.cpu.memory.write_block(pc_.video_info().physical_address, image.data(), pixels);
     if (vram_out) {
-      const auto result = memory_.write(*vram_out, bgrx_.data(), pixels);
+      const auto result = memory_.write(*vram_out, image.data(), pixels);
       if (result != GpuVram::Result::Complete) return result_status(result);
     }
     work_.publish(plan, plan->revision, plan->revision);
-    // The DMA destination is resident and pinned, so this copy cannot need
-    // backing I/O or grow SparseRam after publishing the completed work.
-    if (dma_out) pc_.cpu.memory.write_block(*dma_out, bgrx_.data(), pixels);
-    bgrx_.swap(color_);
+    if (dma_out) pc_.cpu.memory.write_block(*dma_out, image.data(), pixels);
+    if (replay) {
+      ++replayed_frames_;
+      avoided_readback_bytes_ += pixels;
+      avoided_vertex_bytes_ += vertices.size() * sizeof(xgpu::GuestVertex);
+      vertex_bytes_ = backend_ns_ = 0;
+      gpu_ns_.reset();
+    } else {
+      bgrx_.swap(color_);
+      vertex_bytes_ = receipt->vertex_bytes;
+      renderer_name_ = std::move(receipt->renderer);
+      hardware_ = receipt->hardware_reported;
+      backend_ns_ = receipt->cpu_wall_ns;
+      gpu_ns_ = receipt->gpu_query_ns;
+    }
+    if (quantum_cache_enabled_) {
+      previous_plan_ = plan;
+      previous_width_ = width;
+      previous_height_ = height;
+      previous_clear_ = clear;
+      previous_alpha_ = alpha;
+    }
     ++draws_;
     if (dma_out) {
       result_ = pixels;
@@ -842,12 +941,7 @@ class GuestGpuC08 {
     if (alpha) alpha_draw_ticket_ = params_.back();
     source_triangles_ = plan->source_triangles;
     drawn_triangles_ = plan->vertices.size() / 3;
-    vertex_bytes_ = receipt.vertex_bytes;
     presented_bytes_ = present ? color_.size() : 0;
-    renderer_name_ = std::move(receipt.renderer);
-    hardware_ = receipt.hardware_reported;
-    backend_ns_ = receipt.cpu_wall_ns;
-    gpu_ns_ = receipt.gpu_query_ns;
     host_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - start).count();
     return RWGPU_OK;

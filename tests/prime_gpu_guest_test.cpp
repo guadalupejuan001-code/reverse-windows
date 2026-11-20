@@ -303,6 +303,31 @@ void verify_scheduled_dma(PcMachine& pc, PcMotherboardC06& board,
           "VidMm DMA data, MSI fences, fault, or preemption diverged");
   std::cout << "PRIME_C08_SCHEDULED_DMA_PASS msi=6 fence=104 fault=105 preempt=205 pixels=4096"
                " pin=system-ram vbe_stores=0 high_dma=1\n";
+
+  // Draw, overwrite its VidMm allocation and draw the identical scene again.
+  // The second draw must restore the allocation and signal its own fence and MSI.
+  cpu.write32(moved_bar + RWGPU_REG_ENGINE_RESET, 1);
+  const RwGpuDmaFill erase{{RWGPU_DMA_FILL, sizeof(erase)}, target, RWGPU_PAGE_BYTES, 0};
+  store(command_ram + 0x5000, erase);
+  Guest32 repeated;
+  const auto next = [&](unsigned ticket, unsigned offset, unsigned fence, unsigned bytes) {
+    repeated.direct_command(RWGPU_SUBMIT_DMA, ticket, command_ram + offset, fence, bytes);
+    repeated.emit({0xfb,0xf4,0xfa});
+  };
+  next(35, 0x1000, 301, draw_bytes);
+  next(36, 0x5000, 302, sizeof(erase));
+  next(37, 0x1000, 303, draw_bytes);
+  next(38, 0x2000, 304, sizeof(download));
+  repeated.run(pc);
+  cpu.memory.read_block(read_first, pixels.data(), half);
+  cpu.memory.read_block(read_second, pixels.data() + half, half);
+  const auto replay = gpu_stats(*board.attached_gpu());
+  require(cpu.read32(receipt + 20) == 10 && cpu.read32(moved_bar + RWGPU_REG_FENCE_LAST) == 304 &&
+          cpu.read32(moved_bar + RWGPU_REG_SCHEDULED_DRAW_TICKET) == 37 && pixels == reference &&
+          replay.find("\"submitted_triangles\":0,\"vertex_bytes\":0") != std::string::npos,
+          "scheduled replay lost the overwritten VidMm destination, fence or MSI");
+  std::cout << "PRIME_WDDM_REPLAY_PASS msi=4 fence=304 draw_ticket=37 exact_bytes=4096\n";
+
 }
 #else
 void verify_preempt_msi(PcMachine& pc, PcMotherboardC06& board) {
@@ -890,9 +915,12 @@ void measure_vram(const std::filesystem::path& path) {
             << " commits=" << commits << " write_ns=" << durable_time.count()
             << " reopen_and_read_ns=" << reload.count() << " exact=1\n";
 }
+#ifdef REVERSE_WINDOWS_GLES_GUEST
+#include "ether_draw_cases.hpp"
+#endif
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   try {
     auto name = (std::filesystem::temp_directory_path() / "reverse-windows-gpu-XXXXXX").string();
     require(::mkdtemp(name.data()), "Could not create test directory");
@@ -900,9 +928,20 @@ int main() {
       std::filesystem::path path;
       ~RemoveDirectory() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
     } remove{name};
+    if (argc > 1) {
+#ifdef REVERSE_WINDOWS_GLES_GUEST
+      if (argc == 2 && std::string_view(argv[1]) == "--measure-ether") {
+        verify_ether_draws(remove.path / "ether-draw.rqvd");
+        measure_ether_draws(remove.path / "ether-measure.rqvd");
+        return 0;
+      }
+#endif
+      throw std::invalid_argument("Unsupported GPU test option or missing GLES");
+    }
     verify_pci_clocks(remove.path);
 #ifdef REVERSE_WINDOWS_GLES_GUEST
     verify_renderer_thread_bindings();
+    verify_ether_draws(remove.path / "ether-functional.rqvd");
 #endif
     verify(remove.path / "gpu.rqvd");
     verify_quantum_vram(remove.path / "quantum.rqvd");

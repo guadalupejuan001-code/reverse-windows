@@ -198,13 +198,16 @@ static VOID set_scene(RwGpuDevice* state, const RwGpuDrawRequest* cmd) {
     reg_write(state, RWGPU_REG_CLEAR_RGBA, cmd->clear_rgba);
 }
 
-static NTSTATUS draw(RwGpuDevice* state, const RwGpuDrawRequest* cmd, PUCHAR data, ULONG* written) {
+static NTSTATUS draw(RwGpuDevice* state, const RwGpuDrawRequest* cmd, ULONG op, uint64_t mask,
+                     PUCHAR vertex_data, PUCHAR data, ULONG* written) {
     PULONG staging = (PULONG)(state->bar + RWGPU_STAGE_OFFSET);
     const ULONG vertices = cmd->vertex_count * sizeof(RwGpuVertex);
     const ULONG color = cmd->width * cmd->height * 4;
-    if (vertices) WRITE_REGISTER_BUFFER_ULONG(staging, (PULONG)(data + sizeof(*cmd)), vertices / 4);
+    if (op == RWGPU_DRAW_ETHER_MASK && !(reg_read(state, RWGPU_REG_CAPS) & RWGPU_CAP_ETHER_MASK))
+        return STATUS_NOT_SUPPORTED;
+    if (vertices) WRITE_REGISTER_BUFFER_ULONG(staging, (PULONG)vertex_data, vertices / 4);
     set_scene(state, cmd);
-    NTSTATUS status = transfer(state, RWGPU_DRAW, 0, 0, vertices);
+    NTSTATUS status = transfer(state, op, mask, 0, vertices);
     if (!NT_SUCCESS(status)) return status;
     for (ULONG offset = 0; offset < color;) {
         const ULONG left = color - offset;
@@ -324,14 +327,25 @@ static NTSTATUS device_control(PDEVICE_OBJECT dev, PIRP irp) {
     PUCHAR data = irp->AssociatedIrp.SystemBuffer;
     ULONG written = 0;
     status = STATUS_INVALID_DEVICE_REQUEST;
-    if (code == RWGPU_IOCTL_DRAW) {
+    if (code == RWGPU_IOCTL_DRAW || code == RWGPU_IOCTL_DRAW_ETHER_MASK) {
         status = STATUS_INVALID_PARAMETER;
-        if (data && input >= sizeof(RwGpuDrawRequest)) {
-            const RwGpuDrawRequest cmd = *(const RwGpuDrawRequest*)data;
-            if (valid_scene(&cmd) && input == sizeof(cmd) + cmd.vertex_count * sizeof(RwGpuVertex) &&
+        const BOOLEAN masked = code == RWGPU_IOCTL_DRAW_ETHER_MASK;
+        const ULONG header = masked ? sizeof(RwGpuDrawVramRequest) : sizeof(RwGpuDrawRequest);
+        if (data && input >= header) {
+            RwGpuDrawRequest cmd;
+            uint64_t offset = 0;
+            ULONG reserved = 0;
+            if (masked) {
+                const RwGpuDrawVramRequest request = *(const RwGpuDrawVramRequest*)data;
+                cmd = request.draw;
+                offset = request.offset;
+                reserved = request.reserved;
+            } else cmd = *(const RwGpuDrawRequest*)data;
+            if (!reserved && valid_scene(&cmd) && input == header + cmd.vertex_count * sizeof(RwGpuVertex) &&
                 output == cmd.width * cmd.height * 4) {
                 lock_device(state);
-                status = state->bar ? draw(state, &cmd, data, &written) : STATUS_DEVICE_NOT_READY;
+                status = state->bar ? draw(state, &cmd, masked ? RWGPU_DRAW_ETHER_MASK : RWGPU_DRAW,
+                                           offset, data + header, data, &written) : STATUS_DEVICE_NOT_READY;
                 unlock_device(state);
             }
         }

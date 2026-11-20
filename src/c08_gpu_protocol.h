@@ -64,7 +64,10 @@ enum RwGpuCommand {
   // Both gates require LENGTH=0. Basis reads never implicitly measure a qubit.
   RWGPU_QUANTUM_H = 19, RWGPU_QUANTUM_CX = 20,
   // Explicit whole-session snapshot, including qubits outside the VRAM. All parameters zero.
-  RWGPU_QUANTUM_CHECKPOINT_STATE = 21, RWGPU_QUANTUM_RESTORE_STATE = 22
+  RWGPU_QUANTUM_CHECKPOINT_STATE = 21, RWGPU_QUANTUM_RESTORE_STATE = 22,
+  // Staged triangles, OFFSET = shared Ether mask byte offset, AUX = draw flags.
+  // Bit i (LSB first) enables triangle i. All mask bytes must have a definite basis value.
+  RWGPU_DRAW_ETHER_MASK = 23
 };
 enum RwGpuStatus { RWGPU_IDLE = 0, RWGPU_OK = 1, RWGPU_BAD_COMMAND = 2,
                   RWGPU_INVALID = 3, RWGPU_UNAVAILABLE = 4, RWGPU_FAILED = 5,
@@ -73,7 +76,8 @@ enum RwGpuCaps {
   RWGPU_CAP_VRAM = 1, RWGPU_CAP_TRIANGLES = 2, RWGPU_CAP_DIRECT_VRAM = 4,
   RWGPU_CAP_SUM_INDICES = 8, RWGPU_CAP_DRAW_VRAM = 16, RWGPU_CAP_COLOR_DMA = 32,
   RWGPU_CAP_DRAW_RAM = 64, RWGPU_CAP_COLOR_ALPHA = 128, RWGPU_CAP_DRAW_READBACK = 256,
-  RWGPU_CAP_WDDM_SCHEDULER = 512, RWGPU_CAP_QUANTUM_VRAM = 1024, RWGPU_CAP_QUANTUM_STATE = 2048
+  RWGPU_CAP_WDDM_SCHEDULER = 512, RWGPU_CAP_QUANTUM_VRAM = 1024, RWGPU_CAP_QUANTUM_STATE = 2048,
+  RWGPU_CAP_ETHER_MASK = 4096
 };
 enum RwGpuIrq { RWGPU_IRQ_COMPLETE = 1, RWGPU_IRQ_PREEMPT = 2, RWGPU_IRQ_FAULT = 4 };
 #define RWGPU_PCI_MSI_CAP 0x50u

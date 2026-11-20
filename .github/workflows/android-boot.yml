@@ -94,6 +94,19 @@ jobs:
           args=(--no-daemon --stacktrace "-PandroidAbi=$ANDROID_ABI" -PetherPreview=true :app:assembleDebug)
           if [[ "$ANDROID_ABI" == x86_64 ]]; then args+=(:app:assembleDebugAndroidTest); fi
           ./gradlew "${args[@]}" || ./gradlew --refresh-dependencies "${args[@]}"
+      - name: Build on-device Ether GPU measurement for this Android ABI
+        run: |
+          ndk="$ANDROID_HOME/ndk/27.2.12479018"
+          cmake -S . -B "$RUNNER_TEMP/ether-gpu-device" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ndk/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="$ANDROID_ABI" -DANDROID_PLATFORM=android-26 -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+          cmake --build "$RUNNER_TEMP/ether-gpu-device" --target reverse_windows_prime_gpu_guest_test --parallel 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prime-r105-on-device-gpu-${{ matrix.abi }}
+          path: ${{ runner.temp }}/ether-gpu-device/reverse_windows_prime_gpu_guest_test
+          if-no-files-found: error
       - name: Read Prime APK identity from Gradle
         id: apk_metadata
         run: |
@@ -223,6 +236,12 @@ jobs:
           apk=android/app/build/outputs/apk/debug/app-debug.apk
           log="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/android-runtime.log"
           trap 'adb logcat -d > "$log"' EXIT
+          device_dir=/data/local/tmp/reverse-prime-r105
+          adb shell mkdir -p "$device_dir"
+          adb push "$RUNNER_TEMP/ether-gpu-device/reverse_windows_prime_gpu_guest_test" "$device_dir/ether-gpu"
+          adb shell chmod 755 "$device_dir/ether-gpu"
+          adb shell "TMPDIR=$device_dir $device_dir/ether-gpu --measure-ether" | tee "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ether-gpu-device.log"
+          grep -q '^PRIME_ETHER_DRAW_RENDERER ' "$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/ether-gpu-device.log"
           adb shell settings put secure immersive_mode_confirmations confirmed
           adb install -r "$apk"
           adb install -r android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk

@@ -43,7 +43,8 @@ final class GuestMonitor extends View {
     private final VbePresentationStats vbeStats;
     private final byte[] cells = new byte[4000];
     private final char[] row = new char[80];
-    private boolean hasText;
+    private static final int BACKGROUND = 0xff080b10;
+    private boolean hasText, opaqueVideo;
     // Each strip keeps its own Bitmap generation. Canvas can reuse the
     // textures of strips which received no pixels in this guest update.
     private Bitmap[] videoStripes;
@@ -99,6 +100,9 @@ final class GuestMonitor extends View {
                 int y = video[offset++];
                 int width = video[offset++];
                 int height = video[offset++];
+                // Native VBE scanout exports BGRX as opaque ARGB. A full rectangle
+                // establishes coverage even when earlier packets arrived out of order.
+                if (x == 0 && y == 0 && width == videoWidth && height == videoHeight) opaqueVideo = true;
                 int end = y + height;
                 while (y < end) {
                     int stripe = y / videoStripeHeight;
@@ -137,6 +141,7 @@ final class GuestMonitor extends View {
     private void discardVideo() {
         videoNodes = null;
         videoStripes = null;
+        opaqueVideo = false;
     }
 
     @Override
@@ -149,11 +154,13 @@ final class GuestMonitor extends View {
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
         if(drawPending){drawPending=false;input.onPresented();}
-        canvas.drawColor(0xff080b10);
+        if (videoStripes != null) fit(videoWidth, videoHeight);
+        long skipped = 0;
+        if (opaqueVideo) skipped = drawVideoBackground(canvas);
+        else canvas.drawColor(BACKGROUND);
         if (hasText) {
             drawTextMode(canvas);
         } else if (videoStripes != null) {
-            fit(videoWidth, videoHeight);
             canvas.save();
             canvas.clipRect(frame);
             canvas.translate(frame.left, frame.top);
@@ -161,7 +168,7 @@ final class GuestMonitor extends View {
             if (Build.VERSION.SDK_INT >= 29 && canvas.isHardwareAccelerated()) {
                 if (videoNodes == null) videoNodes = new VbeRenderNodes(videoWidth, videoHeight, videoStripeHeight);
                 int recorded = videoNodes.draw(canvas, videoStripes);
-                vbeStats.drawn(VbePresentationStats.Backend.RENDER_NODES, recorded);
+                vbeStats.drawn(VbePresentationStats.Backend.RENDER_NODES, recorded, skipped);
             } else {
                 paint.setFilterBitmap(false);
                 paint.setAntiAlias(false);
@@ -174,7 +181,7 @@ final class GuestMonitor extends View {
                 }
                 paint.setAntiAlias(true);
                 vbeStats.drawn(canvas.isHardwareAccelerated() ? VbePresentationStats.Backend.HARDWARE_CANVAS
-                        : VbePresentationStats.Backend.SOFTWARE_CANVAS, 0);
+                        : VbePresentationStats.Backend.SOFTWARE_CANVAS, 0, skipped);
             }
             canvas.restore();
         } else {
@@ -186,6 +193,25 @@ final class GuestMonitor extends View {
                     getHeight() / 2f - (paint.ascent() + paint.descent()) / 2f, paint);
             paint.setTextAlign(Paint.Align.LEFT);
         }
+    }
+
+    private long drawVideoBackground(Canvas canvas) {
+        // Keep the clear at fractional edges; fully covered interior pixels
+        // will be painted by the opaque guest stripes in this drawing pass.
+        int left = Math.max(0, (int)Math.ceil(frame.left));
+        int top = Math.max(0, (int)Math.ceil(frame.top));
+        int right = Math.min(getWidth(), (int)Math.floor(frame.right));
+        int bottom = Math.min(getHeight(), (int)Math.floor(frame.bottom));
+        if (right <= left || bottom <= top) {
+            canvas.drawColor(BACKGROUND);
+            return 0;
+        }
+        if (left != 0 || top != 0 || right != getWidth() || bottom != getHeight()) {
+            int saved = canvas.save();
+            if (canvas.clipOutRect(left, top, right, bottom)) canvas.drawColor(BACKGROUND);
+            canvas.restoreToCount(saved);
+        }
+        return (long)(right - left) * (bottom - top);
     }
 
     private void fit(int width, int height) {
