@@ -119,6 +119,9 @@ void verify_ram_profile() {
   throw std::runtime_error("Starting a VM with Android memory pressure must be rejected");
 }
 
+#ifndef PRIME_PREVIOUS_ENGINE_WINDOW
+// The historical engine-window benchmark compiles this harness against the
+// 0.3.66 session, which predates the optional backing-read timing API.
 void verify_ram_timing_option(const std::filesystem::path& directory) {
   constexpr std::uint64_t mib = 1024 * 1024;
   const auto profile = Session::ram_profile(768 * mib, 256 * mib, false, true);
@@ -148,6 +151,7 @@ void verify_ram_timing_option(const std::filesystem::path& directory) {
           "A new session must not inherit the previous session's measurement mode");
   std::cout << "PRIME_RAM_TIMING_OPTION_PASS default_off=1 toggle=1 preserves_guest=1 next_session_off=1\n";
 }
+#endif
 
 void verify_ram_spill(const std::filesystem::path& directory) {
   using Backing = reverse_windows::AndroidRamBacking;
@@ -1264,7 +1268,9 @@ int main(int argc, char** argv) {
     verify_ram_profile();
     require(argc == 2 || argc == 3, "Pass the synthetic BIOS fixture and optional evidence path");
     const TestDiskDirectory dir;
+#ifndef PRIME_PREVIOUS_ENGINE_WINDOW
     verify_ram_timing_option(dir.path);
+#endif
     verify_ram_spill(dir.path);
     verify_packed_ram64(dir.path);
     verify_deferred_ram_reclaim(dir.path);
