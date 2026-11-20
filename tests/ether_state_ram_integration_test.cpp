@@ -7,6 +7,7 @@
 #include <future>
 #include <iostream>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -37,6 +38,37 @@ struct Fixture {
   Fixture() { memory.attach_quantum_authority(quantum); }
   void bind(std::uint64_t address, const char* qbase) {
     bind_quantum_ram_byte(memory, quantum, address, qbase);
+  }
+};
+
+// State and rollback remain in the production vector provider. This adapter
+// injects one failure between the RAM segments surrounding a legacy window.
+struct FaultingQuantumAuthority final : cosmic_pc::EtherStateRam::QuantumAuthority {
+  std::shared_ptr<QuantumRamAuthority> actual = std::make_shared<QuantumRamAuthority>();
+  unsigned writes = 0, fail_on_write = 0;
+  bool missing_checkpoint = false, fail_checkpoint = false;
+  bool contains(std::uint64_t address) const noexcept override { return actual->contains(address); }
+  bool intersects(std::uint64_t first, std::size_t count) const noexcept override {
+    return actual->intersects(first, count);
+  }
+  std::vector<std::uint64_t> bound_addresses(std::uint64_t first, std::size_t count) const override {
+    return actual->bound_addresses(first, count);
+  }
+  std::uint8_t read(std::uint64_t address) const override { return actual->read(address); }
+  void write(const std::vector<std::pair<std::uint64_t, std::uint8_t>>& values) override {
+    if (++writes == fail_on_write) throw std::runtime_error("injected second quantum RAM transaction");
+    actual->write(values);
+  }
+  std::uint64_t revision() const noexcept override { return actual->revision(); }
+  std::size_t state_bytes() const noexcept override { return actual->state_bytes(); }
+  void reset() noexcept override { actual->reset(); }
+  void begin_write_scope() noexcept override { actual->begin_write_scope(); }
+  void end_write_scope() noexcept override { actual->end_write_scope(); }
+  void commit_write_scope() noexcept override { actual->commit_write_scope(); }
+  bool restore_write_scope() noexcept override { return actual->restore_write_scope(); }
+  std::unique_ptr<LocalCheckpoint> checkpoint() override {
+    if (fail_checkpoint) throw std::bad_alloc();
+    return missing_checkpoint ? nullptr : actual->checkpoint();
   }
 };
 
@@ -331,6 +363,90 @@ void retired_input_survives_failed_debug_delivery() {
             std::abs(f.quantum->probability_one("16") - .5) < 2e-12,
         "failed debug delivery retained a partial frame or measured its operand");
 }
+
+void mixed_window_failure_is_local(bool fill, bool outer_pin) {
+  MemoryFabric memory(4 * kPage, 4 * kPage);
+  auto provider = std::make_shared<FaultingQuantumAuthority>();
+  auto& quantum = provider->actual;
+  memory.attach_quantum_authority(provider);
+  memory.fill(0, 7, 32);
+  memory.write_byte(1, 8);
+  memory.write_byte(4, 9);
+  memory.write_byte(16, 20);
+  memory.write_byte(24, 0);
+  bind_quantum_ram_byte(memory, quantum, 1, "0");
+  bind_quantum_ram_byte(memory, quantum, 4, "8");
+  bind_quantum_ram_byte(memory, quantum, 16, "16");
+  bind_quantum_ram_byte(memory, quantum, 24, "24");
+  quantum->execute_xi("h 24\nt 24\nh 24\n");
+  const auto phase = quantum->probability_one("24");
+  std::array<std::uint8_t, 2> window{{10, 11}};
+  unsigned window_writes = 0;
+  memory.attach_window(2, 2, [&](auto at) { return window.at(at); },
+                       [&](auto at, auto value) { ++window_writes; window.at(at) = value; });
+  std::array<std::uint8_t, 6> before{}, after{}, replacement{};
+  replacement.fill(0x55);
+  memory.read_block(0, before.data(), before.size());
+  const auto operation = [&] {
+    if (fill) memory.fill(0, 0x55, replacement.size());
+    else memory.write_block(0, replacement.data(), replacement.size());
+  };
+  const auto exercise_failure = [&] {
+    const auto revision = quantum->revision();
+    provider->fail_on_write = provider->writes + 2;
+    bool injected = false;
+    try { operation(); }
+    catch (const std::runtime_error& error) {
+      injected = std::string(error.what()) == "injected second quantum RAM transaction";
+    }
+    check(injected && provider->writes == provider->fail_on_write && window_writes != 0,
+          "mixed-window regression did not fail after its first RAM segment committed");
+    memory.read_block(0, after.data(), after.size());
+    check(after == before && quantum->read(1) == 8 && quantum->read(4) == 9,
+          "failed mixed-window operation retained a basis, quantum or window prefix");
+    check(quantum->revision() > revision && std::abs(quantum->probability_one("24") - phase) < 2e-12,
+          "local rollback reused a revision or damaged unrelated quantum state");
+    provider->fail_on_write = 0;
+  };
+  if (outer_pin) {
+    const auto pins = memory.pin_writes();
+    memory.write_byte(16, 0x26);
+    memory.write_byte(17, 0x27);
+    exercise_failure();
+    check(memory.has_pinned_writes() && quantum->read(16) == 0x26 && memory.read_byte(17) == 0x27,
+          "local mixed-window rollback erased stores preceding it in the outer pin");
+    check(memory.restore_byte(16, 20) && memory.restore_byte(17, 7) && quantum->read(16) == 20 &&
+              memory.read_byte(17) == 7,
+          "local checkpoint moved or invalidated the outer rollback baseline");
+  } else {
+    exercise_failure();
+    check(!memory.has_pinned_writes(), "mixed-window failure leaked its write pin");
+  }
+
+  // Neither an unsupported checkpoint nor a failed allocation may begin any
+  // writes, even when earlier outer stores would need a different baseline.
+  const auto unchanged = quantum->snapshot();
+  const auto writes_before = window_writes;
+  provider->missing_checkpoint = true;
+  rejects(operation, "mixed quantum/window write accepted an unsupported local checkpoint");
+  provider->missing_checkpoint = false;
+  provider->fail_checkpoint = true;
+  bool allocation_failed = false;
+  try { operation(); } catch (const std::bad_alloc&) { allocation_failed = true; }
+  provider->fail_checkpoint = false;
+  memory.read_block(0, after.data(), after.size());
+  check(allocation_failed && after == before && window_writes == writes_before &&
+            quantum->snapshot() == unchanged,
+        "checkpoint preparation failed after values had already changed");
+
+  operation();
+  memory.read_block(0, after.data(), after.size());
+  check(after == replacement && quantum->read(1) == 0x55 && quantum->read(4) == 0x55 &&
+            !memory.has_pinned_writes(),
+        "successful mixed-window operation failed after recovering from an earlier failure");
+  quantum->execute_xi("h 24\ntdg 24\nh 24\n");
+  check(quantum->read(24) == 0, "local checkpoint lost the phase of an unrelated coherent cell");
+}
 }  // namespace
 
 int main() {
@@ -341,12 +457,15 @@ int main() {
     shared_cpus_and_mmio_exclusion();
     failed_instruction_restores_quantum_and_basis_ram();
     retired_input_survives_failed_debug_delivery();
+    for (bool fill : {false, true})
+      for (bool outer_pin : {false, true}) mixed_window_failure_is_local(fill, outer_pin);
     const auto probe = reverse_windows::run_quantum_ram_guest_probe();
     check(probe.passed, "real x86 quantum RAM probe failed");
     std::cout << "{\"ether_state_ram_integration\":\"passed\",\"checks\":" << checks
               << ",\"basis_oracle\":true,\"shared_vcpu\":true,\"mmio_exclusion\":true,"
                  "\"revision_invalidation\":true,\"quantum_rollback\":true,"
-                 "\"retired_store_preserved\":true,\"probe\":";
+                 "\"retired_store_preserved\":true,\"mixed_window_atomicity\":true,"
+                 "\"local_rollback_preserves_outer_stores\":true,\"probe\":";
     probe.write_json(std::cout);
     std::cout << "}\n";
     return 0;

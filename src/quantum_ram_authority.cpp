@@ -135,6 +135,27 @@ struct QuantumRamAuthority::Impl {
   void require_unpinned() const {
     if (scope_depth) throw std::logic_error("quantum RAM ownership cannot change during a guest write scope");
   }
+
+  // A nested fabric operation can fail while an outer CPU instruction still
+  // owns the write pin. Keep its local rollback independent of that CPU's
+  // retirement baseline. The fabric retains the owner and joins readers for
+  // the checkpoint's lifetime; bindings cannot change inside the write pin.
+  struct Checkpoint final : QuantumRamAuthority::LocalCheckpoint {
+    explicit Checkpoint(Impl& state)
+        : owner(state), saved(state.runtime),
+          payload(state.payload_bytes.load(std::memory_order_relaxed)) {}
+    void restore() noexcept override {
+      std::lock_guard<std::mutex> lock(owner.mutex);
+      owner.runtime = saved;
+      owner.payload_bytes.store(payload, std::memory_order_release);
+      if (owner.revision.load(std::memory_order_relaxed) != std::numeric_limits<std::uint64_t>::max())
+        owner.revision.fetch_add(1, std::memory_order_release);
+      // Do not move pinned_runtime, scope_depth or the outer rollback flag.
+    }
+    Impl& owner;
+    Runtime saved;
+    std::size_t payload;
+  };
 };
 
 QuantumRamAuthority::QuantumRamAuthority() : QuantumRamAuthority(Limits{}) {}
@@ -239,6 +260,13 @@ bool QuantumRamAuthority::restore_write_scope() noexcept {
     impl_->scope_restored = true;
   }
   return true;
+}
+
+std::unique_ptr<QuantumRamAuthority::LocalCheckpoint> QuantumRamAuthority::checkpoint() {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (!impl_->scope_depth)
+    throw std::logic_error("quantum RAM local checkpoint requires a live write scope");
+  return std::make_unique<Impl::Checkpoint>(*impl_);
 }
 
 void QuantumRamAuthority::bind(std::uint64_t address, const std::string& qbase,

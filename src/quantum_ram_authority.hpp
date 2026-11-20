@@ -58,6 +58,7 @@ class QuantumRamAuthority final : public cosmic_pc::EtherStateRam::QuantumAuthor
   void commit_write_scope() noexcept override;
   void end_write_scope() noexcept override;
   bool restore_write_scope() noexcept override;
+  std::unique_ptr<LocalCheckpoint> checkpoint() override;
 
   // Bind initializes eight disjoint qubit addresses from the previous guest
   // byte. It rejects a quantum initial state instead of measuring implicitly.
