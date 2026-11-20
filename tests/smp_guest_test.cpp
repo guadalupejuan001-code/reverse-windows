@@ -22,6 +22,14 @@ using reverse_windows::PcMotherboardC06;
 #define PRIME_HAS_R107_GRANTS 0
 #endif
 
+#if !defined(PRIME_R101_BASELINE) && !defined(PRIME_R102_BASELINE) && !defined(PRIME_R103_BASELINE) && \
+    !defined(PRIME_R104_BASELINE) && !defined(PRIME_R105_BASELINE) && !defined(PRIME_R106_BASELINE) && \
+    !defined(PRIME_R107_BASELINE)
+#define PRIME_HAS_C06_READY_WAKE_TESTS 1
+#else
+#define PRIME_HAS_C06_READY_WAKE_TESTS 0
+#endif
+
 namespace {
 constexpr auto kLapic = PcMotherboardC06::kLocalApic;
 constexpr unsigned kProcessors = 16;
@@ -390,6 +398,219 @@ void measure_sleeping_bsp(bool threaded) {
     std::cout << "PRIME_IDLE_BSP_PASS threaded=" << threaded << " grant=" << budget
               << " retired=" << retired << " wake_irq=1\n";
 }
+
+#if PRIME_HAS_C06_READY_WAKE_TESTS
+// A halted BSP must not retain a third of a budget shared by two running APs.
+// Keep device time fixed so this checks allocation, not host timing or IRQs.
+void test_ready_budget_with_parked_bsp(bool threaded, unsigned active_aps) {
+    PcMachine pc(4U << 20);
+    pc.boot_demo();
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {3, 1}, false, {},
+                           PcMotherboardC06::CpuClock::Experimental4_5THz);
+    if (threaded) board.enable_threaded_smp(3);
+    board.enable_active_clock([] { return PcMachine::RunClock::time_point{}; });
+    auto& cpu = pc.cpu;
+    cpu.reset(0, 0x7200);
+    cpu.a20_enabled = true;
+    cpu.out_hook(0x21, 1, 0xff);
+    cpu.out_hook(0xa1, 1, 0xff);
+    constexpr std::uint8_t sleep[]{0xfb, 0x90, 0xf4, 0xeb, 0xfd};
+    cpu.memory.write_block(0x7200, sleep, sizeof(sleep));
+    cpu.write16(kStartupVector << 12, 0xfeeb);
+    for (unsigned id = 1; id <= active_aps; ++id) {
+        cpu.write32(kLapic + 0x310, id << 24);
+        cpu.write32(kLapic + 0x300, 0x600 | kStartupVector);
+    }
+    board.run(4096);
+    require(cpu.halted && board.processors_started() == active_aps + 1 && !board.faulted_cpu(),
+            "ready-budget fixture did not park the BSP beside its running APs");
+    std::array<std::uint64_t, 3> before{};
+    for (unsigned id = 0; id <= active_aps; ++id) before[id] = board.processor_steps(id);
+    const auto total_before = board.total_processor_steps();
+    constexpr unsigned budget = 96;
+    board.run(budget);
+    const auto retired = board.total_processor_steps() - total_before;
+    std::cout << "C06_READY_BUDGET_SAMPLE threaded=" << threaded << " active_aps=" << active_aps
+              << " budget=" << budget << " retired=" << retired;
+    for (unsigned id = 1; id <= active_aps; ++id)
+        std::cout << " ap" << id << '=' << board.processor_steps(id) - before[id];
+    std::cout << '\n';
+    require(!board.faulted_cpu() && cpu.halted && board.processor_steps(0) == before[0],
+            "a parked BSP retired instructions without a wake event");
+    require(retired <= budget, "ready processors exceeded the VM instruction budget");
+    require(retired == budget, "a parked BSP left part of the ready processors' budget unused");
+    for (unsigned id = 1; id <= active_aps; ++id)
+        require(board.processor_steps(id) - before[id] == budget / active_aps,
+                "ready APs did not receive equal shares of the complete 96-step budget");
+}
+
+void test_sleeping_ap_irq_dispatches() {
+    std::array<std::uint64_t, 2> dispatches{};
+    for (const bool interrupts : {false, true}) {
+        PcMachine pc(4U << 20);
+        pc.boot_demo();
+        PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {3, 1}, false, {},
+                               PcMotherboardC06::CpuClock::Experimental4_5THz);
+        board.enable_threaded_smp(2);
+        board.enable_active_clock([] { return PcMachine::RunClock::time_point{}; });
+        auto& cpu = pc.cpu;
+        cpu.reset(0, 0x7200);
+        cpu.a20_enabled = true;
+        cpu.out_hook(0x21, 1, 0xff);
+        cpu.out_hook(0xa1, 1, 0xff);
+        constexpr std::uint8_t spin[]{0xfb, 0x90, 0xeb, 0xfe}; // Running peers keep IF set in both cases.
+        const std::uint8_t sleep[]{std::uint8_t(interrupts ? 0xfb : 0xfa), 0x90, 0xf4};
+        cpu.memory.write_block(0x7200, spin, sizeof(spin));
+        cpu.memory.write_block(0x8000, spin, sizeof(spin));
+        cpu.memory.write_block(0x9000, sleep, sizeof(sleep));
+        cpu.write32(kLapic + 0x310, 1U << 24);
+        cpu.write32(kLapic + 0x300, 0x608);
+        cpu.write32(kLapic + 0x310, 2U << 24);
+        cpu.write32(kLapic + 0x300, 0x609);
+        board.run(1024);
+        require(board.processors_started() == 3 && !board.faulted_cpu() &&
+                std::string(board.processor_state(2)) == "halted", "idle-AP dispatch fixture");
+        const auto total_before = board.total_processor_steps();
+        const auto sleeping_before = board.processor_steps(2);
+        const auto before = board.threaded_smp_stats().dispatches;
+        constexpr unsigned work = 32768;
+        board.run(work);
+        dispatches[interrupts] = board.threaded_smp_stats().dispatches - before;
+        const auto retired = board.total_processor_steps() - total_before;
+        std::cout << "C06_IDLE_IRQ_DISPATCH_SAMPLE if=" << interrupts << " work=" << retired
+                  << " dispatches=" << dispatches[interrupts] << " hz=" << board.guest_tsc_hz() << '\n';
+        require(!board.faulted_cpu() && retired == work && board.processor_steps(2) == sleeping_before &&
+                board.evidence().irq_delivered == 0 && board.active_clock_elapsed_ns() == 0,
+                "idle-AP comparison must perform identical work with no elapsed time or IRQ");
+    }
+    require(dispatches[0] == 4, "the fixed-clock masked-IRQ reference must use four dispatches");
+    require(dispatches[1] == dispatches[0],
+            "enabling IRQs without an IRQ inflated dispatches from " + std::to_string(dispatches[0]) +
+            " to " + std::to_string(dispatches[1]));
+}
+
+// The clock advances only after real guest RAM increments inside one run().
+// A guest IRQ handler records how much peer work occurred before it entered,
+// then issues EOI. This exposes wake latency instead of merely testing IRR.
+void test_parked_timer_wake(bool threaded, unsigned parked_id, bool at_budget_end = false,
+                           bool park_during_run = false) {
+    PcMachine pc(4U << 20);
+    pc.boot_demo();
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {3, 1}, false, {},
+                           PcMotherboardC06::CpuClock::Experimental4_5THz);
+    if (threaded) board.enable_threaded_smp(2);
+    auto& cpu = pc.cpu;
+    constexpr unsigned counters = 0x3400, observations = 0x3500, handler = 0x9400;
+    constexpr std::uint8_t vector = 0x51;
+    bool measuring = false, expired = false;
+    std::uint32_t work_before = 0, work_at_expiry = 0;
+    const auto work_done = [&] {
+        return cpu.read32(counters) + cpu.read32(counters + 4) + cpu.read32(counters + 8);
+    };
+    board.enable_active_clock([&] {
+        const auto work = work_done();
+        const bool parked = std::string(board.processor_state(parked_id)) == "halted";
+        if (measuring && !expired && work - work_before >= 64 && (!park_during_run || parked)) {
+            expired = true;
+            work_at_expiry = work;
+        }
+        return PcMachine::RunClock::time_point{} + std::chrono::milliseconds(expired ? 1 : 0);
+    });
+    cpu.reset(0, 0x9000);
+    cpu.a20_enabled = true;
+    cpu.out_hook(0x21, 1, 0xff);
+    cpu.out_hook(0xa1, 1, 0xff);
+    install_protected32_entry(cpu, 0x9000);
+    cpu.write16(0x2806, 0x07ff);
+    cpu.write32(0x2808, 0x1000);
+    cpu.write64(0x1000 + vector * 8,
+                (handler & 0xffffU) | (0x08ULL << 16) | (0x8eULL << 40));
+    std::vector<std::uint8_t> program{
+        0x66,0xb8,0x10,0,0x8e,0xd8,0x8e,0xc0,0x8e,0xd0, // Flat data segments.
+        0xb8,0x0b,0,0,0,0x31,0xc9,0x0f,0xa2,             // EDX = APIC ID.
+        0x89,0xd7,0xc1,0xe7,2,                            // EDI indexes one counter per CPU.
+        0x89,0xd0,0xc1,0xe0,12,0xbc,0,0x60,0,0,0x01,0xc4, // Private stacks.
+        0x0f,0x01,0x1d,0x06,0x28,0,0,                    // LIDT.
+        0xc7,0x05,0xf0,0,0xe0,0xfe,0xff,1,0,0,           // Enable local APIC.
+        0x83,0xfa,std::uint8_t(parked_id),0x75,0};
+    const auto branch = program.size() - 1;
+    const auto emit = [&](std::initializer_list<std::uint8_t> bytes) { program.insert(program.end(), bytes); };
+    if (park_during_run) {
+        // Remain runnable during setup. Opening the host-controlled gate
+        // makes this CPU arm its timer and execute HLT inside the next grant.
+        emit({0x80,0x3d,8,0x35,0,0,0,0x74,0xf7}); // CMP byte [3508h],0; JE back.
+    }
+    emit({0xc7,0x05,0x20,3,0xe0,0xfe,vector,0,0,0,          // One-shot timer.
+          0xc7,0x05,0xe0,3,0xe0,0xfe,0x0b,0,0,0,          // Divide by one.
+          0xc7,0x05,0x80,3,0xe0,0xfe,0xe8,3,0,0,          // 1000 peripheral ticks.
+          0xfb,0x90,0xf4,0xeb,0xfd});                     // STI; NOP; HLT; repeat HLT.
+    program[branch] = std::uint8_t(program.size() - branch - 1);
+    emit({0xfb,0x90,0xff,0x87,0,0x34,0,0,0xeb,0xf8});     // INC [3400h+EDI]; JMP.
+    cpu.memory.write_block(0x9020, program.data(), program.size());
+    const std::uint8_t irq[]{
+        0x50,0xa1,0,0x34,0,0,0x03,0x05,4,0x34,0,0,0x03,0x05,8,0x34,0,0,
+        0xa3,4,0x35,0,0,                                  // Sample all active counters.
+        0xff,0x05,0,0x35,0,0,                              // Count entries.
+        0xc7,0x05,0xb0,0,0xe0,0xfe,0,0,0,0,0x58,0xcf};    // EOI; restore; IRET.
+    cpu.memory.write_block(handler, irq, sizeof(irq));
+    for (unsigned id = 1; id < 3; ++id) {
+        cpu.write32(kLapic + 0x310, id << 24);
+        cpu.write32(kLapic + 0x300, 0x609);
+    }
+    board.run(4096);
+    if (const auto* fault = board.faulted_cpu()) throw std::runtime_error(fault->fault->describe());
+    require(board.processors_started() == 3 &&
+            std::string(board.processor_state(parked_id)) == (park_during_run ? "running" : "halted") &&
+            cpu.read32(observations) == 0, "timer victim must reach the requested pre-measurement state");
+    work_before = work_done();
+    const auto total_before = board.total_processor_steps();
+    if (park_during_run) cpu.write8(observations + 8, 1);
+    measuring = true;
+    constexpr unsigned budget = 32768;
+    if (at_budget_end) {
+        // The clock edge is discovered as the last active guest instruction
+        // exhausts run(1). Its wake request must survive into the next call.
+        for (unsigned calls = 0; !expired && calls < 512; ++calls) {
+            const auto before = board.total_processor_steps();
+            board.run(1);
+            require(board.total_processor_steps() - before <= 1, "one-step run exceeded its global budget");
+        }
+        require(expired && std::string(board.processor_state(parked_id)) == "halted",
+                "the boundary event must become pending before its parked CPU runs");
+        const auto before = board.total_processor_steps();
+        const auto victim_before = board.processor_steps(parked_id);
+        board.run(1);
+        const auto victim_work = board.processor_steps(parked_id) - victim_before;
+        const auto total_work = board.total_processor_steps() - before;
+        std::cout << "C06_PARKED_TIMER_BOUNDARY_SAMPLE threaded=" << threaded << " victim=" << parked_id
+                  << " budget=1 retired=" << total_work << " victim_retired=" << victim_work << '\n';
+        require(total_work == 1 && victim_work == 1,
+                "the next one-step budget did not prioritize the pending parked-CPU wake");
+        board.run(512);
+    } else {
+        board.run(budget);
+    }
+    if (const auto* fault = board.faulted_cpu()) throw std::runtime_error(fault->fault->describe());
+    const auto observed = cpu.read32(observations + 4);
+    const auto irq_stats = board.lapic_vector_stats()[vector];
+    std::cout << "C06_PARKED_TIMER_SAMPLE threaded=" << threaded << " victim=" << parked_id
+              << " boundary=" << at_budget_end << " park_during_run=" << park_during_run
+              << " expiry_work=" << work_at_expiry << " observed_work=" << observed
+              << " irq=" << irq_stats.deliveries << " eoi=" << irq_stats.eois << '\n';
+    require(expired && board.active_clock_elapsed_ns() == 1'000'000 &&
+            board.total_processor_steps() - total_before <= budget, "controlled timer and global instruction budget");
+    require(cpu.read32(observations) == 1 && irq_stats.deliveries == 1 && irq_stats.eois == 1 &&
+            std::string(board.processor_state(parked_id)) == "halted",
+            "parked timer IRQ must enter its guest handler, EOI once, and return to HLT");
+    require(observed >= work_at_expiry && observed - work_at_expiry <= 128,
+            "parked timer handler observed " + std::to_string(observed - work_at_expiry) +
+            " peer increments after expiry; bound is 128 two-instruction loop iterations");
+    board.run(2048);
+    require(cpu.read32(observations) == 1 && board.lapic_vector_stats()[vector].deliveries == 1 &&
+            board.lapic_vector_stats()[vector].eois == 1, "a one-shot timer was delivered twice after EOI");
+}
+
+#endif
 
 void test_ether_worker_block() {
     if (!Cpu::ether_arm64_host()) return;
@@ -1571,6 +1792,32 @@ int main(int argc, char** argv) {
             measure_sleeping_bsp(true);
             return 0;
         }
+#if PRIME_HAS_C06_READY_WAKE_TESTS
+        if (argc == 2 && std::string(argv[1]) == "--test-ready-budget") {
+            for (const bool threaded : {false, true})
+                for (const unsigned active_aps : {1U, 2U}) test_ready_budget_with_parked_bsp(threaded, active_aps);
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--test-idle-irq-dispatch") {
+            test_sleeping_ap_irq_dispatches();
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--test-parked-timer") {
+            for (const bool threaded : {false, true})
+                for (const unsigned parked_id : {0U, 2U}) test_parked_timer_wake(threaded, parked_id);
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--test-parked-timer-boundary") {
+            for (const bool threaded : {false, true})
+                for (const unsigned parked_id : {0U, 2U}) test_parked_timer_wake(threaded, parked_id, true);
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--test-parked-timer-transition") {
+            for (const bool threaded : {false, true})
+                for (const unsigned parked_id : {0U, 2U}) test_parked_timer_wake(threaded, parked_id, false, true);
+            return 0;
+        }
+#endif
         using Profile = PcMotherboardC06::CpuClock;
         if (argc == 2 && std::string(argv[1]) == "--measure-idle-aps") {
             test_bsp_irq_during_ap_rep();
@@ -1583,6 +1830,17 @@ int main(int argc, char** argv) {
         measure_sleeping_bsp(true);
         measure_sleeping_siblings(false);
         measure_sleeping_siblings(true);
+#if PRIME_HAS_C06_READY_WAKE_TESTS
+        for (const bool threaded : {false, true}) {
+            for (const unsigned active_aps : {1U, 2U}) test_ready_budget_with_parked_bsp(threaded, active_aps);
+            for (const unsigned parked_id : {0U, 2U}) {
+                test_parked_timer_wake(threaded, parked_id);
+                test_parked_timer_wake(threaded, parked_id, true);
+                test_parked_timer_wake(threaded, parked_id, false, true);
+            }
+        }
+        test_sleeping_ap_irq_dispatches();
+#endif
         check_cpu_clock(Profile::Standard, 1);
         check_cpu_clock(Profile::Double, 2);
         check_cpu_clock(Profile::Twentyfold, 20);
