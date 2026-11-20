@@ -348,6 +348,43 @@ void measure_sleeping_siblings(bool threaded) {
               << " retired=" << retired << " slices=" << slices << " equal_work_ns=" << ns << '\n';
 }
 
+void measure_sleeping_bsp(bool threaded) {
+    PcMachine pc(4U << 20);
+    pc.boot_demo();
+    auto& cpu = pc.cpu;
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {2, 1});
+    if (threaded) board.enable_threaded_smp(2);
+    board.enable_active_clock([] { return PcMachine::RunClock::time_point{}; });
+    cpu.reset(0, 0x7200);
+    cpu.a20_enabled = true;
+    cpu.regs[Cpu::ESP] = 0x7000;
+    constexpr std::uint8_t sleep[] = {0xfb,0x90,0xf4,0xeb,0xfe};
+    cpu.memory.write_block(0x7200, sleep, sizeof(sleep));
+    cpu.write32(0x51*4,0x7400);
+    cpu.write8(0x7400,0xcf); // IRET
+    cpu.out_hook(0x21,1,0xff); cpu.out_hook(0xa1,1,0xff);
+    cpu.write32(kLapic+0xf0,0x1ff);
+    cpu.write16(kStartupVector << 12,0xfeeb);
+    cpu.write32(kLapic+0x310,1U << 24);
+    cpu.write32(kLapic+0x300,0x600 | kStartupVector);
+    board.run(4096);
+    require(cpu.halted && board.processors_started()==2, "BSP did not sleep beside a running AP");
+    const auto before = board.processor_steps(1);
+    constexpr unsigned budget = 32768;
+    board.run(budget);
+    const auto retired = board.processor_steps(1) - before;
+#if !defined(PRIME_R103_BASELINE) && !defined(PRIME_R102_BASELINE) && !defined(PRIME_R101_BASELINE)
+    require(retired == budget, "a sleeping BSP consumed the active AP's grant");
+#endif
+    const auto bsp_before = cpu.instructions;
+    cpu.write32(kLapic+0x300,0x40051); // Fixed IPI to self, pending while halted.
+    board.run(256);
+    require(!cpu.fault && !cpu.halted && cpu.instructions>bsp_before && board.lapic_vector_stats()[0x51].deliveries==1,
+            "BSP did not wake on exactly one pending IPI");
+    std::cout << "PRIME_IDLE_BSP_PASS threaded=" << threaded << " grant=" << budget
+              << " retired=" << retired << " wake_irq=1\n";
+}
+
 void test_ether_worker_block() {
     if (!Cpu::ether_arm64_host()) return;
     PcMachine pc(4U << 20);
@@ -1264,6 +1301,11 @@ int main(int argc, char** argv) {
             measure_secondary_irq_work(true, true);
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--measure-idle-bsp") {
+            measure_sleeping_bsp(false);
+            measure_sleeping_bsp(true);
+            return 0;
+        }
         using Profile = PcMotherboardC06::CpuClock;
         if (argc == 2 && std::string(argv[1]) == "--measure-idle-aps") {
             test_bsp_irq_during_ap_rep();
@@ -1272,6 +1314,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         test_bsp_irq_during_ap_rep();
+        measure_sleeping_bsp(false);
+        measure_sleeping_bsp(true);
         measure_sleeping_siblings(false);
         measure_sleeping_siblings(true);
         check_cpu_clock(Profile::Standard, 1);

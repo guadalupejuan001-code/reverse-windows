@@ -276,6 +276,16 @@ void verify_reference(const std::array<std::uint32_t, checks.size()>& samples) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && (std::string_view(argv[1]) == "--quantum-checkpoint" ||
+                          std::string_view(argv[1]) == "--quantum-restore")) {
+            const bool save = std::string_view(argv[1]) == "--quantum-checkpoint";
+            GuestGpu gpu;
+            RwGpuQuantumRequest cmd{0, 0, RWGPU_ABI,
+                save ? unsigned(RWGPU_QUANTUM_CHECKPOINT_STATE) : unsigned(RWGPU_QUANTUM_RESTORE_STATE), 0, 0};
+            gpu.cmd(RWGPU_IOCTL_QUANTUM, &cmd, sizeof(cmd), nullptr, 0, 0);
+            std::puts(save ? "Shared Ether state saved to qSSD" : "Shared Ether state restored from qSSD");
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--quantum") {
             verify_quantum();
             return 0;
@@ -309,7 +319,7 @@ int main(int argc, char** argv) {
         if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--primevgc"))
             verify_primevgc(samples);
         else if (argc == 2 && std::string_view(argv[1]) == "--staged") verify_guest(samples);
-        else throw std::runtime_error("Usage: prime_gpu_scene [--reference | --primevgc | --staged | --wddm | --quantum]");
+        else throw std::runtime_error("Usage: prime_gpu_scene [--reference | --primevgc | --staged | --wddm | --quantum | --quantum-checkpoint | --quantum-restore]");
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());

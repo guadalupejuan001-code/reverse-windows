@@ -233,12 +233,15 @@ static NTSTATUS quantum_request(RwGpuDevice* state, PUCHAR data, ULONG input, UL
     if (!data || input < sizeof(RwGpuQuantumRequest)) return STATUS_INVALID_PARAMETER;
     const RwGpuQuantumRequest cmd = *(const RwGpuQuantumRequest*)data;
     if (cmd.version != RWGPU_ABI || cmd.reserved || cmd.operation < RWGPU_QUANTUM_STORE ||
-        cmd.operation > RWGPU_QUANTUM_CX || cmd.bytes > RWGPU_QUANTUM_TRANSFER_BYTES ||
+        cmd.operation > RWGPU_QUANTUM_RESTORE_STATE || cmd.bytes > RWGPU_QUANTUM_TRANSFER_BYTES ||
         input != sizeof(cmd) + (cmd.operation == RWGPU_QUANTUM_STORE ? cmd.bytes : 0) ||
         output != (cmd.operation == RWGPU_QUANTUM_LOAD ? cmd.bytes : 0)) return STATUS_INVALID_PARAMETER;
     if (!state->bar) return STATUS_DEVICE_NOT_READY;
     if (!(reg_read(state, RWGPU_REG_CAPS) & RWGPU_CAP_QUANTUM_VRAM)) return STATUS_NOT_SUPPORTED;
-    if (cmd.operation >= RWGPU_QUANTUM_H) {
+    if (cmd.operation >= RWGPU_QUANTUM_CHECKPOINT_STATE) {
+        if (!(reg_read(state, RWGPU_REG_CAPS) & RWGPU_CAP_QUANTUM_STATE)) return STATUS_NOT_SUPPORTED;
+        if (cmd.bytes || cmd.offset || cmd.auxiliary) return STATUS_INVALID_PARAMETER;
+    } else if (cmd.operation >= RWGPU_QUANTUM_H) {
         const uint64_t bits = RWGPU_LOGICAL_BYTES * 8;
         if (cmd.bytes || cmd.offset >= bits ||
             (cmd.operation == RWGPU_QUANTUM_H ? cmd.auxiliary != 0 :

@@ -2068,6 +2068,19 @@ class PcMotherboardC06 {
       // their unused grants to runnable processors and poll again within the
       // original per-processor quantum, including when only the BSP is awake.
       const auto dispatch_budget = sleeping ? std::min(budget, count * kSmpQuantum) : budget;
+      // In Android's host-clock mode a halted BSP still polls the devices.
+      // If only one AP is awake, give it the unused guest-instruction budget.
+      // Resample the BSP within one normal quantum so a new IRQ can wake it.
+      if (active_clock_running_ && count == 2 && pc_.cpu.halted) {
+        const auto grant = std::min(dispatch_budget, kSmpQuantum);
+        const auto before = pc_.cpu.instructions;
+        run_bsp(1, deadline);
+        if (!pc_.guest_execution_available()) return;
+        const auto used = static_cast<unsigned>(pc_.cpu.instructions - before);
+        if (grant > used) run_secondary(runnable[1], grant - used, deadline, false);
+        budget -= grant;
+        continue;
+      }
       if (count == 1) {
         run_bsp(dispatch_budget, deadline);
         if (!sleeping || pc_.waiting_key) return;

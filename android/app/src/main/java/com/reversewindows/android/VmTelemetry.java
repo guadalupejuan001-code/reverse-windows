@@ -39,7 +39,7 @@ final class VmTelemetry extends LinearLayout {
     private final TextView resident;
     private final TextView occupancy;
     private final ProgressBar meter;
-    private final LinearLayout[] rows = new LinearLayout[12];
+    private final LinearLayout[] rows = new LinearLayout[15];
     private final TextView[] keys = new TextView[rows.length];
     private final TextView[] values = new TextView[rows.length];
 
@@ -286,9 +286,15 @@ final class VmTelemetry extends LinearLayout {
                 ? storage(number(gpu, "qssd_backing_bytes")) : "No disponible");
         metric(10, "Reloj virtual de VRAM", frequency(number(gpu, "vram_clock_hz")));
         JSONObject quantum = gpu.optJSONObject("quantum_vram");
-        metric(11, "VRAM Éter · guardado / restaurado", storage(number(quantum, "saved_bytes"))
+        metric(11, "Bytes de base Éter guardados / restaurados", storage(number(quantum, "saved_bytes"))
                 + " / " + storage(number(quantum, "restored_bytes")));
-        showRows(12);
+        if (!gpu.has("renderer_ready_at_power_on")) { showRows(12); return; }
+        metric(12, "GLES al encender la placa", gpu.optBoolean("renderer_ready_at_power_on")
+                ? "Listo antes de la primera instrucción" : "Sin preparar");
+        metric(13, "Estados compartidos guardados / restaurados", count(number(quantum, "state_saves"))
+                + " / " + count(number(quantum, "state_restores")));
+        metric(14, "Último estado Éter transferido", storage(number(quantum, "last_state_bytes")));
+        showRows(15);
     }
 
     private void heading(String title, String value, String hint) {

@@ -2,6 +2,7 @@
 
 #include "c08_gpu_dma.h"
 #include "graphics_memory.hpp"
+#include "quantum_vram_backing.hpp"
 #include "guest_triangle_work.hpp"
 #include "pc_machine.hpp"
 #include "prime_pci_clock.h"
@@ -40,12 +41,13 @@ class GuestGpuC08 {
   using Clock = std::function<std::uint64_t()>;
   GuestGpuC08(cosmic_pc::PcMachine& machine, const std::filesystem::path& vram, Msi msi = {},
               std::shared_ptr<SmpWorkers> workers = {}, Clock clock = {})
-      : pc_(machine), memory_(vram, std::move(workers)), msi_(std::move(msi)), clock_(std::move(clock)) {}
+      : pc_(machine), memory_(vram, workers), quantum_state_(vram, std::move(workers)), msi_(std::move(msi)), clock_(std::move(clock)) {}
 
   void reset(std::uint64_t board_tick = 0) noexcept {
     power_on_tick_ = board_tick;
     memory_.power_on();
     quantum_cached_size_ = 0;
+    state_saves_ = state_restores_ = state_payload_ = 0;
     quantum_hits_ = quantum_loads_ = quantum_stores_ = 0;
     quantum_saved_ = quantum_restored_ = quantum_gates_ = quantum_unavailable_ = 0;
     pci_command_ = 0;
@@ -69,8 +71,21 @@ class GuestGpuC08 {
     host_ns_ = backend_ns_ = 0;
     alpha_draw_ticket_ = 0;
     source_triangles_ = drawn_triangles_ = vertex_bytes_ = presented_bytes_ = 0;
+    renderer_ready_at_power_on_ = false;
+    renderer_prepare_ns_ = 0;
 #ifdef REVERSE_WINDOWS_GLES_GUEST
     color_.clear();
+    const auto started = std::chrono::steady_clock::now();
+    try {
+      renderer_.prepare();
+      renderer_name_ = renderer_.renderer_name();
+      hardware_ = renderer_.hardware_reported();
+      renderer_ready_at_power_on_ = true;
+    } catch (const std::exception&) {
+      // Boot video remains available. A guest draw retries the backend.
+    }
+    renderer_prepare_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - started).count();
 #endif
   }
 
@@ -205,7 +220,9 @@ class GuestGpuC08 {
         << ",\"engine_reads\":" << quantum_loads_ << ",\"cache_hits\":" << quantum_hits_
         << ",\"engine_writes\":" << quantum_stores_ << ",\"gates\":" << quantum_gates_
         << ",\"unavailable\":" << quantum_unavailable_
-        << ",\"saved_bytes\":" << quantum_saved_ << ",\"restored_bytes\":" << quantum_restored_ << '}'
+        << ",\"saved_bytes\":" << quantum_saved_ << ",\"restored_bytes\":" << quantum_restored_
+        << ",\"state_saves\":" << state_saves_ << ",\"state_restores\":" << state_restores_
+        << ",\"last_state_bytes\":" << state_payload_ << '}'
         << ",\"qssd_backing_bytes\":" << memory_.journal_bytes()
         << ",\"qssd_vram_commits\":" << memory_.commits()
         << ",\"stage_bytes\":" << stage_.size()
@@ -245,6 +262,8 @@ class GuestGpuC08 {
         << ",\"source_triangles\":" << source_triangles_ << ",\"submitted_triangles\":" << drawn_triangles_
         << ",\"vertex_bytes\":" << vertex_bytes_ << ",\"presented_bytes\":" << presented_bytes_
         << ",\"graphics_serial\":" << work_.snapshot()->serial
+        << ",\"renderer_ready_at_power_on\":" << (renderer_ready_at_power_on_ ? "true" : "false")
+        << ",\"renderer_prepare_ns\":" << renderer_prepare_ns_
         << ",\"renderer\":" << cosmic_pc::PcMachine::quote(renderer_name_)
         << ",\"hardware_reported\":" << (hardware_ ? "true" : "false")
         << ",\"submit_and_present_ns\":" << host_ns_ << ",\"render_and_readback_ns\":" << backend_ns_
@@ -257,6 +276,8 @@ class GuestGpuC08 {
   struct Partial { unsigned reg = UINT32_MAX, value = 0, written = 0; };
   cosmic_pc::PcMachine& pc_;
   GpuVram memory_;
+  QuantumVramBacking quantum_state_;
+  std::uint64_t state_saves_ = 0, state_restores_ = 0, state_payload_ = 0;
   Msi msi_;
   Clock clock_;
   std::uint64_t power_on_tick_ = 0;
@@ -279,7 +300,8 @@ class GuestGpuC08 {
   std::uint64_t scheduler_faults_ = 0, msi_messages_ = 0;
   std::uint64_t paging_upload_bytes_ = 0, paging_download_bytes_ = 0;
   std::optional<std::uint64_t> gpu_ns_;
-  bool hardware_ = false;
+  bool hardware_ = false, renderer_ready_at_power_on_ = false;
+  std::uint64_t renderer_prepare_ns_ = 0;
   std::string renderer_name_;
   std::array<std::uint32_t, 7> params_{};
   std::array<std::uint32_t, 3> direct_params_{};
@@ -323,7 +345,7 @@ class GuestGpuC08 {
       case RWGPU_REG_LOGICAL_LO: return static_cast<std::uint32_t>(GpuVram::kBytes);
       case RWGPU_REG_LOGICAL_HI: return static_cast<std::uint32_t>(GpuVram::kBytes >> 32);
       case RWGPU_REG_CAPS:
-        return RWGPU_CAP_VRAM | RWGPU_CAP_DIRECT_VRAM | RWGPU_CAP_SUM_INDICES | RWGPU_CAP_QUANTUM_VRAM
+        return RWGPU_CAP_VRAM | RWGPU_CAP_DIRECT_VRAM | RWGPU_CAP_SUM_INDICES | RWGPU_CAP_QUANTUM_VRAM | RWGPU_CAP_QUANTUM_STATE
 #ifdef REVERSE_WINDOWS_GLES_GUEST
             | RWGPU_CAP_TRIANGLES | RWGPU_CAP_DRAW_VRAM | RWGPU_CAP_COLOR_DMA |
               RWGPU_CAP_DRAW_RAM | RWGPU_CAP_COLOR_ALPHA | RWGPU_CAP_DRAW_READBACK |
@@ -387,6 +409,18 @@ class GuestGpuC08 {
         case RWGPU_QUANTUM_H: case RWGPU_QUANTUM_CX:
           status_ = quantum_command(op, offset, auxiliary, count);
           break;
+        case RWGPU_QUANTUM_CHECKPOINT_STATE: case RWGPU_QUANTUM_RESTORE_STATE: {
+          if (offset || auxiliary || count) { status_ = RWGPU_INVALID; break; }
+          if (!memory_.backing_ready()) { status_ = RWGPU_UNAVAILABLE; break; }
+          const bool save = op == RWGPU_QUANTUM_CHECKPOINT_STATE;
+          std::size_t bytes = 0;
+          status_ = quantum_state_.transfer(*pc_.quantum_session, save, bytes);
+          if (status_ == RWGPU_OK) {
+            if (save) ++state_saves_; else ++state_restores_;
+            state_payload_ = bytes;
+          }
+          break;
+        }
         case RWGPU_SUM_INDICES: status_ = sum_indices(count); break;
         case RWGPU_SUBMIT_DMA: status_ = execute_dma(offset, auxiliary, count); break;
         case RWGPU_PREEMPT:

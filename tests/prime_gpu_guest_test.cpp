@@ -597,6 +597,14 @@ void verify_quantum_vram(const std::filesystem::path& volume) {
             gpu->vram_journal_bytes() == 64 && board.ram_clock_cycles() == 0 &&
             gpu_stats(*gpu).find("\"power_on_tick\":0,\"clock_cycles\":0") != std::string::npos,
             "CPU, GPU and empty sparse VRAM must share the board's power-on tick");
+#ifdef REVERSE_WINDOWS_GLES_GUEST
+    const auto powered = gpu_stats(*gpu);
+    require(powered.find("\"renderer_ready_at_power_on\":true") != std::string::npos &&
+            powered.find("\"renderer\":\"\"") == std::string::npos &&
+            powered.find("\"draw_requests\":0,") != std::string::npos,
+            "GLES did not prepare before the first x86 instruction or recorded a phantom draw");
+    std::cout << "PRIME_RENDERER_POWER_PASS bsp_retired=0 board_tick=0 draws=0 " << powered << '\n';
+#endif
     graphics_boot(pc);
     Guest32 setup;
     setup.cfg_write(0x10, moved_bar);
@@ -707,6 +715,73 @@ void verify_quantum_vram(const std::filesystem::path& volume) {
             << " clock_hz=" << RW_PRIME_COMPONENT_HZ << " bell_xx=1 bell_zz=1 bell_z=0 checkpoint=1\n";
 }
 
+void verify_quantum_state_restart(const std::filesystem::path& volume) {
+  const auto companion = volume.string() + ".qstate.rqvd";
+  const auto guest_bit = std::to_string(PcMachine::kEtherMemoryLogicalByteBase * 8);
+  const std::string cpu_bit = "37"; // A CPU address outside the entire GPU plane.
+  std::string expected;
+  auto with_board = [&](auto test) {
+    PcMachine pc(PcMachine::high_ram_address_space(4ULL << 30, true), 64 * MiB);
+    pc.boot_graphics_demo(width, height);
+    PcMotherboardC06 board(pc, nullptr, {}, 0, volume);
+    graphics_boot(pc);
+    Guest32 setup;
+    setup.cfg_write(0x10, moved_bar);
+    setup.cfg_write(4, 2);
+    setup.run(pc);
+    unsigned ticket = 0;
+    auto issue = [&](unsigned op, unsigned status, unsigned offset = 0) {
+      Guest32 guest;
+      guest.direct_command(op, ++ticket, offset, 0, 0);
+      guest.run(pc);
+      require(pc.cpu.read32(moved_bar+RWGPU_REG_COMPLETED)==ticket &&
+              pc.cpu.read32(moved_bar+RWGPU_REG_STATUS)==status, "quantum checkpoint ticket/status mismatch");
+    };
+    test(pc, issue);
+  };
+  with_board([&](PcMachine& pc, auto issue) {
+    require(pc.cpu.read32(moved_bar+RWGPU_REG_CAPS) & RWGPU_CAP_QUANTUM_STATE, "missing state capability");
+    const auto epoch = pc.quantum_session->epoch();
+    issue(RWGPU_QUANTUM_RESTORE_STATE, RWGPU_NO_CHECKPOINT);
+    issue(RWGPU_QUANTUM_CHECKPOINT_STATE, RWGPU_INVALID, 1);
+    require(!std::filesystem::exists(companion) && epoch==pc.quantum_session->epoch(),
+            "empty restore or invalid command created a checkpoint");
+    issue(RWGPU_QUANTUM_CHECKPOINT_STATE, RWGPU_OK);
+    issue(RWGPU_QUANTUM_H, RWGPU_OK);
+    pc.quantum_session->apply({{'C',guest_bit,cpu_bit}});
+    expected = pc.quantum_session->snapshot();
+    issue(RWGPU_QUANTUM_CHECKPOINT_STATE, RWGPU_OK);
+  });
+  // Mimic a power loss after the next inactive payload write, before its manifest.
+  const std::uint8_t torn = '!';
+  {
+    reverse_windows::QssdDisk disk(companion);
+    require(disk.write_bytes(reverse_windows::QssdDisk::kBlockSize, 1, &torn), "could not stage torn checkpoint");
+  }
+  with_board([&](PcMachine& pc, auto issue) {
+    require(pc.quantum_session->snapshot()!=expected, "fresh VM implicitly restored a shared state");
+    issue(RWGPU_QUANTUM_RESTORE_STATE, RWGPU_OK);
+    require(pc.quantum_session->snapshot()==expected, "quantum state or measurement RNG changed across restart");
+    const auto values = pc.quantum_session->query_batch({{1,{{guest_bit,'X'},{cpu_bit,'X'}}},
+        {1,{{guest_bit,'Z'},{cpu_bit,'Z'}}}, {1,{{guest_bit,'Z'}}}}).values;
+    require(values==std::vector<double>({1,1,0}), "cross-device Bell correlations did not survive power loss");
+  });
+  {
+    reverse_windows::QssdDisk disk(companion);
+    require(disk.write_bytes(reverse_windows::QssdDisk::kBlockSize + mundo_x::InfiniteCore::max_snapshot_bytes,
+                             1, &torn), "could not corrupt active checkpoint");
+  }
+  with_board([&](PcMachine& pc, auto issue) {
+    const auto before = pc.quantum_session->snapshot();
+    const auto epoch = pc.quantum_session->epoch();
+    issue(RWGPU_QUANTUM_RESTORE_STATE, RWGPU_CORRUPT_CHECKPOINT);
+    require(pc.quantum_session->snapshot()==before && pc.quantum_session->epoch()==epoch,
+            "corrupt checkpoint mutated live state");
+  });
+  std::cout << "PRIME_ENTANGLED_RESTART_PASS sessions=3 snapshots=2 bytes=" << expected.size()
+            << " xx=1 zz=1 z=0 torn_write=1 corrupt_rejected=1\n";
+}
+
 void verify_c13_residency(const std::filesystem::path& path) {
   using Vram = reverse_windows::GpuVram;
   constexpr auto page = Vram::kPageBytes;
@@ -788,6 +863,7 @@ int main() {
     verify_pci_clocks(remove.path);
     verify(remove.path / "gpu.rqvd");
     verify_quantum_vram(remove.path / "quantum.rqvd");
+    verify_quantum_state_restart(remove.path / "joint-state.rqvd");
     verify_c13_residency(remove.path / "c13.rqvd");
     measure_vram(remove.path / "large-vram.rqvd");
   } catch (const std::exception& error) {

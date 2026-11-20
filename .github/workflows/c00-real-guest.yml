@@ -31,6 +31,20 @@ jobs:
           test "$(uname -m)" = "${{ matrix.architecture }}"
           git rev-parse HEAD
           python3 scripts/verify_deps.py --checkout
+      - name: Compare r103 and r104 on identical GS, boot video and AP workloads
+        shell: bash
+        run: |
+          baseline=af88b12d41f72a67f4a5ccd4287a58efe3e50878
+          old_engine=cdf7b70ce23b4129c4d4f4404a76c49264182057
+          git fetch --depth=1 origin "$baseline"
+          git worktree add --detach "$RUNNER_TEMP/prime-r103" "$baseline"
+          git -C deps/mundo-X fetch --depth=1 https://github.com/guadalupejuan001-code/mundo-X.git "$old_engine"
+          git -C deps/mundo-X worktree add --detach "$RUNNER_TEMP/ether-r103" "$old_engine"
+          bash tests/compare_r104.sh "$RUNNER_TEMP/prime-r103" "$RUNNER_TEMP/ether-r103" build/r104 | tee build-r104.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prime-r104-measurements-${{ matrix.architecture }}
+          path: build-r104.log
       - name: Measure ARM64 dispatch and REP with an IRQ held by priority
         shell: bash
         run: |

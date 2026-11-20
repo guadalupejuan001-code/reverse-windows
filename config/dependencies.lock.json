@@ -6,7 +6,7 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "cdf7b70ce23b4129c4d4f4404a76c49264182057",
+      "commit": "ee2f9f44644c5a0221ded4f7153cac605f9fc647",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-RAM",
       "status": "candidate-windows-x64-shared-guest-ram",
@@ -130,7 +130,7 @@
     {
       "key": "reverse_pc",
       "repository": "guadalupejuan001-code/REVERSE-PC",
-      "commit": "5f4f9f6d80004cf9c21df740eff83f0742a53490",
+      "commit": "70baf3c778bdb51336362fe5e68ed1c95b9d5897",
       "checkout": "deps/REVERSE-PC",
       "role": "REgraphics-guest-triangle-renderer-and-C03-integrated-host",
       "status": "candidate-prime-c08-regraphics",

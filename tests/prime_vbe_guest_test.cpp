@@ -322,10 +322,37 @@ void measure() {
             << " first_ns=" << nanoseconds(first_capture) << " partial_ns=" << nanoseconds(later_captures)
             << " delta_ns=" << nanoseconds(first_capture + later_captures) << " pixels=exact\n";
 }
+void measure_boot_surface(unsigned width, unsigned height) {
+  PcMachine pc(2048ULL * MiB, 64 * MiB);
+  GuestVbeFabric video(pc);
+  run_demo(pc, 1024, 768);
+  Pixels canvas;
+  std::uint64_t digest = 0;
+  Clock::duration full{}, delta{};
+  for (unsigned frame=0; frame<160; ++frame) {
+    const bool refresh = frame%10 == 0;
+    draw(pc, {frame*7%960, frame*11%700, 24, 12}, 0x00300000+0x103*frame);
+    if (refresh) video.require_full();
+    const auto start = Clock::now();
+    const auto& packet = video.capture(width, height);
+    (refresh ? full : delta) += Clock::now()-start;
+    apply(packet, width, height, canvas);
+    for (auto word : packet) digest = (digest ^ word) * UINT64_C(1099511628211);
+  }
+  check(pc, width, height, canvas);
+  std::cout << "PRIME_BOOT_SCAN_PASS width=" << width << " height=" << height
+            << " frames=160 checksum=" << digest << " full_ns=" << nanoseconds(full)
+            << " delta_ns=" << nanoseconds(delta) << '\n';
+}
 } // namespace
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string_view(argv[1]) == "--measure-boot-surface") {
+      measure_boot_surface(1024,768);
+      measure_boot_surface(960,720);
+      return 0;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--measure") {
       measure();
       return 0;

@@ -36,6 +36,8 @@ static inline NTSTATUS rwgpu_submit(PUCHAR bar, ULONG command, uint64_t source,
     if (status == RWGPU_OK) return STATUS_SUCCESS;
     if (status == RWGPU_UNAVAILABLE) return STATUS_DEVICE_NOT_READY;
     if (status == RWGPU_QUANTUM_UNAVAILABLE) return STATUS_DEVICE_NOT_READY;
+    if (status == RWGPU_NO_CHECKPOINT) return STATUS_NOT_FOUND;
+    if (status == RWGPU_CORRUPT_CHECKPOINT) return STATUS_DATA_ERROR;
     if (status == RWGPU_INVALID) return STATUS_INVALID_PARAMETER;
     return STATUS_DEVICE_DATA_ERROR;
 }

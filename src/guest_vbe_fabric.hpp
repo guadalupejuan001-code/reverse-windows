@@ -38,6 +38,15 @@ class GuestVbeFabric {
         sample_columns_.resize(width);
         for (unsigned x = 0; x < width; ++x)
           sample_columns_[x] = x * info.width / width;
+        contiguous_end_.clear();
+        // The Android 1024x768 boot surface presents at 960x720. Its nearest-
+        // neighbor samples consist of runs of 15 consecutive source pixels.
+        if (width < info.width && std::uint64_t(info.width-width)*8 <= width) {
+          contiguous_end_.resize(width);
+          contiguous_end_.back() = width;
+          for (unsigned x=width-1; x>0; --x)
+            contiguous_end_[x-1] = sample_columns_[x-1]+1 == sample_columns_[x] ? contiguous_end_[x] : x;
+        }
         source_width_ = info.width;
       }
       rows_.assign(height, xgpu::FramebufferSpan{width, 0});
@@ -92,7 +101,7 @@ class GuestVbeFabric {
   unsigned width_ = 0, height_ = 0, source_width_ = 0;
   bool initialized_ = false;
   std::vector<xgpu::FramebufferSpan> rows_;
-  std::vector<unsigned> sample_columns_;
+  std::vector<unsigned> sample_columns_, contiguous_end_;
   std::vector<std::uint32_t> sorted_pages_;
   std::vector<std::uint8_t> source_;
   std::vector<std::uint32_t> pixels_, packet_;
@@ -143,6 +152,21 @@ class GuestVbeFabric {
       stats_.read_bytes += read_bytes;
       stats_.examined_pixels += last_x - first_x;
       auto* output = pixels_.data() + std::size_t(y) * width_;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+      if (width_ == info.width) {
+        scan_native_row(source_.data(), output+first_x, first_x, last_x, full, rows_[y]);
+        continue;
+      }
+      if (!contiguous_end_.empty()) {
+        for (unsigned x=first_x; x<last_x;) {
+          const auto end_x = std::min(contiguous_end_[x], last_x);
+          const auto* input = source_.data() + 4*(sample_columns_[x]-source_x);
+          scan_native_row(input, output+x, x, end_x, full, rows_[y]);
+          x = end_x;
+        }
+        continue;
+      }
+#endif
       const auto sample = [&](unsigned x) {
         const auto* bgrx = source_.data() + std::size_t(sample_columns_[x] - source_x) * 4;
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -169,6 +193,34 @@ class GuestVbeFabric {
       }
       rows_[y] = changed;
     }
+  }
+
+  // At native width incoming BGRX and cached ARGB have identical color bits.
+  // Ignore X, skip unchanged pixel pairs, and copy a contiguous interior span.
+  static void scan_native_row(const std::uint8_t* input, std::uint32_t* output, unsigned x, unsigned end, bool full,
+                       xgpu::FramebufferSpan& row) {
+    unsigned left = 0, right = end-x;
+    const auto pixel = [&](unsigned i) {
+      std::uint32_t value;
+      std::memcpy(&value, input+4*i, sizeof(value));
+      return value | 0xff000000U;
+    };
+    if (!full) {
+      const auto equal_pair = [&](unsigned i) {
+        std::uint64_t incoming, previous;
+        std::memcpy(&incoming, input+4*i, sizeof(incoming));
+        std::memcpy(&previous, output+i, sizeof(previous));
+        return ((incoming ^ previous) & UINT64_C(0x00ffffff00ffffff)) == 0;
+      };
+      while (right-left >= 2 && equal_pair(left)) left += 2;
+      if (left < right && pixel(left) == output[left]) ++left;
+      if (left == right) return;
+      while (right-left >= 2 && equal_pair(right-2)) right -= 2;
+      if (pixel(right-1) == output[right-1]) --right;
+    }
+    for (unsigned i=left; i<right; ++i) output[i] = pixel(i);
+    row.left = std::min(row.left, x+left);
+    row.right = std::max(row.right, x+right);
   }
 
   void publish(xgpu::FramebufferWorkPlan plan) {
