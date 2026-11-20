@@ -157,7 +157,9 @@ class GuestVbeFabric {
         scan_native_row(source_.data(), output+first_x, first_x, last_x, full, rows_[y]);
         continue;
       }
-      if (!contiguous_end_.empty()) {
+      // Full scaled rows use one uninterrupted gather. Segmenting them only
+      // pays off on dirty captures where equal runs can be skipped.
+      if (!full && !contiguous_end_.empty()) {
         for (unsigned x=first_x; x<last_x;) {
           const auto end_x = std::min(contiguous_end_[x], last_x);
           const auto* input = source_.data() + 4*(sample_columns_[x]-source_x);

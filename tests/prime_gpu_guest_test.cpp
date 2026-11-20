@@ -1,4 +1,6 @@
 #include "android_boot_session.hpp"
+#include <thread>
+#include <exception>
 #include "c08_guest_gpu.hpp"
 #include "c08_wddm_protocol.h"
 #include <array>
@@ -94,6 +96,44 @@ void graphics_boot(PcMachine& pc) {
 }
 
 #ifdef REVERSE_WINDOWS_GLES_GUEST
+void verify_renderer_thread_bindings() {
+  const auto display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+  require(eglInitialize(display, nullptr, nullptr) && eglBindAPI(EGL_OPENGL_ES_API), "host EGL initialization");
+  const EGLint attributes[]{EGL_SURFACE_TYPE,EGL_PBUFFER_BIT,EGL_RENDERABLE_TYPE,EGL_OPENGL_ES2_BIT,EGL_NONE};
+  EGLConfig config{};
+  EGLint count = 0;
+  require(eglChooseConfig(display, attributes, &config, 1, &count) && count, "host EGL configuration");
+  const EGLint size[]{EGL_WIDTH,2,EGL_HEIGHT,2,EGL_NONE}, version[]{EGL_CONTEXT_CLIENT_VERSION,2,EGL_NONE};
+  const auto context = eglCreateContext(display, config, EGL_NO_CONTEXT, version);
+  const auto surface = eglCreatePbufferSurface(display, config, size);
+  require(eglMakeCurrent(display, surface, surface, context), "bind host context");
+  {
+    regraphics::GuestRenderer backend;
+    backend.prepare();
+    require(eglGetCurrentContext()==context && eglGetCurrentSurface(EGL_DRAW)==surface,
+            "GPU startup replaced the caller's EGL binding");
+    bool completed = false;
+    std::exception_ptr failure;
+    std::thread worker([&] {
+      try {
+        std::vector<std::uint8_t> pixels;
+        backend.render(xgpu::GuestTrianglePlan{}, 2, 2, 0x00112233, pixels, true);
+        completed = pixels.size()==16 && pixels[0]==0x11 && pixels[1]==0x22 && pixels[2]==0x33 &&
+                    eglGetCurrentContext()==EGL_NO_CONTEXT;
+      } catch (...) { failure = std::current_exception(); }
+    });
+    worker.join();
+    if (failure) std::rethrow_exception(failure);
+    require(completed, "prepared GLES context could not draw on the VM worker");
+  }
+  require(eglGetCurrentContext()==context && eglMakeCurrent(display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT) &&
+          eglMakeCurrent(display,surface,surface,context) && glGetString(GL_RENDERER),
+          "guest renderer destruction invalidated the caller's context");
+  eglMakeCurrent(display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);
+  eglDestroySurface(display,surface);
+  eglDestroyContext(display,context);
+  std::cout << "PRIME_EGL_THREAD_PASS threads=2 caller_restored=1 survived_teardown=1 pixels=4\n";
+}
 std::uint32_t rgb(const PcMachine& pc, unsigned x, unsigned y) {
   std::array<std::uint8_t, 4> pixel{};
   pc.copy_video_rgba(x, y, 1, 1, pixel.data(), pixel.size());
@@ -861,6 +901,9 @@ int main() {
       ~RemoveDirectory() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
     } remove{name};
     verify_pci_clocks(remove.path);
+#ifdef REVERSE_WINDOWS_GLES_GUEST
+    verify_renderer_thread_bindings();
+#endif
     verify(remove.path / "gpu.rqvd");
     verify_quantum_vram(remove.path / "quantum.rqvd");
     verify_quantum_state_restart(remove.path / "joint-state.rqvd");
