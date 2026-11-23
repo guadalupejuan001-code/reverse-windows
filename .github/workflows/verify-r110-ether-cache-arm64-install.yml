@@ -1,11 +1,23 @@
-name: Verify Prime R110 clock and SMP ARM64 APK installation
+name: Verify Prime R110 vector and debug ARM64 APK installation
 
 on:
   push:
-    branches: [ci/prime-r110-etherprogress-arm64-install]
+    branches: [ci/prime-r110-vector-debug-arm64-install]
     paths: [.github/workflows/verify-r110-ether-cache-arm64-install.yml]
   workflow_dispatch:
     inputs:
+      build_run_id:
+        description: GitHub Actions run ID of the selected .8 build
+        required: true
+        type: string
+      build_artifact_id:
+        description: GitHub Actions artifact ID of the selected .8 ARM64 release
+        required: true
+        type: string
+      build_artifact_digest:
+        description: Artifact archive digest as sha256 followed by a colon and 64 hex digits
+        required: true
+        type: string
       apk_sha256:
         description: SHA-256 of the selected ARM64 release APK
         required: true
@@ -20,23 +32,29 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      APP_ID: com.reversewindows.android.prime.smp.r110.progressperf
-      SOURCE_SHA: e041659f1f9cf5c41bc988d1b3662e149119757e
-      MUNDO_X_SHA: b3a3d04f14d644a2eea332492108f16306d629ff
-      APK_VERSION_NAME: 0.3.88-perf-test.7
-      APK_VERSION_CODE: '126'
-      APK_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.7-e041659f1f9c-arm64-v8a-release.apk
-      EXPECTED_APK_SHA256: ${{ inputs.apk_sha256 || '48bc686080e43c8e5629a7f4e3d0420aba796d48486878da34581734b7235d17' }}
-      BUILD_RUN_ID: '45222926200'
-      BUILD_ARTIFACT_ID: '14841799043'
-      BUILD_ARTIFACT_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.7-e041659f1f9c-ARM64
-      BUILD_ARTIFACT_DIGEST: sha256:1d0795363fb1ce2247cb46a81d119549d1c7a5315da4e22e1b1280122fcf050d
+      APP_ID: com.reversewindows.android.prime.smp.r110.vectorstepperf
+      SOURCE_SHA: b236ec8fd6b6b1c88b941289df6a503b77230020
+      MUNDO_X_SHA: f71c46f3637639e3c6d259af8e5cf3deccb45a6f
+      APK_VERSION_NAME: 0.3.88-perf-test.8
+      APK_VERSION_CODE: '127'
+      APK_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.8-b236ec8fd6b6-arm64-v8a-release.apk
+      BUILD_ARTIFACT_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.8-b236ec8fd6b6-ARM64
+      # Pin the verified .8 build values before pushing this branch.
+      BUILD_RUN_ID: ${{ inputs.build_run_id || '45255433682' }}
+      BUILD_ARTIFACT_ID: ${{ inputs.build_artifact_id || '14857362386' }}
+      BUILD_ARTIFACT_DIGEST: ${{ inputs.build_artifact_digest || 'sha256:0c58a7733821a763d59a5067b9f5983506cd18fba2300d31c18faf6d5854cad1' }}
+      EXPECTED_APK_SHA256: ${{ inputs.apk_sha256 || '373267e940409d7baca8a6af092e5362330e78935cf6a3f8038b2d7550338075' }}
     steps:
       - name: Authenticate the selected build artifact record
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if ! [[ "$BUILD_RUN_ID" =~ ^[1-9][0-9]*$ && "$BUILD_ARTIFACT_ID" =~ ^[1-9][0-9]*$ &&
+            "$BUILD_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ && "$EXPECTED_APK_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            printf 'Supply the verified build run ID, artifact ID, archive digest and APK SHA-256 before installation.\n' >&2
+            exit 1
+          fi
           evidence="$RUNNER_TEMP/r110-install-evidence"
           mkdir -p "$evidence"
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$BUILD_ARTIFACT_ID" > "$evidence/build-artifact.json"
@@ -53,12 +71,15 @@ jobs:
           run-id: ${{ env.BUILD_RUN_ID }}
           github-token: ${{ github.token }}
 
-      - name: Check out the synthetic ISO fixture from the APK source
+      - name: Check out the synthetic ISO fixture and metadata from the APK source
         uses: actions/checkout@v4
         with:
           ref: ${{ env.SOURCE_SHA }}
           path: source
-          sparse-checkout: tests/c09_synthetic_iso.py
+          sparse-checkout: |
+            tests/c09_synthetic_iso.py
+            config/dependencies.lock.json
+            config/integration-manifest.json
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
@@ -82,7 +103,6 @@ jobs:
           evidence="$RUNNER_TEMP/r110-install-evidence"
           mkdir -p "$evidence"
           apk="arm64-release/$APK_NAME"
-          [[ "$EXPECTED_APK_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]
           printf '%s  %s\n' "$EXPECTED_APK_SHA256" "$apk" | sha256sum --check
           awk -v name="$APK_NAME" '$2 == name {print $1 "  arm64-release/" name}' \
             arm64-release/SHA256SUMS > "$evidence/archive-checksum.txt"
@@ -90,6 +110,8 @@ jobs:
           unzip -p "$apk" assets/build-source.txt | diff -u <(printf '%s\n' "$SOURCE_SHA") -
           unzip -p "$apk" assets/dependencies.lock.json | cmp - arm64-release/dependencies.lock.json
           unzip -p "$apk" assets/integration-manifest.json | cmp - arm64-release/integration-manifest.json
+          cmp source/config/dependencies.lock.json arm64-release/dependencies.lock.json
+          cmp source/config/integration-manifest.json arm64-release/integration-manifest.json
           grep -Fxq "source_sha=$SOURCE_SHA" arm64-release/build.txt
           grep -Fxq "mundo_x_sha=$MUNDO_X_SHA" arm64-release/build.txt
           tools="$ANDROID_HOME/build-tools/35.0.0"
@@ -284,6 +306,8 @@ jobs:
               irq = report['irq']
               assert type(irq['irq64_bulk_frames']) is int and 0 <= irq['irq64_bulk_frames'] <= irq['delivered'], irq
               topology = report['cpu_topology']
+              crc32c_retired = topology['crc32c_retired']
+              assert type(crc32c_retired) is int and crc32c_retired == 0, crc32c_retired
               for key in ('threaded_pause_yields', 'threaded_pause_turn_steps', 'threaded_pause_admissions'):
                   assert type(topology[key]) is int and topology[key] >= 0, (key, topology[key])
               verify_tsc_access(topology['tsc_access'])
@@ -378,6 +402,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: prime-r110-arm64-bridge-install-e041659f1f9c
+          name: prime-r110-arm64-bridge-install-b236ec8fd6b6
           path: ${{ runner.temp }}/r110-install-evidence
           if-no-files-found: warn
