@@ -6,10 +6,10 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "be28853186ad67c860c6dfc41c3f0dcc0f197809",
+      "commit": "be0d100d83a8c3eed80d2c66a44ad575ed848982",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-state-RAM",
-      "status": "candidate-r110-guarded-streaming-fill",
+      "status": "experiment/r110-combined-vector-stores",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/pc_video.hpp",

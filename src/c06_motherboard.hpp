@@ -347,6 +347,7 @@ class PcMotherboardC06 {
   std::uint64_t parallel_ram_batches_ = 0, parallel_ram_steps_ = 0;
   std::uint64_t parallel_mixed_batches_ = 0;
   std::uint64_t secondary_store_batches_ = 0, secondary_store_steps_ = 0;
+  std::uint64_t secondary_movaps_batches_ = 0, secondary_movaps_steps_ = 0;
   std::uint64_t secondary_rep_elements_ = 0, secondary_rep_bytes_ = 0;
   std::uint64_t secondary_scan_steps_ = 0;
   std::uint64_t secondary_shift_steps_ = 0, secondary_zero_steps_ = 0, secondary_multiply_steps_ = 0;
@@ -429,6 +430,7 @@ class PcMotherboardC06 {
     parallel_ram_batches_ = parallel_ram_steps_ = 0;
     parallel_mixed_batches_ = 0;
     secondary_store_batches_ = secondary_store_steps_ = 0;
+    secondary_movaps_batches_ = secondary_movaps_steps_ = 0;
     secondary_rep_elements_ = secondary_rep_bytes_ = 0;
     secondary_scan_steps_ = 0;
     secondary_shift_steps_ = secondary_zero_steps_ = secondary_multiply_steps_ = 0;
@@ -1696,10 +1698,17 @@ class PcMotherboardC06 {
       }
       // Apply the same one-page XMM store coalescer as the boot CPU. Shared
       // writes stay inside the scheduler's bus grant in threaded mode.
-      if (pc_.boot_acceleration_enabled() && cpu.movntdq_store_batch_candidate()) {
-        if (const auto stores = cpu.try_movntdq_store_batch(secondary_batch_limit(apic, remaining))) {
-          ++secondary_store_batches_;
-          secondary_store_steps_ += stores;
+      using StoreBatch = cosmic_pc::Cpu::XmmStoreBatch;
+      const auto store_kind = pc_.boot_acceleration_enabled() ? cpu.xmm_store_batch_candidate() : StoreBatch::None;
+      if (store_kind != StoreBatch::None) {
+        if (const auto stores = cpu.try_xmm_store_batch(secondary_batch_limit(apic, remaining), store_kind)) {
+          if (store_kind == StoreBatch::Aligned) {
+            ++secondary_movaps_batches_;
+            secondary_movaps_steps_ += stores;
+          } else {
+            ++secondary_store_batches_;
+            secondary_store_steps_ += stores;
+          }
           used += stores;
           continue;
         }
@@ -2228,6 +2237,8 @@ class PcMotherboardC06 {
   std::uint64_t parallel_ram_steps() const noexcept { return parallel_ram_steps_; }
   std::uint64_t secondary_store_batches() const noexcept { return secondary_store_batches_; }
   std::uint64_t secondary_store_steps() const noexcept { return secondary_store_steps_; }
+  std::uint64_t secondary_movaps_batches() const noexcept { return secondary_movaps_batches_; }
+  std::uint64_t secondary_movaps_steps() const noexcept { return secondary_movaps_steps_; }
   std::uint64_t secondary_rep_elements() const noexcept { return secondary_rep_elements_; }
   std::uint64_t secondary_rep_bytes() const noexcept { return secondary_rep_bytes_; }
   std::uint64_t secondary_scan_steps() const noexcept { return secondary_scan_steps_; }
