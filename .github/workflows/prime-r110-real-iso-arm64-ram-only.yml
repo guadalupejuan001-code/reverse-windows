@@ -1,0 +1,142 @@
+name: Prime R110 physical ARM64 RAM-only paired measurement
+
+on:
+  push:
+    branches: [ci/prime-r110-real-iso-arm64-ram-only-pair]
+    paths:
+      - .github/workflows/prime-r110-real-iso-arm64-ram-only.yml
+      - .github/benchmarks/prime-iso-arm64/compare-ram-only.py
+
+permissions:
+  contents: read
+
+env:
+  PRODUCT_SHA: e3d971be5e8610d1c06ac5d74f2b18368ca3b773
+  REFERENCE_MUNDO_X_SHA: 5158b206b0904b96838323e6628cdaf83b22c129
+  CANDIDATE_MUNDO_X_SHA: e84d1ae998e8deb1ee216f2994139900355113b1
+  AVAILABLE_MIB: '510'
+  THRESHOLD_MIB: '128'
+  STOP_TARGET: '8650000000'
+  PROBE_TIMEOUT_SECONDS: '2000'
+
+jobs:
+  matched-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify the common product checkout and build both exact ARM64 dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence"
+          printf '%s\t%s\n' reference "$REFERENCE_MUNDO_X_SHA" candidate "$CANDIDATE_MUNDO_X_SHA" > "$RUNNER_TEMP/targets.tsv"
+          printf 'role\tproduct_commit\toriginal_tree\tprepared_tree\tlock_sha256\tmundo_x_commit\n' > "$evidence/source-metadata.tsv"
+          sudo apt-get update -qq
+          packages=(ninja-build libcurl4-openssl-dev zlib1g-dev
+                    libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri)
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${packages[@]}"
+          while IFS=$'\t' read -r role core_sha; do
+            product="$RUNNER_TEMP/product-$role"
+            git init "$product"
+            git -C "$product" fetch --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$PRODUCT_SHA"
+            git -C "$product" checkout --detach FETCH_HEAD
+            test "$(git -C "$product" rev-parse HEAD)" = "$PRODUCT_SHA"
+            test -z "$(git -C "$product" status --porcelain)"
+            original_tree="$(git -C "$product" rev-parse HEAD^{tree})"
+            lock=config/dependencies.lock.json
+            PRODUCT_LOCK="$product/$lock" SELECTED_CORE="$core_sha" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          lock = Path(os.environ["PRODUCT_LOCK"])
+          source = lock.read_text()
+          original = os.environ["REFERENCE_MUNDO_X_SHA"]
+          selected = os.environ["SELECTED_CORE"]
+          parts = json.loads(source)["components"]
+          assert sum(part["key"] == "mundo_x" and part["commit"] == original for part in parts) == 1
+          assert source.count(original) == 1
+          if selected != original:
+              lock.write_text(source.replace(original, selected))
+          PY
+            if [[ "$role" == candidate ]]; then
+              test "$(git -C "$product" diff --name-only HEAD)" = "$lock"
+              git -C "$product" add -- "$lock"
+            else
+              test -z "$(git -C "$product" diff --name-only HEAD)"
+            fi
+            prepared_tree="$(git -C "$product" write-tree)"
+            lock_sha="$(sha256sum "$product/$lock" | cut -d' ' -f1)"
+            (cd "$product" && python3 scripts/verify_deps.py --checkout)
+            test "$(git -C "$product/deps/mundo-X" rev-parse HEAD)" = "$core_sha"
+            if [[ "$role" == candidate ]]; then
+              parents="$(git -C "$product/deps/mundo-X" cat-file commit "$core_sha" | sed -n '/^$/q; s/^parent //p')"
+              test "$parents" = "$REFERENCE_MUNDO_X_SHA"
+              git -C "$product/deps/mundo-X" fetch --depth=1 \
+                https://github.com/guadalupejuan001-code/mundo-X.git "$REFERENCE_MUNDO_X_SHA"
+              expected_paths="$(printf '%s\n' pc-android/native/ether_state_ram.hpp pc-android/native/tests/ether_state_ram_test.cpp)"
+              test "$(git -C "$product/deps/mundo-X" diff --name-only "$REFERENCE_MUNDO_X_SHA" "$core_sha")" = "$expected_paths"
+              git -C "$product/deps/mundo-X" diff "$REFERENCE_MUNDO_X_SHA" "$core_sha" > "$evidence/mundo-x-single-variable.patch"
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$role" "$PRODUCT_SHA" "$original_tree" "$prepared_tree" "$lock_sha" "$core_sha" \
+              >> "$evidence/source-metadata.tsv"
+            cmake -S "$bench" -B "$RUNNER_TEMP/build-$role" -G Ninja \
+              -DREVERSE_WINDOWS_SOURCE="$product" -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
+            cmake --build "$RUNNER_TEMP/build-$role" --target session_probe --parallel 2
+          done < "$RUNNER_TEMP/targets.tsv"
+          cc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -o "$RUNNER_TEMP/verified_iso.so" \
+            "$bench/verified_iso.c" -lcurl -pthread
+      - name: Run both official ISO probes on the same CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence"
+          export PROBE_CPU
+          PROBE_CPU="$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          pair_status=0
+          while IFS=$'\t' read -r role core_sha; do
+            iso="$RUNNER_TEMP/windows-eval-$role.sparse"
+            output="$RUNNER_TEMP/session-$role"
+            test ! -e "$output"
+            truncate -s 5550497792 "$iso"
+            chmod 400 "$iso"
+            echo "::group::$role $PRODUCT_SHA / $core_sha"
+            probe=("$RUNNER_TEMP/build-$role/session_probe" "$iso" "$output" "$STOP_TARGET" "$PROBE_TIMEOUT_SECONDS"
+                   "$AVAILABLE_MIB" "$THRESHOLD_MIB")
+            optical_env=(EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1
+                         LD_PRELOAD="$RUNNER_TEMP/verified_iso.so" R110_REMOTE_ISO_STUB="$iso")
+            if timeout "$((PROBE_TIMEOUT_SECONDS + 120))s" taskset -c "$PROBE_CPU" env "${optical_env[@]}" "${probe[@]}" \
+              2> "$evidence/$role.stderr" | tee "$evidence/$role.stdout"; then
+              probe_exit=0
+            else
+              probe_exit=${PIPESTATUS[0]}
+              if ((probe_exit == 0)); then probe_exit=1; fi
+            fi
+            if ! MUNDO_X_SHA="$core_sha" python3 "$bench/summarize.py" \
+              --run "$output" --transport-log "$evidence/$role.stderr" \
+              --output "$evidence/$role.json" --exit-code "$probe_exit"; then
+              pair_status=1
+            fi
+            echo '::endgroup::'
+          done < "$RUNNER_TEMP/targets.tsv"
+          if ! python3 "$bench/compare-ram-only.py" "$evidence/reference.json" "$evidence/candidate.json" \
+            "$evidence/source-metadata.tsv" \
+            "$evidence/paired-comparison.json"; then
+            pair_status=1
+          fi
+          exit "$pair_status"
+      - name: Upload both counter reports and source provenance
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-real-iso-ram-only-pair
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
