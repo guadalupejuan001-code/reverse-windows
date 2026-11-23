@@ -217,7 +217,8 @@ void verify() {
     require(stats.write_sectors == 1 && stats.flushes == 1 && disk.stats().commits > 0,
             "guest ATA write and flush did not reach QSSD");
     require(cpu.read32(kCdIrqs)==2 && cpu.read32(kDiskIrqs)==2 &&
-                board.evidence().ata_irqs==2 && board.evidence().apic_irqs==4 &&
+                board.evidence().ata_irqs==2 && board.evidence().atapi_irqs==2 &&
+                board.evidence().apic_irqs==4 &&
                 board.interrupt_state().in_service==0,
             "x86-64 guest did not acknowledge the optical and disk IRQs through its IDT");
   }

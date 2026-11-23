@@ -5,19 +5,31 @@ plugins {
 }
 
 def etherPreview = providers.gradleProperty('etherPreview').map { it == 'true' }.getOrElse(false)
-def appVersion = '0.3.85'
+def testSignRelease = providers.gradleProperty('testSignRelease').map { it == 'true' }.getOrElse(false)
 def dependencyLock = rootProject.layout.projectDirectory.file('../config/dependencies.lock.json')
+def integrationManifest = rootProject.layout.projectDirectory.file('../config/integration-manifest.json')
 def dependencies = new JsonSlurper().parseText(providers.fileContents(dependencyLock).asText.get())
+def integration = new JsonSlurper().parseText(providers.fileContents(integrationManifest).asText.get())
+def appVersion = integration.version_name
 def mundoXSha = dependencies.components.find { it.key == 'mundo_x' }?.commit
 if (!(mundoXSha ==~ /[0-9a-f]{40}/)) {
     throw new GradleException('A full Mundo X commit is required in config/dependencies.lock.json')
 }
 
+def sourceSha = providers.exec {
+    workingDir(rootProject.projectDir.parentFile)
+    commandLine('git', 'rev-parse', '--verify', 'HEAD')
+}.standardOutput.asText.map { it.trim() }
+
 def componentAssets = layout.buildDirectory.dir('generated/pinnedComponentAssets')
 def copyPinnedComponents = tasks.register('copyPinnedComponents', Sync) {
     from(dependencyLock)
-    from(rootProject.layout.projectDirectory.file('../config/integration-manifest.json'))
+    from(integrationManifest)
     into(componentAssets)
+    inputs.property('sourceSha', sourceSha)
+    doLast {
+        new File(destinationDir, 'build-source.txt').setText(sourceSha.get() + '\n', 'UTF-8')
+    }
 }
 
 android {
@@ -27,10 +39,10 @@ android {
     ndkVersion '27.2.12479018'
 
     defaultConfig {
-        applicationId(etherPreview ? 'com.reversewindows.android.prime.smp.r110' : 'com.reversewindows.android')
+        applicationId(etherPreview ? integration.application_id : 'com.reversewindows.android')
         minSdk 26
         targetSdk 35
-        versionCode 115
+        versionCode integration.version_code
         versionName appVersion
         testInstrumentationRunner 'com.reversewindows.android.VbeRenderTest'
         manifestPlaceholders = [appLabel: etherPreview ? 'REVERSE Windows Prime ' + appVersion : 'REVERSE Windows']
@@ -49,6 +61,14 @@ android {
         cmake {
             path 'src/main/cpp/CMakeLists.txt'
             version '3.22.1'
+        }
+    }
+
+    buildTypes {
+        release {
+            if (testSignRelease) {
+                signingConfig signingConfigs.debug
+            }
         }
     }
 

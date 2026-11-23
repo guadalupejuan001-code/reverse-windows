@@ -64,20 +64,24 @@ final class GuestMonitor extends View {
         setFocusableInTouchMode(true);
     }
 
-    private boolean commitPending,drawPending;
+    private boolean commitPending, drawPending, presentationVisible;
     private int generation;
     String dimensions(){return hasText?"80 × 25 celdas":videoStripes==null?"Pendiente":videoWidth+" × "+videoHeight+" px";}
     void show(VmWorker.Frame update) {
-        if(isShown()){
-            if(android.os.Build.VERSION.SDK_INT>=29 && isHardwareAccelerated()){
-                if(!commitPending){
-                    commitPending=true;int epoch=generation;
-                    getViewTreeObserver().registerFrameCommitCallback(()->{
-                        if(epoch!=generation)return;commitPending=false;
-                        if(isShown())input.onPresented();
+        if (presentationVisible) {
+            if (Build.VERSION.SDK_INT >= 29 && isHardwareAccelerated()) {
+                if (!commitPending) {
+                    commitPending = true;
+                    int epoch = generation;
+                    getViewTreeObserver().registerFrameCommitCallback(() -> {
+                        if (epoch != generation) return;
+                        commitPending = false;
+                        if (presentationVisible) input.onPresented();
                     });
                 }
-            }else drawPending=true;
+            } else {
+                drawPending = true;
+            }
         }
         if (update.text != null) {
             System.arraycopy(update.text, 0, cells, 0, cells.length);
@@ -119,7 +123,7 @@ final class GuestMonitor extends View {
                     y += rows;
                 }
             }
-            if (isShown() && isHardwareAccelerated()) {
+            if (presentationVisible && isHardwareAccelerated()) {
                 for (int i = changedStripes.nextSetBit(0); i >= 0; i = changedStripes.nextSetBit(i + 1)) {
                     videoStripes[i].prepareToDraw();
                 }
@@ -130,7 +134,7 @@ final class GuestMonitor extends View {
     }
 
     void reset() {
-        generation++;commitPending=drawPending=false;
+        clearPendingPresentation();
         vbeStats.reset();
         hasText = false;
         discardVideo();
@@ -144,8 +148,22 @@ final class GuestMonitor extends View {
         opaqueVideo = false;
     }
 
+    private void clearPendingPresentation() {
+        ++generation;
+        commitPending = drawPending = false;
+    }
+
+    @Override
+    public void onVisibilityAggregated(boolean isVisible) {
+        super.onVisibilityAggregated(isVisible);
+        presentationVisible = isVisible;
+        if (!isVisible) clearPendingPresentation();
+    }
+
     @Override
     protected void onDetachedFromWindow() {
+        presentationVisible = false;
+        clearPendingPresentation();
         super.onDetachedFromWindow();
         videoNodes = null;
     }

@@ -26,6 +26,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 namespace reverse_windows {
@@ -281,7 +282,7 @@ class AndroidBootSession final {
     if (active_guest_clock && source != BootSource::SelfTest)
       board_->enable_active_clock({}, PcMotherboardC06::ClockStart::Guest32Or64);
     board_->enable_ps2_keyboard();
-    board_->enable_threaded_smp(kPrimeHostWorkers);
+    board_->enable_threaded_smp(worker_capacity_);
     if (source != BootSource::SelfTest) pc_.enable_guest_restart();
     pc_.enable_boot_acceleration();
     pc_.cpu.enable_page_translation_cache();
@@ -862,6 +863,8 @@ class AndroidBootSession final {
           << ",\"last_rejected_packet\":" << unsigned(cd.last_rejected_packet)
           << ",\"last_sense\":" << unsigned(cd.last_sense)
           << ",\"last_asc\":" << unsigned(cd.last_asc)
+          << ",\"irqs_signaled\":" << cd.irqs_signaled
+          << ",\"irq_pending\":" << (optical->irq_pending() ? "true" : "false")
           << ",\"read_bytes\":" << cd.read_sectors * AtapiCdrom::sector_bytes << '}';
     }
     const auto rtc = board_->rtc_evidence();
@@ -883,7 +886,8 @@ class AndroidBootSession final {
         << ",\"clock_cycles\":" << board_->device_clock_cycles(ata_hz)
         << ",\"last_command_cycle\":" << counts.last_command_cycle
         << "},\"irq\":{\"ticks\":" << platform.ticks << ",\"delivered\":" << platform.irq_delivered
-        << ",\"irq14\":" << platform.ata_irqs << ",\"lapic_delivered\":" << platform.apic_irqs
+        << ",\"irq14\":" << platform.ata_irqs << ",\"irq15\":" << platform.atapi_irqs
+        << ",\"lapic_delivered\":" << platform.apic_irqs
         << ",\"sci_delivered\":" << platform.sci_irqs
         << ",\"virtual_clock_hz\":" << cosmic_pc::PcMachine::kVirtualCyclesPerSecond
         << ",\"clock_source\":\"" << (board_->active_clock_enabled() ? "host-active-monotonic" : "guest-cycles") << '"'
@@ -1050,6 +1054,7 @@ class AndroidBootSession final {
         << ",\"pattern_delta_pages\":" << metrics.pattern_delta_pages
         << ",\"pattern_delta_bytes\":" << metrics.pattern_delta_bytes
         << ",\"compaction_passes\":" << compaction.passes
+        << ",\"compaction_pages_scanned\":" << compaction.pages_scanned
         << ",\"compaction_pages\":" << compaction.pages_compacted
         << ",\"compaction_interval_steps\":" << compaction.interval_steps
         // These cumulative durations overlap; they are not additive parts of
@@ -1382,7 +1387,9 @@ class AndroidBootSession final {
   std::optional<QuantumRamProbeResult> quantum_ram_probe_;
   SpillInfo spill_;
   RamPressure pressure_;
-  std::shared_ptr<SmpWorkers> workers_ = std::make_shared<SmpWorkers>(kPrimeHostWorkers);
+  const unsigned worker_capacity_ =
+      std::min(kPrimeHostWorkers, std::max(1U, std::thread::hardware_concurrency()));
+  std::shared_ptr<SmpWorkers> workers_ = std::make_shared<SmpWorkers>(worker_capacity_);
   std::shared_ptr<OpticalReader> iso_;
   std::unique_ptr<QssdDisk> disk_;
   std::unique_ptr<QssdDisk> data_disk_;

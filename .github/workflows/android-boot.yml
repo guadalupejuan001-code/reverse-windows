@@ -41,6 +41,7 @@ jobs:
         abi: [arm64-v8a, x86_64]
     env:
       ANDROID_ABI: ${{ matrix.abi }}
+      ANDROID_BUILD_TYPE: ${{ matrix.abi == 'arm64-v8a' && 'release' || 'debug' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -90,7 +91,7 @@ jobs:
           cmake --build build --target reverse_windows_android_boot_session_test \
             reverse_windows_quantum_ram_authority_test reverse_windows_ether_state_ram_integration_test reverse_windows_ether_state_ram_test \
             reverse_windows_ether_core_rules_test reverse_windows_prime_ether_arm64_test reverse_windows_sparse_ram_test \
-            reverse_windows_sparse_ram_pressure_test \
+            reverse_windows_sparse_ram_pressure_test reverse_windows_pc_memory_test reverse_windows_x86_ether_rep_batch_test \
             reverse_windows_atapi_cdrom_guest_test reverse_windows_c06_motherboard_guest_test \
             reverse_windows_smp_guest_test reverse_windows_c04_guest_idt \
             reverse_windows_protected_entry_test reverse_windows_protected_real_transition_test \
@@ -104,18 +105,22 @@ jobs:
             reverse_windows_x86_x87_state_test reverse_windows_c09r1_fxstate_test \
             reverse_windows_x86_ether_counter_loop_test --parallel 2
           ctest --test-dir build --output-on-failure \
-            -R '^(reverse_windows_android_|reverse_windows_quantum_ram_authority$|reverse_windows_ether_state_ram(_integration)?$|reverse_windows_ether_core_rules$|reverse_windows_prime_ether_arm64$|reverse_windows_sparse_ram(_pressure)?$|reverse_windows_pc_video$|reverse_windows_c04_real_guest_idt$|reverse_windows_c06_real_motherboard$|reverse_windows_smp_guest$|reverse_windows_protected_entry_stack$|reverse_windows_protected_real_transition$|reverse_windows_cpu_profile$|reverse_windows_lock_rmw$|reverse_windows_x64_optical_qssd$|reverse_windows_x86_(far_transfer64|system64|long_mode|long_null_ss|sse|mmx|x87|ether_counter_loop$)|reverse_windows_x86_c09r1_stage5_cvt_fxsr$|reverse_windows_c09r1_x87_fxsave_context$)'
+            -R '^(reverse_windows_android_|reverse_windows_quantum_ram_authority$|reverse_windows_ether_state_ram(_integration)?$|reverse_windows_ether_core_rules$|reverse_windows_prime_ether_arm64$|reverse_windows_sparse_ram(_pressure)?$|reverse_windows_pc_(memory|video)$|reverse_windows_c04_real_guest_idt$|reverse_windows_c06_real_motherboard$|reverse_windows_smp_guest$|reverse_windows_protected_entry_stack$|reverse_windows_protected_real_transition$|reverse_windows_cpu_profile$|reverse_windows_lock_rmw$|reverse_windows_x64_optical_qssd$|reverse_windows_x86_(far_transfer64|system64|long_mode|long_null_ss|sse|mmx|x87|ether_(counter_loop|rep_batch)$)|reverse_windows_x86_c09r1_stage5_cvt_fxsr$|reverse_windows_c09r1_x87_fxsave_context$)'
       - name: Install Android command-line tools and pinned packages
         uses: android-actions/setup-android@v3
         with:
           cmdline-tools-version: "11076708"
           packages: "platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018 cmake;3.22.1"
       - uses: gradle/actions/setup-gradle@v4
-      - name: Build signed debug APK
+      - name: Build signed Android APK
         working-directory: android
         run: |
-          args=(--no-daemon --stacktrace "-PandroidAbi=$ANDROID_ABI" -PetherPreview=true :app:assembleDebug)
-          if [[ "$ANDROID_ABI" == x86_64 ]]; then args+=(:app:assembleDebugAndroidTest); fi
+          args=(--no-daemon --stacktrace "-PandroidAbi=$ANDROID_ABI" -PetherPreview=true)
+          if [[ "$ANDROID_BUILD_TYPE" == release ]]; then
+            args+=(clean :app:assembleRelease -PtestSignRelease=true)
+          else
+            args+=(:app:assembleDebug :app:assembleDebugAndroidTest)
+          fi
           ./gradlew "${args[@]}" || ./gradlew --refresh-dependencies "${args[@]}"
       - name: Build on-device Ether GPU measurement for this Android ABI
         run: |
@@ -149,17 +154,18 @@ jobs:
           import re
           import subprocess
 
-          path = Path('android/app/build/outputs/apk/debug/output-metadata.json')
+          variant = os.environ['ANDROID_BUILD_TYPE']
+          path = Path(f'android/app/build/outputs/apk/{variant}/output-metadata.json')
           metadata = json.loads(path.read_text())
           artifact, = metadata['elements']
           app_id = metadata['applicationId']
           version = artifact['versionName']
           code = artifact['versionCode']
-          if (artifact['outputFile'] != 'app-debug.apk'
+          if (artifact['outputFile'] != f'app-{variant}.apk'
               or not re.fullmatch(r'com\.reversewindows\.android\.prime\.smp\.r\d+', app_id)
               or not re.fullmatch(r'\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?', version)
               or type(code) is not int or code < 1):
-              raise SystemExit('Unexpected Prime debug APK metadata')
+              raise SystemExit('Unexpected Prime APK metadata')
           integration = json.loads(Path('config/integration-manifest.json').read_text())
           assert (app_id, version, code) == (integration['application_id'], integration['version_name'], integration['version_code'])
           source_sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
@@ -172,20 +178,26 @@ jobs:
       - name: Verify APK signature, manifest and native ABI
         shell: bash
         run: |
-          apk=android/app/build/outputs/apk/debug/app-debug.apk
+          apk="android/app/build/outputs/apk/$ANDROID_BUILD_TYPE/app-$ANDROID_BUILD_TYPE.apk"
+          git diff --exit-code HEAD
           tools="$ANDROID_HOME/build-tools/35.0.0"
           out="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI"
           mkdir -p "$out"
-          apk_name="REVERSE-Windows-Prime-$ANDROID_VERSION-${SOURCE_SHA:0:12}-$ANDROID_ABI.apk"
+          apk_name="REVERSE-Windows-Prime-$ANDROID_VERSION-${SOURCE_SHA:0:12}-$ANDROID_ABI-$ANDROID_BUILD_TYPE.apk"
           cp "$apk" "$out/$apk_name"
           unzip -p "$apk" assets/dependencies.lock.json | cmp - config/dependencies.lock.json
           unzip -p "$apk" assets/integration-manifest.json | cmp - config/integration-manifest.json
+          printf '%s\n' "$SOURCE_SHA" | cmp - <(unzip -p "$apk" assets/build-source.txt)
           "$tools/apksigner" verify --verbose --print-certs "$apk" | tee "$out/signature.txt"
           grep -Fxq 'Number of signers: 1' "$out/signature.txt"
           signer_sha256=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$out/signature.txt")
           [[ "$signer_sha256" =~ ^[[:xdigit:]]{64}$ ]]
           "$tools/zipalign" -c -P 16 -v 4 "$apk" > "$out/alignment.txt"
           "$tools/aapt" dump badging "$apk" > "$out/manifest.txt"
+          if [[ "$ANDROID_BUILD_TYPE" == release ]] && grep -Fxq 'application-debuggable' "$out/manifest.txt"; then
+            echo 'An Android release APK must have debugging disabled' >&2
+            exit 1
+          fi
           grep -Fq "package: name='$ANDROID_APP_ID' versionCode='$ANDROID_VERSION_CODE' versionName='$ANDROID_VERSION'" "$out/manifest.txt"
           grep -Fxq "application-label:'REVERSE Windows Prime $ANDROID_VERSION'" "$out/manifest.txt"
           "$tools/aapt" dump xmltree "$apk" AndroidManifest.xml > "$RUNNER_TEMP/reverse-windows-app-manifest.txt"
@@ -249,6 +261,8 @@ jobs:
             printf 'android_version_code=%s\n' "$ANDROID_VERSION_CODE"
             printf 'android_signer_sha256=%s\n' "$signer_sha256"
             printf 'android_abi=%s\n' "$ANDROID_ABI"
+            printf 'android_build_type=%s\n' "$ANDROID_BUILD_TYPE"
+            printf 'android_signing_profile=test\n'
             printf 'android_ndk=27.2.12479018\n'
           } > "$out/build.txt"
           cp config/dependencies.lock.json config/integration-manifest.json "$out/"

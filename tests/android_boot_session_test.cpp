@@ -1340,8 +1340,11 @@ int main(int argc, char** argv) {
               "ISO startup did not select the Windows x64 processor profile");
       require(progress.find("\"cores\":8,\"threads_per_core\":2,\"logical_processors\":16,\"started\":1") !=
                   std::string::npos, "Prime Android ISO boot uses the requested CPU topology");
-      require(counter(progress, "host_workers_capacity") == 8,
-              "Prime Android must retain a separate eight-worker host limit");
+      const auto worker_capacity = std::min(Session::kPrimeHostWorkers,
+                                           std::max(1U, std::thread::hardware_concurrency()));
+      require(counter(progress, "host_workers_capacity") == worker_capacity &&
+                  counter(progress, "host_workers") <= worker_capacity,
+              "Prime Android must bound workers by host capacity independently of guest topology");
       const auto live = session.diagnostic(false);
       for (const char* field : {"\"ata\":{", "\"disk\":{", "\"data_disk\":{"}) {
         const auto begin = live.find(field);

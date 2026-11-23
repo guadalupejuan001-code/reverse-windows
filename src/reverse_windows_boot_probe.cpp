@@ -207,7 +207,8 @@ int main(int argc, char** argv) {
             static_cast<std::size_t>(opts.ram_mib * 1024ULL * 1024ULL),
             static_cast<std::size_t>(opts.resident_mib * 1024ULL * 1024ULL));
         pc.cpu.use_windows_x64_profile(
-            opts.source == Options::Source::Iso || opts.source == Options::Source::Disk);
+            opts.source == Options::Source::Iso || opts.source == Options::Source::Riso ||
+            opts.source == Options::Source::Disk);
         reverse_windows::AndroidRamBacking* ram_spill = nullptr;
         if (!opts.ram_spill_directory.empty() && pc.cpu.memory.budget_bytes() < pc.cpu.memory.size()) {
             const auto spill_budget = std::min(pc.cpu.memory.size(),
@@ -442,7 +443,8 @@ int main(int argc, char** argv) {
                std::to_string(ata_stats.read_sectors) + ",\"write_sectors\":" +
                std::to_string(ata_stats.write_sectors) + ",\"flushes\":" +
                std::to_string(ata_stats.flushes) + ",\"irq14_delivered\":" +
-               std::to_string(platform.ata_irqs) + ",\"clock_hz\":" + std::to_string(ata_hz) +
+               std::to_string(platform.ata_irqs) + ",\"irq15_delivered\":" +
+               std::to_string(platform.atapi_irqs) + ",\"clock_hz\":" + std::to_string(ata_hz) +
                ",\"clock_cycles\":" + std::to_string(motherboard.device_clock_cycles(ata_hz)) +
                ",\"last_command_cycle\":" + std::to_string(ata_stats.last_command_cycle) + "}" +
             ",\"motherboard_c06\":{\"pci_config\":true,\"acpi_tables\":true,\"apic_full\":false,\"irq_delivered\":" +

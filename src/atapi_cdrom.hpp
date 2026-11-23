@@ -19,6 +19,7 @@ class AtapiCdrom {
   static constexpr std::size_t sector_bytes = 2048;
   struct Activity {
     std::uint64_t packets=0, read_sectors=0, rejected_packets=0;
+    std::uint64_t irqs_signaled=0;
     std::uint8_t last_packet=0, last_rejected_packet=0, last_sense=0, last_asc=0;
   };
 
@@ -40,6 +41,7 @@ class AtapiCdrom {
   }
 
   const Activity& activity() const noexcept { return activity_; }
+  bool irq_pending() const noexcept { return interrupt_pending_; }
 
   std::uint32_t input(std::uint16_t port, unsigned width) {
     if (drive_ & 0x10U) return 0; // No secondary slave.
@@ -57,7 +59,10 @@ class AtapiCdrom {
       case 0x174: return byte_count_ & 255U;
       case 0x175: return byte_count_ >> 8U;
       case 0x176: return drive_;
-      case 0x177: case 0x376: return status_;
+      case 0x177:
+        interrupt_pending_ = false;
+        return status_;
+      case 0x376: return status_;
       default: return 0;
     }
   }
@@ -76,8 +81,11 @@ class AtapiCdrom {
     if (port == 0x376) {
       const auto previous = control_;
       control_ = byte;
-      if (control_ & 4U) status_ = 0x80;
-      else if (previous & 4U) reset_task_file();
+      if (control_ & 4U) {
+        reset_task_file();
+        status_ = 0x80;
+      } else if (previous & 4U) reset_task_file();
+      else if ((previous & 2U) && irq_enabled() && interrupt_pending_) signal_irq();
       return true;
     }
     if (drive_ & 0x10U || control_ & 4U) return true;
@@ -106,6 +114,7 @@ class AtapiCdrom {
   std::size_t packet_pos_=0, position_=0, phase_end_=0;
   std::vector<std::uint8_t> data_;
   std::uint32_t next_lba_=0, sectors_left_=0;
+  bool interrupt_pending_=false;
   Activity activity_;
 
   void reset_task_file() {
@@ -115,9 +124,21 @@ class AtapiCdrom {
     byte_count_ = 0xeb14; // ATAPI reset signature in cylinder registers.
     data_.clear();
     sectors_left_ = 0;
+    interrupt_pending_ = false;
   }
 
-  void irq() const { if (!(control_ & 2U) && irq_) irq_(); }
+  bool irq_enabled() const noexcept { return !(control_ & 2U); }
+
+  void signal_irq() {
+    if (!irq_) return;
+    irq_();
+    ++activity_.irqs_signaled;
+  }
+
+  void irq() {
+    interrupt_pending_ = true;
+    if (irq_enabled()) signal_irq();
+  }
 
   void finish() {
     phase_ = Phase::Idle;
@@ -242,6 +263,7 @@ class AtapiCdrom {
   }
 
   void command(std::uint8_t op) {
+    interrupt_pending_ = false;
     phase_ = Phase::Idle;
     sectors_left_ = 0;
     error_ = 0;

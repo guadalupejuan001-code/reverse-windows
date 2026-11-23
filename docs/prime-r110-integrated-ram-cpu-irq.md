@@ -1,7 +1,9 @@
 # Prime r110: RAM de estados y reparto de CPU/IRQ integrados
 
-Versión Android `0.3.85`, código `115`, paquete Prime
-`com.reversewindows.android.prime.smp.r110`.
+La compilación de mantenimiento usa la versión Android `0.3.86`, código `116`
+y paquete Prime `com.reversewindows.android.prime.smp.r110`. La primera
+compilación R110, `0.3.85` (115), se publicó como artefacto de integración
+del commit `c6679fe0ef4bb4373c1fe6f61ad9074b15da055f`.
 
 ## Contenido acumulado
 
@@ -10,10 +12,11 @@ Versión Android `0.3.85`, código `115`, paquete Prime
 - Presión, conservación de caché y diagnóstico de #100, ya incluida en r109:
   `82718583fe628dc06355dba5cd0fca3582223128`.
 
-El commit de integración conserva ambas historias. No reemplaza las revisiones
-de los componentes de r109: Mundo X sigue fijado en
-`13e82d7020a7cb800888996a3b36851868b14950`, con los mismos pins de GPU Virtual,
-qSSD y REgraphics que figuran en `config/dependencies.lock.json`.
+El commit de integración conserva ambas historias. La compilación de
+mantenimiento fija Mundo X a una revisión descendiente de
+`13e82d7020a7cb800888996a3b36851868b14950` con las correcciones de REP MOVS y
+compactación. Las revisiones de GPU Virtual, qSSD y REgraphics se conservan
+en `config/dependencies.lock.json`.
 
 ## Funcionamiento
 
@@ -45,10 +48,13 @@ ni medidas de rendimiento en el teléfono.
 
 ## Identidad y datos
 
-El nombre del APK y del artefacto incluye el SHA corto de su código. El archivo
-`build.txt` del artefacto registra el SHA completo y el certificado de firma.
+El nombre del APK y del artefacto incluye el SHA corto de su código.
+`assets/build-source.txt` dentro del APK y `build.txt` en el artefacto
+registran el SHA completo. El artefacto incluye el certificado y el SHA-256
+del APK.
 
-El paquete r110 permite una instalación independiente de r108/r109 mientras se
-utiliza la firma de depuración de CI. Los discos privados de las aplicaciones
-anteriores no se transfieren automáticamente. Conservarlos antes de planificar
-una migración; no desinstalar la versión que los contiene para probar r110.
+El paquete r110 permite una instalación independiente de r108/r109. La
+compilación ARM64 de CI usa el tipo `release` con un certificado de pruebas.
+Android exige el mismo certificado para actualizar una instalación existente
+del paquete. Los discos privados de las aplicaciones anteriores permanecen
+vinculados a su instalación.

@@ -15,11 +15,13 @@ import android.widget.FrameLayout;
 import org.json.JSONObject;
 
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** Checks the displayed pixels after a full packet and a one-stripe update on the Android test device. */
 public final class VbeRenderTest extends Instrumentation {
     private static final int WIDTH = 48, HEIGHT = 67, STRIPE = 32;
     private final VbePresentationStats stats = new VbePresentationStats();
+    private final AtomicInteger presented = new AtomicInteger();
     private GuestMonitor monitor;
 
     @Override public void onCreate(Bundle args) {
@@ -36,21 +38,34 @@ public final class VbeRenderTest extends Instrumentation {
                 monitor = new GuestMonitor(activity, new GuestMonitor.Input() {
                     public boolean onKey(KeyEvent key) { return false; }
                     public void onText(CharSequence text) {}
-                    public void onPresented() {}
+                    public void onPresented() { presented.incrementAndGet(); }
                 }, stats);
                 activity.setContentView(monitor, new FrameLayout.LayoutParams(WIDTH, HEIGHT, Gravity.CENTER));
                 monitor.show(packet(0, 0, WIDTH, HEIGHT, Color.RED));
             });
-            awaitPicture(false);
+            awaitPicture(false, 1);
             long first = new JSONObject(stats.json()).getLong("stripe_recordings");
             if (first != 3) throw new AssertionError("Expected three initial stripe recordings: " + stats.json());
 
             runOnMainSync(() -> monitor.show(packet(4, STRIPE + 1, 8, 5, Color.BLUE)));
-            awaitPicture(true);
+            awaitPicture(true, 2);
             JSONObject after = new JSONObject(stats.json());
             if (!"render_nodes".equals(after.getString("last_backend")) ||
                     after.getLong("stripe_recordings") != first + 1)
                 throw new AssertionError("Expected one updated hardware stripe: " + after);
+
+            int beforeReattach = presented.get();
+            runOnMainSync(() -> {
+                FrameLayout parent = (FrameLayout) monitor.getParent();
+                var layout = monitor.getLayoutParams();
+                monitor.show(packet(4, STRIPE + 1, 8, 5, Color.GREEN));
+                parent.removeView(monitor);
+                parent.addView(monitor, layout);
+                monitor.show(packet(4, STRIPE + 1, 8, 5, Color.BLUE));
+            });
+            awaitPicture(true, beforeReattach + 1);
+            if (presented.get() != beforeReattach + 1)
+                throw new AssertionError("Expected one presentation after reattaching the guest display");
 
             Bitmap software = Bitmap.createBitmap(WIDTH, HEIGHT, Bitmap.Config.ARGB_8888);
             runOnMainSync(() -> monitor.draw(new Canvas(software)));
@@ -95,7 +110,7 @@ public final class VbeRenderTest extends Instrumentation {
         return new VmWorker.Frame(words, null);
     }
 
-    private void awaitPicture(boolean updated) {
+    private void awaitPicture(boolean updated, int minimumPresentations) {
         long deadline = SystemClock.uptimeMillis() + 5000;
         int[] origin = new int[2];
         do {
@@ -110,7 +125,7 @@ public final class VbeRenderTest extends Instrumentation {
                 }
                 boolean match = matches(screen, origin[0], origin[1], updated);
                 screen.recycle();
-                if (match) return;
+                if (match && presented.get() >= minimumPresentations) return;
             }
             SystemClock.sleep(50);
         } while (SystemClock.uptimeMillis() < deadline);

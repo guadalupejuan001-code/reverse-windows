@@ -478,6 +478,8 @@ final class VmWorker {
                 final long untilSample = Math.max(0, nextRamSample - SystemClock.uptimeMillis());
                 scheduleRam(VmRamMaintenance.delayMillis(running, preparing, untilSample));
             }
+        } catch (OutOfMemoryError error) {
+            report(error);
         } catch (RuntimeException | LinkageError error) {
             Log.w(TAG, "No se pudo ajustar el respaldo de RAM", error);
             if (foreground) scheduleRam(RAM_SAMPLE_INTERVAL_MS);
@@ -567,28 +569,35 @@ final class VmWorker {
                 return;
             }
             Frame frame = new Frame(video, textCells);
-            if (!main.post(() -> {
-                boolean applied = false;
-                try {
-                    if (!released && foreground && handle == session) {
-                        listener.onFrame(frame);
-                        applied = true;
-                    }
-                } finally {
-                    final boolean retry = !applied;
-                    worker.post(() -> finishFrame(session, retry));
-                }
-            })) {
+            if (!main.post(() -> displayFrame(session, frame))) {
                 frameRequested = false;
                 NativeMachine.retryVideo(session);
                 videoDirty = true;
             }
-        } catch (RuntimeException | LinkageError error) {
+        } catch (RuntimeException | LinkageError | OutOfMemoryError error) {
             frameRequested = false;
             report(error);
         } finally {
             frameNanos += SystemClock.elapsedRealtimeNanos() - started;
         }
+    }
+
+    private void displayFrame(long session, Frame frame) {
+        if (released || !foreground || handle != session) {
+            worker.post(() -> finishFrame(session, true));
+            return;
+        }
+        try {
+            listener.onFrame(frame);
+        } catch (RuntimeException | OutOfMemoryError error) {
+            worker.post(() -> {
+                if (released || handle != session) return;
+                frameRequested = false;
+                report(error);
+            });
+            return;
+        }
+        worker.post(() -> finishFrame(session, false));
     }
 
     private void finishFrame(long session, boolean retry) {

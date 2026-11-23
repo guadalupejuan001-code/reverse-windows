@@ -1,8 +1,8 @@
 {
   "schema": "reverse-windows-integration-v1",
   "revision": "r110",
-  "version_name": "0.3.85",
-  "version_code": 115,
+  "version_name": "0.3.86",
+  "version_code": 116,
   "application_id": "com.reversewindows.android.prime.smp.r110",
   "memory_backend": "ether-state-ram",
   "source_commits": {

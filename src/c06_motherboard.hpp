@@ -45,7 +45,7 @@ class PcMotherboardC06 {
   struct Evidence {
     std::uint64_t ticks,irq_delivered,pit_irqs,apic_irqs;
     bool pci_present,acpi_installed,powered_off;
-    std::uint64_t ata_irqs=0,sci_irqs=0;
+    std::uint64_t ata_irqs=0,sci_irqs=0,atapi_irqs=0;
   };
   struct InterruptState {
     bool global_enabled, software_enabled;
@@ -233,6 +233,7 @@ class PcMotherboardC06 {
   std::array<std::uint8_t,256> ata_cfg_{};
   std::array<std::uint64_t, GuestGpuC08::pci_device + 1> pci_clock_samples_{};
   std::uint64_t ata_irq_delivered_=0;
+  std::uint64_t atapi_irq_delivered_=0;
   Pit pit_{},pit2_{};
   unsigned pit_phase_=0;
   std::uint8_t speaker_control_=0;
@@ -306,7 +307,7 @@ class PcMotherboardC06 {
     // A nested interrupt must have a higher priority class than the interrupted one.
     struct Delivery { std::uint64_t id=0, tick=0, steps=0; };
     std::array<Delivery,16> delivery_by_priority{};
-    std::bitset<256> pending_level, in_service_level, pending_ata, pending_sci, pending_rtc;
+    std::bitset<256> pending_level, in_service_level, pending_ata, pending_atapi, pending_sci, pending_rtc;
     PendingWrite mmio_pending;
   };
   static constexpr auto kMaxProcessors = cosmic_pc::CpuTopology::kMaxLogical;
@@ -327,8 +328,9 @@ class PcMotherboardC06 {
   const bool experimental_mixed_smp_;
   bool threaded_smp_enabled_ = false;
   unsigned worker_limit_ = kMaxProcessors;
-  unsigned next_cpu_ = 0;
-  std::bitset<kMaxProcessors> parked_processors_, wake_pending_;
+  unsigned next_serial_cpu_ = 0, next_native_job_ = 0, next_threaded_job_ = 0;
+  std::bitset<kMaxProcessors> parked_processors_, parked_irq_processors_, wake_pending_;
+  std::array<unsigned, kMaxProcessors> wake_budget_{};
   std::optional<unsigned> faulted_processor_;
   std::shared_ptr<SmpWorkers> workers_;
   std::unique_ptr<EtherX86Sessions> ether_x86_sessions_;
@@ -380,7 +382,7 @@ class PcMotherboardC06 {
     cmos_index_=rtc_c_=0;rtc_a_=0x26;rtc_b_=0x02;pm_control_=0x0001;powered_off_=false;
     pm_status_=pm_enable_=0;sci_active_=false;
     ferr_was_asserted_=false;pc_.cpu.set_x87_ignne(false);
-    cpu_cycles_=ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=sci_irqs_=0;
+    cpu_cycles_=ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=atapi_irq_delivered_=sci_irqs_=0;
     cpu_cycle_phase_ = 0;
     firmware_tsc_remainder_ = active_tsc_remainder_ = 0;
     active_clock_enabled_=active_clock_running_=waiting_for_guest_mode_=false;
@@ -408,9 +410,11 @@ class PcMotherboardC06 {
     interpreter_vector_steps_before_init_.fill(0);
     startup_ipis_ = {};
     faulted_processor_.reset();
-    next_cpu_ = 0;
+    next_serial_cpu_ = next_native_job_ = next_threaded_job_ = 0;
     parked_processors_.reset();
+    parked_irq_processors_.reset();
     wake_pending_.reset();
+    wake_budget_.fill(0);
     threaded_smp_stats_ = {};
     parallel_register_batches_ = parallel_register_steps_ = 0;
     parallel_register_continuations_ = 0;
@@ -1094,6 +1098,7 @@ class PcMotherboardC06 {
       apic.pending.set(vector);
       if (level) apic.pending_level.set(vector);
       if (line == 14) apic.pending_ata.set(vector);
+      if (line == 15) apic.pending_atapi.set(vector);
       if (line == AcpiC06::sci_irq) apic.pending_sci.set(vector);
       if (line == kRtcLine) apic.pending_rtc.set(vector);
     }
@@ -1138,9 +1143,11 @@ class PcMotherboardC06 {
       apic.in_service_level.set(vector, apic.pending_level[vector]);
       apic.pending_level.reset(vector);
       if (apic.pending_ata[vector]) ++ata_irq_delivered_;
+      if (apic.pending_atapi[vector]) ++atapi_irq_delivered_;
       if (apic.pending_sci[vector]) ++sci_irqs_;
       if (apic.pending_rtc[vector]) ++rtc_irq8_delivered_;
       apic.pending_ata.reset(vector);
+      apic.pending_atapi.reset(vector);
       apic.pending_sci.reset(vector);
       apic.pending_rtc.reset(vector);
       ++apic_irqs_; ++irq_delivered_;
@@ -1228,6 +1235,7 @@ class PcMotherboardC06 {
     waiting_for_guest_mode_ = false;
     activate_clock();
     start_clock_sample();
+    refresh_parked_processors();
   }
   struct ActiveClockRun {
     PcMotherboardC06& board;
@@ -1313,6 +1321,7 @@ class PcMotherboardC06 {
         if(cpu.raise_external_irq(std::uint8_t(slave_.vector+sn))){
           slave_.accepted(sn);master_.accepted(2);
           ++irq_delivered_;if(sn==6)++ata_irq_delivered_;
+          if(sn==7)++atapi_irq_delivered_;
           if(sn==AcpiC06::sci_irq-8)++sci_irqs_;
           if(sn==kRtcLine-8)++rtc_irq8_delivered_;
         }
@@ -1452,20 +1461,25 @@ class PcMotherboardC06 {
   static constexpr unsigned kSmpQuantum = 32;
   static constexpr unsigned kExtendedSmpQuantum = 4096;
 
-  void refresh_parked_processors() {
-    parked_processors_.reset();
-    if (!active_clock_running_) return;
-    for (unsigned id = 0; id < processor_count_; ++id) {
-      const auto& apic = apics_[id];
-      parked_processors_.set(id, apic.started && apic.cpu->halted &&
-                                 !apic.init_pending && !apic.startup_vector);
-    }
+  bool refresh_parked_processor(unsigned id) {
+    const auto& apic = apics_[id];
+    const bool parked = active_clock_running_ && apic.started && apic.cpu->halted &&
+                        !apic.init_pending && !apic.startup_vector;
+    parked_processors_.set(id, parked);
+    parked_irq_processors_.set(id, parked && apic.cpu->flag(cosmic_pc::Cpu::IF));
+    return parked;
   }
 
-  bool parked_waits_for_irq() const {
+  bool parked_needs_short_grant() const {
+    return parked_irq_processors_.any() || (parked_processors_[0] && prior_tick_);
+  }
+
+  void refresh_parked_processors() {
+    parked_processors_.reset();
+    parked_irq_processors_.reset();
+    if (!active_clock_running_) return;
     for (unsigned id = 0; id < processor_count_; ++id)
-      if (parked_processors_[id] && apics_[id].cpu->flag(cosmic_pc::Cpu::IF)) return true;
-    return false;
+      refresh_parked_processor(id);
   }
 
   // The dispatch owns this snapshot. Its CPUs have no worker, so their timers
@@ -1478,14 +1492,16 @@ class PcMotherboardC06 {
       if (prior_tick_) prior_tick_();
       poll(false);
     }
-    for (unsigned id = 0; id < processor_count_; ++id) {
-      if (!parked_processors_[id]) continue;
+    for (unsigned id = 0, mask = parked_processors_.to_ulong(); mask; ++id, mask >>= 1) {
+      if (!(mask & 1U)) continue;
       auto& apic = apics_[id];
       if (id) update_secondary_timer(apic);
-      if (apic.init_pending || apic.startup_vector ||
-          (apic.started && apic.cpu->flag(cosmic_pc::Cpu::IF) &&
-           (id ? deliverable_lapic_vector(apic) != 0 : interrupt_pending())))
+      if (!wake_pending_[id] && (apic.init_pending || apic.startup_vector ||
+          (parked_irq_processors_[id] &&
+           (id ? deliverable_lapic_vector(apic) != 0 : interrupt_pending())))) {
         wake_pending_.set(id);
+        wake_budget_[id] = kSmpQuantum;
+      }
     }
   }
 
@@ -1703,16 +1719,18 @@ class PcMotherboardC06 {
     }
   }
 
-  // Keep the first job on the calling lane. Rotate the remaining jobs when
-  // more vCPUs are ready than can start in the first wave.
-  static unsigned rotate_smp_job(unsigned position, unsigned count, unsigned rotation) noexcept {
-    return rotation && position ? 1 + (position - 1 + rotation) % (count - 1) : position;
+  // Keep the BSP on the calling lane when present. Rotate every AP that
+  // shares physical workers with other ready processors.
+  static unsigned rotate_smp_job(unsigned position, unsigned count, unsigned rotation,
+                                 unsigned fixed_jobs) noexcept {
+    if (position < fixed_jobs) return position;
+    return fixed_jobs + (position - fixed_jobs + rotation) % (count - fixed_jobs);
   }
 
   unsigned run_parallel_ether_loops(const std::array<unsigned, kMaxProcessors>& runnable,
                                     unsigned count, unsigned budget,
                                     cosmic_pc::PcMachine::RunClock::time_point deadline) {
-    if (!count || runnable[0] != 0 || parked_waits_for_irq() ||
+    if (count < 2 || parked_needs_short_grant() ||
         budget < 2 * kMinParallelLoopSteps || !cosmic_pc::Cpu::ether_arm64_host() ||
         !pc_.boot_acceleration_enabled() || !pc_.guest_execution_available() ||
         (sci_active_ && (io_redir_low_[AcpiC06::sci_irq] & 0x18000U) == 0x8000U &&
@@ -1720,26 +1738,26 @@ class PcMotherboardC06 {
 
     auto limit = budget;
     std::array<unsigned, kMaxProcessors> candidates{};
-    unsigned candidate_count = 0, active_count = 1;
+    unsigned candidate_count = 0, active_count = 0;
     const auto consider = [&](unsigned id) {
       if (!apics_[id].cpu->ether_arm64_loop_length(kParallelLoopAccess)) return false;
       candidates[candidate_count++] = id;
       return true;
     };
-    if (!consider(0) && !experimental_mixed_smp_) return 0;
-    for (unsigned i = 1; i < count; ++i) {
-      const auto& apic = apics_[runnable[i]];
+    for (unsigned i = 0; i < count; ++i) {
+      const auto id = runnable[i];
+      const auto& apic = apics_[id];
       const auto& cpu = *apic.cpu;
       if (apic.init_pending || apic.startup_vector ||
           (cpu.flag(cosmic_pc::Cpu::IF) && deliverable_lapic_vector(apic))) return 0;
-      if (local_timer_irq_armed(apic)) {
+      if (id && local_timer_irq_armed(apic)) {
         const auto elapsed = ticks_ - apic.last_tick;
         if (elapsed >= apic.timer_cycles) return 0;
         limit = static_cast<unsigned>(std::min<std::uint64_t>(limit, apic.timer_cycles - elapsed - 1));
       }
       if (cpu.halted) continue;
       ++active_count;
-      if (!consider(runnable[i]) && !experimental_mixed_smp_) return 0;
+      if (!consider(id) && !experimental_mixed_smp_) return 0;
     }
     if (candidate_count < 2) return 0;
     // Bound one independent execution by the earliest device edge and the
@@ -1782,11 +1800,12 @@ class PcMotherboardC06 {
       unsigned steps = 0, ram_steps = 0, continuations = 0;
     };
     std::array<Progress, kMaxProcessors> progress{};
-    const auto next_job = next_cpu_ % (job_count - 1);
+    const unsigned fixed_jobs = jobs[0] == 0;
+    const auto next_job = next_native_job_ % (job_count - fixed_jobs);
     const auto lanes = workers_->try_run(std::min(job_count, host_workers_capacity()), [&](unsigned lane, unsigned count) {
       const auto rotation = count < job_count ? next_job : 0U;
       for (unsigned position = lane; position < job_count; position += count) {
-        const auto job = rotate_smp_job(position, job_count, rotation);
+        const auto job = rotate_smp_job(position, job_count, rotation, fixed_jobs);
         const auto id = jobs[job];
         auto& cpu = *apics_[id].cpu;
         auto& block = work[job];
@@ -1810,12 +1829,13 @@ class PcMotherboardC06 {
     });
     if (!lanes) return 0;
     const auto rotation = lanes < job_count ? next_job : 0U;
-    if (lanes < job_count) next_cpu_ = (rotation + lanes - 1) % (job_count - 1);
+    if (lanes < job_count)
+      next_native_job_ = (rotation + lanes - fixed_jobs) % (job_count - fixed_jobs);
     unsigned total = 0, processors = 0, longest = 0, ram_steps = 0, bsp_steps = 0;
     std::array<bool, kMaxProcessors> active_lanes{};
     std::array<bool, kMaxProcessors> serviced{};
     for (unsigned position = 0; position < job_count; ++position) {
-      const auto job = rotate_smp_job(position, job_count, rotation);
+      const auto job = rotate_smp_job(position, job_count, rotation, fixed_jobs);
       const auto& result = progress[job];
       serviced[jobs[job]] = result.steps != 0;
       active_lanes[position % lanes] |= result.steps != 0;
@@ -1891,11 +1911,12 @@ class PcMotherboardC06 {
     std::mutex bus;
     bool parked_during_dispatch = false;
     std::array<std::uint64_t, kMaxProcessors> progress{};
-    const auto next_job = next_cpu_ % (jobs - 1);
+    const unsigned fixed_jobs = ready[0] == 0;
+    const auto next_job = next_threaded_job_ % (jobs - fixed_jobs);
     const auto lanes = workers_->try_run(std::min(jobs, host_workers_capacity()), [&](unsigned worker, unsigned workers) {
       const auto rotation = workers < jobs ? next_job : 0U;
       for (unsigned position = worker; position < jobs; position += workers) {
-        const auto id = ready[rotate_smp_job(position, jobs, rotation)];
+        const auto id = ready[rotate_smp_job(position, jobs, rotation, fixed_jobs)];
         for (unsigned used = 0; used < grant;) {
           std::unique_lock<std::mutex> lock(bus, std::defer_lock);
           auto& wait = bus_wait_[id];
@@ -1914,11 +1935,11 @@ class PcMotherboardC06 {
           }
           if (faulted_processor_ || !pc_.guest_execution_available() ||
               (deadline != Clock::time_point::max() && Clock::now() >= deadline)) return;
-          poll_parked_processors();
           if (wake_pending_.any()) return;
           const auto remaining = grant - used;
           auto& apic = apics_[id];
-          if (id && remaining > bus_steps && !parked_waits_for_irq() &&
+          const bool short_grant = parked_needs_short_grant();
+          if (id && remaining > bus_steps && !short_grant &&
               active_clock_running_ && pc_.boot_acceleration_enabled() &&
               apic.started && !apic.init_pending && !apic.startup_vector && !apic.cpu->halted &&
               grouped_loop_candidate(*apic.cpu)) {
@@ -1936,7 +1957,7 @@ class PcMotherboardC06 {
             }
           }
           const auto before = processor_steps(id);
-          const auto steps = std::min(parked_waits_for_irq() ? kSmpQuantum : bus_steps, remaining);
+          const auto steps = std::min(short_grant ? kSmpQuantum : bus_steps, remaining);
           // The next dispatch can admit a complete cached loop when a
           // short remainder would otherwise leave its vCPU inside it.
           const bool preserve = preserve_loop_entries && used + steps == grant;
@@ -1944,11 +1965,7 @@ class PcMotherboardC06 {
           else pc_.run(steps, deadline, preserve, &lock);
           const auto retired = processor_steps(id) - before;
           progress[worker] += retired;
-          if (active_clock_running_ && apic.started && apic.cpu->halted &&
-              !apic.init_pending && !apic.startup_vector) {
-            parked_processors_.set(id);
-            parked_during_dispatch = true;
-          }
+          parked_during_dispatch |= refresh_parked_processor(id);
           poll_parked_processors();
           if (wake_pending_.any()) return;
           if (parked_processors_[id]) break;
@@ -1960,7 +1977,7 @@ class PcMotherboardC06 {
       }
     });
     if (!lanes) return 0;
-    if (lanes < jobs) next_cpu_ = (next_job + lanes - 1) % (jobs - 1);
+    if (lanes < jobs) next_threaded_job_ = (next_job + lanes - fixed_jobs) % (jobs - fixed_jobs);
     std::uint64_t retired = 0;
     unsigned active = 0;
     for (const auto steps : progress) {
@@ -2120,7 +2137,7 @@ class PcMotherboardC06 {
   PcMotherboardC06(const PcMotherboardC06&)=delete;
   PcMotherboardC06& operator=(const PcMotherboardC06&)=delete;
   Evidence evidence()const{
-    return {ticks_,irq_delivered_,pit_irqs_,apic_irqs_,true,true,powered_off_,ata_irq_delivered_,sci_irqs_};
+    return {ticks_,irq_delivered_,pit_irqs_,apic_irqs_,true,true,powered_off_,ata_irq_delivered_,sci_irqs_,atapi_irq_delivered_};
   }
   const auto& lapic_vector_stats() const noexcept { return lapic_vectors_; }
   InterruptState interrupt_state()const{
@@ -2313,6 +2330,7 @@ class PcMotherboardC06 {
     refresh_parked_processors();
     if (!secondary_can_run() && wake_pending_.none()) {
       run_bsp(budget, deadline);
+      refresh_parked_processor(0);
       poll_parked_processors();
       return;
     }
@@ -2331,24 +2349,29 @@ class PcMotherboardC06 {
         if (!budget || (timed && Clock::now() >= deadline)) return;
         if (!needs_service(apics_[id])) { wake_pending_.reset(id); continue; }
         parked_processors_.reset(id);
+        parked_irq_processors_.reset(id);
         const auto before = processor_steps(id);
-        const auto grant = std::min(budget, kSmpQuantum);
+        // A run(1) can enter an IRQ and stop before its handler completes.
+        // Carry the rest of the bounded wake grant into the next run.
+        auto& wake_budget = wake_budget_[id];
+        const auto grant = std::min(budget, wake_budget);
         if (id) run_secondary(id, grant, deadline, false);
         else run_bsp(grant, deadline);
+        refresh_parked_processor(id);
         const auto retired = static_cast<unsigned>(processor_steps(id) - before);
         if (retired) {
           budget -= retired;
-          wake_pending_.reset(id);
+          wake_budget -= retired;
+          if (!wake_budget || parked_processors_[id]) wake_pending_.reset(id);
         } else if (apics_[id].cpu->halted || !needs_service(apics_[id])) {
           wake_pending_.reset(id);
         } else return;
         if (faulted_processor_ || !pc_.guest_execution_available() || powered_off_) return;
       }
       if (!budget) return;
-      refresh_parked_processors();
       std::array<unsigned, kMaxProcessors> runnable{};
       unsigned count = 0;
-      bool sleeping = parked_waits_for_irq();
+      bool sleeping = parked_irq_processors_.any();
       if (!active_clock_running_ || !pc_.cpu.halted) runnable[count++] = 0;
       sync_active_clock();
       for (unsigned id = 1; id < processor_count_; ++id) {
@@ -2367,6 +2390,7 @@ class PcMotherboardC06 {
         const auto grant = std::min(budget, kSmpQuantum);
         const auto before = pc_.cpu.instructions;
         run_bsp(grant, deadline);
+        refresh_parked_processor(0);
         poll_parked_processors();
         const auto retired = static_cast<unsigned>(pc_.cpu.instructions - before);
         budget -= wake_pending_.any() ? retired : grant;
@@ -2407,11 +2431,12 @@ class PcMotherboardC06 {
       }
       register_peer = false;
       if (count == 1) {
-        const auto grant = parked_processors_.any() ? std::min(dispatch_budget, kSmpQuantum) : dispatch_budget;
+        const auto grant = parked_needs_short_grant() ? std::min(dispatch_budget, kSmpQuantum) : dispatch_budget;
         const auto id = runnable[0];
         const auto before = processor_steps(id);
         if (id) run_secondary(id, grant, deadline, false);
         else run_bsp(grant, deadline);
+        refresh_parked_processor(id);
         poll_parked_processors();
         const auto retired = static_cast<unsigned>(processor_steps(id) - before);
         budget -= wake_pending_.any() ? retired : grant;
@@ -2427,32 +2452,33 @@ class PcMotherboardC06 {
         continue;
       }
       if (wake_pending_.any()) continue;
-      const auto quantum = parked_processors_.any() ? kSmpQuantum : smp_quantum(runnable, count);
+      const auto quantum = parked_needs_short_grant() ? kSmpQuantum : smp_quantum(runnable, count);
       const auto chunk = std::min(dispatch_budget, count * quantum);
-      std::array<unsigned, kMaxProcessors> work{};
-      for (unsigned i = 0; i < count; ++i)
-        work[(next_cpu_ + i) % count] = chunk / count + (i < chunk % count);
-      next_cpu_ = (next_cpu_ + chunk % count) % count;
+      const auto first_ready = std::lower_bound(runnable.begin(), runnable.begin() + count, next_serial_cpu_);
+      const auto start = static_cast<unsigned>(first_ready - runnable.begin()) % count;
+      const auto extra = chunk % count;
       const bool preserve_ether_loop_entry = cosmic_pc::Cpu::ether_arm64_host() &&
           pc_.boot_acceleration_enabled() && budget >= count * kMinParallelLoopSteps;
       const auto before = total_processor_steps();
       bool parked_during_round = false;
-      for (unsigned i = 0; i < count; ++i) {
+      const auto grants = std::min(chunk, count);
+      unsigned i = 0;
+      for (; i < grants; ++i) {
+        if (timed && Clock::now() >= deadline) return;
         poll_parked_processors();
         if (wake_pending_.any()) break;
-        if (work[i]) {
-          const auto id = runnable[i];
-          if (id) run_secondary(id, work[i], deadline, preserve_ether_loop_entry);
-          else run_bsp(work[i], deadline, preserve_ether_loop_entry);
-          const auto& apic = apics_[id];
-          parked_during_round |= active_clock_running_ && apic.started && apic.cpu->halted &&
-                                 !apic.init_pending && !apic.startup_vector;
-        }
-        refresh_parked_processors();
+        const auto slot = (start + i) % count;
+        const auto id = runnable[slot];
+        const auto work = chunk / count + (i < extra);
+        next_serial_cpu_ = runnable[(slot + 1) % count];
+        if (id) run_secondary(id, work, deadline, preserve_ether_loop_entry);
+        else run_bsp(work, deadline, preserve_ether_loop_entry);
+        parked_during_round |= refresh_parked_processor(id);
         poll_parked_processors();
         if (faulted_processor_ || !pc_.guest_execution_available() || powered_off_) return;
         if (wake_pending_.any()) break;
       }
+      if (i == grants) next_serial_cpu_ = runnable[(start + extra) % count];
       budget -= wake_pending_.any() || parked_during_round
           ? static_cast<unsigned>(total_processor_steps() - before) : chunk;
     }

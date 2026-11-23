@@ -157,10 +157,63 @@ int main() {
             activity.last_rejected_packet == 0x5a && activity.last_sense == 5 &&
             activity.last_asc == 0x24,
             "ATAPI diagnostics did not preserve the optical command results");
-    require(cpu.read32(0x9040) >= 8, "IRQ15 did not reach the guest IDT");
+    const auto initial_irqs = cpu.read32(0x9040);
+    require(initial_irqs >= 8 && initial_irqs == board.evidence().atapi_irqs,
+            "IRQ15 did not reach the guest IDT or match motherboard accounting");
+
+    const auto initial_signals = activity.irqs_signaled;
+    const auto run = [&](Program& command) {
+      command.emit({0xfa,0xf4});
+      cpu.memory.write_block(0xa000,command.bytes.data(),command.bytes.size());
+      cpu.eip = 0xa000;
+      cpu.halted = false;
+      machine.run(1024);
+      if (cpu.fault) throw std::runtime_error(cpu.fault->describe());
+      require(cpu.halted, "IRQ15 mask test did not finish");
+    };
+    Program masked;
+    masked.emit({0xfb}); // STI
+    masked.out8(0x376,2);
+    masked.out8(0x177,0xa1);
+    masked.in8(0x376,0x9010);
+    run(masked);
+    require(cpu.read8(0x9010) == 0x48 && board.attached_atapi()->irq_pending() &&
+            activity.irqs_signaled == initial_signals && cpu.read32(0x9040) == initial_irqs,
+            "nIEN must mask IRQ15 without dropping the pending event");
+
+    Program unmask;
+    unmask.emit({0xfb});
+    unmask.out8(0x376,0);
+    unmask.in8(0x177,0x9011);
+    unmask.words(256,0x10600);
+    run(unmask);
+    require(cpu.read8(0x9011) == 0x48 && cpu.read16(0x10600) == 0x8580 &&
+            !board.attached_atapi()->irq_pending() && activity.irqs_signaled == initial_signals + 1 &&
+            cpu.read32(0x9040) == initial_irqs + 1 && board.evidence().atapi_irqs == initial_irqs + 1,
+            "Unmasking must deliver the pending IRQ15 and preserve PIO data");
+
+    Program acknowledge;
+    acknowledge.emit({0xfb});
+    acknowledge.out8(0x376,2);
+    acknowledge.out8(0x177,0xa1);
+    acknowledge.in8(0x177,0x9012);
+    acknowledge.out8(0x376,0);
+    acknowledge.out8(0x376,2);
+    acknowledge.out8(0x177,0xa1);
+    acknowledge.out8(0x376,6); // nIEN + SRST cancel the command.
+    acknowledge.in8(0x376,0x9013);
+    acknowledge.out8(0x376,0);
+    acknowledge.in8(0x174,0x9014);
+    acknowledge.in8(0x175,0x9015);
+    run(acknowledge);
+    require(cpu.read8(0x9012) == 0x48 && cpu.read8(0x9013) == 0x80 &&
+            cpu.read16(0x9014) == 0xeb14 && !board.attached_atapi()->irq_pending() &&
+            activity.irqs_signaled == initial_signals + 1 && cpu.read32(0x9040) == initial_irqs + 1,
+            "Status acknowledgement or software reset left a stale IRQ15");
     std::cout << "REVERSE_WINDOWS_ATAPI_PROTECTED_GUEST_PASS bytes=" << cd.size()
               << " irq15=" << cpu.read32(0x9040) << " readonly=true mode_sense=1"
-              << " packets=" << activity.packets << " rejected=" << activity.rejected_packets << '\n';
+              << " packets=" << activity.packets << " rejected=" << activity.rejected_packets
+              << " nien=1\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "REVERSE_WINDOWS_ATAPI_PROTECTED_GUEST_FAIL " << error.what() << '\n';

@@ -124,7 +124,7 @@ if(BUILD_TESTING)
     set_tests_properties(reverse_windows_riso_codec reverse_windows_riso_real_iso_boot
       reverse_windows_riso_probe PROPERTIES TIMEOUT 120)
     set_tests_properties(reverse_windows_riso_probe PROPERTIES
-      PASS_REGULAR_EXPRESSION "\"compressed_media_mounted\":true")
+      PASS_REGULAR_EXPRESSION "\"compressed_media_mounted\":true.*\"machine\":\\{\"status\":\"halted\",\"instructions\":3,.*\"cpuid_vendor\":\"GenuineIntel\"")
   endif()
   add_executable(reverse_windows_android_boot_session_test tests/android_boot_session_test.cpp)
   target_link_libraries(reverse_windows_android_boot_session_test PRIVATE reverse_windows_component_headers)

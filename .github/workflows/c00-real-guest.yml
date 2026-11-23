@@ -1,7 +1,7 @@
 name: REVERSE Windows Ether boot, RAM and QSSD regressions
 on:
   push:
-    branches: [main, "feature/**"]
+    branches: [main, "feature/**", "fix/r110-rep-batch-and-ram-sweep"]
   pull_request:
   workflow_dispatch:
 
@@ -289,7 +289,7 @@ jobs:
       - name: Execute real x86 and long-mode x64 guest demos
         env:
           LIBGL_ALWAYS_SOFTWARE: '1'
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --output-junit "$PWD/build/ctest.xml"
       - name: Compare the guest clocks on sixteen vCPUs with identical arithmetic
         shell: bash
         run: ./build/reverse_windows_smp_guest_test --measure-cpu-clock | tee build/prime-smp-clock.log
@@ -698,6 +698,7 @@ jobs:
         with:
           name: reverse-windows-c08-${{ matrix.architecture }}-evidence
           path: |
+            build/ctest.xml
             build/reverse-windows-x64.json
             build/reverse-windows-c06-motherboard.log
             build/prime-bios-keyboard.log

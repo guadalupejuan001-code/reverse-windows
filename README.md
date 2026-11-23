@@ -2,7 +2,7 @@
 
 Emulador de PC x86/x64 para arrancar Windows 10 como sistema invitado real.
 
-**Versión de esta rama: Prime r110 · 0.3.85 (115).** Reúne la RAM Éter de estados de r109, la gestión de presión de RAM y la corrección de reparto de CPU y despertares IRQ de la PR #99. El arranque completo de Windows 10 todavía necesita una prueba con una ISO real; el proyecto no incluye esa imagen.
+**Versión de esta rama: Prime r110 · 0.3.86 (116).** Reúne la RAM Éter de estados de r109, la gestión de presión de RAM y la corrección de reparto de CPU y despertares IRQ de la PR #99. Incluye las correcciones de mantenimiento de REP MOVS y compactación de RAM. El arranque completo de Windows 10 todavía necesita una prueba con una ISO real. El proyecto no incluye esa imagen.
 
 Reglas del proyecto:
 

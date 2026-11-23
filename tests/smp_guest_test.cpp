@@ -448,6 +448,46 @@ void test_ready_budget_with_parked_bsp(bool threaded, unsigned active_aps) {
                 "ready APs did not receive equal shares of the complete 96-step budget");
 }
 
+void test_serial_deadline_rotates_ready_cpus() {
+    using Clock = PcMachine::RunClock;
+    PcMachine pc(4U << 20);
+    pc.boot_demo();
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {2, 1});
+    board.enable_active_clock([] { return Clock::time_point{}; });
+    auto& cpu = pc.cpu;
+    cpu.reset(0, 0x7200);
+    cpu.write16(0x7200, 0xfeeb);
+    cpu.write16(kStartupVector << 12, 0xfeeb);
+    cpu.write32(kLapic + 0x310, 1U << 24);
+    cpu.write32(kLapic + 0x300, 0x600 | kStartupVector);
+    constexpr unsigned budget = 64;
+    board.run(budget);
+    require(board.processors_started() == 2, "deadline fixture did not start both CPUs");
+
+    auto deadline = Clock::time_point::max();
+    bool stall_bsp = false;
+    cpu.step_trace_hook = [&](const auto&) {
+        if (stall_bsp) {
+            stall_bsp = false;
+            std::this_thread::sleep_until(deadline);
+        }
+    };
+    const auto run_with_stall = [&] {
+        stall_bsp = true;
+        deadline = Clock::now() + std::chrono::milliseconds(25);
+        board.run(budget, deadline);
+    };
+    const auto ap_before = board.processor_steps(1);
+    run_with_stall();
+    require(!stall_bsp && board.processor_steps(1) == ap_before,
+            "first deadline must interrupt the round before the AP receives its share");
+    run_with_stall();
+    const auto ap_retired = board.processor_steps(1) - ap_before;
+    require(ap_retired == budget / 2 && !board.faulted_cpu(),
+            "the next deadline must give the previously skipped AP its share");
+    std::cout << "C06_SERIAL_DEADLINE_PASS ap_steps=" << ap_retired << '\n';
+}
+
 void test_sleeping_ap_irq_dispatches() {
     std::array<std::uint64_t, 2> dispatches{};
     for (const bool interrupts : {false, true}) {
@@ -1800,6 +1840,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string(argv[1]) == "--test-ready-budget") {
             for (const bool threaded : {false, true})
                 for (const unsigned active_aps : {1U, 2U}) test_ready_budget_with_parked_bsp(threaded, active_aps);
+            test_serial_deadline_rotates_ready_cpus();
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--test-idle-irq-dispatch") {
@@ -1843,6 +1884,7 @@ int main(int argc, char** argv) {
                 test_parked_timer_wake(threaded, parked_id, false, true);
             }
         }
+        test_serial_deadline_rotates_ready_cpus();
         test_sleeping_ap_irq_dispatches();
 #endif
         check_cpu_clock(Profile::Standard, 1);

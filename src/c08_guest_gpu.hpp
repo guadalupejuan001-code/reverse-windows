@@ -79,12 +79,13 @@ class GuestGpuC08 {
     color_.clear();
     const auto started = std::chrono::steady_clock::now();
     try {
-      renderer_.prepare();
-      renderer_name_ = renderer_.renderer_name();
-      hardware_ = renderer_.hardware_reported();
+      if (!renderer_) renderer_.emplace();
+      renderer_->prepare();
+      renderer_name_ = renderer_->renderer_name();
+      hardware_ = renderer_->hardware_reported();
       renderer_ready_at_power_on_ = true;
-    } catch (const std::exception&) {
-      // Boot video remains available. A guest draw retries the backend.
+    } catch (const std::exception& error) {
+      invalidate_renderer(error.what());
     }
     renderer_prepare_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - started).count();
@@ -280,6 +281,8 @@ class GuestGpuC08 {
         << ",\"renderer_ready_at_power_on\":" << (renderer_ready_at_power_on_ ? "true" : "false")
         << ",\"renderer_prepare_ns\":" << renderer_prepare_ns_
         << ",\"renderer\":" << cosmic_pc::PcMachine::quote(renderer_name_)
+        << ",\"renderer_failures\":" << renderer_failures_
+        << ",\"last_renderer_error\":" << cosmic_pc::PcMachine::quote(last_renderer_error_.data())
         << ",\"hardware_reported\":" << (hardware_ ? "true" : "false")
         << ",\"submit_and_present_ns\":" << host_ns_ << ",\"render_and_readback_ns\":" << backend_ns_
         << ",\"gpu_query_ns\":";
@@ -321,8 +324,9 @@ class GuestGpuC08 {
   std::uint64_t paging_upload_bytes_ = 0, paging_download_bytes_ = 0;
   std::optional<std::uint64_t> gpu_ns_;
   bool hardware_ = false, renderer_ready_at_power_on_ = false;
-  std::uint64_t renderer_prepare_ns_ = 0;
+  std::uint64_t renderer_prepare_ns_ = 0, renderer_failures_ = 0;
   std::string renderer_name_;
+  std::array<char, 192> last_renderer_error_{};
   std::array<std::uint32_t, 7> params_{};
   std::array<std::uint32_t, 3> direct_params_{};
   std::uint32_t pci_command_ = 0, bar_ = pci_window_start, status_ = RWGPU_IDLE, completed_ = 0;
@@ -336,7 +340,7 @@ class GuestGpuC08 {
   bool probe_bar_ = false;
   std::vector<std::uint8_t> stage_, transfer_, dma_commands_;
 #ifdef REVERSE_WINDOWS_GLES_GUEST
-  regraphics::GuestRenderer renderer_;
+  std::optional<regraphics::GuestRenderer> renderer_;
   RenderPlan previous_plan_;
   unsigned previous_width_ = 0, previous_height_ = 0, previous_clear_ = 0;
   bool previous_alpha_ = false;
@@ -867,6 +871,19 @@ class GuestGpuC08 {
   }
 
 #ifdef REVERSE_WINDOWS_GLES_GUEST
+  void invalidate_renderer(const char* reason) noexcept {
+    // Release the failed EGL context after the renderer restores the caller's binding.
+    // A later draw can establish a fresh context while boot VGA remains available.
+    renderer_.reset();
+    hardware_ = false;
+    renderer_name_.clear();
+    gpu_ns_.reset();
+    ++renderer_failures_;
+    const auto length = std::min(std::strlen(reason), last_renderer_error_.size() - 1);
+    std::memcpy(last_renderer_error_.data(), reason, length);
+    last_renderer_error_[length] = '\0';
+  }
+
   unsigned select_ether_triangles(std::uint64_t offset, std::size_t triangles) {
     const auto bytes = (triangles + 7) / 8;
     if (!GpuVram::valid_range(offset, bytes)) return RWGPU_INVALID;
@@ -920,7 +937,13 @@ class GuestGpuC08 {
                                           vertices.size() * sizeof(xgpu::GuestVertex)) == 0);
     std::optional<regraphics::GuestRenderReceipt> receipt;
     if (!replay) {
-      receipt = renderer_.render(*plan, width, height, clear, bgrx_, alpha);
+      if (!renderer_) renderer_.emplace();
+      try {
+        receipt = renderer_->render(*plan, width, height, clear, bgrx_, alpha);
+      } catch (const std::runtime_error& error) {
+        invalidate_renderer(error.what());
+        throw;
+      }
       if (bgrx_.size() != pixels) return RWGPU_FAILED;
       ++backend_frames_;
       readback_bytes_ += pixels;
