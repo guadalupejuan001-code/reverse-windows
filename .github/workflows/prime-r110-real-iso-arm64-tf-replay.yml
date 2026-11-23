@@ -1,0 +1,135 @@
+name: Prime R110 ARM64 trap-flag replay up to 18B
+
+on:
+  push:
+    branches: [ci/prime-r110-arm64-tf-replay]
+    paths:
+      - .github/benchmarks/prime-iso-arm64/tf-replay-targets.json
+      - .github/workflows/prime-r110-real-iso-arm64-tf-replay.yml
+
+permissions:
+  contents: read
+
+env:
+  AVAILABLE_MIB: '749'
+  THRESHOLD_MIB: '128'
+  STOP_TARGET: '18000000000'
+  PROBE_TIMEOUT_SECONDS: '4200'
+
+jobs:
+  sustained-official-iso:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 85
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify pins and validate the production ARM64 trap-flag test
+        id: revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence"
+          python3 "$bench/resolve-combined.py" "$bench/tf-replay-targets.json" --reference-only-allowed \
+            > "$RUNNER_TEMP/targets.tsv"
+          cp "$bench/tf-replay-targets.json" "$evidence/targets.json"
+          sudo apt-get update -qq
+          packages=(ninja-build libcurl4-openssl-dev zlib1g-dev
+                    libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri)
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${packages[@]}"
+          while IFS=$'\t' read -r role product_sha core_sha; do
+            product="$RUNNER_TEMP/product-$role"
+            bash "$bench/checkout-product.sh" "$product" "$product_sha" "$core_sha"
+            cp "$product/config/dependencies.lock.json" "$evidence/$role-dependencies.lock.json"
+            gate="$RUNNER_TEMP/gate-$role"
+            cmake -S "$product" -B "$gate" -G Ninja -DBUILD_TESTING=ON \
+              -DREVERSE_WINDOWS_GLES_GUEST=OFF -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
+            cmake --build "$gate" --target reverse_windows_c09r_cpu_features reverse_windows_x86_system64_test --parallel 2
+            ctest --test-dir "$gate" --no-tests=error --verbose \
+              -R '^reverse_windows_(c09r_real_cpu_cx16_prefetchw|x86_system64)$' | tee "$evidence/$role-trap-flag-test.log"
+            grep -q 'WINDOWS_X64_TRAP_FLAG_PASS' "$evidence/$role-trap-flag-test.log"
+            grep -q 'X86_SYSTEM64_PASS' "$evidence/$role-trap-flag-test.log"
+            cmake -S "$bench" -B "$RUNNER_TEMP/build-$role" -G Ninja \
+              -DREVERSE_WINDOWS_SOURCE="$product" -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
+            cmake --build "$RUNNER_TEMP/build-$role" --target session_probe --parallel 2
+          done < "$RUNNER_TEMP/targets.tsv"
+          cc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -o "$RUNNER_TEMP/verified_iso.so" \
+            "$bench/verified_iso.c" -lcurl -pthread
+          sha256sum "$RUNNER_TEMP"/build-*/session_probe "$RUNNER_TEMP/verified_iso.so" > "$evidence/native-sha256.txt"
+      - name: Start the pinned correction and observe 11.5B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          python3 - <<'PY' > "$RUNNER_TEMP/probe-cpu"
+          import os
+          cpus = sorted(os.sched_getaffinity(0))[:2]
+          if len(cpus) < 2:
+              raise SystemExit("At least two host CPUs are required for this SMP probe")
+          print(",".join(map(str, cpus)))
+          PY
+          {
+            uname -m
+            lscpu
+            c++ --version
+            printf 'CPU affinity %s\n' "$(cat "$RUNNER_TEMP/probe-cpu")"
+          } > "$evidence/runner.txt"
+          nohup bash "$bench/run-combined-role.sh" reference < /dev/null > "$evidence/reference-driver.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/reference.pid"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/reference-progress" 11500000000
+      - name: Upload the 11.5B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-tf-replay-11-5b-target
+          path: ${{ runner.temp }}/reference-progress/
+      - name: Observe 15.2B beyond the unsupported POPFQ stop
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/post-popfq-checkpoint" 15200000000
+      - name: Upload the 15.2B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-tf-replay-15-2b-target
+          path: ${{ runner.temp }}/post-popfq-checkpoint/
+      - name: Record the same session at 16.5B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/pre-fault-checkpoint" 16500000000
+      - name: Upload observation for the 16.5B target
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-tf-replay-16-5b-target
+          path: ${{ runner.temp }}/pre-fault-checkpoint/
+      - name: Record the exact terminal state, or continue to 18B or 70 minutes
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/evidence"
+          pid=$(cat "$RUNNER_TEMP/reference.pid")
+          while [[ ! -f "$RUNNER_TEMP/reference.exit" ]]; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo 'Reference driver ended before recording its exit code' >&2
+              exit 1
+            fi
+            if [[ -s "$evidence/reference.stdout" ]]; then
+              tail -n1 "$evidence/reference.stdout"
+            fi
+            sleep 20
+          done
+          if [[ -s "$evidence/reference.stdout" ]]; then tail -n1 "$evidence/reference.stdout"; fi
+          test "$(cat "$RUNNER_TEMP/reference.exit")" = 0
+      - name: Preserve late per-vCPU execution and IRQ evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-tf-replay-raw-final
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
