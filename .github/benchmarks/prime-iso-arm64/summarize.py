@@ -12,7 +12,7 @@ NATIVE = ("translated", "executed_blocks", "cache_hits", "data_fallbacks", "gues
           "resident_read_hits", "off_bus_register_steps", "repeated_loop_steps", "repeated_loop_dispatches",
           "staged_ram_blocks", "staged_ram_steps", "coalesced_ram_writes", "ram_add_guest_steps",
           "on_bus_register_steps", "register_bus_reacquisitions", "register_bus_reacquire_samples",
-          "register_bus_reacquire_contentions", "register_bus_reacquire_wait_ns")
+          "register_bus_reacquire_contentions", "register_bus_reacquire_wait_ns", "native_compile_ns")
 BOOT_LOOPS = ("boot_scan_loop_steps", "boot_forward_copy_loop_steps", "boot_zero_loop_steps",
               "boot_rep_elements", "boot_rep_direct_page_copy_bytes", "boot_counter_loop_steps",
               "boot_streaming_sse_fill_steps", "secondary_streaming_sse_fill_steps")
@@ -97,6 +97,7 @@ def load_checkpoint(record):
             "ram_backend": vm["ram_profile"].get("memory_backend"),
             "ram_spill_backend": vm["ram_profile"].get("spill_backend") or "none",
             "system_disk_bytes": vm["disk"].get("logical_bytes"),
+            "system_disk_initial_commits": vm["disk"].get("initial_commits"),
             "data_disk_bytes": vm.get("data_disk", {}).get("logical_bytes", 0),
         },
         "tsc_access": topology.get("tsc_access"),
@@ -122,6 +123,9 @@ def load_checkpoint(record):
         "ata_device": pick(vm.get("ata", {}), ATA_DEVICE),
         "coverage": pick(vm["ether_coverage"], COVERAGE),
         "native_arm64": pick(arm64, NATIVE),
+        "native_arm64_limits": pick(arm64, ("block_max_instructions", "block_max_bytes")),
+        "native_arm64_cache": pick(arm64.get("x86_virtual_space", {}),
+                                  ("cache_metadata_bytes", "allocated_sets", "translated_block_capacity")),
         "boot_loops": pick(vm.get("ether_next", {}), BOOT_LOOPS),
         "native_arm64_supported": arm64["host_supported"],
         "native_arm64_enabled": arm64["enabled"],

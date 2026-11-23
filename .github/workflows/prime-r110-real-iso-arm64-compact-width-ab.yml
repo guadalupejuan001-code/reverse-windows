@@ -1,15 +1,15 @@
-name: Prime R110 ARM64 parked vCPU scheduler Windows ISO A/B
+name: Prime R110 ARM64 compact block Windows ISO A/B
 
 on:
   push:
-    branches: [ci/prime-r110-arm64-parked-native-iso-ab]
+    branches: [ci/prime-r110-arm64-compact-iso-ab]
     paths:
-      - .github/benchmarks/prime-iso-arm64/parked-native-iso-targets.json
-      - .github/benchmarks/prime-iso-arm64/parked-native-iso-progress.py
+      - .github/benchmarks/prime-iso-arm64/compact-width-iso-targets.json
+      - .github/benchmarks/prime-iso-arm64/compact-width-iso-progress.py
       - .github/benchmarks/prime-iso-arm64/run-combined-role.sh
       - .github/benchmarks/prime-iso-arm64/session_probe.cpp
       - .github/benchmarks/prime-iso-arm64/summarize.py
-      - .github/workflows/prime-r110-real-iso-arm64-parked-native-ab.yml
+      - .github/workflows/prime-r110-real-iso-arm64-compact-width-ab.yml
 
 permissions:
   contents: read
@@ -18,7 +18,7 @@ env:
   AVAILABLE_MIB: '749'
   THRESHOLD_MIB: '128'
   STOP_TARGET: '12500000000'
-  PROBE_TIMEOUT_SECONDS: '1680'
+  PROBE_TIMEOUT_SECONDS: '1620'
 
 jobs:
   native-iso-pair:
@@ -36,13 +36,13 @@ jobs:
           bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
           evidence="$RUNNER_TEMP/evidence"
           mkdir -p "$evidence"
-          python3 "$bench/resolve-combined.py" "$bench/parked-native-iso-targets.json" > "$RUNNER_TEMP/targets.tsv"
-          cp "$bench/parked-native-iso-targets.json" "$evidence/targets.json"
+          python3 "$bench/resolve-combined.py" "$bench/compact-width-iso-targets.json" > "$RUNNER_TEMP/targets.tsv"
+          cp "$bench/compact-width-iso-targets.json" "$evidence/targets.json"
           python3 - <<'PY' > "$RUNNER_TEMP/probe-cpu"
           import os
           cpus = sorted(os.sched_getaffinity(0))[:2]
           if len(cpus) != 2:
-              raise SystemExit("Two physical ARM64 runner CPU slots are required")
+              raise SystemExit("Two native ARM64 runner CPU slots are required")
           print(",".join(map(str, cpus)))
           PY
           {
@@ -63,51 +63,74 @@ jobs:
             git -C "$product/deps/mundo-X" diff --exit-code
             cp "$product/config/dependencies.lock.json" "$evidence/$role-dependencies.lock.json"
             cmake -S "$bench" -B "$RUNNER_TEMP/build-$role" -G Ninja \
-              -DREVERSE_WINDOWS_SOURCE="$product" -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
+              -DREVERSE_WINDOWS_SOURCE="$product" -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG' \
+              -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+            cp "$RUNNER_TEMP/build-$role/compile_commands.json" "$evidence/$role-compile-commands.json"
             cmake --build "$RUNNER_TEMP/build-$role" --target session_probe --parallel 2
           done < "$RUNNER_TEMP/targets.tsv"
-          cmp "$evidence/reference-dependencies.lock.json" "$evidence/candidate-dependencies.lock.json"
+          python3 - "$evidence" <<'PY'
+          import json
+          from pathlib import Path
+          from shlex import split
+          import sys
+
+          evidence = Path(sys.argv[1])
+          flags = ("-DMUNDO_X_ETHER_ARM64_WIDE_BLOCK_EXPERIMENT=1",
+                   "-DMUNDO_X_ETHER_ARM64_COMPACT_BLOCK_EXPERIMENT=1")
+          external_locks = {}
+          for role in ("reference", "candidate"):
+              lock = json.loads((evidence / f"{role}-dependencies.lock.json").read_text())
+              lock["components"] = [entry for entry in lock["components"] if entry["key"] != "mundo_x"]
+              external_locks[role] = lock
+              commands = json.loads((evidence / f"{role}-compile-commands.json").read_text())
+              command, = (row["command"] for row in commands if Path(row["file"]).name == "session_probe.cpp")
+              if any((flag in split(command)) != (role == "candidate") for flag in flags):
+                  raise SystemExit(f"{role}: session_probe did not inherit its expected translation flags")
+          if external_locks["reference"] != external_locks["candidate"]:
+              raise SystemExit("Both roles must use identical non-Mundo X dependency locks")
+          PY
           cmp "$RUNNER_TEMP/product-reference/config/integration-manifest.json" \
             "$RUNNER_TEMP/product-candidate/config/integration-manifest.json"
           cc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -o "$RUNNER_TEMP/verified_iso.so" \
             "$bench/verified_iso.c" -lcurl -pthread
           sha256sum "$RUNNER_TEMP"/build-*/session_probe "$RUNNER_TEMP/verified_iso.so" > "$evidence/native-sha256.txt"
-      - name: Gate both ISO runs on native SMP and parked IRQ correctness
-        id: native_ap
+      - name: Gate the ISO runs on the native ARM64 translator and SMP contracts
+        id: native_gate
         shell: bash
         run: |
           set -euo pipefail
           evidence="$RUNNER_TEMP/evidence"
           smp_test=reverse_windows_smp_guest_test
+          ether_test=reverse_windows_prime_ether_arm64_test
           build="$RUNNER_TEMP/gate-candidate"
           cmake -S "$RUNNER_TEMP/product-candidate" -B "$build" -G Ninja \
             -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
-          cmake --build "$build" --target "$smp_test" --parallel 2
+          cmake --build "$build" --target "$ether_test" "$smp_test" --parallel 2
           affinity=$(cat "$RUNNER_TEMP/probe-cpu")
-          taskset -c "$affinity" "$build/$smp_test" --test-parked-native \
-            | tee "$evidence/native-ap-parked-native.log"
           taskset -c "$affinity" ctest --test-dir "$build" --output-on-failure -V \
-            -R '^reverse_windows_smp_guest$' \
-            --no-tests=error --output-junit "$evidence/native-ap-oracles.xml" | tee "$evidence/native-ap-oracles.log"
-      - name: Observe the candidate until 12.5B guest steps or 28 minutes
+            -R '^reverse_windows_(prime_ether_arm64|smp_guest)$' \
+            --no-tests=error --output-junit "$evidence/native-oracles.xml" | tee "$evidence/native-oracles.log"
+          grep -Eq 'PRIME_ETHER_FORWARD_WIDTH_BENCH .*"max_instructions":32,"max_bytes":128,"body_instructions":27,.*"native_blocks_per_body":1' \
+            "$evidence/native-oracles.log"
+      - name: Observe the candidate until 12.5B guest steps or 27 minutes
         shell: bash
         run: |
           bash "$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64/run-combined-role.sh" candidate
       - name: Summarize the experimental counters before the same-runner control
-        if: ${{ (success() || failure()) && steps.native_ap.outcome == 'success' }}
+        if: ${{ (success() || failure()) && steps.native_gate.outcome == 'success' }}
         shell: bash
         run: |
-          python3 "$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64/parked-native-iso-progress.py" \
+          python3 "$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64/compact-width-iso-progress.py" \
             "$RUNNER_TEMP/evidence" --candidate-only
       - name: Preserve the candidate observation
-        if: ${{ (success() || failure()) && steps.native_ap.outcome == 'success' }}
+        if: ${{ (success() || failure()) && steps.native_gate.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-parked-native-iso-candidate
+          name: prime-r110-arm64-compact-iso-candidate
           path: ${{ runner.temp }}/evidence/
           if-no-files-found: error
       - name: Observe the exact .8 control on the same CPUs, bound and optical media
-        if: ${{ (success() || failure()) && steps.native_ap.outcome == 'success' }}
+        if: ${{ (success() || failure()) && steps.native_gate.outcome == 'success' }}
         shell: bash
         run: |
           # The candidate already exported its evidence. Reclaim the disposable
@@ -115,15 +138,15 @@ jobs:
           rm -rf -- "$RUNNER_TEMP/session-candidate"
           bash "$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64/run-combined-role.sh" reference
       - name: Compare aligned wall time and 10.5B to 11.5B guest-step observations
-        if: ${{ (success() || failure()) && steps.native_ap.outcome == 'success' }}
+        if: ${{ (success() || failure()) && steps.native_gate.outcome == 'success' }}
         shell: bash
         run: |
-          python3 "$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64/parked-native-iso-progress.py" \
+          python3 "$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64/compact-width-iso-progress.py" \
             "$RUNNER_TEMP/evidence"
       - name: Preserve pinned native tests and both real ISO observations
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-parked-native-iso-pair
+          name: prime-r110-arm64-compact-iso-pair
           path: ${{ runner.temp }}/evidence/
           if-no-files-found: warn
