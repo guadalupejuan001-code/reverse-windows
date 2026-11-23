@@ -2314,6 +2314,9 @@ class PcMotherboardC06 {
   std::uint64_t processor_steps(unsigned id) const noexcept {
     return apics_[id].cpu->instructions + retired_before_init_[id];
   }
+  std::uint64_t processor_crc32c_retired(unsigned id) const noexcept {
+    return apics_[id].cpu->crc32c_retired;
+  }
   const cosmic_pc::Cpu::TscAccessStats& processor_tsc_access_stats(unsigned id) const noexcept {
     return apics_[id].cpu->tsc_access_stats();
   }
@@ -2337,7 +2340,7 @@ class PcMotherboardC06 {
   }
   struct CpuExecutionTotals {
     std::uint64_t guest_steps = 0, ether_steps = 0, projected_steps = 0;
-    std::uint64_t state_vector_interpreter_steps = 0;
+    std::uint64_t state_vector_interpreter_steps = 0, crc32c_retired = 0;
     unsigned processors_with_projected_steps = 0;
     RamViewStats ram_views;
     cosmic_pc::Cpu::TscAccessStats tsc_access;
@@ -2359,6 +2362,7 @@ class PcMotherboardC06 {
       totals.tsc_access.read_adjust += tsc.read_adjust;
       totals.tsc_access.write_adjust += tsc.write_adjust;
       totals.guest_steps += processor_steps(id);
+      totals.crc32c_retired += processor_crc32c_retired(id);
       totals.ether_steps += processor_ether_arm64_steps(id);
       totals.projected_steps += projected;
       totals.state_vector_interpreter_steps += processor_state_vector_interpreter_steps(id);
