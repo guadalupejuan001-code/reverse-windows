@@ -1,13 +1,13 @@
-name: Verify Prime R110 throughput ARM64 APK installation
+name: Verify Prime R110 long-mode ARM64 APK installation
 
 on:
   push:
-    branches: [ci/prime-r110-throughput-arm64-install]
+    branches: [ci/prime-r110-long64-arm64-install]
     paths: [.github/workflows/verify-r110-ether-cache-arm64-install.yml]
   workflow_dispatch:
     inputs:
       apk_sha256:
-        description: SHA-256 of the existing release APK from run 45147645088
+        description: SHA-256 of the existing release APK from run 45157826579
         required: true
         type: string
 
@@ -20,17 +20,20 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      APP_ID: com.reversewindows.android.prime.smp.r110.perftest
-      SOURCE_SHA: e3d971be5e8610d1c06ac5d74f2b18368ca3b773
-      APK_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.3-e3d971be5e86-arm64-v8a-release.apk
-      EXPECTED_APK_SHA256: ${{ inputs.apk_sha256 || '1c1567b9342de953ce7e7dc64ade2e0607c826c28105affff58b7084afeff4aa' }}
+      APP_ID: com.reversewindows.android.prime.smp.r110.long64test
+      SOURCE_SHA: 90912908d4235f7c8d9365b92ad1b2fe25ab4766
+      MUNDO_X_SHA: 1d31a6b8bcf1c72b48536f5365f7f5dacbc42a7c
+      APK_VERSION_NAME: 0.3.88-perf-test.4
+      APK_VERSION_CODE: '123'
+      APK_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.4-90912908d423-arm64-v8a-release.apk
+      EXPECTED_APK_SHA256: ${{ inputs.apk_sha256 || 'bc083568d587eab1902e570def8b85545c1429db1038cd9924a80240fa3535d2' }}
     steps:
       - name: Download the existing ARM64 release
         uses: actions/download-artifact@v4
         with:
-          name: REVERSE-Windows-Prime-0.3.88-perf-test.3-e3d971be5e86-ARM64
+          name: REVERSE-Windows-Prime-0.3.88-perf-test.4-90912908d423-ARM64
           path: arm64-release
-          run-id: 45147645088
+          run-id: 45157826579
           github-token: ${{ github.token }}
 
       - name: Enable KVM for the x86 Android emulator
@@ -49,7 +52,7 @@ jobs:
       - name: Check the exact bytes to be installed
         shell: bash
         run: |
-          set -eu
+          set -euo pipefail
           evidence="$RUNNER_TEMP/r110-install-evidence"
           mkdir -p "$evidence"
           apk="arm64-release/$APK_NAME"
@@ -59,12 +62,20 @@ jobs:
             arm64-release/SHA256SUMS > "$evidence/archive-checksum.txt"
           sha256sum --check "$evidence/archive-checksum.txt"
           unzip -p "$apk" assets/build-source.txt | diff -u <(printf '%s\n' "$SOURCE_SHA") -
+          unzip -p "$apk" assets/dependencies.lock.json | cmp - arm64-release/dependencies.lock.json
+          unzip -p "$apk" assets/integration-manifest.json | cmp - arm64-release/integration-manifest.json
           grep -Fxq "source_sha=$SOURCE_SHA" arm64-release/build.txt
+          grep -Fxq "mundo_x_sha=$MUNDO_X_SHA" arm64-release/build.txt
           tools="$ANDROID_HOME/build-tools/35.0.0"
           "$tools/apksigner" verify --verbose --print-certs "$apk" > "$evidence/signature.txt"
+          "$tools/zipalign" -c -P 16 -v 4 "$apk" > "$evidence/alignment.txt"
           "$tools/aapt" dump badging "$apk" > "$evidence/manifest.txt"
-          grep -Fq "package: name='$APP_ID' versionCode='122' versionName='0.3.88-perf-test.3'" "$evidence/manifest.txt"
+          grep -Fq "package: name='$APP_ID' versionCode='$APK_VERSION_CODE' versionName='$APK_VERSION_NAME'" "$evidence/manifest.txt"
           grep -Fxq "native-code: 'arm64-v8a'" "$evidence/manifest.txt"
+          if grep -Fxq 'application-debuggable' "$evidence/manifest.txt"; then
+            printf 'The selected release APK is debuggable.\n' >&2
+            exit 1
+          fi
 
       - name: Prepare installation and BIOS checks
         shell: bash
@@ -100,7 +111,7 @@ jobs:
             grep -Fxq 'Status: ok' "$evidence/launch.txt"
             adb shell dumpsys package "$APP_ID" > "$evidence/package.txt"
             grep -Fq 'primaryCpuAbi=arm64-v8a' "$evidence/package.txt"
-            grep -Fq 'versionName=0.3.88-perf-test.3' "$evidence/package.txt"
+            grep -Fq "versionName=$APK_VERSION_NAME" "$evidence/package.txt"
             adb shell pidof "$APP_ID"
           } 2>&1 | tee "$evidence/install.txt"
           adb exec-out screencap -p > "$evidence/launch.png"
@@ -205,6 +216,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: prime-r110-arm64-bridge-install-e3d971be5e86
+          name: prime-r110-arm64-bridge-install-90912908d423
           path: ${{ runner.temp }}/r110-install-evidence
           if-no-files-found: warn
