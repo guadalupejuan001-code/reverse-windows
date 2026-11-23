@@ -8,10 +8,11 @@ permissions:
   contents: read
 
 env:
-  PRODUCT_SHA: c92856e6e35a81d774210ddce6fa789a528f0090
-  MUNDO_X_SHA: 4b014ac6e4419e523167ba3e7ac034e3a16877e3
+  PRODUCT_SHA: ccf66d7a3b0ba48e687d80660737ac035741bb1d
+  MUNDO_X_SHA: ae7ba3593b40ef8ddfe5b4a079073ac102454874
   AVAILABLE_MIB: '2048'
   THRESHOLD_MIB: '256'
+  STOP_TARGET: '1000000000'
 
 jobs:
   real-iso-slice:
@@ -57,7 +58,7 @@ jobs:
           chmod 400 "$iso"
           export PROBE_CPU
           PROBE_CPU="$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')"
-          probe=("$RUNNER_TEMP/build/session_probe" "$iso" "$output" 700000000 600
+          probe=("$RUNNER_TEMP/build/session_probe" "$iso" "$output" "$STOP_TARGET" 600
                  "$AVAILABLE_MIB" "$THRESHOLD_MIB")
           optical_env=(EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1
                        LD_PRELOAD="$RUNNER_TEMP/verified_iso.so" R110_REMOTE_ISO_STUB="$iso")

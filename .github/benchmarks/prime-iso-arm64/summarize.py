@@ -76,6 +76,29 @@ def compare(first, last):
     }
 
 
+def continuation_record(run_dir, target):
+    report = run_dir / "session.json"
+    if not report.is_file():
+        return {"target_steps": target, "complete": False}
+    vm = json.loads(report.read_text())
+    machine = vm["machine"]
+    boot = vm["boot_progress"]
+    phases = [entry["state"] for entry in vm.get("boot_profile", {}).get("checkpoints", [])
+              if entry["state"]["steps"] >= 700_000_000]
+    return {
+        "target_steps": target,
+        "actual_steps": boot["session_steps"],
+        "complete": boot["session_steps"] >= target,
+        "status": vm["status"],
+        "cpu_mode": machine["cpu_mode"],
+        "long64_observed": machine["cpu_mode"] == "long64" or any(p["mode"] == "long64" for p in phases),
+        "restarts": boot["restarts"],
+        "bios_reads": machine["disk_reads"],
+        "iso_read_us": vm["iso_read_us"],
+        "phase_samples": [pick(phase, ("steps", "mode")) for phase in phases],
+    }
+
+
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--run", type=Path, required=True)
@@ -101,6 +124,7 @@ def main():
 
     product_sha = os.environ["PRODUCT_SHA"]
     core_sha = os.environ["MUNDO_X_SHA"]
+    stop_target = int(os.environ.get("STOP_TARGET", "700000000"))
     valid_checkpoints = all(
         target in checkpoints and checkpoints[target]["native_arm64_supported"]
         and checkpoints[target]["native_arm64_enabled"]
@@ -128,6 +152,8 @@ def main():
         summary["validated_measurement"] = bool(
             args.exit_code == 0 and valid_source and not summary["measured_segment"]["restarts_in_interval"]
         )
+    if stop_target > 700_000_000:
+        summary["continuation"] = continuation_record(args.run, stop_target)
     args.output.write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
     return 0 if summary["validated_measurement"] else 1
