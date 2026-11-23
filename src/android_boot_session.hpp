@@ -761,7 +761,8 @@ class AndroidBootSession final {
     const auto gate_work = pc_.quantum_session->gate_work_stats();
     const auto& boot_work = pc_.boot_acceleration();
     const auto batched_steps = boot_work.rep_elements + boot_work.shift_loop_steps +
-        boot_work.zero_loop_steps + boot_work.scan_loop_steps + boot_work.counter_loop_steps +
+        boot_work.zero_loop_steps + boot_work.scan_loop_steps + boot_work.forward_copy_loop_steps +
+        boot_work.counter_loop_steps +
         boot_work.affine_ram_rotate_steps + boot_work.movntdq_store_steps + board_->secondary_store_steps() +
         board_->secondary_rep_elements() + board_->secondary_scan_steps() + board_->secondary_shift_steps() +
         board_->secondary_zero_steps() + board_->secondary_multiply_steps() + execution.state_vector_interpreter_steps;
@@ -789,6 +790,7 @@ class AndroidBootSession final {
         << ",\"boot_zero_loop_batches\":" << boot_work.zero_loop_batches
         << ",\"boot_zero_loop_steps\":" << boot_work.zero_loop_steps
         << ",\"boot_scan_loop_steps\":" << boot_work.scan_loop_steps
+        << ",\"boot_forward_copy_loop_steps\":" << boot_work.forward_copy_loop_steps
         << ",\"boot_counter_loop_batches\":" << boot_work.counter_loop_batches
         << ",\"boot_counter_loop_steps\":" << boot_work.counter_loop_steps
         << ",\"boot_wide_multiply_loop_batches\":" << boot_work.wide_multiply_loop_batches

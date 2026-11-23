@@ -9,6 +9,7 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -365,6 +366,62 @@ void zero_boot_with_lapic_guest(){
   need(cpu.try_zero_loop_batch(17)==16&&cpu.eip==0xa000&&cpu.regs[Cpu::ECX]==75,
        "only whole zero-loop iterations may retire within a slice");
 }
+void forward_copy_boot_guest() {
+  constexpr unsigned entry = 0xa000, base = 0x200000, count = 1577;
+  const std::vector<std::uint8_t> program{
+      0x8a,0x01,0x88,0x04,0x1a,0x43,0x41,0x4f,0x85,0xff,0x7f,0xf4,0xfa,0xf4};
+  const auto check = [&](bool accelerate, unsigned source, unsigned target, bool interrupt) {
+    PcMachine pc(16*1024*1024);
+    boot32(pc);
+    PcMotherboardC06 board(pc);
+    pc.enable_boot_acceleration(accelerate);
+    auto& cpu = pc.cpu;
+    cpu.a20_enabled = true;
+    std::vector<std::uint8_t> data(3 * cosmic_pc::MemoryFabric::kPageSize);
+    for (unsigned i = 0; i < data.size(); ++i) data[i] = std::uint8_t(i ^ (i >> 4) ^ (i >> 10));
+    code(cpu, base, data);
+    code(cpu, entry, program);
+    cpu.eip = entry;
+    cpu.regs[Cpu::EAX] = 0x123456ff;
+    cpu.regs[Cpu::EBX] = 17;
+    cpu.regs[Cpu::ECX] = source;
+    cpu.regs[Cpu::EDX] = target - 17;
+    cpu.regs[Cpu::EDI] = count;
+    cpu.eflags = 2 | Cpu::DF | Cpu::CF | Cpu::OF;
+    if (interrupt) {
+      cpu.eflags |= Cpu::IF;
+      cpu.idtr = {0x1000, 0x15000};
+      cpu.regs[Cpu::ESP] = 0x190000;
+      gate(cpu, 0x42, 0x13000);
+      code(cpu, 0x13000, {
+          0x50,0x8b,0x44,0x24,0x04,0xa3,0x00,0x91,0,0, // Record interrupted EIP.
+          0xc7,0x05,0xb0,0,0xe0,0xfe,0,0,0,0,0x58,0xcf}); // EOI and IRETD.
+      cpu.write32(0xfee000f0, 0x1ff);
+      cpu.write32(0xfee00320, 0x42);
+      cpu.write32(0xfee00380, 193);
+    }
+    for (unsigned window = 0; window < 100 && !cpu.halted; ++window) run(pc, 241);
+    need(cpu.halted && !cpu.regs[Cpu::EDI] && cpu.regs[Cpu::ECX] == source + count &&
+         cpu.regs[Cpu::EBX] == 17 + count && cpu.regs[Cpu::EDX] == target - 17,
+         "forward copy did not complete with the expected registers");
+    need(!accelerate || pc.boot_acceleration().forward_copy_loop_steps > 7 * (count / 2),
+         "forward copy did not run through the board's bounded fast path");
+    need(board.evidence().apic_irqs == unsigned(interrupt), "forward copy changed IRQ delivery");
+    cpu.memory.read_block(base, data.data(), data.size());
+    return std::make_pair(std::move(data), std::array<std::uint64_t, 6>{
+        cpu.regs[Cpu::EAX], cpu.eflags, cpu.eip, cpu.instructions, cpu.read32(0x9100), board.evidence().ticks});
+  };
+  const auto compare = [&](unsigned source, unsigned target, bool interrupt = false) {
+    need(check(false, source, target, interrupt) == check(true, source, target, interrupt),
+         "forward copy changed memory, flags, the instruction count or an IRQ boundary");
+  };
+  compare(base + 300, base + 4093, true);
+  compare(base + 300, base + 303);
+  compare(base + 303, base + 300);
+  compare(base + 300, base + 300);
+  std::cout << "ETHER_BOOT_FORWARD_COPY_PASS overlap=1 page_split=1 lapic=1\n";
+}
+
 void pic_legacy_x87_guest(){
   PcMachine pc(16*1024*1024);boot32(pc);
   PcMotherboardC06 board(pc);
@@ -1757,6 +1814,7 @@ int main(){
     std::cout<<"ETHER_BOOT_IRQ_TIMING_PASS pit=1 lapic=1 shift_loop=1\n";
     zero_boot_with_lapic_guest();
     std::cout<<"ETHER_BOOT_ZERO_LOOP_PASS protected32=1 lapic=1 bounds=1\n";
+    forward_copy_boot_guest();
     optical_irq_wakes_sti_hlt();
     pic_legacy_x87_guest();
     pci_acpi_cmos_guest();
