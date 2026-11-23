@@ -782,6 +782,7 @@ class AndroidBootSession final {
         boot_work.zero_loop_steps + boot_work.scan_loop_steps + boot_work.forward_copy_loop_steps +
         boot_work.counter_loop_steps +
         boot_work.affine_ram_rotate_steps + boot_work.movntdq_store_steps + board_->secondary_store_steps() +
+        boot_work.movaps_store_steps + board_->secondary_movaps_steps() +
         board_->secondary_rep_elements() + board_->secondary_scan_steps() + board_->secondary_shift_steps() +
         board_->secondary_zero_steps() + board_->secondary_multiply_steps() + execution.state_vector_interpreter_steps;
     const auto accelerated_steps = execution.ether_steps + batched_steps;
@@ -821,6 +822,10 @@ class AndroidBootSession final {
         << ",\"boot_movntdq_store_steps\":" << boot_work.movntdq_store_steps
         << ",\"secondary_movntdq_store_batches\":" << board_->secondary_store_batches()
         << ",\"secondary_movntdq_store_steps\":" << board_->secondary_store_steps()
+        << ",\"boot_movaps_store_batches\":" << boot_work.movaps_store_batches
+        << ",\"boot_movaps_store_steps\":" << boot_work.movaps_store_steps
+        << ",\"secondary_movaps_store_batches\":" << board_->secondary_movaps_batches()
+        << ",\"secondary_movaps_store_steps\":" << board_->secondary_movaps_steps()
         << ",\"secondary_rep_elements\":" << board_->secondary_rep_elements()
         << ",\"secondary_rep_bytes\":" << board_->secondary_rep_bytes()
         << ",\"secondary_scan_loop_steps\":" << board_->secondary_scan_steps()

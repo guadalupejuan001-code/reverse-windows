@@ -1208,6 +1208,88 @@ void test_secondary_streaming_stores(bool threaded) {
     }
 }
 
+void test_directed_irq_aligned_stores(bool threaded) {
+    constexpr unsigned vector = 0xd1, handler = 0x18000, idt = 0x16000;
+    constexpr unsigned source = 0xa000, saved_mxcsr = 0xc0ac, destination = 0xc0f0;
+    constexpr unsigned saved_flags = 0xd000, saved_rsp = 0xd004, stack = 0x1f0000;
+    constexpr std::uint8_t guest[] = {
+        0xbc,0,0,0x1f,0, 0xbd,0,0xc1,0,0,                         // Initial RSP and RBP.
+        0x0f,0x20,0xe0, 0x0d,0,2,0,0, 0x0f,0x22,0xe0,          // CR4.OSFXSR.
+        0xb9,0x01,0x01,0,0xc0, 0xb8,0,0xa8,0,0, 0x31,0xd2, 0x0f,0x30, // GS base.
+        0xf3,0x0f,0x6f,0x04,0x25,0,0xa0,0,0,                    // Load the known XMM0 bytes.
+        0x0f,0x01,0x1c,0x25,0x80,0x51,0,0,                     // LIDT [5180h].
+        0xbb,0,0,0xe0,0xfe, 0xc7,0x83,0xf0,0,0,0,0xff,1,0,0, // Enable AP LAPIC.
+        0xfb,0xf4,                                               // Wake only upon the fixed IPI.
+        0x9c,0x58,0x89,0x04,0x25,0,0xd0,0,0,                    // Publish flags restored by IRETQ.
+        0x89,0x24,0x25,4,0xd0,0,0,0xfa,0xf4                     // Publish ESP, then CLI; HLT.
+    };
+    constexpr std::uint8_t isr[] = {
+        0x0f,0xae,0x5d,0xac, 0x65,0x0f,0xae,0x14,0x25,0x80,0x01,0,0, // STMXCSR; GS LDMXCSR.
+        0x0f,0x29,0x45,0xf0, 0x0f,0x29,0x45,0,    0x0f,0x29,0x45,0x10,
+        0x0f,0x29,0x45,0x20, 0x0f,0x29,0x45,0x30, 0x0f,0x29,0x45,0x40,
+        0xc7,0x83,0xb0,0,0,0,0,0,0,0, 0x48,0xcf                 // LAPIC EOI; IRETQ.
+    };
+    std::uint64_t scalar_steps = 0;
+    for (const bool accelerated : {false, true}) {
+        PcMachine pc(4U << 20);
+        pc.boot_long_mode_demo();
+        pc.run(4000);
+        auto& cpu = pc.cpu;
+        require(cpu.is_long_mode() && cpu.halted && !cpu.fault, "AP IRQ long-mode fixture");
+        PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {2,1});
+        if (threaded) board.enable_threaded_smp(2);
+        board.enable_active_clock([] { return PcMachine::RunClock::time_point{}; });
+        pc.enable_boot_acceleration(accelerated);
+        cpu.write64(0x2000 + 3 * 8, 0x6003);
+        cpu.write64(0x6000 + ((kLapic >> 21) & 511) * 8, kLapic | 0x83);
+        cpu.write16(0x5180, 4095);
+        cpu.write64(0x5182, idt);
+        cpu.write64(idt + 16 * vector, (handler & 0xffffU) | (0x18ULL << 16) |
+                                   (0x8eULL << 40) | (std::uint64_t(handler >> 16) << 48));
+        cpu.write64(idt + 16 * vector + 8, 0);
+        cpu.memory.write_block(handler, isr, sizeof(isr));
+        cpu.write32(0xa980, 0x9f80);
+        for (unsigned i = 0; i < 16; ++i) cpu.write8(source + i, std::uint8_t(0x80 + i));
+        cpu.memory.fill(destination - 1, 0x7b, 98);
+        install_long_mode_smp_guest(cpu, guest, sizeof(guest));
+        start_long_mode_smp_guest(cpu);
+        cpu.write8(0x7000, 0xf4);
+        cpu.eip = 0x7000;
+        board.run(256);
+        if (const auto* fault = board.faulted_cpu()) throw std::runtime_error(fault->fault->describe());
+        require(board.processors_started() == 2 &&
+                std::string(board.processor_state(1)) == "halted" && (board.processor_position(1).flags & Cpu::IF),
+                std::string("AP reaches its interruptible HLT, current state: ") + board.processor_state(1));
+        const auto before = board.processor_steps(1);
+        const auto flags = board.processor_position(1).flags;
+        cpu.write32(kLapic + 0x310, 1U << 24);
+        cpu.write32(kLapic + 0x300, vector);
+        board.run(2);
+        require(board.processor_steps(1) == before + 2, "AP executes both MXCSR operations");
+        board.run(3);
+        require(board.processor_steps(1) == before + 5, "AP saves three vectors in a three-step grant");
+        require(board.secondary_movaps_batches() == unsigned(accelerated) &&
+                board.secondary_movaps_steps() == (accelerated ? 3U : 0U) && !board.secondary_store_steps(),
+                "C06 coalesces eligible AP stores, keeping the MOVNTDQ counter separate");
+        board.run(128);
+        const auto& irq = board.lapic_vector_stats()[vector];
+        require(!board.faulted_cpu() && !cpu.fault && !board.secondary_can_run() &&
+                irq.deliveries == 1 && irq.eois == 1 && cpu.read32(saved_mxcsr) == 0x1f80 &&
+                cpu.read32(saved_flags) == flags && cpu.read32(saved_rsp) == stack,
+                "C06 directed IRQ, MXCSR save, EOI and IRETQ retain exact state");
+        for (unsigned i = 0; i < 96; ++i)
+            require(cpu.read8(destination + i) == 0x80 + i % 16, "AP XMM byte");
+        require(cpu.read8(destination - 1) == 0x7b && cpu.read8(destination + 96) == 0x7b,
+                "AP XMM byte boundaries");
+        const auto retired = board.processor_steps(1) - before;
+        if (accelerated) {
+            require(retired == scalar_steps, "C06 scalar and coalesced AP retirement match");
+            std::cout << "SMP_IRQ_MOVAPS_PASS threaded=" << threaded << " stores=3 eoi=1 guest_steps="
+                      << retired << '\n';
+        } else scalar_steps = retired;
+    }
+}
+
 void test_signed_projection_with_smp_quantum(bool threaded) {
     if (!Cpu::ether_arm64_host()) return;
     constexpr unsigned loop = 0x7000;
@@ -1825,6 +1907,11 @@ void measure_smp_clock(PcMotherboardC06::CpuClock profile) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--test-movaps-irq") {
+            test_directed_irq_aligned_stores(false);
+            test_directed_irq_aligned_stores(true);
+            return 0;
+        }
 #if PRIME_HAS_R107_GRANTS
         if (argc == 2 && std::string(argv[1]) == "--measure-ram-views") {
             for (auto work : {RamWork::Independent, RamWork::Readers, RamWork::Counter}) measure_ram_views(work);
@@ -1929,6 +2016,8 @@ int main(int argc, char** argv) {
         test_ether_worker_block();
         test_secondary_streaming_stores(false);
         test_secondary_streaming_stores(true);
+        test_directed_irq_aligned_stores(false);
+        test_directed_irq_aligned_stores(true);
         test_signed_projection_with_smp_quantum(false);
         test_signed_projection_with_smp_quantum(true);
         test_secondary_interpreter_projection();
