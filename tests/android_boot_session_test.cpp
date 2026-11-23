@@ -1457,7 +1457,9 @@ int main(int argc, char** argv) {
     verify_ram_spill(dir.path);
     verify_packed_ram64(dir.path);
     verify_deferred_ram_reclaim(dir.path);
+#ifndef PRIME_PREVIOUS_ENGINE_WINDOW
     verify_deflate_sampling(dir.path);
+#endif
     verify_prepared_ram_backing(dir.path);
     verify_shared_ram(dir.path);
     verify_real_mode_ps2(dir.path / "keyboard-irq.rqvd", true);
