@@ -170,12 +170,14 @@ jobs:
               left, top, right, bottom = map(int, re.findall(r'\d+', node.get('bounds', '')))
               return (left, top, right, bottom) if right > left and bottom > top else None
 
-          def visible(field, value, *, tap=False, scroll=False, focused=False):
+          def visible(field, value, *, tap=False, scroll=False, focused=False, row=False):
               deadline = time.monotonic() + 60
               while time.monotonic() < deadline:
                   try:
                       adb('shell', 'uiautomator', 'dump', ui)
-                      tree = list(ET.fromstring(adb('exec-out', 'cat', ui)).iter('node'))
+                      raw = adb('exec-out', 'cat', ui)
+                      root = ET.fromstring(raw)
+                      tree = list(root.iter('node'))
                   except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ET.ParseError):
                       continue
                   for node in tree:
@@ -183,6 +185,13 @@ jobs:
                           continue
                       if focused and node.get('focused') != 'true':
                           continue
+                      if row:
+                          parents = {child: parent for parent in tree for child in parent}
+                          ancestor = node
+                          while ancestor.get('clickable') != 'true' and ancestor in parents:
+                              ancestor = parents[ancestor]
+                          if ancestor.get('clickable') == 'true':
+                              node = ancestor
                       bounds = center(node)
                       if bounds is None:
                           continue
@@ -205,6 +214,8 @@ jobs:
                               x, str(top + (bottom-top)//5), '300')
                           break
                   time.sleep(1)
+              (evidence / 'last-window.xml').write_bytes(adb('exec-out', 'cat', ui))
+              screenshot('last-window.png')
               raise AssertionError(f'Visible {field} did not reach {value}')
 
           def settings():
@@ -295,11 +306,13 @@ jobs:
 
           iso = Path(os.environ['RUNNER_TEMP']) / 'r110-boot-profile.iso'
           adb('push', str(iso), f'/sdcard/Download/{iso.name}')
+          # Keep touch coordinates in the same orientation during the picker handoff.
+          adb('shell', 'wm', 'user-rotation', 'lock', '1')
           adb('shell', 'am', 'force-stop', package)
           adb('shell', 'am', 'start', '-W', '-n', activity)
           settings()
           visible('resource-id', f'{package}:id/vm_select_iso', tap=True, scroll=True)
-          visible('text', iso.name, tap=True)
+          visible('text', iso.name, tap=True, row=True)
           visible('resource-id', f'{package}:id/vm_boot_iso', tap=True, scroll=True)
           report = verify_diagnostic('iso', 'halted')
           assert report['iso_bytes'] == iso.stat().st_size
