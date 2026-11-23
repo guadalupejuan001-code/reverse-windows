@@ -29,6 +29,11 @@ add_dependencies(reverse_windows_component_headers reverse_windows_verify_mundo_
 target_compile_definitions(reverse_windows_component_headers INTERFACE
   MUNDO_X_PC_STATE_RAM=1
   REVERSE_MUNDO_X_SOURCE_SHA="${REVERSE_MUNDO_X_SOURCE_SHA}")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+  target_compile_definitions(reverse_windows_component_headers INTERFACE
+    MUNDO_X_ETHER_ARM64_WIDE_BLOCK_EXPERIMENT=1
+    MUNDO_X_ETHER_ARM64_COMPACT_BLOCK_EXPERIMENT=1)
+endif()
 target_include_directories(reverse_windows_component_headers INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${REVERSE_MUNDO_X_ROOT}/pc-android/native"

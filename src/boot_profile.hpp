@@ -26,6 +26,8 @@ inline void write_ether_arm64(std::ostream& out, const cosmic_pc::Cpu& cpu) {
   const auto space = cpu.ether_arm64_virtual_stats();
   out << "{\"host_supported\":" << (cpu.ether_arm64_host() ? "true" : "false")
       << ",\"enabled\":" << (cpu.ether_arm64_blocks_enabled() ? "true" : "false")
+      << ",\"block_max_instructions\":" << cosmic_pc::ether_arm64::Block::kMaxInstructions
+      << ",\"block_max_bytes\":" << cosmic_pc::ether_arm64::Block::kMaxBytes
       << ",\"translated\":" << stats.translated << ",\"cache_hits\":" << stats.hits
       << ",\"executed_blocks\":" << stats.blocks << ",\"guest_steps\":" << stats.steps
       << ",\"protected32_guest_steps\":" << stats.protected32_steps

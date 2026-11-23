@@ -30,6 +30,11 @@ target_compile_features(reverse_windows_android PRIVATE cxx_std_17)
 add_dependencies(reverse_windows_android reverse_windows_verify_mundo_x)
 target_compile_definitions(reverse_windows_android PRIVATE MUNDO_X_PC_ETHER_NEXT=1 MUNDO_X_PC_STATE_RAM=1 REVERSE_WINDOWS_GLES_GUEST=1
     REVERSE_MUNDO_X_SOURCE_SHA="${REVERSE_MUNDO_X_SOURCE_SHA}")
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    target_compile_definitions(reverse_windows_android PRIVATE
+        MUNDO_X_ETHER_ARM64_WIDE_BLOCK_EXPERIMENT=1
+        MUNDO_X_ETHER_ARM64_COMPACT_BLOCK_EXPERIMENT=1)
+endif()
 target_include_directories(reverse_windows_android PRIVATE
     "${REVERSE_WINDOWS_ROOT}/src"
     "${REVERSE_MUNDO_X_ROOT}/pc-android/native"
