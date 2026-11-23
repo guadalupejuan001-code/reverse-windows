@@ -1,8 +1,8 @@
-name: Prime R110 ARM64 APIC ICR diagnostic replay up to 18B
+name: Prime R110 ARM64 LSL replay up to 18B
 
 on:
   push:
-    branches: [ci/prime-r110-arm64-apic-icr-replay]
+    branches: [ci/prime-r110-arm64-lsl-replay]
     paths:
       - .github/benchmarks/prime-iso-arm64/apic-icr-replay-targets.json
       - .github/workflows/prime-r110-real-iso-arm64-apic-icr-replay.yml
@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Verify pins and run native ARM64 SMP, trap-flag and CRC32C tests
+      - name: Verify pins and test native ARM64 LSL, NMI, trap flag and CRC32C
         id: revisions
         shell: bash
         run: |
@@ -54,7 +54,9 @@ jobs:
             grep -q 'WINDOWS_X64_TRAP_FLAG_PASS' "$evidence/$role-native-gates.log"
             grep -q 'WINDOWS_X64_CRC32C_PASS' "$evidence/$role-native-gates.log"
             grep -q 'X86_SYSTEM64_PASS' "$evidence/$role-native-gates.log"
+            grep -q 'X86_LSL_PASS' "$evidence/$role-native-gates.log"
             grep -q 'SMP_ICR_REJECTION_PASS' "$evidence/$role-native-gates.log"
+            grep -q 'SMP_LAPIC_NMI_PRIORITY_PASS' "$evidence/$role-native-gates.log"
             cmake -S "$bench" -B "$RUNNER_TEMP/build-$role" -G Ninja \
               -DREVERSE_WINDOWS_SOURCE="$product" -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
             cmake --build "$RUNNER_TEMP/build-$role" --target session_probe --parallel 2
@@ -62,7 +64,7 @@ jobs:
           cc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -o "$RUNNER_TEMP/verified_iso.so" \
             "$bench/verified_iso.c" -lcurl -pthread
           sha256sum "$RUNNER_TEMP"/build-*/session_probe "$RUNNER_TEMP/verified_iso.so" > "$evidence/native-sha256.txt"
-      - name: Start the pinned APIC diagnostic engine and observe 11.5B
+      - name: Start the pinned LSL engine and observe 11.5B
         shell: bash
         run: |
           set -euo pipefail
@@ -87,9 +89,9 @@ jobs:
       - name: Upload the 11.5B observation
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-apic-icr-replay-11-5b-target
+          name: prime-r110-arm64-lsl-replay-11-5b-target
           path: ${{ runner.temp }}/reference-progress/
-      - name: Observe 15.2B beyond the unsupported POPFQ stop
+      - name: Observe the same session at 15.2B
         shell: bash
         run: |
           set -euo pipefail
@@ -98,9 +100,9 @@ jobs:
       - name: Upload the 15.2B observation
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-apic-icr-replay-15-2b-target
+          name: prime-r110-arm64-lsl-replay-15-2b-target
           path: ${{ runner.temp }}/post-popfq-checkpoint/
-      - name: Observe 16.1B beyond the x86 CRC32C stop
+      - name: Observe the same session at 16.1B
         shell: bash
         run: |
           set -euo pipefail
@@ -109,7 +111,7 @@ jobs:
       - name: Upload the 16.1B observation
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-apic-icr-replay-16-1b-target
+          name: prime-r110-arm64-lsl-replay-16-1b-target
           path: ${{ runner.temp }}/post-crc32c-checkpoint/
       - name: Record the same session at 16.5B
         shell: bash
@@ -120,7 +122,7 @@ jobs:
       - name: Upload observation for the 16.5B target
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-apic-icr-replay-16-5b-target
+          name: prime-r110-arm64-lsl-replay-16-5b-target
           path: ${{ runner.temp }}/pre-fault-checkpoint/
       - name: Record the exact terminal state, or continue to 18B or 70 minutes
         shell: bash
@@ -157,12 +159,38 @@ jobs:
               detail = json.dumps(rejection, indent=2) + "\n"
               terminal.with_name("reference-icr-low-rejection.json").write_text(detail)
               print(detail, end="")
+          session = json.loads(terminal.with_name("reference-session.json").read_text())
+          topology = session["cpu_topology"]
+          lsl_count = topology["lsl_retired"]
+          lsl_by_vcpu = [cpu["lsl_retired"] for cpu in topology["execution_by_logical_processor"]]
+          if lsl_count != sum(lsl_by_vcpu):
+              raise SystemExit("The aggregate LSL count differs from the per-vCPU counts")
+          message = fault.get("message", "")
+          repeated_lsl_stop = "opcode=0f03" in message and "two-byte opcode is not implemented" in message
+          proof = {
+              "guest_steps": session["boot_progress"]["session_steps"],
+              "lsl_retired": lsl_count,
+              "lsl_by_vcpu": lsl_by_vcpu,
+              "previous_lsl_fault_reproduced": repeated_lsl_stop,
+              "lapic_nmi_delivered": session["irq"]["lapic_nmi_delivered"],
+              "lapic_nmi_last_delivery": session["irq"].get("lapic_nmi_last_delivery"),
+              "windows_ready": session["machine"]["windows_ready"],
+              "terminal_status": session["status"],
+              "cpu_fault": session.get("cpu_fault"),
+          }
+          detail = json.dumps(proof, indent=2) + "\n"
+          terminal.with_name("reference-lsl-evidence.json").write_text(detail)
+          print(detail, end="")
+          if repeated_lsl_stop:
+              raise SystemExit("The previous unimplemented LSL fault reproduced")
+          if lsl_count == 0:
+              raise SystemExit("No guest LSL retirement was observed before this terminal state")
           PY
           test "$(cat "$RUNNER_TEMP/reference.exit")" = 0
       - name: Preserve late per-vCPU execution and IRQ evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-apic-icr-replay-raw-final
+          name: prime-r110-arm64-lsl-replay-raw-final
           path: ${{ runner.temp }}/evidence/
           if-no-files-found: warn

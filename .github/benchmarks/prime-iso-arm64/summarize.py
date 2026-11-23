@@ -87,6 +87,7 @@ def load_checkpoint(record):
         "started_vcpus": topology["started"],
         "guest_tsc_hz": topology.get("guest_tsc_hz"),
         "crc32c_retired": topology.get("crc32c_retired"),
+        "lsl_retired": topology.get("lsl_retired"),
         "tsc_access": topology.get("tsc_access"),
         "tsc_access_by_logical_processor": topology.get("tsc_access_by_logical_processor"),
         "smp": pick(topology, SMP),
@@ -97,7 +98,7 @@ def load_checkpoint(record):
         "vcpu_execution": topology.get("execution_by_logical_processor", []),
         "rtc": pick(vm.get("rtc", {}), RTC),
         "irq_clock": pick(irq, IRQ_CLOCK),
-        "irq_counters": pick(irq, ("irq64_bulk_frames",)),
+        "irq_counters": pick(irq, ("irq64_bulk_frames", "lapic_nmi_delivered", "lapic_nmi_last_delivery")),
         "irq_vectors": {str(vector["vector"]): pick(vector, IRQ_VECTOR)
                         for vector in irq.get("lapic_vectors", [])},
         "boot_profile_current": pick(profile.get("current", {}), BOOT_PROFILE_STATE),
@@ -238,6 +239,7 @@ def continuation_record(run_dir, target):
         "iso_read_us": vm["iso_read_us"],
         "boot_loops": pick(vm.get("ether_next", {}), BOOT_LOOPS),
         "crc32c_retired": vm["cpu_topology"].get("crc32c_retired"),
+        "lsl_retired": vm["cpu_topology"].get("lsl_retired"),
         "phase_samples": [pick(phase, ("steps", "mode")) for phase in phases],
     }
 
