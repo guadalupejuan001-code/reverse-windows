@@ -10,6 +10,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -135,6 +136,37 @@ void verify_ram_profile() {
 }
 
 #ifndef PRIME_PREVIOUS_ENGINE_WINDOW
+void verify_profile_first_secondary() {
+  using Board = reverse_windows::PcMotherboardC06;
+  cosmic_pc::PcMachine pc(4U << 20);
+  pc.boot_demo();
+  pc.cpu.reset(0, 0x7100);
+  pc.cpu.a20_enabled = true;
+  pc.cpu.write16(0x7100, 0xfeeb);  // BSP spins in a short branch.
+  pc.cpu.write16(0x8000, 0xf4fa);  // Secondary disables interrupts and halts.
+  Board board(pc, nullptr, {}, 0, {}, nullptr, {1, 2});
+  reverse_windows::BootProfile profile(4096);
+  profile.begin(pc, board);
+  pc.cpu.write32(Board::kLocalApic + 0x310, 1U << 24);
+  pc.cpu.write32(Board::kLocalApic + 0x300, 0x4500);  // INIT
+  pc.cpu.write32(Board::kLocalApic + 0x300, 0x0608);  // SIPI to physical 0x8000.
+  board.run(64);
+  profile.after_run(pc, board);
+  const auto secondary = board.processor_position(1);
+  require(std::string(secondary.mode) == "real16" && secondary.cs == 0x800 && secondary.rip == 2 &&
+              secondary.flags == 2 && board.processor_steps(1) == 2,
+          "Position and steps must describe the secondary's executed startup instructions");
+  std::ostringstream out;
+  profile.write_json(out, pc, board);
+  const auto report = out.str();
+  const auto first = report.find("\"first_ap_start_observed\":{");
+  require(first != std::string::npos, "The first observed SIPI must be captured between checkpoints");
+  const auto observation = report.substr(first);
+  require(counter(observation, "started_vcpus") == 2 && counter(observation, "sipi_targets_applied") == 1 &&
+              counter(observation, "total_processor_steps") == pc.cpu.instructions + board.processor_steps(1),
+          "SIPI observation must count both started processors and preserve BSP accounting");
+}
+
 // The historical engine-window benchmark compiles this harness against the
 // 0.3.66 session, which predates the optional backing-read timing API.
 void verify_ram_timing_option(const std::filesystem::path& directory) {
@@ -1450,6 +1482,7 @@ int main(int argc, char** argv) {
     require(argc == 2 || argc == 3, "Pass the synthetic BIOS fixture and optional evidence path");
     const TestDiskDirectory dir;
 #ifndef PRIME_PREVIOUS_ENGINE_WINDOW
+    verify_profile_first_secondary();
     verify_ram_timing_option(dir.path);
     verify_state_ram_reclaim_batches(dir.path);
     verify_prime_guest_writeback(dir.path / "prime-writeback.rqvd");
@@ -1543,6 +1576,14 @@ int main(int argc, char** argv) {
                   live.find("\"status\":\"waiting_key\"") != std::string::npos &&
                   counter(live, "session_steps") == counter(progress, "session_steps"),
               "Live status must preserve guest progress without serializing detailed profiles");
+#ifndef PRIME_PREVIOUS_ENGINE_WINDOW
+      const auto execution = progress.find("\"execution_by_logical_processor\":[{\"mode\":\"real16\"");
+      require(execution != std::string::npos &&
+                  live.find("\"execution_by_logical_processor\":") == std::string::npos &&
+                  counter(progress.substr(execution), "steps") == counter(progress, "instructions") &&
+                  progress.find("\"first_ap_start_observed\":null") != std::string::npos,
+              "Saved diagnostics must include live boot CPU position without inventing a SIPI");
+#endif
       const auto atapi = live.find("\"atapi\":{");
       require(atapi != std::string::npos &&
                   counter(live.substr(atapi), "read_bytes") ==

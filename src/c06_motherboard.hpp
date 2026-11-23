@@ -61,6 +61,12 @@ class PcMotherboardC06 {
     std::uint64_t init_icr_writes = 0, sipi_icr_writes = 0;
     std::uint64_t init_targets_queued = 0, sipi_targets_queued = 0, sipi_targets_applied = 0;
   };
+  struct ProcessorPosition {
+    const char* mode;
+    std::uint16_t cs;
+    std::uint64_t rip, cr3;
+    std::uint32_t flags;
+  };
   struct RtcEvidence {
     unsigned selected_register, register_a, register_b, register_c;
     bool nmi_masked;
@@ -2158,6 +2164,11 @@ class PcMotherboardC06 {
     if (apic.init_pending || apic.startup_vector) return "startup_pending";
     if (!apic.started) return "wait_for_sipi";
     return apic.cpu->halted ? "halted" : "running";
+  }
+  ProcessorPosition processor_position(unsigned id) const {
+    const auto* cpu = apics_.at(id).cpu;
+    if (!cpu) throw std::out_of_range("Unknown vCPU");
+    return {cpu->mode_name(), cpu->segments[cosmic_pc::Cpu::CS], cpu->eip, cpu->cr3, cpu->eflags};
   }
   unsigned processors_started() const noexcept {
     return static_cast<unsigned>(std::count_if(apics_.begin(), apics_.begin() + processor_count_,

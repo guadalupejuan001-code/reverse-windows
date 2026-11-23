@@ -725,6 +725,16 @@ class AndroidBootSession final {
       out << "],\"state_vector_interpreter_steps_by_logical_processor\":[";
       for (unsigned id = 0; id < topology.logical_processors(); ++id)
         out << (id ? "," : "") << board_->processor_state_vector_interpreter_steps(id);
+      out << "],\"execution_by_logical_processor\":[";
+      for (unsigned id = 0; id < topology.logical_processors(); ++id) {
+        const auto position = board_->processor_position(id);
+        out << (id ? "," : "") << "{\"mode\":\"" << position.mode << "\",\"cs\":" << position.cs
+            << ",\"rip_hex\":\"" << std::hex << std::setw(16) << std::setfill('0') << position.rip
+            << "\",\"cr3_hex\":\"" << std::setw(16) << position.cr3
+            << std::dec << std::setfill(' ') << "\",\"flags\":" << position.flags
+            << ",\"steps\":" << board_->processor_steps(id)
+            << ",\"ether_arm64_steps\":" << board_->processor_ether_arm64_steps(id) << '}';
+      }
       out << ']';
     }
     out << ",\"guest_tsc_hz\":" << board_->guest_tsc_hz() << '}';

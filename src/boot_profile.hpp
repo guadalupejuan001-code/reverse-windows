@@ -3,9 +3,11 @@
 #include "c06_motherboard.hpp"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <iomanip>
 #include <ios>
+#include <optional>
 #include <ostream>
 #include <stdexcept>
 
@@ -69,14 +71,21 @@ class BootProfile {
   }
 
   void begin(const cosmic_pc::PcMachine& pc, const PcMotherboardC06& board) noexcept {
-    initial_ = last_ = capture(pc, board);
+    start_time_ = Clock::now();
+    initial_ = last_ = capture(pc, board, start_time_);
     next_ = initial_.steps + interval_;
     count_ = 0;
+    first_ap_start_.reset();
   }
 
   void after_run(const cosmic_pc::PcMachine& pc, const PcMotherboardC06& board) noexcept {
-    if (pc.cpu.instructions != next_) return;
+    const bool checkpoint = pc.cpu.instructions == next_;
+    const bool first_ap_start = !first_ap_start_ &&
+        board.startup_ipis().sipi_targets_applied > initial_.sipi_targets_applied;
+    if (!checkpoint && !first_ap_start) return;
     const auto current = capture(pc, board);
+    if (first_ap_start) first_ap_start_ = current;
+    if (!checkpoint) return;
     const auto scalar = current.steps - last_.steps - (current.batched - last_.batched);
     points_[count_ % points_.size()] = {current, last_.steps, scalar, current.timing.since(last_.timing)};
     last_ = current;
@@ -90,6 +99,9 @@ class BootProfile {
     write(out, initial_);
     out << ",\"current\":";
     write(out, capture(pc, board));
+    out << ",\"first_ap_start_observed\":";
+    if (first_ap_start_) write(out, *first_ap_start_);
+    else out << "null";
     out << ",\"checkpoints\":[";
     const auto first = count_ > points_.size() ? count_ - points_.size() : 0;
     for (auto i = first; i < count_; ++i) {
@@ -106,8 +118,12 @@ class BootProfile {
   }
 
  private:
+  using Clock = cosmic_pc::PcMachine::RunClock;
   struct State {
     std::uint64_t steps = 0, ip = 0, cr3 = 0, ticks = 0, irq = 0;
+    std::uint64_t total_processor_steps = 0, ether_arm64_steps = 0, rtc_irq8_delivered = 0;
+    std::uint64_t host_elapsed_ns = 0, sipi_targets_applied = 0;
+    unsigned started_vcpus = 0;
     std::uint64_t disk_reads = 0, ata_commands = 0, atapi_packets = 0;
     std::uint64_t page_walks = 0, page_hits = 0, instruction_page_hits = 0, batched = 0;
     std::uint64_t instruction_page_reuses = 0;
@@ -125,12 +141,21 @@ class BootProfile {
     cosmic_pc::BootTiming::Counters timing;
   };
 
-  static State capture(const cosmic_pc::PcMachine& pc, const PcMotherboardC06& board) noexcept {
+  State capture(const cosmic_pc::PcMachine& pc, const PcMotherboardC06& board,
+                Clock::time_point now = Clock::now()) const noexcept {
     const auto& cpu = pc.cpu;
     const auto board_state = board.evidence();
+    const auto execution = board.cpu_execution_totals();
     const auto& work = pc.boot_acceleration();
     State out;
     out.steps = cpu.instructions;
+    out.total_processor_steps = execution.guest_steps;
+    out.ether_arm64_steps = execution.ether_steps;
+    out.started_vcpus = board.processors_started();
+    out.rtc_irq8_delivered = board.rtc_evidence().irq8_delivered;
+    out.sipi_targets_applied = board.startup_ipis().sipi_targets_applied;
+    // Wall time since this profile phase began, including time between board runs.
+    out.host_elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - start_time_).count();
     out.ip = cpu.eip;
     out.cr3 = cpu.cr3;
     out.cs = cpu.segments[cosmic_pc::Cpu::CS];
@@ -167,6 +192,12 @@ class BootProfile {
         << "\",\"cr3_hex\":\"" << std::setw(16) << s.cr3
         << std::dec << std::setfill(' ') << "\",\"flags\":" << s.flags
         << ",\"board_ticks\":" << s.ticks << ",\"irq_delivered\":" << s.irq
+        << ",\"total_processor_steps\":" << s.total_processor_steps
+        << ",\"ether_arm64_steps\":" << s.ether_arm64_steps
+        << ",\"started_vcpus\":" << s.started_vcpus
+        << ",\"rtc_irq8_delivered\":" << s.rtc_irq8_delivered
+        << ",\"sipi_targets_applied\":" << s.sipi_targets_applied
+        << ",\"host_elapsed_ns\":" << s.host_elapsed_ns
         << ",\"bios_disk_reads\":" << s.disk_reads << ",\"ata_commands\":" << s.ata_commands
         << ",\"atapi_packets\":" << s.atapi_packets << ",\"page_walks\":" << s.page_walks
         << ",\"page_translation_hits\":" << s.page_hits
@@ -187,6 +218,8 @@ class BootProfile {
 
   const std::uint64_t interval_;
   std::uint64_t next_, count_ = 0;
+  Clock::time_point start_time_{};
+  std::optional<State> first_ap_start_;
   State initial_{}, last_{};
   std::array<Point,8> points_{};
 };

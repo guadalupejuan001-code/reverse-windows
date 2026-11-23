@@ -18,7 +18,7 @@ def check(condition, message):
         raise RuntimeError(message)
 
 
-TIMING_ONLY = {"run_ns", "sampled_iterations"}
+TIMING_ONLY = {"run_ns", "sampled_iterations", "host_elapsed_ns"}
 
 
 def guest_state(report):
@@ -61,6 +61,15 @@ def validate(report, timed, start, interval, stop):
     check(profile["checkpoints_seen"] == completed and
           absolute_steps == [start + n * interval for n in range(max(1, completed - 7), completed + 1)],
           "checkpoint cadence or retention is incorrect")
+    states = [profile["start"], *[p["state"] for p in checkpoints], profile["current"]]
+    elapsed = [s["host_elapsed_ns"] for s in states]
+    check(elapsed[0] == 0 and elapsed[-1] > 0 and elapsed == sorted(elapsed),
+          "checkpoint wall clock must be relative to profile start and monotonic")
+    check(profile["first_ap_start_observed"] is None and
+          all(s["started_vcpus"] == 1 and s["sipi_targets_applied"] == 0 and
+              s["total_processor_steps"] == s["steps"] and 0 <= s["ether_arm64_steps"] <= s["steps"] and
+              0 <= s["rtc_irq8_delivered"] <= s["irq_delivered"] for s in states),
+          "single-vCPU profile must report exact totals and no SIPI")
 
     if not timed:
         check("boot_time_samples" not in report and "boot_code_regions" not in report,
