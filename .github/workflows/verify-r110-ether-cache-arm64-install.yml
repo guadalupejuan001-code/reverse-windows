@@ -1,8 +1,8 @@
-name: Verify Prime R110 sustained boot ARM64 APK installation
+name: Verify Prime R110 clock and SMP ARM64 APK installation
 
 on:
   push:
-    branches: [ci/prime-r110-ethersustained-arm64-install]
+    branches: [ci/prime-r110-etherprogress-arm64-install]
     paths: [.github/workflows/verify-r110-ether-cache-arm64-install.yml]
   workflow_dispatch:
     inputs:
@@ -20,17 +20,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      APP_ID: com.reversewindows.android.prime.smp.r110.sustainperf
-      SOURCE_SHA: 64b24f000e1774fb8fb0c28ea130180192baac6b
-      MUNDO_X_SHA: 9bda35773a1d634fcf1c29566da9093f62d6c70b
-      APK_VERSION_NAME: 0.3.88-perf-test.6
-      APK_VERSION_CODE: '125'
-      APK_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.6-64b24f000e17-arm64-v8a-release.apk
-      EXPECTED_APK_SHA256: ${{ inputs.apk_sha256 || 'f3ab01d91c715f729a7e2eef80727af9ba7affffedf1d3c2606f51d5fe6e7baa' }}
-      BUILD_RUN_ID: '45208033066'
-      BUILD_ARTIFACT_ID: '14835112942'
-      BUILD_ARTIFACT_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.6-64b24f000e17-ARM64
-      BUILD_ARTIFACT_DIGEST: sha256:6e49198941ba57489630b827e073838df2560096ecd4cfa13b243c3557f58e86
+      APP_ID: com.reversewindows.android.prime.smp.r110.progressperf
+      SOURCE_SHA: e041659f1f9cf5c41bc988d1b3662e149119757e
+      MUNDO_X_SHA: b3a3d04f14d644a2eea332492108f16306d629ff
+      APK_VERSION_NAME: 0.3.88-perf-test.7
+      APK_VERSION_CODE: '126'
+      APK_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.7-e041659f1f9c-arm64-v8a-release.apk
+      EXPECTED_APK_SHA256: ${{ inputs.apk_sha256 || '48bc686080e43c8e5629a7f4e3d0420aba796d48486878da34581734b7235d17' }}
+      BUILD_RUN_ID: '45222926200'
+      BUILD_ARTIFACT_ID: '14841799043'
+      BUILD_ARTIFACT_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.7-e041659f1f9c-ARM64
+      BUILD_ARTIFACT_DIGEST: sha256:1d0795363fb1ce2247cb46a81d119549d1c7a5315da4e22e1b1280122fcf050d
     steps:
       - name: Authenticate the selected build artifact record
         env:
@@ -241,6 +241,11 @@ jobs:
               assert image.startswith(b'\x89PNG\r\n\x1a\n')
               (evidence / name).write_bytes(image)
 
+          def verify_tsc_access(access):
+              keys = ('rdtsc', 'rdmsr_tsc', 'wrmsr_tsc', 'rdmsr_tsc_adjust', 'wrmsr_tsc_adjust')
+              for key in keys:
+                  assert type(access[key]) is int and access[key] >= 0, (key, access[key])
+
           def verify_diagnostic(source, status):
               path = f'/data/user/0/{package}/files/ultimo-diagnostico.json'
               label = 'bios' if source == 'self-test' else source
@@ -279,6 +284,9 @@ jobs:
               irq = report['irq']
               assert type(irq['irq64_bulk_frames']) is int and 0 <= irq['irq64_bulk_frames'] <= irq['delivered'], irq
               topology = report['cpu_topology']
+              for key in ('threaded_pause_yields', 'threaded_pause_turn_steps', 'threaded_pause_admissions'):
+                  assert type(topology[key]) is int and topology[key] >= 0, (key, topology[key])
+              verify_tsc_access(topology['tsc_access'])
               positions = topology['execution_by_logical_processor']
               assert len(positions) == topology['logical_processors'] == 16, positions
               for entry in positions:
@@ -287,6 +295,7 @@ jobs:
                   assert re.fullmatch(r'[0-9a-fA-F]{16}', entry['cr3_hex']), entry
                   assert 0 <= entry['cs'] <= 0xffff and 0 <= entry['flags'] <= 0xffffffff, entry
                   assert 0 <= entry['ether_arm64_steps'] <= entry['steps'], entry
+                  verify_tsc_access(entry['tsc_access'])
               assert [p['steps'] for p in positions] == topology['steps_by_logical_processor']
               assert [p['ether_arm64_steps'] for p in positions] == topology['ether_arm64_steps_by_logical_processor']
               machine = report['machine']
@@ -347,6 +356,7 @@ jobs:
               assert phase['started_vcpus'] == 1 and phase['sipi_targets_applied'] == 0, phase
               assert 0 <= phase['ether_arm64_steps'] <= phase['steps'] == phase['total_processor_steps'], phase
               assert 0 <= phase['rtc_irq8_delivered'] <= phase['irq_delivered'], phase
+              verify_tsc_access(phase['tsc_access'])
           assert current['total_processor_steps'] == report['cpu_topology']['phase_x86_steps'], current
           assert current['ether_arm64_steps'] == report['cpu_topology']['phase_ether_arm64_steps'], current
           print('PRIME_ARM64_APK_BRIDGE_ISO_PROFILE_PASS source=synthetic-el-torito mode='
@@ -368,6 +378,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: prime-r110-arm64-bridge-install-64b24f000e17
+          name: prime-r110-arm64-bridge-install-e041659f1f9c
           path: ${{ runner.temp }}/r110-install-evidence
           if-no-files-found: warn
