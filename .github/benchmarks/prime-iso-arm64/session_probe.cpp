@@ -93,6 +93,8 @@ int main(int argc, char** argv) {
       milestone_steps.push_back(point);
     for (std::uint64_t point = 8'200'000'000; point <= 8'650'000'000; point += 50'000'000)
       milestone_steps.push_back(point);
+    for (const auto point : {9'000'000'000ULL, 9'250'000'000ULL, 9'500'000'000ULL})
+      milestone_steps.push_back(point);
     std::size_t next_milestone = 0;
     std::vector<GuestSlice> windows;
     windows.reserve(60000);

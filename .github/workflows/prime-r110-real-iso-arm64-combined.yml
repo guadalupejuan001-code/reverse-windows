@@ -1,0 +1,148 @@
+name: Prime R110 matched ARM64 CPU RAM and QSSD comparison
+
+on:
+  push:
+    branches: [ci/prime-r110-arm64-combined-pair]
+    paths:
+      - .github/benchmarks/prime-iso-arm64/combined-targets.json
+      - .github/workflows/prime-r110-real-iso-arm64-combined.yml
+
+permissions:
+  contents: read
+
+env:
+  AVAILABLE_MIB: '510'
+  THRESHOLD_MIB: '128'
+  STOP_TARGET: '9500000000'
+  PROBE_TIMEOUT_SECONDS: '2700'
+
+jobs:
+  paired-official-iso:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 105
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify and build both exact native products
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence"
+          python3 "$bench/resolve-combined.py" "$bench/combined-targets.json" > "$RUNNER_TEMP/targets.tsv"
+          cp "$bench/combined-targets.json" "$evidence/targets.json"
+          sudo apt-get update -qq
+          packages=(ninja-build libcurl4-openssl-dev zlib1g-dev
+                    libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri)
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${packages[@]}"
+          while IFS=$'\t' read -r role product_sha core_sha; do
+            product="$RUNNER_TEMP/product-$role"
+            bash "$bench/checkout-product.sh" "$product" "$product_sha" "$core_sha"
+            cp "$product/config/dependencies.lock.json" "$evidence/$role-dependencies.lock.json"
+            cmake -S "$bench" -B "$RUNNER_TEMP/build-$role" -G Ninja \
+              -DREVERSE_WINDOWS_SOURCE="$product" -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
+            cmake --build "$RUNNER_TEMP/build-$role" --target session_probe --parallel 2
+          done < "$RUNNER_TEMP/targets.tsv"
+          cc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -o "$RUNNER_TEMP/verified_iso.so" \
+            "$bench/verified_iso.c" -lcurl -pthread
+          sha256sum "$RUNNER_TEMP"/build-*/session_probe "$RUNNER_TEMP/verified_iso.so" > "$evidence/native-sha256.txt"
+      - name: Run both verified official ISOs on the same physical CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          export PROBE_CPU
+          PROBE_CPU="$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          {
+            uname -m
+            lscpu
+            c++ --version
+            printf 'CPU affinity %s\n' "$PROBE_CPU"
+          } > "$evidence/runner.txt"
+          pair_status=0
+          while IFS=$'\t' read -r role product_sha core_sha; do
+            iso="$RUNNER_TEMP/windows-eval-$role.sparse"
+            output="$RUNNER_TEMP/session-$role"
+            truncate -s 5550497792 "$iso"
+            chmod 400 "$iso"
+            echo "::group::$role $product_sha"
+            probe=("$RUNNER_TEMP/build-$role/session_probe" "$iso" "$output" "$STOP_TARGET" "$PROBE_TIMEOUT_SECONDS"
+                   "$AVAILABLE_MIB" "$THRESHOLD_MIB")
+            optical_env=(EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1
+                         LD_PRELOAD="$RUNNER_TEMP/verified_iso.so" R110_REMOTE_ISO_STUB="$iso")
+            if timeout "$((PROBE_TIMEOUT_SECONDS + 120))s" taskset -c "$PROBE_CPU" env "${optical_env[@]}" "${probe[@]}" \
+              2> "$evidence/$role.stderr" | tee "$evidence/$role.stdout"; then
+              probe_exit=0
+            else
+              probe_exit=${PIPESTATUS[0]}
+              if ((probe_exit == 0)); then probe_exit=1; fi
+            fi
+            if ! PRODUCT_SHA="$product_sha" MUNDO_X_SHA="$core_sha" python3 "$bench/summarize.py" \
+              --run "$output" --transport-log "$evidence/$role.stderr" \
+              --output "$evidence/$role.json" --exit-code "$probe_exit"; then
+              pair_status=1
+            fi
+            echo '::endgroup::'
+          done < "$RUNNER_TEMP/targets.tsv"
+          if ! python3 "$bench/compare-combined.py" "$evidence/reference.json" "$evidence/candidate.json" \
+            "$evidence/paired-comparison.json"; then
+            pair_status=1
+          fi
+          exit "$pair_status"
+      - name: Upload paired counters, progress and exact revision evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-matched-iso-9-5b
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+
+  candidate-native-oracles:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Run candidate native CPU RAM IRQ and QSSD checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence"
+          python3 "$bench/resolve-combined.py" "$bench/combined-targets.json" > "$RUNNER_TEMP/targets.tsv"
+          IFS=$'\t' read -r role product_sha core_sha < <(tail -n1 "$RUNNER_TEMP/targets.tsv")
+          test "$role" = candidate
+          product="$RUNNER_TEMP/product-candidate"
+          bash "$bench/checkout-product.sh" "$product" "$product_sha" "$core_sha"
+          cp "$bench/combined-targets.json" "$evidence/targets.json"
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ninja-build zlib1g-dev
+          build="$RUNNER_TEMP/native-tests"
+          cmake -S "$product" -B "$build" -G Ninja -DBUILD_TESTING=ON -DREVERSE_WINDOWS_GLES_GUEST=OFF \
+            -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
+          cmake --build "$build" --parallel 2 --target reverse_windows_prime_ether_arm64_test \
+            reverse_windows_x86_ether_next_guest_test reverse_windows_x86_ether_rep_batch_test \
+            reverse_windows_ether_state_ram_test reverse_windows_ether_state_ram_integration_test \
+            reverse_windows_pc_memory_fabric_test reverse_windows_pc_memory_test \
+            reverse_windows_qssd_disk_test reverse_windows_c06_motherboard_guest_test reverse_windows_smp_guest_test
+          ctest --test-dir "$build" --parallel 1 --output-on-failure --no-tests=error \
+            -R '^reverse_windows_(prime_ether_arm64|x86_ether_next_guest|x86_ether_rep_batch|ether_state_ram|ether_state_ram_integration|pc_memory_fabric|pc_memory|qssd_sparse_atomic_reboot_x86|c06_real_motherboard|smp_guest)$' \
+            --output-junit "$evidence/candidate-native-arm64.xml" | tee "$evidence/candidate-native-arm64.log"
+      - name: Upload native CPU RAM IRQ and QSSD evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-candidate-native-oracles
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn

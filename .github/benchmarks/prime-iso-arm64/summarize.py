@@ -9,17 +9,28 @@ from pathlib import Path
 COVERAGE = ("translated_steps", "batched_steps", "projected_steps", "interpreted_steps")
 NATIVE = ("translated", "executed_blocks", "cache_hits", "data_fallbacks", "guest_steps",
           "invalidated", "compiled_evictions", "code_byte_checks", "ram_read_callbacks",
-          "resident_read_hits", "off_bus_register_steps", "repeated_loop_steps", "repeated_loop_dispatches")
+          "resident_read_hits", "off_bus_register_steps", "repeated_loop_steps", "repeated_loop_dispatches",
+          "staged_ram_blocks", "staged_ram_steps", "coalesced_ram_writes", "ram_add_guest_steps")
 BOOT_LOOPS = ("boot_scan_loop_steps", "boot_forward_copy_loop_steps", "boot_zero_loop_steps",
               "boot_rep_elements", "boot_rep_direct_page_copy_bytes", "boot_counter_loop_steps")
 RAM = ("usable_bytes", "resident_bytes", "resident_metadata_bytes", "backing_budget_bytes",
        "spill_limit_bytes", "spilled_bytes", "spill_file_payload_bytes", "spill_reads", "spill_writes",
        "spill_write_calls", "spill_cache_bytes", "spill_cache_capacity_bytes", "spill_grouped_pages",
        "spill_cache_hits", "spill_read_us", "spill_write_us", "compaction_passes", "compaction_pages_scanned",
-       "pressure_status", "pressure_error", "spill_error")
-ACCESS = ("forced_reclaims", "forced_failures", "forced_reclaim_ns", "selection_ns", "backing_read_attempts")
+       "pressure_status", "pressure_error", "spill_error", "resident_ceiling_bytes", "resident_working_set_bytes",
+       "resident_payload_bytes", "resident_cache_bytes", "pressure_target_bytes", "pressure_maintenance_us",
+       "pressure_reclaimed_bytes", "pressure_released_resident_bytes", "compaction_pages", "compaction_interval_steps",
+       "spill_deferred_enabled", "spill_deferred_staged_pages", "spill_deferred_packed_pages")
+ACCESS = ("forced_reclaims", "forced_failures", "forced_reclaim_ns",
+          "selection_ns", "backing_read_attempts", "backing_read_failures", "backing_read_ns",
+          "requested_pages", "reclaimed_bytes", "write_promotion_attempts", "write_promotions")
+JOURNAL = ("pread_calls", "pread_bytes", "pread_ns", "pwrite_calls", "pwrite_bytes", "pwrite_ns",
+           "fsync_calls", "fsync_ns")
+PARALLEL_IO = ("read_runs", "write_transactions", "read_bytes", "write_bytes")
+ATA = ("reads", "writes", "flushes", "read_ns", "write_ns", "flush_ns", "batched_pio_bytes")
 EARLY_LONG64 = tuple(range(750_000_000, 1_000_000_001, 50_000_000))
 LATE_LONG64 = tuple(range(8_200_000_000, 8_650_000_001, 50_000_000))
+AFTER_8_65B = (8_650_000_000, 9_000_000_000, 9_250_000_000, 9_500_000_000)
 RANGES = re.compile(
     r"REMOTE_ISO requests=(\d+) verified_ranges=(\d+) downloaded=(\d+) delivered=(\d+) failed=(\d+)"
     r" first_offset=(\d+) last_byte=(\d+)"
@@ -35,6 +46,7 @@ def load_checkpoint(record):
     boot = vm["boot_progress"]
     arm64 = vm["ether_arm64"]
     machine = vm["machine"]
+    storage = vm["storage_io"]
     return {
         "target_steps": record["target_steps"],
         "actual_steps": boot["session_steps"],
@@ -54,6 +66,9 @@ def load_checkpoint(record):
         "irq_delivered": vm["irq"]["delivered"],
         "started_vcpus": vm["cpu_topology"]["started"],
         "qssd_commits": vm["disk"]["commits"],
+        "system_qssd_journal": pick(storage.get("qssd_journal", {}), JOURNAL),
+        "system_qssd_parallel_io": pick(storage.get("qssd_parallel_io", {}), PARALLEL_IO + ("peak_workers",)),
+        "ata_backend": pick(storage.get("ata_backend", {}), ATA),
         "coverage": pick(vm["ether_coverage"], COVERAGE),
         "native_arm64": pick(arm64, NATIVE),
         "boot_loops": pick(vm.get("ether_next", {}), BOOT_LOOPS),
@@ -61,13 +76,16 @@ def load_checkpoint(record):
         "native_arm64_enabled": arm64["enabled"],
         "mundo_x_source_sha": arm64["mundo_x_source_sha"],
         "ram": pick(vm["ram_profile"], RAM),
-        "ram_access_pressure": pick(vm["ram_profile"].get("access_pressure", {}), ACCESS),
+        "spill_codec": {key: value for key, value in vm["ram_profile"].get("spill_codec", {}).items()
+                        if type(value) is int},
+        "ram_access_pressure": pick(vm["ram_profile"].get("access_pressure", {}),
+                                    ACCESS + ("forced_reclaim_max_ns",)),
     }
 
 
 def compute_delta(first, last, fields):
     return {key: last[key] - first[key] for key in fields
-            if isinstance(first.get(key), int) and isinstance(last.get(key), int)}
+            if type(first.get(key)) is int and type(last.get(key)) is int}
 
 
 def compare(first, last):
@@ -79,6 +97,9 @@ def compare(first, last):
     if steps <= 0 or wall_ns <= 0 or optical_ns < 0:
         raise ValueError("Matched checkpoints must have increasing steps and time")
     remaining_ns = wall_ns - optical_ns
+    native_counts = compute_delta(first["native_arm64"], last["native_arm64"], NATIVE)
+    native_blocks = native_counts.get("executed_blocks", 0)
+    native_steps = native_counts.get("guest_steps")
     return {
         "from_target_steps": first["target_steps"],
         "to_target_steps": last["target_steps"],
@@ -96,14 +117,20 @@ def compare(first, last):
         "guest_steps_per_wall_second": steps * 1e9 / wall_ns,
         "guest_steps_per_second_excluding_measured_optical_io":
             steps * 1e9 / remaining_ns if remaining_ns > 0 else None,
-        "native_arm64_delta": compute_delta(first["native_arm64"], last["native_arm64"], NATIVE),
+        "native_arm64_delta": native_counts,
+        "native_guest_steps_per_executed_block": (native_steps / native_blocks
+                                                   if native_steps is not None and native_blocks > 0 else None),
         "coverage_delta": compute_delta(first["coverage"], last["coverage"], COVERAGE),
         "boot_loop_delta": compute_delta(first["boot_loops"], last["boot_loops"], BOOT_LOOPS),
         "bios_read_delta": compute_delta(first, last, ("bios_reads", "bios_bytes")),
         "irq_delivered_delta": last["irq_delivered"] - first["irq_delivered"],
         "qssd_commits_delta": last["qssd_commits"] - first["qssd_commits"],
+        "system_qssd_journal_delta": compute_delta(first["system_qssd_journal"], last["system_qssd_journal"], JOURNAL),
+        "system_qssd_parallel_io_delta": compute_delta(first["system_qssd_parallel_io"], last["system_qssd_parallel_io"], PARALLEL_IO),
+        "ata_backend_delta": compute_delta(first["ata_backend"], last["ata_backend"], ATA),
         "mode_changes_in_interval": last["mode_changes"] - first["mode_changes"],
         "ram_counter_delta": compute_delta(first["ram"], last["ram"], RAM),
+        "spill_codec_delta": compute_delta(first["spill_codec"], last["spill_codec"], last["spill_codec"]),
         "ram_access_pressure_delta": compute_delta(first["ram_access_pressure"], last["ram_access_pressure"], ACCESS),
         "restarts_in_interval": last["restarts"] - first["restarts"],
     }
@@ -201,6 +228,7 @@ def main():
         "host_available_mib": int(os.environ["AVAILABLE_MIB"]),
         "host_threshold_mib": int(os.environ["THRESHOLD_MIB"]),
         "probe_exit_code": args.exit_code,
+        "probe_timeout_seconds": int(os.environ.get("PROBE_TIMEOUT_SECONDS", "600")),
         "optical_media": "Microsoft Windows 10 22H2 Enterprise Evaluation x64, verified HTTPS 206 ranges",
         "optical_media_bytes": 5_550_497_792,
         "optical_media_etag": "0x10B3D1548F58FA2A3866686CB570F06A16F6734DD99BBA1C7F0542A849EDD8E4",
@@ -216,15 +244,20 @@ def main():
     summary["continuation"] = continuation_record(args.run, stop_target)
     summary["early_long64_per_50m"] = long64_intervals(checkpoints, EARLY_LONG64)
     summary["late_long64_per_50m"] = long64_intervals(checkpoints, LATE_LONG64)
+    summary["continuation_after_8_65b"] = long64_intervals(checkpoints, AFTER_8_65B)
     for name, bounds in (("early_long64_control", (EARLY_LONG64[0], EARLY_LONG64[-1])),
                          ("late_long64_8_2_to_8_6", (LATE_LONG64[0], 8_600_000_000)),
-                         ("late_long64_total", (LATE_LONG64[0], LATE_LONG64[-1]))):
+                         ("late_long64_total", (LATE_LONG64[0], LATE_LONG64[-1])),
+                         ("continuation_8_65_to_9_5", (AFTER_8_65B[0], AFTER_8_65B[-1]))):
         if valid_targets(bounds):
             summary[name] = long64_interval(checkpoints[bounds[0]], checkpoints[bounds[-1]])
     required_targets = EARLY_LONG64 if stop_target == EARLY_LONG64[-1] else EARLY_LONG64 + LATE_LONG64
     required_intervals = summary["early_long64_per_50m"]
     if stop_target != EARLY_LONG64[-1]:
         required_intervals = required_intervals + summary["late_long64_per_50m"]
+    if stop_target >= AFTER_8_65B[-1]:
+        required_targets += AFTER_8_65B[1:]
+        required_intervals = required_intervals + summary["continuation_after_8_65b"]
     summary["validated_measurement"] = bool(
         args.exit_code == 0 and valid_source and summary["continuation"]["complete"]
         and valid_targets(required_targets)
