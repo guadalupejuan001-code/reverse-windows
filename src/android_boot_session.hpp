@@ -901,6 +901,7 @@ class AndroidBootSession final {
         << "},\"irq\":{\"ticks\":" << platform.ticks << ",\"delivered\":" << platform.irq_delivered
         << ",\"irq14\":" << platform.ata_irqs << ",\"irq15\":" << platform.atapi_irqs
         << ",\"lapic_delivered\":" << platform.apic_irqs
+        << ",\"irq64_bulk_frames\":" << pc_.cpu.irq64_bulk_frames
         << ",\"sci_delivered\":" << platform.sci_irqs
         << ",\"virtual_clock_hz\":" << cosmic_pc::PcMachine::kVirtualCyclesPerSecond
         << ",\"clock_source\":\"" << (board_->active_clock_enabled() ? "host-active-monotonic" : "guest-cycles") << '"'

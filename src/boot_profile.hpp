@@ -31,7 +31,12 @@ inline void write_ether_arm64(std::ostream& out, const cosmic_pc::Cpu& cpu) {
       << ",\"staged_ram_steps\":" << stats.staged_ram_steps
       << ",\"coalesced_ram_writes\":" << stats.coalesced_ram_writes
       << ",\"ram_add_guest_steps\":" << stats.ram_add_steps
+      << ",\"on_bus_register_steps\":" << stats.on_bus_register_steps
       << ",\"off_bus_register_steps\":" << stats.off_bus_register_steps
+      << ",\"register_bus_reacquisitions\":" << stats.register_bus_reacquisitions
+      << ",\"register_bus_reacquire_samples\":" << stats.register_bus_reacquire_samples
+      << ",\"register_bus_reacquire_contentions\":" << stats.register_bus_reacquire_contentions
+      << ",\"register_bus_reacquire_wait_ns\":" << stats.register_bus_reacquire_wait_ns
       << ",\"resident_read_hits\":" << stats.resident_read_hits
       << ",\"ram_read_callbacks\":" << stats.ram_read_callbacks
       << ",\"repeated_loop_dispatches\":" << stats.repeated_loop_dispatches
