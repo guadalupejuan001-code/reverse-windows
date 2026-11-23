@@ -30,16 +30,18 @@ JOURNAL = ("pread_calls", "pread_bytes", "pread_ns", "pwrite_calls", "pwrite_byt
            "fsync_calls", "fsync_ns")
 PARALLEL_IO = ("read_runs", "write_transactions", "read_bytes", "write_bytes")
 ATA = ("reads", "writes", "flushes", "read_ns", "write_ns", "flush_ns", "batched_pio_bytes")
+ATA_DEVICE = ("commands", "identify_data_transfers", "read_sectors", "write_sectors", "flushes")
 SMP = ("started", "host_workers", "host_workers_capacity", "host_workers_peak_dispatch",
        "threaded_dispatches", "threaded_guest_steps", "off_bus_ram_blocks", "off_bus_ram_steps",
        "ram_view_conflicts", "sampled_bus_grants", "sampled_bus_contentions", "sampled_bus_wait_ns",
-       "parallel_register_steps", "parallel_ram_steps", "parallel_mixed_batches")
+       "parallel_register_steps", "parallel_ram_steps", "parallel_mixed_batches",
+       "threaded_pause_yields", "threaded_pause_turn_steps", "threaded_pause_admissions")
 RTC = ("register_a", "register_b", "irq8_assertions", "irq8_acknowledgements", "irq8_delivered")
 IRQ_VECTOR = ("deliveries", "eois", "entry_to_eoi_ticks", "entry_to_eoi_steps")
 IRQ_CLOCK = ("clock_source", "virtual_clock_hz", "active_clock_elapsed_ns", "active_clock_ticks")
 BOOT_PROFILE_STATE = ("steps", "total_processor_steps", "ether_arm64_steps", "started_vcpus",
                       "rtc_irq8_delivered", "host_elapsed_ns", "sipi_targets_applied", "mode",
-                      "ip_hex", "run_ns", "irq_delivered", "spill_reads", "spill_writes", "registers")
+                      "ip_hex", "run_ns", "irq_delivered", "spill_reads", "spill_writes", "registers", "tsc_access")
 EARLY_LONG64 = tuple(range(750_000_000, 1_000_000_001, 50_000_000))
 LATE_LONG64 = tuple(range(8_200_000_000, 8_650_000_001, 50_000_000))
 AFTER_8_65B = (8_650_000_000, 9_000_000_000, 9_250_000_000, 9_500_000_000)
@@ -81,6 +83,8 @@ def load_checkpoint(record):
         "irq_delivered": vm["irq"]["delivered"],
         "started_vcpus": topology["started"],
         "guest_tsc_hz": topology.get("guest_tsc_hz"),
+        "tsc_access": topology.get("tsc_access"),
+        "tsc_access_by_logical_processor": topology.get("tsc_access_by_logical_processor"),
         "smp": pick(topology, SMP),
         "startup_ipis": topology.get("startup_ipis", {}),
         "vcpu_states": topology.get("states_by_logical_processor", []),
@@ -99,6 +103,7 @@ def load_checkpoint(record):
         "system_qssd_journal": pick(storage.get("qssd_journal", {}), JOURNAL),
         "system_qssd_parallel_io": pick(storage.get("qssd_parallel_io", {}), PARALLEL_IO + ("peak_workers",)),
         "ata_backend": pick(storage.get("ata_backend", {}), ATA),
+        "ata_device": pick(vm.get("ata", {}), ATA_DEVICE),
         "coverage": pick(vm["ether_coverage"], COVERAGE),
         "native_arm64": pick(arm64, NATIVE),
         "boot_loops": pick(vm.get("ether_next", {}), BOOT_LOOPS),
@@ -174,6 +179,7 @@ def compare(first, last):
         "system_qssd_journal_delta": compute_delta(first["system_qssd_journal"], last["system_qssd_journal"], JOURNAL),
         "system_qssd_parallel_io_delta": compute_delta(first["system_qssd_parallel_io"], last["system_qssd_parallel_io"], PARALLEL_IO),
         "ata_backend_delta": compute_delta(first["ata_backend"], last["ata_backend"], ATA),
+        "ata_device_delta": compute_delta(first["ata_device"], last["ata_device"], ATA_DEVICE),
         "mode_changes_in_interval": last["mode_changes"] - first["mode_changes"],
         "ram_counter_delta": compute_delta(first["ram"], last["ram"], RAM),
         "spill_codec_delta": compute_delta(first["spill_codec"], last["spill_codec"], last["spill_codec"]),
