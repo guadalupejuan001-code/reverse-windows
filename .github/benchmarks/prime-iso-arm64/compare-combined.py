@@ -6,7 +6,7 @@ from pathlib import Path
 CONTROLS = ("protected32_control", "early_long64_control", "late_long64_8_2_to_8_6", "late_long64_total",
             "continuation_8_65_to_9_5")
 MATCHED_INPUTS = ("optical_media_bytes", "optical_media_etag", "affinity_cpu", "host_available_mib",
-                  "host_threshold_mib", "runner_architecture", "probe_timeout_seconds")
+                  "host_threshold_mib", "runner_architecture", "probe_timeout_seconds", "affinity_cpus")
 SPAN_FIELDS = ("actual_steps", "wall_ns", "process_cpu_ns", "engine_window_ns", "optical_io_ns",
                "process_peak_rss_bytes_at_end", "guest_steps_per_wall_second", "mode_classification",
                "from_cpu_mode", "to_cpu_mode", "mode_changes_in_interval", "restarts_in_interval",
@@ -14,7 +14,9 @@ SPAN_FIELDS = ("actual_steps", "wall_ns", "process_cpu_ns", "engine_window_ns", 
                "coverage_delta", "native_arm64_delta", "native_guest_steps_per_executed_block",
                "boot_loop_delta", "ram_counter_delta", "spill_codec_delta",
                "ram_access_pressure_delta", "system_qssd_journal_delta", "system_qssd_parallel_io_delta",
-               "ata_backend_delta")
+               "ata_backend_delta", "bsp_steps_per_wall_second", "vcpu_steps", "vcpu_arm64_steps",
+               "started_vcpus", "smp_delta", "startup_ipis_delta", "irq_vectors_delta", "rtc_delta",
+               "irq_clock_delta")
 
 
 def pick(record, fields):
@@ -30,26 +32,32 @@ def compare(reference, candidate):
     mode_path_equal = all(reference[key] == candidate[key] for key in
                           ("from_cpu_mode", "to_cpu_mode", "mode_changes_in_interval", "restarts_in_interval"))
     media_reads_equal = reference["bios_read_delta"] == candidate["bios_read_delta"]
+    vcpu_path_equal = reference["started_vcpus"] == candidate["started_vcpus"]
     return {"from_target_steps": targets[0], "to_target_steps": targets[1],
-            "relative_change_percent": (new / old - 1) * 100 if mode_path_equal and media_reads_equal else None,
+            "relative_change_percent": (new / old - 1) * 100
+            if mode_path_equal and media_reads_equal and vcpu_path_equal else None,
             "observed_mode_path_equal": mode_path_equal,
             "observed_bios_media_reads_equal": media_reads_equal,
+            "observed_vcpu_path_equal": vcpu_path_equal,
             "reference": pick(reference, SPAN_FIELDS), "candidate": pick(candidate, SPAN_FIELDS)}
 
 
 def compare_series(reference, candidate, key):
-    old = {(row["from_target_steps"], row["to_target_steps"]): row for row in reference[key]}
-    new = {(row["from_target_steps"], row["to_target_steps"]): row for row in candidate[key]}
+    old = {(row["from_target_steps"], row["to_target_steps"]): row for row in reference.get(key, [])}
+    new = {(row["from_target_steps"], row["to_target_steps"]): row for row in candidate.get(key, [])}
     return [compare(old[span], new[span]) for span in sorted(old.keys() & new.keys())]
 
 
 def terminal(run):
     latest = run["checkpoints"][-1] if run["checkpoints"] else None
-    identity = pick(run, ("product_sha", "mundo_x_sha", "probe_exit_code", "transport", "continuation"))
+    identity = pick(run, ("product_sha", "mundo_x_sha", "probe_exit_code", "transport", "continuation",
+                          "observed_two_live_vcpus"))
     if latest:
         identity["last_checkpoint"] = pick(latest, ("actual_steps", "cpu_mode", "rip_hex", "irq_delivered",
             "started_vcpus", "bios_reads", "qssd_commits", "process_peak_rss_bytes", "ram",
-            "ram_access_pressure", "spill_codec", "system_qssd_journal", "system_qssd_parallel_io", "ata_backend"))
+            "ram_access_pressure", "spill_codec", "system_qssd_journal", "system_qssd_parallel_io", "ata_backend",
+            "windows_ready", "smp", "startup_ipis", "vcpu_states", "vcpu_steps", "vcpu_arm64_steps", "irq_vectors",
+            "irq_clock"))
     return identity
 
 
@@ -74,15 +82,18 @@ summary = {
     "early_long64_per_50m": compare_series(reference, candidate, "early_long64_per_50m"),
     "late_long64_per_50m": compare_series(reference, candidate, "late_long64_per_50m"),
     "continuation_after_8_65b": compare_series(reference, candidate, "continuation_after_8_65b"),
+    "sustained_long64_per_50m": compare_series(reference, candidate, "sustained_long64_per_50m"),
 }
 args.output.write_text(json.dumps(summary, indent=2) + "\n")
 for key, result in controls.items():
     old = result["reference"]["guest_steps_per_wall_second"]
     new = result["candidate"]["guest_steps_per_wall_second"]
     gain = result["relative_change_percent"]
-    comparison = f"{gain:+.2f}%" if gain is not None else "mode path or BIOS media reads differ"
+    comparison = f"{gain:+.2f}%" if gain is not None else "mode path, BIOS media reads or vCPU availability differ"
     print(f"{key} {old:,.0f} -> {new:,.0f} steps/s ({comparison})")
 valid = (summary["reference_valid"] and summary["candidate_valid"] and all(matched.values())
          and len(controls) == len(CONTROLS) and len(summary["late_long64_per_50m"]) == 9
-         and len(summary["early_long64_per_50m"]) == 5 and len(summary["continuation_after_8_65b"]) == 3)
+         and len(summary["early_long64_per_50m"]) == 5 and len(summary["continuation_after_8_65b"]) == 3
+         and len(summary["sustained_long64_per_50m"]) ==
+         (reference["continuation"]["target_steps"] - 9_500_000_000) // 50_000_000)
 raise SystemExit(0 if valid else 1)

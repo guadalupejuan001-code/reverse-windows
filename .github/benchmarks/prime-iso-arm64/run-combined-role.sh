@@ -29,5 +29,10 @@ else
   probe_exit=${PIPESTATUS[0]}
   if ((probe_exit == 0)); then probe_exit=1; fi
 fi
+for screen in terminal.ppm text-screen.txt; do
+  if [[ -f "$output/$screen" ]]; then
+    cp "$output/$screen" "$evidence/$role-$screen"
+  fi
+done
 PRODUCT_SHA="$product_sha" MUNDO_X_SHA="$core_sha" python3 "$bench/summarize.py" \
   --run "$output" --transport-log "$evidence/$role.stderr" --output "$evidence/$role.json" --exit-code "$probe_exit"

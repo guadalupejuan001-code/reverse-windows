@@ -1,12 +1,15 @@
-"""Resolve the two explicitly pinned products for the physical ARM64 job."""
+"""Resolve the pinned reference and optional candidate for the physical ARM64 job."""
 import json
 from pathlib import Path
 import re
 import sys
 
 pins = json.loads(Path(sys.argv[1]).read_text())
+allow_reference_only = sys.argv[2:] == ["--reference-only-allowed"]
 for role in ('reference', 'candidate'):
     record = pins.get(role)
+    if role == 'candidate' and record is None and allow_reference_only:
+        break
     if not record:
         raise SystemExit(f'A published {role} product and its Mundo X pin are required')
     revisions = (record.get('product_sha'), record.get('mundo_x_sha'))

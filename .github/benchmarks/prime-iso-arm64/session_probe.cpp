@@ -56,6 +56,38 @@ std::string_view checkpoint_field(std::string_view diagnostic, std::string_view 
   return finish == std::string_view::npos ? "unavailable" : diagnostic.substr(start, finish - start);
 }
 
+void save_full_frame(const Session::VideoUpdate& frame, const std::filesystem::path& path) {
+  if (!frame.graphics || !frame.width || !frame.height) return;
+  const auto& packet = *frame.graphics;
+  const auto pixels = std::size_t(frame.width) * frame.height;
+  if (packet.empty() || packet[0] > pixels) throw std::runtime_error("Invalid frame rectangle count");
+  std::vector<std::uint8_t> rgb(pixels * 3), covered(pixels);
+  std::size_t at = 1;
+  for (unsigned i = 0; i < packet[0]; ++i) {
+    if (packet.size() - at < 4) throw std::runtime_error("Incomplete frame rectangle");
+    const auto x = packet[at++], y = packet[at++], width = packet[at++], height = packet[at++];
+    if (!width || !height || x >= frame.width || y >= frame.height || width > frame.width - x ||
+        height > frame.height - y || std::size_t(width) * height > packet.size() - at)
+      throw std::runtime_error("Out-of-range frame rectangle");
+    for (unsigned row = 0; row < height; ++row) {
+      for (unsigned column = 0; column < width; ++column) {
+        const auto pixel = packet[at++];
+        const auto index = std::size_t(y + row) * frame.width + x + column;
+        rgb[index * 3] = std::uint8_t(pixel >> 16);
+        rgb[index * 3 + 1] = std::uint8_t(pixel >> 8);
+        rgb[index * 3 + 2] = std::uint8_t(pixel);
+        covered[index] = 1;
+      }
+    }
+  }
+  if (at != packet.size() || std::find(covered.begin(), covered.end(), 0) != covered.end())
+    throw std::runtime_error("Requested full frame has missing RGB pixels");
+  std::ofstream out(path, std::ios::binary);
+  out << "P6\n" << frame.width << ' ' << frame.height << "\n255\n";
+  out.write(reinterpret_cast<const char*>(rgb.data()), rgb.size());
+  if (!out) throw std::runtime_error("Could not write the terminal RGB frame");
+}
+
 int main(int argc, char** argv) {
   if (argc != 7) {
     std::cerr << "usage: session_probe ISO OUTPUT_DIR RETIRED_TARGET TIMEOUT_S AVAILABLE_MIB THRESHOLD_MIB\n";
@@ -94,6 +126,8 @@ int main(int argc, char** argv) {
     for (std::uint64_t point = 8'200'000'000; point <= 8'650'000'000; point += 50'000'000)
       milestone_steps.push_back(point);
     for (const auto point : {9'000'000'000ULL, 9'250'000'000ULL, 9'500'000'000ULL})
+      milestone_steps.push_back(point);
+    for (std::uint64_t point = 9'550'000'000ULL; point <= target; point += 50'000'000ULL)
       milestone_steps.push_back(point);
     std::size_t next_milestone = 0;
     std::vector<GuestSlice> windows;
@@ -183,7 +217,9 @@ int main(int argc, char** argv) {
     maintenance_log.close();
     if (!maintenance_log) throw std::runtime_error("Could not write the maintenance timing log");
     std::array<std::uint8_t,4000> text{};
+    session.retry_video();
     const auto video = session.capture_video(text.data(), text.size());
+    save_full_frame(video, run_dir / "terminal.ppm");
     std::ofstream report(run_dir / "session.json");
     report << session.diagnostic(true) << '\n';
     if (!report) throw std::runtime_error("Could not write session evidence");

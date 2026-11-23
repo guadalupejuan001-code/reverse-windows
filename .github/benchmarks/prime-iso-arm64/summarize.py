@@ -28,6 +28,13 @@ JOURNAL = ("pread_calls", "pread_bytes", "pread_ns", "pwrite_calls", "pwrite_byt
            "fsync_calls", "fsync_ns")
 PARALLEL_IO = ("read_runs", "write_transactions", "read_bytes", "write_bytes")
 ATA = ("reads", "writes", "flushes", "read_ns", "write_ns", "flush_ns", "batched_pio_bytes")
+SMP = ("started", "host_workers", "host_workers_capacity", "host_workers_peak_dispatch",
+       "threaded_dispatches", "threaded_guest_steps", "off_bus_ram_blocks", "off_bus_ram_steps",
+       "ram_view_conflicts", "sampled_bus_grants", "sampled_bus_contentions", "sampled_bus_wait_ns",
+       "parallel_register_steps", "parallel_ram_steps", "parallel_mixed_batches")
+RTC = ("register_a", "register_b", "irq8_assertions", "irq8_acknowledgements", "irq8_delivered")
+IRQ_VECTOR = ("deliveries", "eois", "entry_to_eoi_ticks", "entry_to_eoi_steps")
+IRQ_CLOCK = ("clock_source", "virtual_clock_hz", "active_clock_elapsed_ns", "active_clock_ticks")
 EARLY_LONG64 = tuple(range(750_000_000, 1_000_000_001, 50_000_000))
 LATE_LONG64 = tuple(range(8_200_000_000, 8_650_000_001, 50_000_000))
 AFTER_8_65B = (8_650_000_000, 9_000_000_000, 9_250_000_000, 9_500_000_000)
@@ -47,6 +54,8 @@ def load_checkpoint(record):
     arm64 = vm["ether_arm64"]
     machine = vm["machine"]
     storage = vm["storage_io"]
+    topology = vm["cpu_topology"]
+    irq = vm["irq"]
     return {
         "target_steps": record["target_steps"],
         "actual_steps": boot["session_steps"],
@@ -64,7 +73,17 @@ def load_checkpoint(record):
         "bios_reads": machine["disk_reads"],
         "bios_bytes": vm["storage_io"]["bios_boot_media"]["read_bytes"],
         "irq_delivered": vm["irq"]["delivered"],
-        "started_vcpus": vm["cpu_topology"]["started"],
+        "started_vcpus": topology["started"],
+        "smp": pick(topology, SMP),
+        "startup_ipis": topology.get("startup_ipis", {}),
+        "vcpu_states": topology.get("states_by_logical_processor", []),
+        "vcpu_steps": topology.get("steps_by_logical_processor", []),
+        "vcpu_arm64_steps": topology.get("ether_arm64_steps_by_logical_processor", []),
+        "rtc": pick(vm.get("rtc", {}), RTC),
+        "irq_clock": pick(irq, IRQ_CLOCK),
+        "irq_vectors": {str(vector["vector"]): pick(vector, IRQ_VECTOR)
+                        for vector in irq.get("lapic_vectors", [])},
+        "windows_ready": machine["windows_ready"],
         "qssd_commits": vm["disk"]["commits"],
         "system_qssd_journal": pick(storage.get("qssd_journal", {}), JOURNAL),
         "system_qssd_parallel_io": pick(storage.get("qssd_parallel_io", {}), PARALLEL_IO + ("peak_workers",)),
@@ -100,6 +119,11 @@ def compare(first, last):
     native_counts = compute_delta(first["native_arm64"], last["native_arm64"], NATIVE)
     native_blocks = native_counts.get("executed_blocks", 0)
     native_steps = native_counts.get("guest_steps")
+    vcpu_steps = [b - a for a, b in zip(first["vcpu_steps"], last["vcpu_steps"])]
+    vcpu_arm64_steps = [b - a for a, b in zip(first["vcpu_arm64_steps"], last["vcpu_arm64_steps"])]
+    irq_vectors = {vector: compute_delta(
+        {key: first["irq_vectors"].get(vector, {}).get(key, 0) for key in IRQ_VECTOR},
+        counters, IRQ_VECTOR) for vector, counters in last["irq_vectors"].items()}
     return {
         "from_target_steps": first["target_steps"],
         "to_target_steps": last["target_steps"],
@@ -115,6 +139,15 @@ def compare(first, last):
         "process_peak_rss_bytes_at_end": last["process_peak_rss_bytes"],
         "optical_io_ns": optical_ns,
         "guest_steps_per_wall_second": steps * 1e9 / wall_ns,
+        "bsp_steps_per_wall_second": vcpu_steps[0] * 1e9 / wall_ns if vcpu_steps else None,
+        "vcpu_steps": vcpu_steps,
+        "vcpu_arm64_steps": vcpu_arm64_steps,
+        "started_vcpus": [first["started_vcpus"], last["started_vcpus"]],
+        "smp_delta": compute_delta(first["smp"], last["smp"], SMP[4:]),
+        "startup_ipis_delta": compute_delta(first["startup_ipis"], last["startup_ipis"], last["startup_ipis"]),
+        "irq_vectors_delta": irq_vectors,
+        "rtc_delta": compute_delta(first["rtc"], last["rtc"], RTC[2:]),
+        "irq_clock_delta": compute_delta(first["irq_clock"], last["irq_clock"], IRQ_CLOCK[2:]),
         "guest_steps_per_second_excluding_measured_optical_io":
             steps * 1e9 / remaining_ns if remaining_ns > 0 else None,
         "native_arm64_delta": native_counts,
@@ -224,7 +257,8 @@ def main():
         "product_sha": product_sha,
         "mundo_x_sha": core_sha,
         "runner_architecture": os.environ.get("RUNNER_ARCH"),
-        "affinity_cpu": int(os.environ["PROBE_CPU"]),
+        "affinity_cpu": int(os.environ["PROBE_CPU"].split(",")[0]),
+        "affinity_cpus": [int(cpu) for cpu in os.environ["PROBE_CPU"].split(",")],
         "host_available_mib": int(os.environ["AVAILABLE_MIB"]),
         "host_threshold_mib": int(os.environ["THRESHOLD_MIB"]),
         "probe_exit_code": args.exit_code,
@@ -245,6 +279,13 @@ def main():
     summary["early_long64_per_50m"] = long64_intervals(checkpoints, EARLY_LONG64)
     summary["late_long64_per_50m"] = long64_intervals(checkpoints, LATE_LONG64)
     summary["continuation_after_8_65b"] = long64_intervals(checkpoints, AFTER_8_65B)
+    late_smp_targets = tuple(range(9_500_000_000, stop_target + 1, 50_000_000))
+    summary["sustained_long64_per_50m"] = long64_intervals(checkpoints, late_smp_targets)
+    summary["observed_two_live_vcpus"] = any(
+        min(interval["started_vcpus"]) >= 2
+        and len(interval["vcpu_steps"]) > 1 and min(interval["vcpu_steps"][:2]) > 0
+        and interval["smp_delta"].get("threaded_guest_steps", 0) > 0
+        for interval in summary["sustained_long64_per_50m"])
     for name, bounds in (("early_long64_control", (EARLY_LONG64[0], EARLY_LONG64[-1])),
                          ("late_long64_8_2_to_8_6", (LATE_LONG64[0], 8_600_000_000)),
                          ("late_long64_total", (LATE_LONG64[0], LATE_LONG64[-1])),
@@ -258,10 +299,13 @@ def main():
     if stop_target >= AFTER_8_65B[-1]:
         required_targets += AFTER_8_65B[1:]
         required_intervals = required_intervals + summary["continuation_after_8_65b"]
+    if stop_target > AFTER_8_65B[-1]:
+        required_targets += late_smp_targets[1:]
     summary["validated_measurement"] = bool(
         args.exit_code == 0 and valid_source and summary["continuation"]["complete"]
         and valid_targets(required_targets)
         and all(interval["long64_endpoints_no_restart"] for interval in required_intervals)
+        and all(interval["restarts_in_interval"] == 0 for interval in summary["sustained_long64_per_50m"])
     )
     args.output.write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
