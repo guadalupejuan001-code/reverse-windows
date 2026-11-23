@@ -1,0 +1,72 @@
+name: R110 native ARM64 PAUSE scheduling A-B
+on:
+  push:
+    branches: [ci/prime-r110-native-pause-smp]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  timestamp-exchange:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 18
+    env:
+      REFERENCE_PRODUCT: 64b24f000e1774fb8fb0c28ea130180192baac6b
+      REFERENCE_MUNDO: 9bda35773a1d634fcf1c29566da9093f62d6c70b
+      CANDIDATE_PRODUCT: e041659f1f9cf5c41bc988d1b3662e149119757e
+      CANDIDATE_MUNDO: b3a3d04f14d644a2eea332492108f16306d629ff
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REFERENCE_PRODUCT }}
+          path: reference
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANDIDATE_PRODUCT }}
+          path: candidate
+          persist-credentials: false
+      - name: Verify revisions and compile the same guest workload
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          bench="$PWD/.github/benchmarks/prime-r110-native-pause"
+          mkdir build evidence
+          for variant in reference candidate; do
+            if [[ "$variant" == reference ]]; then
+              product="$REFERENCE_PRODUCT"
+              engine="$REFERENCE_MUNDO"
+              flags=(-DPRIME_BASELINE_PAUSE_SCHEDULER=1)
+            else
+              product="$CANDIDATE_PRODUCT"
+              engine="$CANDIDATE_MUNDO"
+              flags=()
+            fi
+            checkout="$PWD/$variant"
+            test "$(git -C "$checkout" rev-parse HEAD)" = "$product"
+            (cd "$checkout" && python3 scripts/verify_deps.py --checkout)
+            test "$(git -C "$checkout/deps/mundo-X" rev-parse HEAD)" = "$engine"
+            cp "$checkout/config/dependencies.lock.json" "evidence/$variant-dependencies.lock.json"
+            printf '%s product=%s mundo_x=%s\n' "$variant" "$product" "$engine" | tee -a evidence/revisions.txt
+            c++ -std=c++17 -O2 -DNDEBUG -DMUNDO_X_PC_STATE_RAM=1 -frounding-math -pthread "${flags[@]}" \
+              -I"$checkout/src" -I"$checkout/deps/mundo-X/pc-android/native" -I"$checkout/deps/mundo-X/native/include" \
+              -I"$checkout/deps/Virtual-qSSD-/include" -I"$checkout/deps/GPU-VIRTUAL/include" \
+              "$bench/workload.cpp" -lz -o "build/$variant"
+          done
+          (uname -a && lscpu && c++ --version) > evidence/runner.txt
+          sha256sum build/reference build/candidate "$bench/workload.cpp" "$bench/compare.py" > evidence/SHA256SUMS
+      - name: Compare native ARM64 exchange completion and record windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/benchmarks/prime-r110-native-pause/compare.py \
+            build/reference build/candidate evidence | tee evidence/paired.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: r110-native-arm64-pause-paired
+          path: evidence
+          if-no-files-found: error
