@@ -769,6 +769,23 @@ class AndroidBootSession final {
         out << ",\"interrupt_origin\":";
         cosmic_pc::PcMachine::write_interrupt_origin(out, *faulted_cpu->fault->interrupt_origin);
       }
+      if (const auto rejection = board_->fault_icr_write_rejection(*faulted_cpu)) {
+        using Reason = PcMotherboardC06::IcrWriteRejectionReason;
+        out << ",\"icr_low_rejection\":{\"source_apic_id\":" << rejection->source_apic_id
+            << ",\"icr_low\":" << rejection->low << ",\"icr_high\":" << rejection->high
+            << ",\"delivery_mode\":" << ((rejection->low >> 8) & 7U)
+            << ",\"destination_shorthand\":" << ((rejection->low >> 18) & 3U)
+            << ",\"global_enabled\":" << (rejection->global_enabled ? "true" : "false")
+            << ",\"software_enabled\":" << (rejection->software_enabled ? "true" : "false")
+            << ",\"reason\":\"" << (rejection->reason == Reason::GlobalApicDisabled
+                                        ? "global_apic_disabled" : "delivery_mode_unsupported")
+            << "\",\"regs_hex\":[";
+        for (unsigned i = 0; i < faulted_cpu->regs.size(); ++i) {
+          out << (i ? ",\"" : "\"") << std::hex << std::setw(16) << std::setfill('0')
+              << faulted_cpu->regs[i] << '"';
+        }
+        out << std::dec << "]}";
+      }
       out << '}';
     }
     out << ",\"ram_profile\":";

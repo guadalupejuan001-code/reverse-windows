@@ -269,6 +269,58 @@ void test_secondary_interrupts(bool threaded) {
             board.evidence().apic_irqs == 2, "directed IPI, EOI, and independent AP timer");
 }
 
+#if PRIME_HAS_C06_READY_WAKE_TESTS
+void test_secondary_icr_rejection(bool global_enabled) {
+    PcMachine pc(4U << 20);
+    pc.boot_demo();
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {2, 1});
+    board.enable_threaded_smp();
+    auto& bsp = pc.cpu;
+    bsp.reset(0, 0x7200);
+    bsp.a20_enabled = true;
+    bsp.write16(0x7200, 0xfeeb);
+    install_protected32_entry(bsp, 0x9000);
+    constexpr std::uint8_t prepare[] = {
+        0x66,0xb8,0x10,0,0x8e,0xd8,                 // Flat data segment.
+        0xc7,0x05,0xf0,0,0xe0,0xfe,0xff,1,0,0,      // Software-enable AP LAPIC.
+        0xc7,0x05,0x10,3,0xe0,0xfe,0,0,0,0x8a      // Set source ICR high.
+    };
+    constexpr std::uint8_t disable[] = {
+        0xb9,0x1b,0,0,0,0xb8,0,0,0xe0,0xfe,0x31,0xd2,0x0f,0x30 // IA32_APIC_BASE.EN = 0.
+    };
+    constexpr std::uint8_t send[] = {
+        0xb8,0,0,0xe0,0xfe,0xba,0,4,8,0,           // EAX = LAPIC; EDX = NMI, all including self.
+        0x89,0x90,0,3,0,0,                          // MOV [EAX+300h], EDX.
+        0xf4
+    };
+    bsp.memory.write_block(0x9020, prepare, sizeof(prepare));
+    auto send_address = 0x9020 + sizeof(prepare);
+    if (!global_enabled) {
+        bsp.memory.write_block(send_address, disable, sizeof(disable));
+        send_address += sizeof(disable);
+    }
+    bsp.memory.write_block(send_address, send, sizeof(send));
+    bsp.write32(kLapic + 0x310, 1U << 24);
+    bsp.write32(kLapic + 0x300, 0x0609U);
+    board.run(256);
+    const auto* faulted = board.faulted_cpu();
+    require(faulted && faulted->apic_id() == 1 && faulted->fault &&
+                faulted->fault->code == cosmic_pc::FaultCode::UnsupportedPort &&
+                faulted->fault->eip == send_address + 10,
+            "unsupported AP ICR write must still fail at the guest instruction");
+    const auto rejection = board.fault_icr_write_rejection(*faulted);
+    using Reason = PcMotherboardC06::IcrWriteRejectionReason;
+    require(rejection && rejection->source_apic_id == 1 && rejection->low == 0x00080400U &&
+                rejection->high == 0x8a000000U && rejection->software_enabled &&
+                rejection->global_enabled == global_enabled &&
+                rejection->reason == (global_enabled ? Reason::DeliveryModeUnsupported : Reason::GlobalApicDisabled),
+            "ICR rejection must identify the writing AP, its unmasked payload and exact rejection reason");
+    require(!board.fault_icr_write_rejection(bsp) && bsp.read32(kLapic + 0x310) == 1U << 24 &&
+                board.evidence().apic_irqs == 0,
+            "failed AP write must neither leak into BSP state nor deliver an interrupt");
+}
+#endif
+
 void test_bsp_irq_during_ap_rep() {
     PcMachine pc(4U << 20);
     pc.boot_demo();
@@ -2058,6 +2110,11 @@ int main(int argc, char** argv) {
         test_eight_cores_sixteen_threads(true, 8);
         test_secondary_interrupts(false);
         test_secondary_interrupts(true);
+#if PRIME_HAS_C06_READY_WAKE_TESTS
+        test_secondary_icr_rejection(true);
+        test_secondary_icr_rejection(false);
+        std::cout << "SMP_ICR_REJECTION_PASS unsupported_mode=1 disabled_apic=1\n";
+#endif
         test_ether_worker_block();
         test_secondary_streaming_stores(false);
         test_secondary_streaming_stores(true);

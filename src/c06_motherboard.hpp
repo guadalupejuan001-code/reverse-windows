@@ -61,6 +61,15 @@ class PcMotherboardC06 {
     std::uint64_t init_icr_writes = 0, sipi_icr_writes = 0;
     std::uint64_t init_targets_queued = 0, sipi_targets_queued = 0, sipi_targets_applied = 0;
   };
+  enum class IcrWriteRejectionReason { GlobalApicDisabled, DeliveryModeUnsupported };
+  struct IcrWriteRejection {
+    unsigned source_apic_id;
+    std::uint32_t low, high;
+    bool global_enabled, software_enabled;
+    IcrWriteRejectionReason reason;
+    std::uint16_t cs;
+    std::uint64_t rip, retired_steps;
+  };
   struct ProcessorPosition {
     const char* mode;
     std::uint16_t cs;
@@ -307,6 +316,7 @@ class PcMotherboardC06 {
     std::optional<std::uint8_t> startup_vector;
     std::uint32_t svr = 0xff, ldr = 0, dfr = 0xffffffffU;
     std::uint32_t esr = 0, errors = 0, icr_low = 0, icr_high = 0;
+    std::optional<IcrWriteRejection> icr_write_rejection;
     std::array<std::uint32_t,6> lvt{};
     std::uint32_t timer_reload = 0, divider = 0;
     std::uint64_t timer_cycles = 0, last_tick = 0;
@@ -891,10 +901,20 @@ class PcMotherboardC06 {
     if(!reg)return std::nullopt;
     return std::uint8_t((*reg>>((a&3)*8))&255U);
   }
+  static bool reject_icr_low(LocalApic& source, std::uint32_t value, IcrWriteRejectionReason reason) {
+    const auto& cpu = *source.cpu;
+    source.icr_write_rejection = IcrWriteRejection{
+        cpu.apic_id(), value, source.icr_high, cpu.apic_global_enabled(), bool(source.svr & 0x100U),
+        reason, cpu.segments[cosmic_pc::Cpu::CS], cpu.eip, cpu.instructions};
+    return false;
+  }
   bool mmio_commit(LocalApic& apic, std::uint64_t base,std::uint32_t v) {
     if(base>=kLocalApic&&base<kLocalApic+4096){
-      if(!apic.cpu->apic_global_enabled())return false;
       const auto r=unsigned(base-kLocalApic);
+      if(!apic.cpu->apic_global_enabled()){
+        if(r==0x300) return reject_icr_low(apic, v, IcrWriteRejectionReason::GlobalApicDisabled);
+        return false;
+      }
       if(const auto lvt=lvt_index(r)){
         if(*lvt==kTimer&&(v&0x40000U))return false; // No TSC deadline.
         const std::uint32_t writable=*lvt==kTimer?0x300ffU:
@@ -1012,8 +1032,9 @@ class PcMotherboardC06 {
     };
     if (mode > 1 && mode != 5 && mode != 6) {
       for (unsigned id = 0; id < processor_count_; ++id)
-        if (selected(id)) return false;
+        if (selected(id)) return reject_icr_low(source, value, IcrWriteRejectionReason::DeliveryModeUnsupported);
     }
+    source.icr_write_rejection.reset();
     source.icr_low=value&0x000ccfffU;
     if (mode == 5 || mode == 6) {
       if (mode == 5) ++startup_ipis_.init_icr_writes;
@@ -2255,6 +2276,14 @@ class PcMotherboardC06 {
   unsigned longest_parallel_register_slice() const noexcept { return longest_parallel_register_slice_; }
   const cosmic_pc::Cpu* faulted_cpu() const noexcept {
     return faulted_processor_ ? apics_[*faulted_processor_].cpu : nullptr;
+  }
+  std::optional<IcrWriteRejection> fault_icr_write_rejection(const cosmic_pc::Cpu& cpu) const noexcept {
+    if (!cpu.fault || cpu.fault->code != cosmic_pc::FaultCode::UnsupportedPort ||
+        cpu.apic_id() >= processor_count_) return std::nullopt;
+    const auto& rejection = apics_[cpu.apic_id()].icr_write_rejection;
+    if (!rejection || rejection->cs != cpu.fault->cs || rejection->rip != cpu.fault->eip ||
+        rejection->retired_steps != cpu.instructions) return std::nullopt;
+    return rejection;
   }
   void enable_active_clock(ClockSource source={}, ClockStart start=ClockStart::Immediate) {
     if(active_clock_enabled_)return;
