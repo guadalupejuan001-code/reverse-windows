@@ -49,50 +49,54 @@ jobs:
           cc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -o "$RUNNER_TEMP/verified_iso.so" \
             "$bench/verified_iso.c" -lcurl -pthread
           sha256sum "$RUNNER_TEMP"/build-*/session_probe "$RUNNER_TEMP/verified_iso.so" > "$evidence/native-sha256.txt"
-      - name: Run both verified official ISOs on the same physical CPU
+      - name: Run the exact reference on the physical CPU
         shell: bash
         run: |
           set -euo pipefail
           bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
           evidence="$RUNNER_TEMP/evidence"
-          export PROBE_CPU
-          PROBE_CPU="$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          python3 -c 'import os; print(min(os.sched_getaffinity(0)))' > "$RUNNER_TEMP/probe-cpu"
           {
             uname -m
             lscpu
             c++ --version
-            printf 'CPU affinity %s\n' "$PROBE_CPU"
+            printf 'CPU affinity %s\n' "$(cat "$RUNNER_TEMP/probe-cpu")"
           } > "$evidence/runner.txt"
-          pair_status=0
-          while IFS=$'\t' read -r role product_sha core_sha; do
-            iso="$RUNNER_TEMP/windows-eval-$role.sparse"
-            output="$RUNNER_TEMP/session-$role"
-            truncate -s 5550497792 "$iso"
-            chmod 400 "$iso"
-            echo "::group::$role $product_sha"
-            probe=("$RUNNER_TEMP/build-$role/session_probe" "$iso" "$output" "$STOP_TARGET" "$PROBE_TIMEOUT_SECONDS"
-                   "$AVAILABLE_MIB" "$THRESHOLD_MIB")
-            optical_env=(EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1
-                         LD_PRELOAD="$RUNNER_TEMP/verified_iso.so" R110_REMOTE_ISO_STUB="$iso")
-            if timeout "$((PROBE_TIMEOUT_SECONDS + 120))s" taskset -c "$PROBE_CPU" env "${optical_env[@]}" "${probe[@]}" \
-              2> "$evidence/$role.stderr" | tee "$evidence/$role.stdout"; then
-              probe_exit=0
-            else
-              probe_exit=${PIPESTATUS[0]}
-              if ((probe_exit == 0)); then probe_exit=1; fi
+          bash "$bench/run-combined-role.sh" reference
+      - name: Start the candidate and export the first aligned checkpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          nohup bash "$bench/run-combined-role.sh" candidate < /dev/null > "$RUNNER_TEMP/candidate-driver.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/candidate.pid"
+          python3 "$bench/early-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/early-evidence"
+      - name: Upload provisional early comparison from the ongoing candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-matched-iso-early-progress
+          path: ${{ runner.temp }}/early-evidence/
+      - name: Continue observing the same candidate to 9.5B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          pid=$(cat "$RUNNER_TEMP/candidate.pid")
+          while [[ ! -f "$RUNNER_TEMP/candidate.exit" ]]; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo 'Candidate driver ended before recording its exit code' >&2
+              exit 1
             fi
-            if ! PRODUCT_SHA="$product_sha" MUNDO_X_SHA="$core_sha" python3 "$bench/summarize.py" \
-              --run "$output" --transport-log "$evidence/$role.stderr" \
-              --output "$evidence/$role.json" --exit-code "$probe_exit"; then
-              pair_status=1
+            if [[ -s "$evidence/candidate.stdout" ]]; then
+              tail -n1 "$evidence/candidate.stdout"
             fi
-            echo '::endgroup::'
-          done < "$RUNNER_TEMP/targets.tsv"
-          if ! python3 "$bench/compare-combined.py" "$evidence/reference.json" "$evidence/candidate.json" \
-            "$evidence/paired-comparison.json"; then
-            pair_status=1
-          fi
-          exit "$pair_status"
+            sleep 20
+          done
+          if [[ -s "$evidence/candidate.stdout" ]]; then tail -n1 "$evidence/candidate.stdout"; fi
+          test "$(cat "$RUNNER_TEMP/candidate.exit")" = 0
+          python3 "$bench/compare-combined.py" "$evidence/reference.json" "$evidence/candidate.json" \
+            "$evidence/paired-comparison.json"
       - name: Upload paired counters, progress and exact revision evidence
         if: always()
         uses: actions/upload-artifact@v7

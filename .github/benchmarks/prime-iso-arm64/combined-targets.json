@@ -3,5 +3,8 @@
     "product_sha": "90912908d4235f7c8d9365b92ad1b2fe25ab4766",
     "mundo_x_sha": "1d31a6b8bcf1c72b48536f5365f7f5dacbc42a7c"
   },
-  "candidate": null
+  "candidate": {
+    "product_sha": "433b2d7d6cd7d785c3c8cfe186e9f60c06f25387",
+    "mundo_x_sha": "5e460d2971068535c2cd9a68f25fb143034de92c"
+  }
 }
