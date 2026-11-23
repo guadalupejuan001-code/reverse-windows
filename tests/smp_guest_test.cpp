@@ -270,7 +270,10 @@ void test_secondary_interrupts(bool threaded) {
 }
 
 #if PRIME_HAS_C06_READY_WAKE_TESTS
-void test_secondary_icr_rejection(bool global_enabled) {
+void test_secondary_icr_rejection(PcMotherboardC06::IcrWriteRejectionReason reason) {
+    using Reason = PcMotherboardC06::IcrWriteRejectionReason;
+    const bool global_enabled = reason != Reason::GlobalApicDisabled;
+    const std::uint8_t mode = reason == Reason::InvalidNmiDestinationShorthand ? 4 : 2;
     PcMachine pc(4U << 20);
     pc.boot_demo();
     PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {2, 1});
@@ -288,8 +291,8 @@ void test_secondary_icr_rejection(bool global_enabled) {
     constexpr std::uint8_t disable[] = {
         0xb9,0x1b,0,0,0,0xb8,0,0,0xe0,0xfe,0x31,0xd2,0x0f,0x30 // IA32_APIC_BASE.EN = 0.
     };
-    constexpr std::uint8_t send[] = {
-        0xb8,0,0,0xe0,0xfe,0xba,0,4,8,0,           // EAX = LAPIC; EDX = NMI, all including self.
+    const std::uint8_t send[] = {
+        0xb8,0,0,0xe0,0xfe,0xba,0,mode,8,0,        // EAX = LAPIC; EDX = SMI or NMI, all including self.
         0x89,0x90,0,3,0,0,                          // MOV [EAX+300h], EDX.
         0xf4
     };
@@ -309,15 +312,124 @@ void test_secondary_icr_rejection(bool global_enabled) {
                 faulted->fault->eip == send_address + 10,
             "unsupported AP ICR write must still fail at the guest instruction");
     const auto rejection = board.fault_icr_write_rejection(*faulted);
-    using Reason = PcMotherboardC06::IcrWriteRejectionReason;
-    require(rejection && rejection->source_apic_id == 1 && rejection->low == 0x00080400U &&
+    require(rejection && rejection->source_apic_id == 1 && rejection->low == (0x80000U | (mode << 8)) &&
                 rejection->high == 0x8a000000U && rejection->software_enabled &&
-                rejection->global_enabled == global_enabled &&
-                rejection->reason == (global_enabled ? Reason::DeliveryModeUnsupported : Reason::GlobalApicDisabled),
+                rejection->global_enabled == global_enabled && rejection->reason == reason,
             "ICR rejection must identify the writing AP, its unmasked payload and exact rejection reason");
     require(!board.fault_icr_write_rejection(bsp) && bsp.read32(kLapic + 0x310) == 1U << 24 &&
                 board.evidence().apic_irqs == 0,
             "failed AP write must neither leak into BSP state nor deliver an interrupt");
+}
+
+void test_lapic_nmi(bool threaded, bool active_clock) {
+    PcMachine pc(4U << 20);
+    pc.boot_demo();
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {4, 1});
+    if (threaded) board.enable_threaded_smp(2);
+    if (active_clock) board.enable_active_clock();
+    auto& bsp = pc.cpu;
+    bsp.reset(0, 0x7200);
+    bsp.a20_enabled = true;
+    bsp.regs[Cpu::ESP] = 0x7000;
+    constexpr std::uint8_t bsp_wait[] = {0xfa,0xf4,0xeb,0xfd}; // CLI; HLT; JMP HLT.
+    constexpr std::uint8_t bsp_nmi[] = {0xff,0x06,0x18,0x34,0xcf}; // INC [3418h]; IRET.
+    bsp.memory.write_block(0x7200, bsp_wait, sizeof(bsp_wait));
+    bsp.memory.write_block(0x7400, bsp_nmi, sizeof(bsp_nmi));
+    bsp.write32(2 * 4, 0x7400);
+    bsp.write32(kLapic + 0x80, 0xff);
+    // The AP leaves its SVR software-disabled and sets TPR to the highest class.
+    install_protected32_entry(bsp, 0x9000);
+    bsp.write16(0x2806, 0x7ff);
+    bsp.write32(0x2808, 0x1000);
+    bsp.write64(0x1010, 0x00008e0000089200ULL);
+    constexpr std::uint8_t ap_wait[] = {
+        0x66,0xb8,0x10,0,0x8e,0xd8,0x8e,0xd0,0xbc,0,0x62,0,0, // DS, SS, flat stack.
+        0x0f,0x01,0x1d,0x06,0x28,0,0,                 // LIDT.
+        0xc7,0x05,0x80,0,0xe0,0xfe,0xff,0,0,0,        // Set AP TPR.
+        0xfa,0xf4,                                    // Wait with IF clear.
+        0xff,0x05,0x04,0x34,0,0,                       // Retire after HLT exactly once.
+        0xf4,0xeb,0xfd                                // HLT; JMP HLT.
+    };
+    constexpr std::uint8_t ap_nmi[] = {
+        0xff,0x05,0x08,0x34,0,0,                       // Count this handler entry.
+        0xc7,0x05,0x10,0x03,0xe0,0xfe,0,0,0,0,        // Target BSP by physical ID.
+        0xc7,0x05,0x00,0x03,0xe0,0xfe,0xff,0x44,0,0,  // NMI with an ignored vector byte.
+        0x83,0x3d,0x14,0x34,0,0,0,0x74,0xf7,          // Wait until the fixture permits IRET.
+        0xcf
+    };
+    bsp.memory.write_block(0x9020, ap_wait, sizeof(ap_wait));
+    bsp.memory.write_block(0x9200, ap_nmi, sizeof(ap_nmi));
+    bsp.write32(kLapic + 0x310, 1U << 24);
+    bsp.write32(kLapic + 0x300, 0x609);
+    if (threaded) {
+        constexpr std::uint8_t busy_peer[] = {0xfa,0xeb,0xfe}; // AP2 stays runnable while the BSP is parked.
+        bsp.memory.write_block(0xa000, busy_peer, sizeof(busy_peer));
+        bsp.write32(kLapic + 0x310, 2U << 24);
+        bsp.write32(kLapic + 0x300, 0x60a);
+        bsp.write32(kLapic + 0x310, 1U << 24);
+    }
+    const unsigned started = threaded ? 3 : 2;
+    board.run(256);
+    require(!bsp.fault && !board.faulted_cpu() && bsp.halted && !bsp.flag(Cpu::IF) &&
+                std::string_view(board.processor_state(1)) == "halted" &&
+                !(board.processor_position(1).flags & Cpu::IF) && board.processors_started() == started,
+            "the BSP and addressed AP must both be in HLT with IF clear");
+
+    // The serial fixture broadcasts to two unstarted APs. The threaded one
+    // targets AP1 alone so that its running peer can compete for worker turns.
+    bsp.write32(kLapic + 0x300, threaded ? 0x4400U : 0x000c4400U);
+    board.run(512);
+    require(!bsp.fault && !board.faulted_cpu() && bsp.read32(0x3408) == 1 && bsp.read16(0x3418) == 1 &&
+                board.processors_started() == started && bsp.read32(0x3404) == 0,
+            "NMI must wake both HLT CPUs and leave wait-for-SIPI unchanged");
+
+    bsp.write32(kLapic + 0x300, 0x4400U); // Explicitly target AP1 while it is inside the NMI handler.
+    bsp.write32(kLapic + 0x300, 0x4400U);
+    board.run(256);
+    require(!bsp.fault && !board.faulted_cpu() && bsp.read32(0x3408) == 1 &&
+                bsp.read16(0x3418) == 1 && board.evidence().lapic_nmis == 2,
+            "multiple NMIs must coalesce until IRET unblocks delivery");
+    bsp.write32(0x3414, 1);
+    board.run(512);
+    const auto last = board.last_lapic_nmi();
+    require(!bsp.fault && !board.faulted_cpu() && bsp.read32(0x3408) == 2 && bsp.read16(0x3418) == 2 &&
+                bsp.read32(0x3404) == 1 && bsp.regs[Cpu::ESP] == 0x7000 &&
+                board.evidence().lapic_nmis == 4 && board.evidence().apic_irqs == 0 &&
+                last && last->source_apic_id == 1 && last->destination_apic_id == 0 &&
+                (!threaded || board.threaded_smp_stats().peak_workers >= 2) &&
+                board.lapic_vector_stats()[2].deliveries == 0 && board.lapic_vector_stats()[2].eois == 0,
+            "a latched NMI must deliver after IRET, without using maskable LAPIC ISR or EOI");
+    std::cout << "SMP_LAPIC_NMI_PASS threaded=" << threaded << " active_clock=" << active_clock
+              << " wake_if_clear=2 delivered=4 eois=0\n";
+}
+
+void test_lapic_nmi_priority() {
+    PcMachine pc(4U << 20);
+    pc.boot_demo();
+    PcMotherboardC06 board(pc);
+    auto& bsp = pc.cpu;
+    bsp.reset(0, 0x7200);
+    bsp.a20_enabled = true;
+    bsp.regs[Cpu::ESP] = 0x7000;
+    constexpr std::uint8_t wait[] = {0xfb,0x90,0xf4,0xeb,0xfd};      // STI; NOP; HLT; JMP HLT.
+    constexpr std::uint8_t nmi[] = {0xc6,0x06,0x80,0x34,1,0xcf};    // Write an NMI marker and IRET.
+    constexpr std::uint8_t irq[] = {0xa0,0x80,0x34,0xa2,0x81,0x34,0xcf}; // Read that marker and IRET.
+    bsp.memory.write_block(0x7200, wait, sizeof(wait));
+    bsp.memory.write_block(0x7400, nmi, sizeof(nmi));
+    bsp.memory.write_block(0x7420, irq, sizeof(irq));
+    bsp.write32(2 * 4, 0x7400);
+    bsp.write32(0x71 * 4, 0x7420);
+    bsp.write32(kLapic + 0xf0, 0x1ff);
+    board.run(16);
+    require(bsp.halted && bsp.flag(Cpu::IF), "priority fixture must be halted with IF set");
+    bsp.write32(kLapic + 0x300, 0x71U);   // Fixed vector to explicit physical destination BSP.
+    bsp.write32(kLapic + 0x300, 0x44efU); // NMI to the same physical destination.
+    board.run(16);
+    require(!bsp.fault && bsp.halted && bsp.read8(0x3481) == 1 &&
+                board.evidence().lapic_nmis == 1 && board.evidence().apic_irqs == 1 &&
+                board.interrupt_state().in_service == 0x71U,
+            "NMI must run before the pending maskable IRQ and must not consume its ISR state");
+    std::cout << "SMP_LAPIC_NMI_PRIORITY_PASS nmi_first=1 maskable_isr_preserved=1\n";
 }
 #endif
 
@@ -2111,9 +2223,15 @@ int main(int argc, char** argv) {
         test_secondary_interrupts(false);
         test_secondary_interrupts(true);
 #if PRIME_HAS_C06_READY_WAKE_TESTS
-        test_secondary_icr_rejection(true);
-        test_secondary_icr_rejection(false);
-        std::cout << "SMP_ICR_REJECTION_PASS unsupported_mode=1 disabled_apic=1\n";
+        using Reason = PcMotherboardC06::IcrWriteRejectionReason;
+        test_secondary_icr_rejection(Reason::DeliveryModeUnsupported);
+        test_secondary_icr_rejection(Reason::GlobalApicDisabled);
+        test_secondary_icr_rejection(Reason::InvalidNmiDestinationShorthand);
+        std::cout << "SMP_ICR_REJECTION_PASS unsupported_mode=1 disabled_apic=1 invalid_nmi_shorthand=1\n";
+        test_lapic_nmi(false, false);
+        test_lapic_nmi(false, true);
+        test_lapic_nmi(true, true);
+        test_lapic_nmi_priority();
 #endif
         test_ether_worker_block();
         test_secondary_streaming_stores(false);

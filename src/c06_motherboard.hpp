@@ -45,7 +45,7 @@ class PcMotherboardC06 {
   struct Evidence {
     std::uint64_t ticks,irq_delivered,pit_irqs,apic_irqs;
     bool pci_present,acpi_installed,powered_off;
-    std::uint64_t ata_irqs=0,sci_irqs=0,atapi_irqs=0;
+    std::uint64_t ata_irqs=0,sci_irqs=0,atapi_irqs=0,lapic_nmis=0;
   };
   struct InterruptState {
     bool global_enabled, software_enabled;
@@ -57,11 +57,16 @@ class PcMotherboardC06 {
   struct LapicVectorStats {
     std::uint64_t deliveries = 0, eois = 0, entry_to_eoi_ticks = 0, entry_to_eoi_steps = 0;
   };
+  struct LapicNmiDelivery {
+    unsigned source_apic_id, destination_apic_id;
+  };
   struct StartupIpis {
     std::uint64_t init_icr_writes = 0, sipi_icr_writes = 0;
     std::uint64_t init_targets_queued = 0, sipi_targets_queued = 0, sipi_targets_applied = 0;
   };
-  enum class IcrWriteRejectionReason { GlobalApicDisabled, DeliveryModeUnsupported };
+  enum class IcrWriteRejectionReason {
+    GlobalApicDisabled, DeliveryModeUnsupported, InvalidNmiDestinationShorthand
+  };
   struct IcrWriteRejection {
     unsigned source_apic_id;
     std::uint32_t low, high;
@@ -269,7 +274,7 @@ class PcMotherboardC06 {
   bool sci_active_=false;
   bool powered_off_=false;
   bool ferr_was_asserted_=false;
-  std::uint64_t ticks_=0,irq_delivered_=0,pit_irqs_=0,apic_irqs_=0,sci_irqs_=0;
+  std::uint64_t ticks_=0,irq_delivered_=0,pit_irqs_=0,apic_irqs_=0,sci_irqs_=0,lapic_nmis_=0;
   static constexpr std::uint32_t kLvtMasked=1U<<16;
   static constexpr unsigned kTimer=0,kLint0=3,kLint1=4,kError=5;
   // Local state is private to one x86 logical processor. The I/O APIC,
@@ -314,6 +319,7 @@ class PcMotherboardC06 {
     cosmic_pc::Cpu* cpu;
     bool started = false, init_pending = false;
     std::optional<std::uint8_t> startup_vector;
+    std::optional<unsigned> pending_nmi_source;
     std::uint32_t svr = 0xff, ldr = 0, dfr = 0xffffffffU;
     std::uint32_t esr = 0, errors = 0, icr_low = 0, icr_high = 0;
     std::optional<IcrWriteRejection> icr_write_rejection;
@@ -334,6 +340,7 @@ class PcMotherboardC06 {
   std::array<std::unique_ptr<cosmic_pc::Cpu>, kMaxProcessors> secondary_cpus_{};
   std::array<LocalApic, kMaxProcessors> apics_;
   std::array<LapicVectorStats, 256> lapic_vectors_{};
+  std::optional<LapicNmiDelivery> last_lapic_nmi_;
   std::array<RamViewStats, kMaxProcessors> ram_views_before_init_{};
   std::array<BusWaitStats, kMaxProcessors> bus_wait_{};
   std::array<std::uint64_t, kMaxProcessors> retired_before_init_{};
@@ -402,6 +409,8 @@ class PcMotherboardC06 {
     pm_status_=pm_enable_=0;sci_active_=false;
     ferr_was_asserted_=false;pc_.cpu.set_x87_ignne(false);
     cpu_cycles_=ticks_=irq_delivered_=pit_irqs_=apic_irqs_=ata_irq_delivered_=atapi_irq_delivered_=sci_irqs_=0;
+    lapic_nmis_ = 0;
+    last_lapic_nmi_.reset();
     cpu_cycle_phase_ = 0;
     firmware_tsc_remainder_ = active_tsc_remainder_ = 0;
     active_clock_enabled_=active_clock_running_=waiting_for_guest_mode_=false;
@@ -1030,12 +1039,29 @@ class PcMotherboardC06 {
       return shorthand == 1 ? id == sender : shorthand == 2 ? true :
              shorthand == 3 ? id != sender : lapic_destination(apics_[id], value, source.icr_high);
     };
-    if (mode > 1 && mode != 5 && mode != 6) {
+    // xAPIC NMI supports an explicit destination or all excluding self.
+    if (mode == 4 && (shorthand == 1 || shorthand == 2))
+      return reject_icr_low(source, value, IcrWriteRejectionReason::InvalidNmiDestinationShorthand);
+    if (mode > 1 && mode != 4 && mode != 5 && mode != 6) {
       for (unsigned id = 0; id < processor_count_; ++id)
         if (selected(id)) return reject_icr_low(source, value, IcrWriteRejectionReason::DeliveryModeUnsupported);
     }
     source.icr_write_rejection.reset();
     source.icr_low=value&0x000ccfffU;
+    if (mode == 4) {
+      bool yield_bsp = false;
+      for (unsigned id = 0; id < processor_count_; ++id) {
+        auto& target = apics_[id];
+        if (!selected(id) || !target.started || target.init_pending ||
+            !target.cpu->apic_global_enabled()) continue;
+        // A second NMI can wait while the CPU blocks delivery. Further NMIs
+        // coalesce into that one pending event instead of entering APIC IRR.
+        if (!target.pending_nmi_source) target.pending_nmi_source = sender;
+        yield_bsp |= sender == 0 && id != 0;
+      }
+      if (yield_bsp) pc_.yield_after_instruction();
+      return true;
+    }
     if (mode == 5 || mode == 6) {
       if (mode == 5) ++startup_ipis_.init_icr_writes;
       else ++startup_ipis_.sipi_icr_writes;
@@ -1185,6 +1211,18 @@ class PcMotherboardC06 {
       ++apic_irqs_; ++irq_delivered_;
       ++lapic_vectors_[vector].deliveries;
       apic.delivery_by_priority[vector >> 4] = {apic_irqs_, ticks_, apic.cpu->instructions};
+    }
+    return true;
+  }
+  static bool deliverable_lapic_nmi(const LocalApic& apic) {
+    return apic.pending_nmi_source && apic.cpu->can_accept_nmi();
+  }
+  bool deliver_lapic_nmi(LocalApic& apic) {
+    if (!deliverable_lapic_nmi(apic)) return false;
+    const auto source = std::exchange(apic.pending_nmi_source, std::nullopt);
+    if (apic.cpu->raise_nmi()) {
+      ++lapic_nmis_;
+      last_lapic_nmi_ = LapicNmiDelivery{*source, apic.cpu->apic_id()};
     }
     return true;
   }
@@ -1341,7 +1379,9 @@ class PcMotherboardC06 {
     // LAPIC acceptance. The guest can read both IRRs with interrupts disabled.
     const auto slave_irq=slave_.pending();
     master_.irr = cascaded_pic_requests(slave_irq);
-    if(!deliver_bsp||cpu.fault||!cpu.flag(cosmic_pc::Cpu::IF))return;
+    if(!deliver_bsp||cpu.fault)return;
+    if (deliver_lapic_nmi(bsp())) return;
+    if(!cpu.flag(cosmic_pc::Cpu::IF))return;
     if (deliver_lapic_irq(bsp())) return;
     // 8259 cascade: a pending slave IRQ presents IRQ2 at the master PIC.
     // Deliver the SLAVE vector, not master IRQ2's vector. Both PICs must EOI.
@@ -1366,6 +1406,7 @@ class PcMotherboardC06 {
   // The current step has already polled the board. Stop the batch before
   // another tick could change the interrupt or timer state visible to the CPU.
   unsigned batch_limit(unsigned steps) const {
+    if (deliverable_lapic_nmi(bsp())) return std::min(steps, 1U);
     if (pc_.cpu.flag(cosmic_pc::Cpu::IF) && interrupt_pending()) return std::min(steps, 1U);
     return device_batch_limit(steps);
   }
@@ -1459,7 +1500,8 @@ class PcMotherboardC06 {
 
   static bool needs_service(const LocalApic& apic) noexcept {
     return apic.init_pending || apic.startup_vector ||
-           (apic.started && (!apic.cpu->halted || apic.cpu->flag(cosmic_pc::Cpu::IF)));
+           (apic.started && (!apic.cpu->halted || deliverable_lapic_nmi(apic) ||
+                             apic.cpu->flag(cosmic_pc::Cpu::IF)));
   }
   void apply_startup(LocalApic& apic) {
     auto& cpu = *apic.cpu;
@@ -1528,7 +1570,7 @@ class PcMotherboardC06 {
       if (!(mask & 1U)) continue;
       auto& apic = apics_[id];
       if (id) update_secondary_timer(apic);
-      if (!wake_pending_[id] && (apic.init_pending || apic.startup_vector ||
+      if (!wake_pending_[id] && (apic.init_pending || apic.startup_vector || deliverable_lapic_nmi(apic) ||
           (parked_irq_processors_[id] &&
            (id ? deliverable_lapic_vector(apic) != 0 : interrupt_pending())))) {
         wake_pending_.set(id);
@@ -1541,7 +1583,8 @@ class PcMotherboardC06 {
     for (unsigned slot = 0; slot < count; ++slot) {
       const auto& apic = apics_[runnable[slot]];
       const auto& cpu = *apic.cpu;
-      if (!apic.started || apic.init_pending || apic.startup_vector || local_timer_irq_armed(apic) ||
+      if (!apic.started || apic.init_pending || apic.startup_vector || deliverable_lapic_nmi(apic) ||
+          local_timer_irq_armed(apic) ||
           cpu.halted || cpu.flag(cosmic_pc::Cpu::IF | cosmic_pc::Cpu::TF) ||
           !cpu.is_long_mode() || !cpu.ether_arm64_block_candidate()) return kSmpQuantum;
     }
@@ -1593,7 +1636,7 @@ class PcMotherboardC06 {
     auto limit = batch_limit(budget);
     for (unsigned id = 1; id < processor_count_; ++id) {
       const auto& apic = apics_[id];
-      if (apic.init_pending || apic.startup_vector) return 1;
+      if (apic.init_pending || apic.startup_vector || deliverable_lapic_nmi(apic)) return 1;
       if (!apic.started || !apic.cpu->flag(cosmic_pc::Cpu::IF)) continue;
       if (deliverable_lapic_vector(apic)) return 1;
       if (local_timer_irq_armed(apic)) {
@@ -1693,7 +1736,7 @@ class PcMotherboardC06 {
       if (!apic.started) return;
       cpu.a20_enabled = pc_.cpu.a20_enabled;
       update_secondary_timer(apic);
-      deliver_lapic_irq(apic);
+      if (!deliver_lapic_nmi(apic)) deliver_lapic_irq(apic);
       if (cpu.fault) {
         faulted_processor_ = id;
         return;
@@ -1790,7 +1833,7 @@ class PcMotherboardC06 {
       const auto id = runnable[i];
       const auto& apic = apics_[id];
       const auto& cpu = *apic.cpu;
-      if (apic.init_pending || apic.startup_vector ||
+      if (apic.init_pending || apic.startup_vector || deliverable_lapic_nmi(apic) ||
           (cpu.flag(cosmic_pc::Cpu::IF) && deliverable_lapic_vector(apic))) return 0;
       if (id && local_timer_irq_armed(apic)) {
         const auto elapsed = ticks_ - apic.last_tick;
@@ -2190,9 +2233,11 @@ class PcMotherboardC06 {
   PcMotherboardC06(const PcMotherboardC06&)=delete;
   PcMotherboardC06& operator=(const PcMotherboardC06&)=delete;
   Evidence evidence()const{
-    return {ticks_,irq_delivered_,pit_irqs_,apic_irqs_,true,true,powered_off_,ata_irq_delivered_,sci_irqs_,atapi_irq_delivered_};
+    return {ticks_,irq_delivered_,pit_irqs_,apic_irqs_,true,true,powered_off_,ata_irq_delivered_,
+            sci_irqs_,atapi_irq_delivered_,lapic_nmis_};
   }
   const auto& lapic_vector_stats() const noexcept { return lapic_vectors_; }
+  std::optional<LapicNmiDelivery> last_lapic_nmi() const noexcept { return last_lapic_nmi_; }
   InterruptState interrupt_state()const{
     const auto vector = bsp().in_service.highest();
     const auto delivery = bsp().delivery_by_priority[vector >> 4]; // Class zero is never delivered.
@@ -2458,14 +2503,14 @@ class PcMotherboardC06 {
       std::array<unsigned, kMaxProcessors> runnable{};
       unsigned count = 0;
       bool sleeping = parked_irq_processors_.any();
-      if (!active_clock_running_ || !pc_.cpu.halted) runnable[count++] = 0;
+      if (!active_clock_running_ || !pc_.cpu.halted || deliverable_lapic_nmi(bsp())) runnable[count++] = 0;
       sync_active_clock();
       for (unsigned id = 1; id < processor_count_; ++id) {
         auto& apic = apics_[id];
         if (!needs_service(apic)) continue;
         if (apic.cpu->halted && !apic.init_pending && !apic.startup_vector) {
           update_secondary_timer(apic);
-          if (!deliverable_lapic_vector(apic)) { sleeping = true; continue; }
+          if (!deliverable_lapic_nmi(apic) && !deliverable_lapic_vector(apic)) { sleeping = true; continue; }
         }
         runnable[count++] = id;
       }

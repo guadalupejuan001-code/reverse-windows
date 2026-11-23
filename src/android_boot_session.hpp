@@ -771,14 +771,17 @@ class AndroidBootSession final {
       }
       if (const auto rejection = board_->fault_icr_write_rejection(*faulted_cpu)) {
         using Reason = PcMotherboardC06::IcrWriteRejectionReason;
+        const char* reason = "delivery_mode_unsupported";
+        if (rejection->reason == Reason::GlobalApicDisabled) reason = "global_apic_disabled";
+        if (rejection->reason == Reason::InvalidNmiDestinationShorthand)
+          reason = "invalid_nmi_destination_shorthand";
         out << ",\"icr_low_rejection\":{\"source_apic_id\":" << rejection->source_apic_id
             << ",\"icr_low\":" << rejection->low << ",\"icr_high\":" << rejection->high
             << ",\"delivery_mode\":" << ((rejection->low >> 8) & 7U)
             << ",\"destination_shorthand\":" << ((rejection->low >> 18) & 3U)
             << ",\"global_enabled\":" << (rejection->global_enabled ? "true" : "false")
             << ",\"software_enabled\":" << (rejection->software_enabled ? "true" : "false")
-            << ",\"reason\":\"" << (rejection->reason == Reason::GlobalApicDisabled
-                                        ? "global_apic_disabled" : "delivery_mode_unsupported")
+            << ",\"reason\":\"" << reason
             << "\",\"regs_hex\":[";
         for (unsigned i = 0; i < faulted_cpu->regs.size(); ++i) {
           out << (i ? ",\"" : "\"") << std::hex << std::setw(16) << std::setfill('0')
@@ -936,6 +939,7 @@ class AndroidBootSession final {
         << "},\"irq\":{\"ticks\":" << platform.ticks << ",\"delivered\":" << platform.irq_delivered
         << ",\"irq14\":" << platform.ata_irqs << ",\"irq15\":" << platform.atapi_irqs
         << ",\"lapic_delivered\":" << platform.apic_irqs
+        << ",\"lapic_nmi_delivered\":" << platform.lapic_nmis
         << ",\"irq64_bulk_frames\":" << pc_.cpu.irq64_bulk_frames
         << ",\"sci_delivered\":" << platform.sci_irqs
         << ",\"virtual_clock_hz\":" << cosmic_pc::PcMachine::kVirtualCyclesPerSecond
@@ -953,6 +957,10 @@ class AndroidBootSession final {
         << ",\"lapic_timer_count\":" << interrupts.timer_count
         << ",\"ioapic_select\":" << interrupts.ioapic_select
         << ",\"ioapic_id\":" << interrupts.ioapic_id;
+    if (const auto nmi = board_->last_lapic_nmi()) {
+      out << ",\"lapic_nmi_last_delivery\":{\"source_apic_id\":" << nmi->source_apic_id
+          << ",\"destination_apic_id\":" << nmi->destination_apic_id << '}';
+    }
     if (detailed) {
       out << ",\"lapic_vectors\":[";
       bool first = true;
