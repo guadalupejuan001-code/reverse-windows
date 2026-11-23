@@ -1,0 +1,88 @@
+name: Prime R110 ARM64 parked vCPU scheduler A/B
+
+on:
+  push:
+    branches: [ci/prime-r110-arm64-parked-native-ab]
+    paths:
+      - .github/benchmarks/prime-iso-arm64/parked-native-targets.json
+      - .github/benchmarks/prime-iso-arm64/parked-native-ab.py
+      - .github/workflows/prime-r110-arm64-parked-native-ab.yml
+
+permissions:
+  contents: read
+
+jobs:
+  paired-native-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify pinned revisions and build the same fixture twice
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence"
+          cp "$bench/parked-native-targets.json" "$evidence/targets.json"
+          python3 "$bench/resolve-combined.py" "$evidence/targets.json" > "$RUNNER_TEMP/targets.tsv"
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ninja-build zlib1g-dev
+          while IFS=$'\t' read -r role product core; do
+            source="$RUNNER_TEMP/product-$role"
+            bash "$bench/checkout-product.sh" "$source" "$product" "$core"
+            cp "$source/config/dependencies.lock.json" "$evidence/$role-dependencies.lock.json"
+          done < "$RUNNER_TEMP/targets.tsv"
+          for tree in "$RUNNER_TEMP"/product-{reference,candidate}; do
+            git -C "$tree" diff --exit-code
+          done
+          test "$(git -C "$RUNNER_TEMP/product-reference/deps/mundo-X" rev-parse HEAD)" = \
+            "$(git -C "$RUNNER_TEMP/product-candidate/deps/mundo-X" rev-parse HEAD)"
+          reference="$RUNNER_TEMP/product-reference/tests/smp_guest_test.cpp"
+          candidate="$RUNNER_TEMP/product-candidate/tests/smp_guest_test.cpp"
+          cp "$candidate" "$reference"
+          cmp "$candidate" "$reference"
+          sha256sum "$candidate" "$reference" > "$evidence/fixture-sha256.txt"
+          for role in reference candidate; do
+            cmake -S "$RUNNER_TEMP/product-$role" -B "$RUNNER_TEMP/build-$role" -G Ninja \
+              -DBUILD_TESTING=ON -DREVERSE_WINDOWS_GLES_GUEST=OFF \
+              -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
+            cmake --build "$RUNNER_TEMP/build-$role" --target reverse_windows_smp_guest_test --parallel 2
+          done
+          sha256sum "$RUNNER_TEMP"/build-*/reverse_windows_smp_guest_test > "$evidence/executables-sha256.txt"
+      - name: Verify scheduler behavior and measure matched native work
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          affinity=$(python3 - <<'PY'
+          import os
+
+          cpus = sorted(os.sched_getaffinity(0))[:2]
+          if len(cpus) != 2:
+              raise SystemExit("Two available host CPUs are required")
+          print(",".join(map(str, cpus)))
+          PY
+          )
+          {
+            uname -m
+            lscpu
+            c++ --version
+            printf 'CPU affinity %s\n' "$affinity"
+          } > "$evidence/runner.txt"
+          taskset -c "$affinity" ctest --test-dir "$RUNNER_TEMP/build-candidate" --no-tests=error \
+            --verbose -R '^reverse_windows_smp_guest$' | tee "$evidence/candidate-smp-test.log"
+          taskset -c "$affinity" "$RUNNER_TEMP/build-candidate/reverse_windows_smp_guest_test" \
+            --test-parked-native | tee "$evidence/candidate-parked-test.log"
+          taskset -c "$affinity" python3 "$bench/parked-native-ab.py" "$RUNNER_TEMP" "$evidence"
+      - name: Preserve matched timings and assertions
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-parked-native-ab
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
