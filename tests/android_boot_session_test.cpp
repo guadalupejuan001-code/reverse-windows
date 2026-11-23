@@ -505,6 +505,68 @@ void verify_packed_ram64(const std::filesystem::path& directory) {
 }
 
 #ifndef PRIME_PREVIOUS_ENGINE_WINDOW
+void verify_deflate_sampling(const std::filesystem::path& directory) {
+  using Backing = reverse_windows::AndroidRamBacking;
+  using Clock = cosmic_pc::SparseRam::ReclaimClock;
+  constexpr auto page_bytes = Backing::kPageSize;
+  constexpr auto logical = 1024 * page_bytes;
+  constexpr auto quota_pages = 320;
+  using Page = std::array<std::uint8_t, page_bytes>;
+  std::vector<Page> dense(quota_pages);
+  std::uint32_t random = 0xe512fa72;
+  for (auto& page : dense) {
+    for (auto& byte : page) {
+      random ^= random << 13;
+      random ^= random >> 17;
+      random ^= random << 5;
+      byte = static_cast<std::uint8_t>(random);
+    }
+  }
+  Page repeating, sparse{}, restored;
+  repeating.fill(0x5a); // Too dense for the sparse codec, but fits with DEFLATE.
+  sparse.back() = 0x5a;
+  Backing backing(directory, logical, quota_pages * page_bytes, true, false, true);
+  for (std::size_t i = 0; i < 32; ++i) backing.write(i, dense[i].data());
+  backing.write(32, sparse.data());
+  std::array<Backing::PageWrite, Backing::kMaxWritePages> group;
+  for (std::size_t i = 0; i < group.size(); ++i) group[i] = {33 + i, dense[33 + i].data()};
+  require(backing.write_pages(group.data(), group.size(), Clock::time_point::max()) == group.size(),
+          "Sampled writes must commit the full raw group");
+  auto stats = backing.codec_stats();
+  require(stats.encode_deflate == 32 && stats.encode_deflate_bypassed == group.size() &&
+              stats.encode_sparse == 1 && stats.encode_packed == 1,
+          "The low-yield group must skip DEFLATE while retaining the sparse codec");
+  backing.write(49, repeating.data()); // The next dense candidate is a probe.
+  backing.write(50, repeating.data()); // A successful probe resumes ordinary encoding.
+  stats = backing.codec_stats();
+  require(stats.encode_deflate == 34 && stats.encode_packed == 3,
+          "The dense probe must restore DEFLATE on successful compression");
+  for (std::size_t i = 0; i <= 50; ++i) {
+    backing.read(i, restored.data());
+    require(restored == (i == 32 ? sparse : i >= 49 ? repeating : dense[i]),
+            "Sampled and compressed backing pages must both restore exact bytes");
+  }
+
+  backing.reset();
+  for (std::size_t i = 0; i < quota_pages - 1; ++i) backing.write(i, dense[i].data());
+  const auto near_quota = backing.codec_stats();
+  require(near_quota.encode_deflate_bypassed > 0 && near_quota.encode_deflate > 250,
+          "Backing must stop bypassing DEFLATE before reaching its physical quota");
+  const Backing::PageWrite last_pair[]{{quota_pages - 1, repeating.data()}, {quota_pages, repeating.data()}};
+  require(backing.write_pages(last_pair, 2, Clock::time_point::max()) == 2 &&
+              backing.file_payload_bytes() == quota_pages * page_bytes && backing.packed_pages() == 2 &&
+              backing.codec_stats().encode_deflate_bypassed == near_quota.encode_deflate_bypassed,
+          "Near the quota, two dense compressible pages must fit in the final block");
+  bool full = false;
+  try { backing.write(quota_pages + 1, dense.back().data()); }
+  catch (const Backing::CapacityExceeded&) { full = true; }
+  backing.read(quota_pages, restored.data());
+  require(full && restored == repeating, "Quota exhaustion must preserve the last compressed page");
+  std::cout << "PRIME_RAM_DEFLATE_SAMPLING_PASS skipped=" << near_quota.encode_deflate_bypassed
+            << " forced_probes=" << near_quota.encode_deflate << " quota_bytes=" << backing.file_payload_bytes()
+            << '\n';
+}
+
 void verify_state_ram_reclaim_batches(const std::filesystem::path& directory) {
   using Ram = cosmic_pc::MemoryFabric;
   using Backing = reverse_windows::AndroidRamBacking;
@@ -1395,6 +1457,7 @@ int main(int argc, char** argv) {
     verify_ram_spill(dir.path);
     verify_packed_ram64(dir.path);
     verify_deferred_ram_reclaim(dir.path);
+    verify_deflate_sampling(dir.path);
     verify_prepared_ram_backing(dir.path);
     verify_shared_ram(dir.path);
     verify_real_mode_ps2(dir.path / "keyboard-irq.rqvd", true);

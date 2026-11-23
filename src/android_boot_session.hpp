@@ -1017,7 +1017,7 @@ class AndroidBootSession final {
     }
     try {
       auto file = std::make_unique<AndroidRamBacking>(directory, memory.size(), info.limit, packed,
-                                                      defer_pressure_packing);
+                                                      defer_pressure_packing, packed && defer_pressure_packing);
       auto* file_stats = file.get();
       using CachePolicy = cosmic_pc::SparseRam::BackingCachePolicy;
       if (packed) memory.attach_page_backing(std::move(file), CachePolicy::Adaptive, kPrimeCleanReservePages);
@@ -1203,6 +1203,7 @@ class AndroidBootSession final {
         << ",\"encode_bypassed\":" << codec.encode_bypassed
         << ",\"encode_sparse\":" << codec.encode_sparse
         << ",\"encode_deflate\":" << codec.encode_deflate
+        << ",\"encode_deflate_bypassed\":" << codec.encode_deflate_bypassed
         << ",\"decode_attempts\":" << codec.decode_attempts
         << ",\"decode_sparse\":" << codec.decode_sparse
         << ",\"encode_wall_ns\":" << codec.encode.wall_ns

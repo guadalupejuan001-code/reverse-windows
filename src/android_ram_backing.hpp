@@ -34,6 +34,7 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
     std::uint64_t encode_attempts = 0, encode_packed = 0, encode_raw = 0, encode_bypassed = 0;
     std::uint64_t decode_attempts = 0;
     std::uint64_t encode_sparse = 0, encode_deflate = 0, decode_sparse = 0;
+    std::uint64_t encode_deflate_bypassed = 0;
     CodecTiming encode, decode;
   };
 
@@ -48,9 +49,11 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
   }
 
   AndroidRamBacking(const std::filesystem::path& directory, std::uint64_t logical_bytes,
-                    std::uint64_t spill_bytes, bool pack_pages = false, bool defer_pressure_packing = false) {
+                    std::uint64_t spill_bytes, bool pack_pages = false, bool defer_pressure_packing = false,
+                    bool adaptive_deflate = false) {
     if (pack_pages)
-      packed_ = std::make_unique<Packed>(directory, logical_bytes, spill_bytes, defer_pressure_packing);
+      packed_ = std::make_unique<Packed>(directory, logical_bytes, spill_bytes, defer_pressure_packing,
+                                         adaptive_deflate);
     else raw_ = std::make_unique<qssd::TransientPages>(directory, logical_bytes, spill_bytes);
   }
 
@@ -174,8 +177,30 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
     using Clock = cosmic_pc::SparseRam::ReclaimClock;
     using FileCounter = std::uint64_t (qssd::PackedTransientPages::*)() const noexcept;
 
+    struct DeflateSampling {
+      static constexpr unsigned kMissesBeforeSampling = 32;
+      // The probe period differs from the maximum 16-page write group.
+      static constexpr unsigned kSkipsBetweenProbes = 16;
+
+      unsigned misses = 0;
+      unsigned skips = 0;
+
+      bool bypass(bool room) noexcept {
+        if (!room || misses < kMissesBeforeSampling || skips == kSkipsBetweenProbes) return false;
+        ++skips;
+        return true;
+      }
+
+      void record(bool packed) noexcept {
+        misses = packed ? 0 : std::min(misses + 1, kMissesBeforeSampling);
+        skips = 0;
+      }
+    };
+
     Packed(const std::filesystem::path& directory, std::uint64_t logical_bytes,
-           std::uint64_t spill_bytes, bool defer) : pages(directory, logical_bytes, spill_bytes) {
+           std::uint64_t spill_bytes, bool defer, bool adaptive_deflate)
+        : pages(directory, logical_bytes, spill_bytes),
+          deflate_sampling_limit(adaptive_deflate ? sampling_limit(std::min(logical_bytes, spill_bytes)) : 0) {
       if (!start_encoder(encoder))
         throw std::runtime_error("No se pudo iniciar la compresión del respaldo de RAM.");
       if (defer && host_can_defer() && start_encoder(background_encoder)) {
@@ -205,6 +230,20 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
       return ::deflateInit2(&state, Z_BEST_SPEED, Z_DEFLATED, 12, 5, Z_DEFAULT_STRATEGY) == Z_OK;
     }
 
+    static std::uint64_t sampling_limit(std::uint64_t bytes) noexcept {
+      // Close to the quota, favor compact records and preserve room for
+      // staged writes and relocation. Raw writes still use the same quota.
+      const auto reserve = std::max<std::uint64_t>(256 * kPageSize, bytes / 8);
+      return bytes > reserve ? bytes - reserve : 0;
+    }
+
+    bool room_to_sample(std::size_t count) const noexcept {
+      const auto worst_case_bytes = count * kPageSize;
+      return deflate_sampling_limit >= worst_case_bytes &&
+             pages.file_payload_bytes() <= deflate_sampling_limit - worst_case_bytes &&
+             pages.room_for_raw(count + kMaxWritePages);
+    }
+
     std::uint64_t file_counter(FileCounter counter) const noexcept {
       std::lock_guard<std::mutex> lock(io_mutex);
       return (pages.*counter)();
@@ -219,8 +258,15 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
 
     void write(std::uint64_t index, const std::uint8_t* page) {
       Buffer target;
-      const auto packed = encode_page(page, target);
-      std::unique_lock<std::mutex> lock(io_mutex);
+      std::unique_lock<std::mutex> lock(io_mutex, std::defer_lock);
+      bool room = false;
+      if (deflate_sampling_limit && sampling.misses == DeflateSampling::kMissesBeforeSampling) {
+        lock.lock();
+        room = room_to_sample(1);
+        lock.unlock();
+      }
+      const auto packed = encode_page(page, target, room);
+      lock.lock();
       settle_for_reserve(lock, 2);
       pages.write(index, packed ? target.data() : page, packed);
       retire(index);
@@ -238,6 +284,7 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
       constexpr auto write_margin = std::chrono::microseconds(250);
       std::array<qssd::PackedTransientPages::PageWrite, kMaxWritePages> prepared;
       const bool paced = deadline != Clock::time_point::max();
+      bool room;
       {
         std::unique_lock<std::mutex> lock(io_mutex, std::defer_lock);
         if (!acquire_write_lock(lock, paced)) return yield_batch();
@@ -261,6 +308,7 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
           if (paced) return yield_batch();
           settle_for_reserve(lock, count + 1);
         }
+        room = room_to_sample(count);
       }
 
       // The worker only replaces raw pages with smaller records, so room
@@ -270,7 +318,7 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
       do {
         const auto& write = writes[processed];
         auto& target = buffers[processed];
-        const auto packed = encode_page(write.bytes, target);
+        const auto packed = encode_page(write.bytes, target, room);
         prepared[processed++] = {write.page, packed ? target.data() : write.bytes, packed};
       } while (processed < count && (!paced || Clock::now() + write_margin < deadline));
       std::unique_lock<std::mutex> lock(io_mutex, std::defer_lock);
@@ -293,27 +341,34 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
       return count;
     }
 
-    bool encode_page(const std::uint8_t* page, Buffer& target) {
+    bool encode_page(const std::uint8_t* page, Buffer& target, bool room) {
       // The same bytes cannot encode differently with a freshly reset encoder.
       if (has_raw_page && std::memcmp(page, raw_page.data(), kPageSize) == 0) {
         ++stats.encode_bypassed;
         return false;
       }
-      const auto packed = encode(page, target, encoder, stats);
-      if (!packed) {
+      const auto deflate_before = stats.encode_deflate;
+      const auto packed = encode(page, target, encoder, stats, deflate_sampling_limit ? &sampling : nullptr, room);
+      if (!packed && stats.encode_deflate != deflate_before) {
         std::memcpy(raw_page.data(), page, kPageSize);
         has_raw_page = true;
       }
       return packed;
     }
 
-    static bool encode(const std::uint8_t* page, Buffer& target, z_stream& encoder, CodecStats& stats) {
+    static bool encode(const std::uint8_t* page, Buffer& target, z_stream& encoder, CodecStats& stats,
+                       DeflateSampling* sampling = nullptr, bool room = false) {
       ++stats.encode_attempts;
       const CodecTimer timer(stats.encode);
       if (encode_sparse(page, target)) {
         ++stats.encode_sparse;
         ++stats.encode_packed;
         return true;
+      }
+      if (sampling && sampling->bypass(room)) {
+        ++stats.encode_deflate_bypassed;
+        ++stats.encode_raw;
+        return false;
       }
       ++stats.encode_deflate;
       if (::deflateReset(&encoder) != Z_OK)
@@ -324,11 +379,13 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
       encoder.avail_out = target.size();
       const auto status = ::deflate(&encoder, Z_FINISH);
       if (status == Z_STREAM_END) {
+        if (sampling) sampling->record(true);
         ++stats.encode_packed;
         std::fill(target.begin() + encoder.total_out, target.end(), 0);
         return true;
       }
       if ((status == Z_OK || status == Z_BUF_ERROR) && encoder.avail_out == 0) {
+        if (sampling) sampling->record(false);
         ++stats.encode_raw;
         return false;
       }
@@ -398,6 +455,7 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
       std::lock_guard<std::mutex> lock(io_mutex);
       pages.reset();
       stats = {};
+      sampling = {};
       has_raw_page = false;
       pending = {};
       staging = StagingStats{staging.enabled};
@@ -504,6 +562,8 @@ class AndroidRamBacking final : public cosmic_pc::SparseRam::PageBacking {
     }
 
     qssd::PackedTransientPages pages;
+    const std::uint64_t deflate_sampling_limit;
+    DeflateSampling sampling;
     mutable std::mutex io_mutex;
     std::condition_variable ready;
     std::array<Pending, 128> pending{};
