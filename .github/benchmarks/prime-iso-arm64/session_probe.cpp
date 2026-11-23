@@ -129,12 +129,13 @@ int main(int argc, char** argv) {
     for (std::uint64_t point = 12'000'000'000ULL; point <= target; point += 500'000'000ULL)
       milestone_steps.push_back(point);
     constexpr std::uint64_t post_popfq_checkpoint = 15'200'000'000ULL;
-    if (target >= post_popfq_checkpoint) {
-      milestone_steps.insert(std::lower_bound(milestone_steps.begin(), milestone_steps.end(),
-                                              post_popfq_checkpoint), post_popfq_checkpoint);
+    constexpr std::uint64_t post_crc32c_checkpoint = 16'100'000'000ULL;
+    for (const auto point : {post_popfq_checkpoint, post_crc32c_checkpoint}) {
+      if (point <= target)
+        milestone_steps.insert(std::lower_bound(milestone_steps.begin(), milestone_steps.end(), point), point);
     }
-    constexpr std::array<std::uint64_t, 3> frame_checkpoints{
-        11'500'000'000ULL, post_popfq_checkpoint, 16'500'000'000ULL};
+    constexpr std::array<std::uint64_t, 4> frame_checkpoints{
+        11'500'000'000ULL, post_popfq_checkpoint, post_crc32c_checkpoint, 16'500'000'000ULL};
     std::size_t next_milestone = 0;
     std::array<std::uint8_t, 4000> text{};
     const auto start = Clock::now();

@@ -86,6 +86,7 @@ def load_checkpoint(record):
         "irq_delivered": vm["irq"]["delivered"],
         "started_vcpus": topology["started"],
         "guest_tsc_hz": topology.get("guest_tsc_hz"),
+        "crc32c_retired": topology.get("crc32c_retired"),
         "tsc_access": topology.get("tsc_access"),
         "tsc_access_by_logical_processor": topology.get("tsc_access_by_logical_processor"),
         "smp": pick(topology, SMP),
@@ -236,6 +237,7 @@ def continuation_record(run_dir, target):
         "bios_reads": machine["disk_reads"],
         "iso_read_us": vm["iso_read_us"],
         "boot_loops": pick(vm.get("ether_next", {}), BOOT_LOOPS),
+        "crc32c_retired": vm["cpu_topology"].get("crc32c_retired"),
         "phase_samples": [pick(phase, ("steps", "mode")) for phase in phases],
     }
 
