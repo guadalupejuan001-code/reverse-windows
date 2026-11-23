@@ -1,13 +1,13 @@
-name: Verify Prime R110 long-mode ARM64 APK installation
+name: Verify Prime R110 Ether memory ARM64 APK installation
 
 on:
   push:
-    branches: [ci/prime-r110-long64-arm64-install]
+    branches: [ci/prime-r110-etherfast-arm64-install]
     paths: [.github/workflows/verify-r110-ether-cache-arm64-install.yml]
   workflow_dispatch:
     inputs:
       apk_sha256:
-        description: SHA-256 of the existing release APK from run 45157826579
+        description: SHA-256 of the selected ARM64 release APK
         required: true
         type: string
 
@@ -20,20 +20,37 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      APP_ID: com.reversewindows.android.prime.smp.r110.long64test
-      SOURCE_SHA: 90912908d4235f7c8d9365b92ad1b2fe25ab4766
-      MUNDO_X_SHA: 1d31a6b8bcf1c72b48536f5365f7f5dacbc42a7c
-      APK_VERSION_NAME: 0.3.88-perf-test.4
-      APK_VERSION_CODE: '123'
-      APK_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.4-90912908d423-arm64-v8a-release.apk
-      EXPECTED_APK_SHA256: ${{ inputs.apk_sha256 || 'bc083568d587eab1902e570def8b85545c1429db1038cd9924a80240fa3535d2' }}
+      APP_ID: com.reversewindows.android.prime.smp.r110.etherfasttest
+      SOURCE_SHA: 433b2d7d6cd7d785c3c8cfe186e9f60c06f25387
+      MUNDO_X_SHA: 5e460d2971068535c2cd9a68f25fb143034de92c
+      APK_VERSION_NAME: 0.3.88-perf-test.5
+      APK_VERSION_CODE: '124'
+      APK_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.5-433b2d7d6cd7-arm64-v8a-release.apk
+      EXPECTED_APK_SHA256: ${{ inputs.apk_sha256 || '08b2ca63fa4e0f934acc912e934c64152b3c3f74416e88742193d316e598a383' }}
+      BUILD_RUN_ID: '45167780845'
+      BUILD_ARTIFACT_ID: '14816245720'
+      BUILD_ARTIFACT_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.5-433b2d7d6cd7-ARM64
+      BUILD_ARTIFACT_DIGEST: sha256:c672a2cbb0b4541a1f9758c9e9001e0d4f3517d0309771006a0ff961256f5602
     steps:
+      - name: Authenticate the selected build artifact record
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/r110-install-evidence"
+          mkdir -p "$evidence"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$BUILD_ARTIFACT_ID" > "$evidence/build-artifact.json"
+          jq -e --arg run "$BUILD_RUN_ID" --arg sha "$SOURCE_SHA" \
+            --arg name "$BUILD_ARTIFACT_NAME" --arg digest "$BUILD_ARTIFACT_DIGEST" \
+            '.workflow_run.id == ($run | tonumber) and .workflow_run.head_sha == $sha and
+              .name == $name and .digest == $digest and .expired == false' "$evidence/build-artifact.json"
+
       - name: Download the existing ARM64 release
         uses: actions/download-artifact@v4
         with:
-          name: REVERSE-Windows-Prime-0.3.88-perf-test.4-90912908d423-ARM64
+          name: ${{ env.BUILD_ARTIFACT_NAME }}
           path: arm64-release
-          run-id: 45157826579
+          run-id: ${{ env.BUILD_RUN_ID }}
           github-token: ${{ github.token }}
 
       - name: Enable KVM for the x86 Android emulator
@@ -94,6 +111,11 @@ jobs:
             printf 'Android advertised ABIs %s\n' "$abis"
             [[ ",$abis," == *,arm64-v8a,* ]]
             adb shell getprop ro.dalvik.vm.native.bridge | tr -d '\r' | grep -Fx 'libndk_translation.so'
+            # The disposable userdebug emulator may read the test app's own persisted diagnostic.
+            adb shell getprop ro.build.type | tr -d '\r' | grep -Fx 'userdebug'
+            adb root
+            adb wait-for-device
+            adb shell id -u | tr -d '\r' | grep -Fx '0'
             adb install --no-incremental "$apk" | tee "$evidence/package-installer.txt"
             grep -Fxq 'Success' "$evidence/package-installer.txt"
             adb shell settings put secure immersive_mode_confirmations confirmed
@@ -118,6 +140,7 @@ jobs:
           python3 "$RUNNER_TEMP/r110-bios-check.py" | tee "$evidence/bios.txt"
           BASH
           cat > "$RUNNER_TEMP/r110-bios-check.py" <<'PY'
+          import json
           import os
           import re
           import subprocess
@@ -183,11 +206,43 @@ jobs:
               assert image.startswith(b'\x89PNG\r\n\x1a\n')
               (evidence / name).write_bytes(image)
 
+          def verify_diagnostic(status):
+              path = f'/data/user/0/{package}/files/ultimo-diagnostico.json'
+              deadline = time.monotonic() + 20
+              report = {}
+              while time.monotonic() < deadline:
+                  try:
+                      raw = adb('exec-out', 'cat', path)
+                      report = json.loads(raw)
+                  except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
+                      time.sleep(1)
+                      continue
+                  if report.get('status') == status:
+                      (evidence / f'bios-{status}.json').write_bytes(raw)
+                      break
+                  time.sleep(1)
+              else:
+                  raise AssertionError(f'Expected saved BIOS diagnostic {status}, got {report.get("status")}')
+              assert report['schema'] == 'reverse-windows-android-session-v1', report.get('schema')
+              assert report['source'] == 'self-test', report.get('source')
+              assert report['application_id'] == package, report.get('application_id')
+              assert report['app_version'] == os.environ['APK_VERSION_NAME'], report.get('app_version')
+              assert report['app_version_code'] == int(os.environ['APK_VERSION_CODE']), report.get('app_version_code')
+              ether = report['ether_arm64']
+              assert report['mundo_x_sha'] == ether['mundo_x_source_sha'] == os.environ['MUNDO_X_SHA'], ether
+              ram_add = ether['ram_add_guest_steps']
+              deflate_bypassed = report['ram_profile']['spill_codec']['encode_deflate_bypassed']
+              assert type(ram_add) is int and ram_add >= 0, ram_add
+              assert type(deflate_bypassed) is int and deflate_bypassed >= 0, deflate_bypassed
+              print(f'PRIME_BIOS_DIAGNOSTIC_SCHEMA_PASS status={status} ram_add_guest_steps={ram_add} '
+                    f'encode_deflate_bypassed={deflate_bypassed}')
+
           settings()
           visible('resource-id', f'{package}:id/vm_bios_test', tap=True, scroll=True)
           settings()
           visible('text', 'BIOS espera una tecla')
           screenshot('bios-wait.png')
+          verify_diagnostic('waiting_key')
           visible('text', '‹  Consola', tap=True)
           visible('resource-id', f'{package}:id/vm_monitor', focused=True)
           adb('shell', 'input', 'keyevent', 'KEYCODE_HOME')
@@ -198,6 +253,7 @@ jobs:
           settings()
           visible('text', 'La CPU invitada se detuvo')
           screenshot('bios-halted.png')
+          verify_diagnostic('halted')
           print('PRIME_ARM64_APK_BRIDGE_BIOS_PASS host=x86_64 android=30 bridge=libndk_translation.so')
           PY
 
@@ -216,6 +272,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: prime-r110-arm64-bridge-install-90912908d423
+          name: prime-r110-arm64-bridge-install-433b2d7d6cd7
           path: ${{ runner.temp }}/r110-install-evidence
           if-no-files-found: warn
