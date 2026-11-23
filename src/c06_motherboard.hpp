@@ -2340,8 +2340,7 @@ class PcMotherboardC06 {
     // The budget counts work across the whole VM. Small calls keep a rotating
     // position so that every runnable processor gets a turn.
     bool register_peer = false;
-    while (budget && !faulted_processor_ && !pc_.cpu.fault && !powered_off_ &&
-           pc_.guest_restart() == cosmic_pc::PcMachine::GuestRestart::None) {
+    while (budget && !faulted_processor_ && !powered_off_ && pc_.guest_execution_available()) {
       if(timed&&Clock::now()>=deadline)return;
       refresh_parked_processors();
       poll_parked_processors();
