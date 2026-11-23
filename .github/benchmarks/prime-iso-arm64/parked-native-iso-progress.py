@@ -86,12 +86,58 @@ def collect_intervals(first, last, pairs):
         yield item
 
 
+def admission_point(point):
+    counters = point.get("parked_native_admission")
+    if not isinstance(counters, dict) or counters.get("sample_period") != 1021:
+        raise ValueError("Missing the expected parked admission sampler")
+    if not all(isinstance(counters.get(key), dict) for key in ("register_candidate_samples", "outcomes")):
+        raise ValueError("Missing parked admission eligibility or outcome counts")
+    if not (sum(counters["register_candidate_samples"].values()) == counters["samples"]
+            == sum(counters["outcomes"].values())):
+        raise ValueError("Parked admission samples and outcome counts disagree")
+    execution = point["vcpu_execution"]
+    return {
+        **pick(point, ("target_steps", "actual_steps", "elapsed_ns", "cpu_mode", "started_vcpus",
+                       "irq_delivered", "windows_ready")),
+        "parked_vcpus": point["vcpu_states"].count("halted"),
+        "admission": counters,
+        "off_bus_register_steps_by_logical_processor": [
+            cpu["off_bus_register_steps"] for cpu in execution
+        ],
+    }
+
+
+def extract_admission(evidence, candidate):
+    run = json.loads((evidence / "candidate.json").read_text())
+    terminal = admission_point(candidate["terminal"])
+    steps = [admission_point(point) for point in run["checkpoints"]]
+    wall = {mark: admission_point(point) for mark, point in run["wall_observations"].items()}
+    valid = (candidate["valid"] and terminal["cpu_mode"] == "long64"
+             and terminal["actual_steps"] >= 9_500_000_000 and terminal["started_vcpus"] > 1
+             and terminal["admission"]["samples"] > 0
+             and len(terminal["off_bus_register_steps_by_logical_processor"])
+             == candidate["terminal"]["machine_inputs"]["logical_processors"])
+    save(evidence / "parked-admission.json", {
+        "valid": valid,
+        **pick(candidate, INPUTS + REVISIONS),
+        "terminal": terminal,
+        "checkpoints": steps,
+        "wall_observations": wall,
+    })
+    print("Parked admission samples:", terminal["admission"]["samples"])
+    print("Parked admission outcomes:", json.dumps(terminal["admission"]["outcomes"], sort_keys=True))
+    return valid
+
+
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("evidence", type=Path)
     cli.add_argument("--candidate-only", action="store_true")
+    cli.add_argument("--admission", action="store_true")
     args = cli.parse_args()
     candidate = load_role(args.evidence, "candidate")
+    if args.admission:
+        return 0 if extract_admission(args.evidence, candidate) else 1
     if args.candidate_only:
         return 0 if candidate["valid"] else 1
     reference = load_role(args.evidence, "reference")

@@ -102,6 +102,7 @@ def load_checkpoint(record):
         "tsc_access": topology.get("tsc_access"),
         "tsc_access_by_logical_processor": topology.get("tsc_access_by_logical_processor"),
         "smp": pick(topology, SMP),
+        "parked_native_admission": topology.get("parked_native_admission"),
         "startup_ipis": topology.get("startup_ipis", {}),
         "vcpu_states": topology.get("states_by_logical_processor", []),
         "vcpu_steps": topology.get("steps_by_logical_processor", []),

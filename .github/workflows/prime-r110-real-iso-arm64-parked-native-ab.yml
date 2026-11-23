@@ -1,8 +1,8 @@
-name: Prime R110 ARM64 parked vCPU scheduler Windows ISO A/B
+name: Prime R110 ARM64 parked scheduler admission Windows ISO
 
 on:
   push:
-    branches: [ci/prime-r110-arm64-parked-native-iso-ab]
+    branches: [ci/prime-r110-arm64-parked-admission-iso]
     paths:
       - .github/benchmarks/prime-iso-arm64/parked-native-iso-targets.json
       - .github/benchmarks/prime-iso-arm64/parked-native-iso-progress.py
@@ -21,14 +21,14 @@ env:
   PROBE_TIMEOUT_SECONDS: '1680'
 
 jobs:
-  native-iso-pair:
+  native-iso-admission:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 68
+    timeout-minutes: 38
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Verify and build both exact checkouts on the same ARM64 runner
+      - name: Verify and build the exact diagnostic product on ARM64
         shell: bash
         run: |
           set -euo pipefail
@@ -36,7 +36,7 @@ jobs:
           bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
           evidence="$RUNNER_TEMP/evidence"
           mkdir -p "$evidence"
-          python3 "$bench/resolve-combined.py" "$bench/parked-native-iso-targets.json" > "$RUNNER_TEMP/targets.tsv"
+          python3 "$bench/resolve-combined.py" "$bench/parked-native-iso-targets.json" --candidate-only > "$RUNNER_TEMP/targets.tsv"
           cp "$bench/parked-native-iso-targets.json" "$evidence/targets.json"
           python3 - <<'PY' > "$RUNNER_TEMP/probe-cpu"
           import os
@@ -56,23 +56,22 @@ jobs:
           packages=(ninja-build libcurl4-openssl-dev zlib1g-dev
                     libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri)
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${packages[@]}"
-          while IFS=$'\t' read -r role product_sha core_sha; do
-            product="$RUNNER_TEMP/product-$role"
-            bash "$bench/checkout-product.sh" "$product" "$product_sha" "$core_sha" | tee "$evidence/$role-checkout.log"
-            git -C "$product" diff --exit-code
-            git -C "$product/deps/mundo-X" diff --exit-code
-            cp "$product/config/dependencies.lock.json" "$evidence/$role-dependencies.lock.json"
-            cmake -S "$bench" -B "$RUNNER_TEMP/build-$role" -G Ninja \
-              -DREVERSE_WINDOWS_SOURCE="$product" -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
-            cmake --build "$RUNNER_TEMP/build-$role" --target session_probe --parallel 2
-          done < "$RUNNER_TEMP/targets.tsv"
-          cmp "$evidence/reference-dependencies.lock.json" "$evidence/candidate-dependencies.lock.json"
-          cmp "$RUNNER_TEMP/product-reference/config/integration-manifest.json" \
-            "$RUNNER_TEMP/product-candidate/config/integration-manifest.json"
+          IFS=$'\t' read -r role product_sha core_sha < "$RUNNER_TEMP/targets.tsv"
+          test "$role" = candidate
+          product="$RUNNER_TEMP/product-candidate"
+          build="$RUNNER_TEMP/build-candidate"
+          bash "$bench/checkout-product.sh" "$product" "$product_sha" "$core_sha" | tee "$evidence/candidate-checkout.log"
+          git -C "$product" diff --exit-code
+          git -C "$product/deps/mundo-X" diff --exit-code
+          cp "$product/config/dependencies.lock.json" "$evidence/candidate-dependencies.lock.json"
+          cp "$product/config/integration-manifest.json" "$evidence/candidate-integration-manifest.json"
+          cmake -S "$bench" -B "$build" -G Ninja \
+            -DREVERSE_WINDOWS_SOURCE="$product" -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
+          cmake --build "$build" --target session_probe --parallel 2
           cc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -o "$RUNNER_TEMP/verified_iso.so" \
             "$bench/verified_iso.c" -lcurl -pthread
-          sha256sum "$RUNNER_TEMP"/build-*/session_probe "$RUNNER_TEMP/verified_iso.so" > "$evidence/native-sha256.txt"
-      - name: Gate both ISO runs on native SMP and parked IRQ correctness
+          sha256sum "$build/session_probe" "$RUNNER_TEMP/verified_iso.so" > "$evidence/native-sha256.txt"
+      - name: Gate the diagnostic run on native SMP and parked IRQ correctness
         id: native_ap
         shell: bash
         run: |
@@ -86,6 +85,9 @@ jobs:
           affinity=$(cat "$RUNNER_TEMP/probe-cpu")
           taskset -c "$affinity" "$build/$smp_test" --test-parked-native \
             | tee "$evidence/native-ap-parked-native.log"
+          grep -q '^C06_PARKED_NATIVE_SAMPLE ' "$evidence/native-ap-parked-native.log"
+          grep -Eq '^C06_PARKED_ADMISSION_SAMPLE attempts=[1-9][0-9]* samples=[1-9][0-9]* ' \
+            "$evidence/native-ap-parked-native.log"
           taskset -c "$affinity" ctest --test-dir "$build" --output-on-failure -V \
             -R '^reverse_windows_smp_guest$' \
             --no-tests=error --output-junit "$evidence/native-ap-oracles.xml" | tee "$evidence/native-ap-oracles.log"
@@ -93,37 +95,16 @@ jobs:
         shell: bash
         run: |
           bash "$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64/run-combined-role.sh" candidate
-      - name: Summarize the experimental counters before the same-runner control
+      - name: Validate and extract scheduler admission at every milestone
         if: ${{ (success() || failure()) && steps.native_ap.outcome == 'success' }}
         shell: bash
         run: |
           python3 "$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64/parked-native-iso-progress.py" \
-            "$RUNNER_TEMP/evidence" --candidate-only
-      - name: Preserve the candidate observation
-        if: ${{ (success() || failure()) && steps.native_ap.outcome == 'success' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: prime-r110-arm64-parked-native-iso-candidate
-          path: ${{ runner.temp }}/evidence/
-          if-no-files-found: error
-      - name: Observe the exact .8 control on the same CPUs, bound and optical media
-        if: ${{ (success() || failure()) && steps.native_ap.outcome == 'success' }}
-        shell: bash
-        run: |
-          # The candidate already exported its evidence. Reclaim the disposable
-          # VM disk and RAM backing before requesting the same profile again.
-          rm -rf -- "$RUNNER_TEMP/session-candidate"
-          bash "$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64/run-combined-role.sh" reference
-      - name: Compare aligned wall time and 10.5B to 11.5B guest-step observations
-        if: ${{ (success() || failure()) && steps.native_ap.outcome == 'success' }}
-        shell: bash
-        run: |
-          python3 "$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64/parked-native-iso-progress.py" \
-            "$RUNNER_TEMP/evidence"
-      - name: Preserve pinned native tests and both real ISO observations
+            "$RUNNER_TEMP/evidence" --admission
+      - name: Preserve pinned native tests and real ISO admission observations
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-parked-native-iso-pair
+          name: prime-r110-arm64-parked-admission-iso
           path: ${{ runner.temp }}/evidence/
           if-no-files-found: warn
