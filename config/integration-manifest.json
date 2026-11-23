@@ -15,6 +15,7 @@
     "ether-state-ram",
     "quantum-ram-authority",
     "ram-pressure-maintenance",
+    "paced-ram-reclaim",
     "ready-vcpu-budget",
     "parked-vcpu-irq-wake"
   ],

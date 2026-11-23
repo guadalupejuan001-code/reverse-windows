@@ -489,6 +489,45 @@ void verify_packed_ram64(const std::filesystem::path& directory) {
             << stats->file_payload_bytes() << " prime_phone_budget_mib=" << prime.backing_bytes / mib << '\n';
 }
 
+void verify_state_ram_reclaim_batches(const std::filesystem::path& directory) {
+  using Ram = cosmic_pc::MemoryFabric;
+  using Backing = reverse_windows::AndroidRamBacking;
+  constexpr auto page = Backing::kPageSize;
+  constexpr std::size_t resident_pages = 24, reclaim_pages = 8;
+  const auto logical = Session::kPrimeRamBytes;
+  Ram ram(logical, 32 * page);
+  auto backing = std::make_unique<Backing>(directory, logical, 64 * page, true);
+  auto& store = *backing;
+  ram.attach_page_backing(std::move(backing), cosmic_pc::SparseRam::BackingCachePolicy::Adaptive);
+  std::vector<std::uint8_t> data(resident_pages * page), restored(data.size());
+  std::uint32_t random = 0x193ac6e5U;
+  for (auto& byte : data) {
+    random ^= random << 13;
+    random ^= random >> 17;
+    random ^= random << 5;
+    byte = static_cast<std::uint8_t>(random);
+  }
+  ram.write_block(0, data.data(), data.size());
+  require(std::string(ram.backend_name()) == "ether-state-ram" &&
+              ram.allocated_bytes() == data.size(), "Packed pressure test requires resident Ether RAM");
+
+  const auto before = ram.budget_bytes();
+  const auto state = ram.adjust_payload_budget(0, reclaim_pages);
+  const auto staged = ram.budget_bytes();
+  require(state == cosmic_pc::SparseRam::BudgetAdjustment::Reclaiming &&
+              ram.metrics().spilled_pages == reclaim_pages && store.grouped_pages() == reclaim_pages &&
+              store.write_batches() == 1 && store.write_calls() == 1,
+          "Ether pressure must commit dirty pages in a single backing batch");
+  require(staged < before && staged >= ram.allocated_bytes() &&
+              staged <= ram.allocated_bytes() + ram.metrics().backing_cache_capacity_bytes + 4 * page,
+          "The partial reclaim must restrict new resident allocations before the next adjustment");
+  ram.read_block(0, restored.data(), restored.size());
+  require(restored == data, "Reading back grouped spill pages must preserve all guest bytes");
+  std::cout << "PRIME_ETHER_STATE_RAM_GROUPED_RECLAIM_PASS pages=" << store.grouped_pages()
+            << " writes=" << store.write_calls() << " budget_before=" << before
+            << " budget_after=" << staged << '\n';
+}
+
 void verify_deferred_ram_reclaim(const std::filesystem::path& directory) {
   using Backing = reverse_windows::AndroidRamBacking;
   using Ram = cosmic_pc::SparseRam;
@@ -1270,6 +1309,7 @@ int main(int argc, char** argv) {
     const TestDiskDirectory dir;
 #ifndef PRIME_PREVIOUS_ENGINE_WINDOW
     verify_ram_timing_option(dir.path);
+    verify_state_ram_reclaim_batches(dir.path);
 #endif
     verify_ram_spill(dir.path);
     verify_packed_ram64(dir.path);

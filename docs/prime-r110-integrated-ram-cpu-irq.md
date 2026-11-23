@@ -21,6 +21,10 @@ en `config/dependencies.lock.json`.
 ## Funcionamiento
 
 `EtherStateRam` permanece seleccionado desde la construcción de `MemoryFabric`.
+Cuando Android reduce el presupuesto residente, esta ruta agrupa las escrituras
+de páginas sucias al respaldo y reserva un margen limitado para nuevas páginas
+entre tandas de liberación. La regresión de integración comprueba la escritura
+agrupada, el presupuesto intermedio y la recuperación exacta de los datos.
 El reparto C06 entrega el presupuesto a las vCPU listas, devuelve el trabajo
 no consumido y conserva los despertares pendientes. El ejecutor de la vCPU
 destinataria entrega la interrupción. La autoridad vectorial y la regulación
