@@ -206,8 +206,13 @@ jobs:
           old="$RUNNER_TEMP/mundo-prime-r097"
           git -C deps/mundo-X fetch --no-tags --depth=1 https://github.com/guadalupejuan001-code/mundo-X.git "$reference"
           git -C deps/mundo-X worktree add --detach "$old" "$reference"
+          # Keep the historical driver compatible with both older headers.
+          # The current measurement routines use the same guest workloads.
+          fixture=b3a3d04f14d644a2eea332492108f16306d629ff
           driver=pc-android/native/tests/x86_ether_counter_loop_test.cpp
-          cp "deps/mundo-X/$driver" "$old/pc-android/native/tests/prime-vector-compare.cpp"
+          git -C deps/mundo-X fetch --no-tags --depth=1 https://github.com/guadalupejuan001-code/mundo-X.git "$fixture"
+          git -C deps/mundo-X show "$fixture:$driver" > "$RUNNER_TEMP/prime-vector-fixture.cpp"
+          cp "$RUNNER_TEMP/prime-vector-fixture.cpp" "$old/pc-android/native/tests/prime-vector-compare.cpp"
           c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread \
             -I"$old/pc-android/native" -I"$old/native/include" \
             "$old/pc-android/native/tests/prime-vector-compare.cpp" -o build/prime-vector-r097
@@ -233,7 +238,7 @@ jobs:
           git -C deps/mundo-X fetch --no-tags --depth=1 https://github.com/guadalupejuan001-code/mundo-X.git "$reference"
           git -C deps/mundo-X worktree add --detach "$old" "$reference"
           driver=pc-android/native/tests/x86_ether_counter_loop_test.cpp
-          cp "deps/mundo-X/$driver" "$old/$driver"
+          cp "$RUNNER_TEMP/prime-vector-fixture.cpp" "$old/$driver"
           c++ -std=c++17 -O2 -DNDEBUG -frounding-math -pthread \
             -I"$old/pc-android/native" -I"$old/native/include" "$old/$driver" -o build/prime-x86-r099
           for trial in 1 2 3 4 5; do
