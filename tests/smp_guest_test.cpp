@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -928,6 +929,20 @@ void test_parallel_work_with_parked_irq(bool expire_timer, bool require_parallel
         require(peer_delay && *peer_delay == 0, "the parked timer must be serviced before another prepared grant");
     if (near_edge)
         require(native_at_expiry == native_before, "a one-tick timer must prevent the prepared batch until delivery");
+    const auto& sample = board.parked_admission_stats();
+    const auto first_outcomes = std::accumulate(sample.outcomes.begin(), sample.outcomes.end(), std::uint64_t{});
+    require(sample.attempts && sample.samples == (sample.attempts - 1) / sample.kSamplePeriod + 1 &&
+                first_outcomes == sample.samples && sample.samples == sample.no_register_candidate +
+                    sample.one_register_candidate + sample.partial_register_candidates + sample.all_register_candidates,
+            "parked admission must record one census and first outcome per periodic sample");
+    require(sample.register_candidates + sample.ram_only_candidates <= sample.ready_processors,
+            "candidate census must count each ready processor at most once");
+    for (unsigned id = 0; id < 3; ++id)
+        require(board.processor_off_bus_register_steps(id) <= board.processor_ether_arm64_steps(id),
+                "vCPU off-bus register steps must be part of its ARM64 retired steps");
+    std::cout << "C06_PARKED_ADMISSION_SAMPLE attempts=" << sample.attempts << " samples=" << sample.samples
+              << " ready=" << sample.ready_processors << " registers=" << sample.register_candidates
+              << " ram_only=" << sample.ram_only_candidates << " outcomes=" << first_outcomes << '\n';
     const auto native_steps = board.parallel_register_steps() - native_before;
     const auto native_batches = board.parallel_register_batches() - batches_before;
     std::cout << (near_edge ? "C06_PARKED_NATIVE_NEAR_EDGE timer=" : "C06_PARKED_NATIVE_SAMPLE timer=") << expire_timer

@@ -95,6 +95,29 @@ class PcMotherboardC06 {
     std::uint64_t pause_yields = 0, pause_steps = 0, pause_admissions = 0;
     unsigned last_workers = 0, peak_workers = 0;
   };
+  struct ParkedAdmissionStats {
+    enum class Outcome : unsigned {
+      TooFewRunnable, DeviceGate, WakePending, ShortBudget, HostOrGuestUnavailable,
+      Deferred, PendingApic, ApicTimerDue, MissingRegisterLoop, TooFewCandidates,
+      DeadlineBeforePreparation, ShortDeviceGrant, PreparationFailed,
+      DeadlineAfterPreparation, WorkersUnavailable, ZeroRetired, OneProcessorRetired,
+      ParallelRetired
+    };
+    static constexpr std::array kOutcomeNames{
+      "too_few_runnable", "device_gate", "wake_pending", "short_budget", "host_or_guest_unavailable",
+      "deferred", "pending_apic", "apic_timer_due", "missing_register_loop", "too_few_candidates",
+      "deadline_before_preparation", "short_device_grant", "preparation_failed",
+      "deadline_after_preparation", "workers_unavailable", "zero_retired", "one_processor_retired",
+      "parallel_retired"
+    };
+    static_assert(static_cast<unsigned>(Outcome::ParallelRetired) + 1 == kOutcomeNames.size());
+    static constexpr std::uint64_t kSamplePeriod = 1021;
+    std::uint64_t attempts = 0, samples = 0;
+    std::uint64_t ready_processors = 0, register_candidates = 0, ram_only_candidates = 0;
+    std::uint64_t no_register_candidate = 0, one_register_candidate = 0;
+    std::uint64_t partial_register_candidates = 0, all_register_candidates = 0;
+    std::array<std::uint64_t, kOutcomeNames.size()> outcomes{};
+  };
 
  private:
   struct Pic {
@@ -330,6 +353,7 @@ class PcMotherboardC06 {
   std::array<BusWaitStats, kMaxProcessors> bus_wait_{};
   std::array<std::uint64_t, kMaxProcessors> retired_before_init_{};
   std::array<std::uint64_t, kMaxProcessors> ether_steps_before_init_{};
+  std::array<std::uint64_t, kMaxProcessors> off_bus_register_steps_before_init_{};
   std::array<std::uint64_t, kMaxProcessors> state_vector_steps_before_init_{};
   std::array<std::uint64_t, kMaxProcessors> interpreter_vector_steps_before_init_{};
   StartupIpis startup_ipis_{};
@@ -344,6 +368,7 @@ class PcMotherboardC06 {
   std::shared_ptr<SmpWorkers> workers_;
   std::unique_ptr<EtherX86Sessions> ether_x86_sessions_;
   ThreadedSmpStats threaded_smp_stats_;
+  ParkedAdmissionStats parked_admission_stats_;
   std::uint64_t parallel_register_batches_ = 0, parallel_register_steps_ = 0;
   std::uint64_t parallel_register_continuations_ = 0;
   std::uint64_t parallel_ram_batches_ = 0, parallel_ram_steps_ = 0;
@@ -417,6 +442,7 @@ class PcMotherboardC06 {
     bus_wait_.fill({});
     retired_before_init_.fill(0);
     ether_steps_before_init_.fill(0);
+    off_bus_register_steps_before_init_.fill(0);
     state_vector_steps_before_init_.fill(0);
     interpreter_vector_steps_before_init_.fill(0);
     startup_ipis_ = {};
@@ -427,6 +453,7 @@ class PcMotherboardC06 {
     wake_pending_.reset();
     wake_budget_.fill(0);
     threaded_smp_stats_ = {};
+    parked_admission_stats_ = {};
     parallel_register_batches_ = parallel_register_steps_ = 0;
     parallel_register_continuations_ = 0;
     parallel_ram_batches_ = parallel_ram_steps_ = 0;
@@ -1455,6 +1482,7 @@ class PcMotherboardC06 {
       ram_views_before_init_[id] = processor_ram_views(id);
       retired_before_init_[id] += cpu.instructions;
       ether_steps_before_init_[id] += cpu.ether_arm64_stats().steps;
+      off_bus_register_steps_before_init_[id] += cpu.ether_arm64_stats().off_bus_register_steps;
       const auto& interpreter = cpu.state_vector_interpreter_stats();
       state_vector_steps_before_init_[id] += cpu.ether_arm64_stats().state_vector_steps +
                                               interpreter.projected_steps;
@@ -1772,18 +1800,50 @@ class PcMotherboardC06 {
     return start + std::min(kParkedParallelWindow, std::chrono::nanoseconds(until_edge));
   }
 
+  ParkedAdmissionStats* sample_parked_admission(const std::array<unsigned, kMaxProcessors>& runnable,
+                                                 unsigned count) noexcept {
+    auto& stats = parked_admission_stats_;
+    if (stats.attempts++ % ParkedAdmissionStats::kSamplePeriod) return nullptr;
+    ++stats.samples;
+    // A cache-only snapshot includes later peers even when admission rejects
+    // the first peer. It does not translate guest addresses or prepare work.
+    unsigned ready = 0, registers = 0;
+    for (unsigned i = 0; i < count; ++i) {
+      const auto& cpu = *apics_[runnable[i]].cpu;
+      if (cpu.halted) continue;
+      ++ready;
+      if (cpu.ether_arm64_loop_length(cosmic_pc::Cpu::EtherLoopAccess::Registers)) ++registers;
+      else if (cpu.ether_arm64_loop_length(kParallelLoopAccess)) ++stats.ram_only_candidates;
+    }
+    stats.ready_processors += ready;
+    stats.register_candidates += registers;
+    if (registers == 0) ++stats.no_register_candidate;
+    else if (registers == 1) ++stats.one_register_candidate;
+    else if (registers < ready) ++stats.partial_register_candidates;
+    else ++stats.all_register_candidates;
+    return &stats;
+  }
+
   unsigned run_parallel_ether_loops(const std::array<unsigned, kMaxProcessors>& runnable,
                                     unsigned count, unsigned budget,
                                     cosmic_pc::PcMachine::RunClock::time_point deadline,
                                     bool& defer_parked_parallel) {
-    if (count < 2 || prior_tick_ || wake_pending_.any() ||
-        budget < 2 * kMinParallelLoopSteps || !cosmic_pc::Cpu::ether_arm64_host() ||
-        !pc_.boot_acceleration_enabled() || !pc_.guest_execution_available() ||
-        (sci_active_ && (io_redir_low_[AcpiC06::sci_irq] & 0x18000U) == 0x8000U &&
-         !io_remote_targets_[AcpiC06::sci_irq])) return 0;
-
     const bool watch_parked_irqs = parked_irq_processors_.any();
-    if (watch_parked_irqs && defer_parked_parallel) return 0;
+    auto* sample = watch_parked_irqs ? sample_parked_admission(runnable, count) : nullptr;
+    using Outcome = ParkedAdmissionStats::Outcome;
+    const auto record = [sample](Outcome outcome) {
+      if (sample) ++sample->outcomes[static_cast<unsigned>(outcome)];
+      return 0U;
+    };
+    if (count < 2) return record(Outcome::TooFewRunnable);
+    if (prior_tick_) return record(Outcome::DeviceGate);
+    if (wake_pending_.any()) return record(Outcome::WakePending);
+    if (budget < 2 * kMinParallelLoopSteps) return record(Outcome::ShortBudget);
+    if (!cosmic_pc::Cpu::ether_arm64_host() || !pc_.boot_acceleration_enabled() || !pc_.guest_execution_available())
+      return record(Outcome::HostOrGuestUnavailable);
+    if (sci_active_ && (io_redir_low_[AcpiC06::sci_irq] & 0x18000U) == 0x8000U &&
+        !io_remote_targets_[AcpiC06::sci_irq]) return record(Outcome::DeviceGate);
+    if (watch_parked_irqs && defer_parked_parallel) return record(Outcome::Deferred);
     // A read-only RAM loop can still block on page backing. While an IRQ
     // target sleeps, admit only bounded native work on private registers.
     const auto access = watch_parked_irqs ? cosmic_pc::Cpu::EtherLoopAccess::Registers : kParallelLoopAccess;
@@ -1801,29 +1861,29 @@ class PcMotherboardC06 {
       const auto& apic = apics_[id];
       const auto& cpu = *apic.cpu;
       if (apic.init_pending || apic.startup_vector ||
-          (cpu.flag(cosmic_pc::Cpu::IF) && deliverable_lapic_vector(apic))) return 0;
+          (cpu.flag(cosmic_pc::Cpu::IF) && deliverable_lapic_vector(apic))) return record(Outcome::PendingApic);
       if (id && local_timer_irq_armed(apic)) {
         const auto elapsed = ticks_ - apic.last_tick;
-        if (elapsed >= apic.timer_cycles) return 0;
+        if (elapsed >= apic.timer_cycles) return record(Outcome::ApicTimerDue);
         limit = static_cast<unsigned>(std::min<std::uint64_t>(limit, apic.timer_cycles - elapsed - 1));
       }
       if (cpu.halted) continue;
       ++active_count;
-      if (!consider(id) && !allow_mixed) return 0;
+      if (!consider(id) && !allow_mixed) return record(Outcome::MissingRegisterLoop);
     }
-    if (candidate_count < 2) return 0;
+    if (candidate_count < 2) return record(Outcome::TooFewCandidates);
     auto work_deadline = deadline;
     if (watch_parked_irqs) {
       const auto sample_start = Clock::now();
       poll_parked_processors(true);
-      if (wake_pending_.any()) return 0;
+      if (wake_pending_.any()) return record(Outcome::WakePending);
       work_deadline = std::min(deadline, parked_parallel_deadline(sample_start));
-      if (Clock::now() >= work_deadline) return 0;
+      if (Clock::now() >= work_deadline) return record(Outcome::DeadlineBeforePreparation);
     }
     // Bound one independent execution by the earliest device edge and the
     // aggregate budget, including the processors that need serial service.
     limit = batch_limit(std::min(limit, budget / active_count) + 1) - 1;
-    if (limit < kMinParallelLoopSteps) return 0;
+    if (limit < kMinParallelLoopSteps) return record(Outcome::ShortDeviceGrant);
 
     std::array<unsigned, kMaxProcessors> jobs{};
     std::array<cosmic_pc::Cpu::EtherLoopWork, kMaxProcessors> work{};
@@ -1848,8 +1908,8 @@ class PcMotherboardC06 {
     };
     auto job_count = candidate_count == active_count ? prepare(false) : 0U;
     if (job_count < active_count) job_count = prepare_mixed();
-    if (job_count < 2) return 0;
-    if (watch_parked_irqs && Clock::now() >= work_deadline) return 0;
+    if (job_count < 2) return record(Outcome::PreparationFailed);
+    if (watch_parked_irqs && Clock::now() >= work_deadline) return record(Outcome::DeadlineAfterPreparation);
     if (!workers_) workers_ = std::make_shared<SmpWorkers>(host_workers_capacity());
 
     // A worker publishes register state to its own vCPU and can use the
@@ -1888,7 +1948,7 @@ class PcMotherboardC06 {
         } while (continued);
       }
     });
-    if (!lanes) return 0;
+    if (!lanes) return record(Outcome::WorkersUnavailable);
     const auto rotation = lanes < job_count ? next_job : 0U;
     if (lanes < job_count)
       next_native_job_ = (rotation + lanes - fixed_jobs) % (job_count - fixed_jobs);
@@ -1907,6 +1967,8 @@ class PcMotherboardC06 {
       ram_steps += result.ram_steps;
       parallel_register_continuations_ += result.continuations;
     }
+    record(processors > 1 ? Outcome::ParallelRetired :
+           processors == 1 ? Outcome::OneProcessorRetired : Outcome::ZeroRetired);
     if (watch_parked_irqs) {
       // Worker retirement is private. Poll the devices at the join before
       // RAM maintenance or another guest grant.
@@ -2280,6 +2342,7 @@ class PcMotherboardC06 {
     return ether_x86_sessions_ ? ether_x86_sessions_->worker_count() : 0;
   }
   std::uint64_t parallel_register_batches() const noexcept { return parallel_register_batches_; }
+  const ParkedAdmissionStats& parked_admission_stats() const noexcept { return parked_admission_stats_; }
   std::uint64_t parallel_register_steps() const noexcept { return parallel_register_steps_; }
   std::uint64_t parallel_register_continuations() const noexcept { return parallel_register_continuations_; }
   std::uint64_t parallel_ram_batches() const noexcept { return parallel_ram_batches_; }
@@ -2378,6 +2441,9 @@ class PcMotherboardC06 {
   }
   std::uint64_t processor_ether_arm64_steps(unsigned id) const noexcept {
     return apics_[id].cpu->ether_arm64_stats().steps + ether_steps_before_init_[id];
+  }
+  std::uint64_t processor_off_bus_register_steps(unsigned id) const noexcept {
+    return apics_[id].cpu->ether_arm64_stats().off_bus_register_steps + off_bus_register_steps_before_init_[id];
   }
   std::uint64_t processor_state_vector_steps(unsigned id) const noexcept {
     const auto& cpu = *apics_[id].cpu;

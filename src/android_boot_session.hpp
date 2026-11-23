@@ -667,6 +667,7 @@ class AndroidBootSession final {
     const auto execution = board_->cpu_execution_totals();
     const auto startup = board_->startup_ipis();
     const auto& threaded = board_->threaded_smp_stats();
+    const auto& admission = board_->parked_admission_stats();
     out << ",\"cpu_topology\":{\"sockets\":1,\"cores\":" << topology.cores
         << ",\"threads_per_core\":" << topology.threads_per_core
         << ",\"logical_processors\":" << topology.logical_processors()
@@ -703,6 +704,18 @@ class AndroidBootSession final {
         << ",\"init_targets_queued\":" << startup.init_targets_queued
         << ",\"sipi_targets_queued\":" << startup.sipi_targets_queued
         << ",\"sipi_targets_applied\":" << startup.sipi_targets_applied << '}';
+    out << ",\"parked_native_admission\":{\"sample_period\":" << admission.kSamplePeriod
+        << ",\"attempts\":" << admission.attempts << ",\"samples\":" << admission.samples
+        << ",\"ready_processors\":" << admission.ready_processors
+        << ",\"register_candidates\":" << admission.register_candidates
+        << ",\"ram_only_candidates\":" << admission.ram_only_candidates
+        << ",\"register_candidate_samples\":{\"none\":" << admission.no_register_candidate
+        << ",\"one\":" << admission.one_register_candidate
+        << ",\"partial\":" << admission.partial_register_candidates
+        << ",\"all\":" << admission.all_register_candidates << "},\"outcomes\":{";
+    for (std::size_t i = 0; i < admission.outcomes.size(); ++i)
+      out << (i ? ",\"" : "\"") << admission.kOutcomeNames[i] << "\":" << admission.outcomes[i];
+    out << "}}";
     out << ",\"crc32c_retired\":" << execution.crc32c_retired << ",\"tsc_access\":";
     write_tsc_access(out, execution.tsc_access);
     if (detailed) {
@@ -739,6 +752,7 @@ class AndroidBootSession final {
             << std::dec << std::setfill(' ') << "\",\"flags\":" << position.flags
             << ",\"steps\":" << board_->processor_steps(id)
             << ",\"ether_arm64_steps\":" << board_->processor_ether_arm64_steps(id)
+            << ",\"off_bus_register_steps\":" << board_->processor_off_bus_register_steps(id)
             << ",\"crc32c_retired\":" << board_->processor_crc32c_retired(id)
             << ",\"tsc_access\":";
         write_tsc_access(out, board_->processor_tsc_access_stats(id));
