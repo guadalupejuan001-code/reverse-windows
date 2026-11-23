@@ -1,0 +1,104 @@
+name: R110 native ARM64 called PAUSE gap A-B
+on:
+  push:
+    branches: [ci/prime-r110-native-pause-gap]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  called-pause:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify revisions and compile the same guest workloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          bench="$PWD/.github/benchmarks/prime-r110-native-pause-gap"
+          mkdir build evidence
+          cp "$bench/targets.json" evidence/
+          reference_engine=$(jq -er '.gap8.engine' "$bench/targets.json")
+          reference_product=$(jq -er '.gap8.product' "$bench/targets.json")
+          for variant in gap8 gap24; do
+            product=$(jq -er --arg variant "$variant" '.[$variant].product | select(test("^[0-9a-f]{40}$"))' "$bench/targets.json")
+            engine=$(jq -er --arg variant "$variant" '.[$variant].engine | select(test("^[0-9a-f]{40}$"))' "$bench/targets.json")
+            checkout="$PWD/$variant"
+            test "$product" = "$reference_product"
+            git init --quiet "$checkout"
+            git -C "$checkout" fetch --no-tags --depth=1 https://github.com/guadalupejuan001-code/reverse-windows.git "$product"
+            git -C "$checkout" checkout --detach FETCH_HEAD
+            test "$(git -C "$checkout" rev-parse HEAD)" = "$product"
+            if [[ "$variant" == gap24 ]]; then
+              python3 - "$checkout" "$reference_engine" "$engine" <<'PY'
+          import json
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          checkout, reference, candidate = sys.argv[1:]
+          relative = 'config/dependencies.lock.json'
+          path = Path(checkout, relative)
+          source = subprocess.check_output(['git', '-C', checkout, 'show', f'HEAD:{relative}'])
+          assert path.read_bytes() == source
+          assert source.count(reference.encode()) == 1
+          dependencies = json.loads(source)['components']
+          assert [item['commit'] for item in dependencies if item['key'] == 'mundo_x'] == [reference]
+          path.write_bytes(source.replace(reference.encode(), candidate.encode()))
+          assert subprocess.check_output(['git', '-C', checkout, 'diff', '--name-only']).decode().splitlines() == [relative]
+          PY
+              git -C "$checkout" diff -- config/dependencies.lock.json > evidence/gap24-product-lock.diff
+              git -C "$checkout" diff --check
+            else
+              git -C "$checkout" diff --exit-code HEAD
+            fi
+            (cd "$checkout" && python3 scripts/verify_deps.py --checkout)
+            test "$(git -C "$checkout/deps/mundo-X" rev-parse HEAD)" = "$engine"
+            if [[ "$variant" == gap24 ]]; then
+              test "$(git -C "$checkout" diff --name-only HEAD)" = config/dependencies.lock.json
+              module="$checkout/deps/mundo-X"
+              git -C "$module" fetch --no-tags --depth=1 https://github.com/guadalupejuan001-code/mundo-X.git "$reference_engine"
+              test "$(git -C "$module" diff --name-only "$reference_engine" "$engine")" = pc-android/native/x86_cpu.hpp
+              python3 - "$module" "$reference_engine" "$engine" <<'PY'
+          import subprocess
+          import sys
+
+          module, reference, candidate = sys.argv[1:]
+          path = 'pc-android/native/x86_cpu.hpp'
+          def read(revision):
+              return subprocess.check_output(['git', '-C', module, 'show', f'{revision}:{path}'])
+          source = read(reference)
+          original = b'kPauseRepeatGap = 8, kMinPauseRepeats = 4;'
+          replacement = b'kPauseRepeatGap = 24, kMinPauseRepeats = 4;'
+          assert source.count(original) == 1
+          assert read(candidate) == source.replace(original, replacement)
+          PY
+              git -C "$module" diff "$reference_engine" "$engine" > evidence/gap24-engine.diff
+            else
+              git -C "$checkout" diff --exit-code HEAD
+            fi
+            cp "$checkout/config/dependencies.lock.json" "evidence/$variant-dependencies.lock.json"
+            printf '%s product=%s mundo_x=%s\n' "$variant" "$product" "$engine" | tee -a evidence/revisions.txt
+            flags=()
+            if [[ "$variant" == gap24 ]]; then flags=(-DPRIME_EXPECT_WIDE_PAUSE_GAP=1); fi
+            c++ -std=c++17 -O2 -DNDEBUG -DMUNDO_X_PC_STATE_RAM=1 -frounding-math -pthread "${flags[@]}" \
+              -I"$checkout/src" -I"$checkout/deps/mundo-X/pc-android/native" -I"$checkout/deps/mundo-X/native/include" \
+              -I"$checkout/deps/Virtual-qSSD-/include" -I"$checkout/deps/GPU-VIRTUAL/include" \
+              "$bench/workload.cpp" -lz -o "build/$variant"
+          done
+          (uname -a && lscpu && c++ --version) > evidence/runner.txt
+          sha256sum build/gap8 build/gap24 "$bench/workload.cpp" "$bench/compare.py" > evidence/SHA256SUMS
+      - name: Compare observed helper waits and productive controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/benchmarks/prime-r110-native-pause-gap/compare.py build evidence | tee evidence/paired.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: r110-native-arm64-called-pause-paired
+          path: evidence
+          if-no-files-found: error
