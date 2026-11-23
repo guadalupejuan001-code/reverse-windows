@@ -9,7 +9,7 @@
       "commit": "3f2bda8825ed782ee51b9593b396cd6408fb8944",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-state-RAM",
-      "status": "experiment/r110-aligned-trap-stores",
+      "status": "candidate-r110-aligned-trap-stores",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/pc_video.hpp",
