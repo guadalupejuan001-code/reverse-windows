@@ -8,6 +8,7 @@ from pathlib import Path
 
 COVERAGE = ("translated_steps", "batched_steps", "projected_steps", "interpreted_steps")
 NATIVE = ("translated", "executed_blocks", "cache_hits", "data_fallbacks", "guest_steps")
+BOOT_LOOPS = ("boot_scan_loop_steps", "boot_forward_copy_loop_steps")
 RAM = ("usable_bytes", "resident_bytes", "resident_metadata_bytes", "backing_budget_bytes",
        "spill_limit_bytes", "spilled_bytes", "spill_file_payload_bytes", "spill_reads", "spill_writes",
        "spill_write_calls", "spill_cache_bytes", "spill_cache_capacity_bytes", "spill_grouped_pages")
@@ -40,6 +41,7 @@ def load_checkpoint(record):
         "started_vcpus": vm["cpu_topology"]["started"],
         "coverage": pick(vm["ether_coverage"], COVERAGE),
         "native_arm64": pick(arm64, NATIVE),
+        "boot_loops": pick(vm.get("ether_next", {}), BOOT_LOOPS),
         "native_arm64_supported": arm64["host_supported"],
         "native_arm64_enabled": arm64["enabled"],
         "mundo_x_source_sha": arm64["mundo_x_source_sha"],
@@ -68,6 +70,7 @@ def compare(first, last):
             steps * 1e9 / remaining_ns if remaining_ns > 0 else None,
         "native_arm64_delta": compute_delta(first["native_arm64"], last["native_arm64"], NATIVE),
         "coverage_delta": compute_delta(first["coverage"], last["coverage"], COVERAGE),
+        "boot_loop_delta": compute_delta(first["boot_loops"], last["boot_loops"], BOOT_LOOPS),
         "bios_read_delta": compute_delta(first, last, ("bios_reads", "bios_bytes")),
         "restarts_in_interval": last["restarts"] - first["restarts"],
     }
