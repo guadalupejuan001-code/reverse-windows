@@ -14,7 +14,10 @@ NATIVE = ("translated", "executed_blocks", "cache_hits", "data_fallbacks", "gues
           "on_bus_register_steps", "register_bus_reacquisitions", "register_bus_reacquire_samples",
           "register_bus_reacquire_contentions", "register_bus_reacquire_wait_ns")
 BOOT_LOOPS = ("boot_scan_loop_steps", "boot_forward_copy_loop_steps", "boot_zero_loop_steps",
-              "boot_rep_elements", "boot_rep_direct_page_copy_bytes", "boot_counter_loop_steps")
+              "boot_rep_elements", "boot_rep_direct_page_copy_bytes", "boot_counter_loop_steps",
+              "boot_streaming_sse_fill_steps", "secondary_streaming_sse_fill_steps",
+              "boot_movaps_store_batches", "boot_movaps_store_steps",
+              "secondary_movaps_store_batches", "secondary_movaps_store_steps")
 RAM = ("usable_bytes", "resident_bytes", "resident_metadata_bytes", "backing_budget_bytes",
        "spill_limit_bytes", "spilled_bytes", "spill_file_payload_bytes", "spill_reads", "spill_writes",
        "spill_write_calls", "spill_cache_bytes", "spill_cache_capacity_bytes", "spill_grouped_pages",
@@ -232,6 +235,7 @@ def continuation_record(run_dir, target):
         "restarts": boot["restarts"],
         "bios_reads": machine["disk_reads"],
         "iso_read_us": vm["iso_read_us"],
+        "boot_loops": pick(vm.get("ether_next", {}), BOOT_LOOPS),
         "phase_samples": [pick(phase, ("steps", "mode")) for phase in phases],
     }
 
