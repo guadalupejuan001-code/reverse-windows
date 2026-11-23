@@ -34,6 +34,8 @@ function(reverse_windows_add_quantum_ram root)
   if(MSVC)
     target_compile_options(reverse_windows_quantum_ram PRIVATE /fp:strict)
   elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(reverse_windows_quantum_ram PRIVATE -frounding-math -fvisibility=hidden)
+    # Preserve inverse-gate cancellation when restoring bytes on ARM64.
+    target_compile_options(reverse_windows_quantum_ram PRIVATE
+      -frounding-math -ffp-contract=off -fvisibility=hidden)
   endif()
 endfunction()
