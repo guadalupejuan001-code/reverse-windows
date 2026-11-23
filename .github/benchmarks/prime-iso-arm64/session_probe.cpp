@@ -94,6 +94,41 @@ void save_full_frame(const Session::VideoUpdate& frame, const std::filesystem::p
   std::filesystem::rename(temporary, path);
 }
 
+void save_wall_observation(Session& session, const std::filesystem::path& dir,
+                           std::uint64_t target_ms, std::uint64_t elapsed_ns,
+                           std::uint64_t cpu_ns, std::uint64_t engine_ns) {
+  const auto label = "wall-" + std::to_string(target_ms);
+  std::array<std::uint8_t, 4000> text{};
+  try {
+    session.retry_video();
+    const auto frame = session.capture_video(text.data(), text.size());
+    save_full_frame(frame, dir / (label + ".ppm"));
+    if (frame.text_bytes) {
+      std::ofstream out(dir / (label + ".txt"));
+      for (std::size_t i = 0; i < frame.text_bytes / 2; ++i) {
+        const auto ch = text[i * 2];
+        out << (ch >= 32 && ch <= 126 ? char(ch) : ' ');
+        if (i % 80 == 79) out << '\n';
+      }
+      if (!out) throw std::runtime_error("Could not write text screen snapshot");
+    }
+  } catch (const std::exception& error) {
+    std::cerr << "PRIME_WALL_FRAME_ERROR " << target_ms << ' ' << error.what() << '\n';
+  }
+  const auto temporary = dir / (label + ".json.tmp");
+  std::ofstream out(temporary);
+  out << "{\"wall_target_ms\":" << target_ms
+      << ",\"target_steps\":" << session.session_steps()
+      << ",\"elapsed_ns\":" << elapsed_ns
+      << ",\"process_cpu_ns\":" << cpu_ns
+      << ",\"engine_window_ns\":" << engine_ns
+      << ",\"process_peak_rss_bytes\":" << peak_rss_bytes()
+      << ",\"session\":" << session.diagnostic(true) << "}\n";
+  out.close();
+  if (!out) throw std::runtime_error("Could not write wall observation");
+  std::filesystem::rename(temporary, dir / (label + ".json"));
+}
+
 int main(int argc, char** argv) {
   if (argc != 7) {
     std::cerr << "usage: session_probe ISO OUTPUT_DIR RETIRED_TARGET TIMEOUT_S AVAILABLE_MIB THRESHOLD_MIB\n";
@@ -140,7 +175,8 @@ int main(int argc, char** argv) {
       milestone_steps.push_back(point);
     constexpr std::array<std::uint64_t, 4> frame_checkpoints{
         11'500'000'000ULL, 20'000'000'000ULL, 30'000'000'000ULL, 37'000'000'000ULL};
-    std::size_t next_milestone = 0;
+    constexpr std::array<std::uint64_t, 2> wall_observations{720000, 1080000};
+    std::size_t next_milestone = 0, next_wall_observation = 0;
     std::array<std::uint8_t, 4000> text{};
     const auto start = Clock::now();
     const auto cpu_start = process_cpu_ns();
@@ -149,10 +185,15 @@ int main(int argc, char** argv) {
     std::uint64_t next_sample = 0, next_maintenance = 0, next_snapshot = 0, next_video = 0;
     std::uint64_t video_signature = 0;
     bool reclaim_pending = false;
-    while (status == Session::Step::Running && session.session_steps() < target &&
-           Clock::now() - start < run_time) {
+    while (status == Session::Step::Running && Clock::now() - start < run_time) {
       const auto due_at = Clock::now();
       const auto uptime = count_since<Milliseconds>(start, due_at);
+      while (next_wall_observation < wall_observations.size() &&
+             uptime >= wall_observations[next_wall_observation]) {
+        const auto point = wall_observations[next_wall_observation++];
+        save_wall_observation(session, run_dir, point, count_since<Nanoseconds>(start, due_at),
+                              process_cpu_ns() - cpu_start, engine_elapsed_ns);
+      }
       if (uptime >= next_maintenance) {
         const bool sampled = uptime >= next_sample;
         if (sampled) {
@@ -178,7 +219,7 @@ int main(int argc, char** argv) {
         if (!snapshots) throw std::runtime_error("Could not write a session snapshot");
         next_snapshot = uptime + (session.session_steps() < 11'500'000'000ULL ? 1000U : 30000U);
       }
-      if (session.session_steps() >= 11'500'000'000ULL && uptime >= next_video) {
+      if (uptime >= 600000 && uptime >= next_video) {
         next_video = uptime + 10000;
         try {
           session.retry_video();
@@ -254,6 +295,14 @@ int main(int argc, char** argv) {
       }
       if (!output) throw std::runtime_error("Could not write text screen evidence");
     }
+    std::ofstream completion(run_dir / "wall-completion.json");
+    completion << "{\"elapsed_ms\":" << elapsed_ms << ",\"native_status\":" << int(status)
+               << ",\"process_cpu_ns\":" << process_cpu_ns() - cpu_start
+               << ",\"engine_window_ns\":" << engine_elapsed_ns
+               << ",\"process_peak_rss_bytes\":" << peak_rss_bytes()
+               << ",\"requested_wall_ms\":" << std::chrono::duration_cast<Milliseconds>(run_time).count()
+               << "}\n";
+    if (!completion) throw std::runtime_error("Could not write wall completion evidence");
     session.flush();
     return status == Session::Step::Fault ? 2 : 0;
   } catch (const std::exception& error) {

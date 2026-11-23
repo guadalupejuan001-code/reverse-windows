@@ -355,6 +355,25 @@ def main():
         and all(interval["long64_endpoints_no_restart"] for interval in required_intervals)
         and all(interval["restarts_in_interval"] == 0 for interval in summary["sustained_long64_per_50m"])
     )
+    wall_completion = args.run / "wall-completion.json"
+    if wall_completion.is_file():
+        wall = json.loads(wall_completion.read_text())
+        vm = json.loads((args.run / "session.json").read_text())
+        summary["wall_probe"] = wall
+        summary["terminal_observation"] = load_checkpoint({
+            "target_steps": vm["boot_progress"]["session_steps"],
+            "elapsed_ns": wall["elapsed_ms"] * 1_000_000,
+            "process_cpu_ns": wall["process_cpu_ns"],
+            "engine_window_ns": wall["engine_window_ns"],
+            "process_peak_rss_bytes": wall["process_peak_rss_bytes"],
+            "session": vm,
+        })
+        summary["validated_measurement"] = bool(
+            args.exit_code == 0 and valid_source
+            and wall["elapsed_ms"] >= wall["requested_wall_ms"]
+            and summary["terminal_observation"]["mundo_x_source_sha"] == core_sha
+            and all((args.run / f"wall-{point}.json").is_file() for point in (720000, 1080000))
+        )
     args.output.write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
     return 0 if summary["validated_measurement"] else 1

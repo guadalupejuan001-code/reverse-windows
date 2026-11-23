@@ -18,18 +18,20 @@ iso="$RUNNER_TEMP/windows-eval-$role.sparse"
 output="$RUNNER_TEMP/session-$role"
 truncate -s 5550497792 "$iso"
 chmod 400 "$iso"
-probe=("$RUNNER_TEMP/build-$role/session_probe" "$iso" "$output" "$STOP_TARGET" "$PROBE_TIMEOUT_SECONDS"
+# The session reserves two seconds to flush and capture before the hard bound.
+probe=("$RUNNER_TEMP/build-$role/session_probe" "$iso" "$output" "$STOP_TARGET" "$((PROBE_TIMEOUT_SECONDS - 2))"
        "$AVAILABLE_MIB" "$THRESHOLD_MIB")
 optical_env=(EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1
              LD_PRELOAD="$RUNNER_TEMP/verified_iso.so" R110_REMOTE_ISO_STUB="$iso")
-if timeout "$((PROBE_TIMEOUT_SECONDS + 120))s" taskset -c "$PROBE_CPU" env "${optical_env[@]}" "${probe[@]}" \
+if timeout --kill-after=2s "${PROBE_TIMEOUT_SECONDS}s" taskset -c "$PROBE_CPU" env "${optical_env[@]}" "${probe[@]}" \
   2> "$evidence/$role.stderr" | tee "$evidence/$role.stdout"; then
   probe_exit=0
 else
   probe_exit=${PIPESTATUS[0]}
   if ((probe_exit == 0)); then probe_exit=1; fi
 fi
-for screen in "$output"/screen-*.ppm "$output/display-latest.ppm" "$output/terminal.ppm" "$output/text-screen.txt"; do
+for screen in "$output"/screen-*.ppm "$output"/wall-*.ppm "$output"/wall-*.txt "$output/display-latest.ppm" \
+              "$output/terminal.ppm" "$output/text-screen.txt" "$output/wall-completion.json"; do
   if [[ -f "$screen" ]]; then
     cp "$screen" "$evidence/$role-${screen##*/}"
   fi
