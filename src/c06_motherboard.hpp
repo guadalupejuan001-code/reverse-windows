@@ -92,6 +92,7 @@ class PcMotherboardC06 {
   };
   struct ThreadedSmpStats {
     std::uint64_t dispatches = 0, guest_steps = 0;
+    std::uint64_t pause_yields = 0, pause_steps = 0, pause_admissions = 0;
     unsigned last_workers = 0, peak_workers = 0;
   };
 
@@ -1897,7 +1898,7 @@ class PcMotherboardC06 {
   }
 
   unsigned run_threaded_smp(const std::array<unsigned, kMaxProcessors>& ready, unsigned jobs,
-                            unsigned budget, Clock::time_point deadline) {
+                            unsigned budget, Clock::time_point deadline, bool cooperative_pauses) {
     if (!threaded_smp_enabled_ || !pc_.guest_execution_available()) return 0;
 
     constexpr unsigned bus_steps = 64, timed_grant = 512;
@@ -1945,7 +1946,8 @@ class PcMotherboardC06 {
           const auto remaining = grant - used;
           auto& apic = apics_[id];
           const bool short_grant = parked_needs_short_grant();
-          if (id && remaining > bus_steps && !short_grant &&
+          const bool pause_turn = cooperative_pauses && apic.cpu->pause_wait_hint();
+          if (id && remaining > bus_steps && !short_grant && !pause_turn &&
               active_clock_running_ && pc_.boot_acceleration_enabled() &&
               apic.started && !apic.init_pending && !apic.startup_vector && !apic.cpu->halted &&
               grouped_loop_candidate(*apic.cpu)) {
@@ -1963,7 +1965,7 @@ class PcMotherboardC06 {
             }
           }
           const auto before = processor_steps(id);
-          const auto steps = std::min(short_grant ? kSmpQuantum : bus_steps, remaining);
+          const auto steps = std::min(short_grant || pause_turn ? kSmpQuantum : bus_steps, remaining);
           // The next dispatch can admit a complete cached loop when a
           // short remainder would otherwise leave its vCPU inside it.
           const bool preserve = preserve_loop_entries && used + steps == grant;
@@ -1976,6 +1978,15 @@ class PcMotherboardC06 {
           if (wake_pending_.any()) return;
           if (parked_processors_[id]) break;
           if (!retired) break;
+          // Keep polling a real condition on every admitted turn, but let
+          // a runnable peer proceed before spending another grant waiting.
+          if (cooperative_pauses && apic.cpu->pause_wait_hint()) {
+            if (retired < remaining) {
+              ++threaded_smp_stats_.pause_yields;
+              threaded_smp_stats_.pause_steps += retired;
+            }
+            break;
+          }
           used += unsigned(retired);
           if (retired < steps && !(id && steps < remaining && active_clock_running_ &&
                                   grouped_loop_candidate(*apic.cpu))) break;
@@ -1992,7 +2003,8 @@ class PcMotherboardC06 {
     }
     record_threaded_dispatch(active, retired);
     const auto scheduled = jobs * grant;
-    if (wake_pending_.any() || parked_during_dispatch) return static_cast<unsigned>(retired);
+    if (cooperative_pauses || wake_pending_.any() || parked_during_dispatch)
+      return static_cast<unsigned>(retired);
     return preserve_loop_entries && retired ? std::min<std::uint64_t>(scheduled, retired) : scheduled;
   }
 
@@ -2351,6 +2363,7 @@ class PcMotherboardC06 {
     // The budget counts work across the whole VM. Small calls keep a rotating
     // position so that every runnable processor gets a turn.
     bool register_peer = false;
+    bool pause_admitted = false;
     while (budget && !faulted_processor_ && !powered_off_ && pc_.guest_execution_available()) {
       if(timed&&Clock::now()>=deadline)return;
       refresh_parked_processors();
@@ -2455,16 +2468,29 @@ class PcMotherboardC06 {
         if (!sleeping && !parked_processors_.any()) return;
         continue;
       }
-      if (const auto completed = run_parallel_ether_loops(runnable, count, dispatch_budget, deadline)) {
-        budget -= completed;
-        continue;
-      }
-      if (const auto scheduled = run_threaded_smp(runnable, count, dispatch_budget, deadline)) {
-        budget -= scheduled;
-        continue;
+      // A quiet pair keeps its normal dispatch. In a large group of
+      // pollers, the existing serial rotation admits ready CPUs through one
+      // short turn before a worker can exhaust the window on an early job.
+      const bool cooperative_pauses = timed && active_clock_running_ && threaded_smp_enabled_ && count > 2 &&
+          std::count_if(runnable.begin(), runnable.begin() + count, [&](unsigned id) {
+            return apics_[id].cpu->pause_wait_hint();
+          }) >= 2;
+      const bool pause_admission = cooperative_pauses && !pause_admitted && count > host_workers_capacity();
+      if (pause_admission) {
+        pause_admitted = true;
+      } else {
+        if (const auto completed = run_parallel_ether_loops(runnable, count, dispatch_budget, deadline)) {
+          budget -= completed;
+          continue;
+        }
+        if (const auto scheduled = run_threaded_smp(runnable, count, dispatch_budget, deadline, cooperative_pauses)) {
+          budget -= scheduled;
+          continue;
+        }
       }
       if (wake_pending_.any()) continue;
-      const auto quantum = parked_needs_short_grant() ? kSmpQuantum : smp_quantum(runnable, count);
+      const auto quantum = pause_admission || parked_needs_short_grant()
+          ? kSmpQuantum : smp_quantum(runnable, count);
       const auto chunk = std::min(dispatch_budget, count * quantum);
       const auto first_ready = std::lower_bound(runnable.begin(), runnable.begin() + count, next_serial_cpu_);
       const auto start = static_cast<unsigned>(first_ready - runnable.begin()) % count;
@@ -2473,6 +2499,7 @@ class PcMotherboardC06 {
           pc_.boot_acceleration_enabled() && budget >= count * kMinParallelLoopSteps;
       const auto before = total_processor_steps();
       bool parked_during_round = false;
+      bool admission_serviced = false;
       const auto grants = std::min(chunk, count);
       unsigned i = 0;
       for (; i < grants; ++i) {
@@ -2483,15 +2510,20 @@ class PcMotherboardC06 {
         const auto id = runnable[slot];
         const auto work = chunk / count + (i < extra);
         next_serial_cpu_ = runnable[(slot + 1) % count];
+        const auto started = pause_admission && !admission_serviced ? processor_steps(id) : 0;
         if (id) run_secondary(id, work, deadline, preserve_ether_loop_entry);
         else run_bsp(work, deadline, preserve_ether_loop_entry);
+        if (pause_admission && !admission_serviced && processor_steps(id) != started) {
+          ++threaded_smp_stats_.pause_admissions;
+          admission_serviced = true;
+        }
         parked_during_round |= refresh_parked_processor(id);
         poll_parked_processors();
         if (faulted_processor_ || !pc_.guest_execution_available() || powered_off_) return;
         if (wake_pending_.any()) break;
       }
       if (i == grants) next_serial_cpu_ = runnable[(start + extra) % count];
-      budget -= wake_pending_.any() || parked_during_round
+      budget -= pause_admission || wake_pending_.any() || parked_during_round
           ? static_cast<unsigned>(total_processor_steps() - before) : chunk;
     }
   }
