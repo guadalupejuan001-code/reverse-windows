@@ -307,7 +307,8 @@ jobs:
           iso = Path(os.environ['RUNNER_TEMP']) / 'r110-boot-profile.iso'
           adb('push', str(iso), f'/sdcard/Download/{iso.name}')
           # Keep touch coordinates in the same orientation during the picker handoff.
-          adb('shell', 'wm', 'user-rotation', 'lock', '1')
+          adb('shell', 'settings', 'put', 'system', 'accelerometer_rotation', '0')
+          adb('shell', 'settings', 'put', 'system', 'user_rotation', '1')
           adb('shell', 'am', 'force-stop', package)
           adb('shell', 'am', 'start', '-W', '-n', activity)
           settings()
