@@ -31,6 +31,22 @@ jobs:
           test "$(uname -m)" = "${{ matrix.architecture }}"
           git rev-parse HEAD
           python3 scripts/verify_deps.py --checkout
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Compile native boot probe against actual x86/x64 CPU
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri zlib1g-dev
+          cmake -S . -B build -DREVERSE_MUNDO_X_ROOT="$PWD/deps/mundo-X" -DREVERSE_QSSD_ROOT="$PWD/deps/Virtual-qSSD-" -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+      - name: Build the complete native suite
+        run: |
+          cmake --build build --parallel 2
+      - name: Execute real x86 and long-mode x64 guest demos
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: ctest --test-dir build --output-on-failure --output-junit "$PWD/build/ctest.xml"
       - name: Measure ARM64 dispatch and REP with an IRQ held by priority
         shell: bash
         run: |
@@ -164,10 +180,6 @@ jobs:
         with:
           name: prime-engine-window-${{ matrix.architecture }}
           path: build/prime-engine-window.log
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
       - name: Measure exact x86 loops and individually executed instructions
         shell: bash
         run: |
@@ -262,11 +274,6 @@ jobs:
         with:
           name: prime-vbe-compare-${{ matrix.architecture }}
           path: build/prime-vbe-compare.log
-      - name: Compile native boot probe against actual x86/x64 CPU
-        run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri zlib1g-dev
-          cmake -S . -B build -DREVERSE_MUNDO_X_ROOT="$PWD/deps/mundo-X" -DREVERSE_QSSD_ROOT="$PWD/deps/Virtual-qSSD-" -DREVERSE_GPU_VIRTUAL_ROOT="$PWD/deps/GPU-VIRTUAL" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
       - name: Verify PrimeVGC guest transfers and measure bulk QSSD bandwidth
         shell: bash
         run: |
@@ -283,13 +290,6 @@ jobs:
           grep -q 'exact_bytes=268435456 .*command_bytes=524288 upload_commits=512' build/primevgc-bulk.log
           grep -q 'exact_bytes=268435456 .*command_bytes=8388608 upload_commits=32' build/primevgc-bulk.log
           ./build/reverse_windows_primevgc_compute_test | tee build/primevgc-compute.log
-      - name: Build the remaining native regressions
-        run: |
-          cmake --build build --parallel 2
-      - name: Execute real x86 and long-mode x64 guest demos
-        env:
-          LIBGL_ALWAYS_SOFTWARE: '1'
-        run: ctest --test-dir build --output-on-failure --output-junit "$PWD/build/ctest.xml"
       - name: Compare the guest clocks on sixteen vCPUs with identical arithmetic
         shell: bash
         run: ./build/reverse_windows_smp_guest_test --measure-cpu-clock | tee build/prime-smp-clock.log

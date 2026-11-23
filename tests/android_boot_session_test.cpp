@@ -489,6 +489,7 @@ void verify_packed_ram64(const std::filesystem::path& directory) {
             << stats->file_payload_bytes() << " prime_phone_budget_mib=" << prime.backing_bytes / mib << '\n';
 }
 
+#ifndef PRIME_PREVIOUS_ENGINE_WINDOW
 void verify_state_ram_reclaim_batches(const std::filesystem::path& directory) {
   using Ram = cosmic_pc::MemoryFabric;
   using Backing = reverse_windows::AndroidRamBacking;
@@ -527,6 +528,7 @@ void verify_state_ram_reclaim_batches(const std::filesystem::path& directory) {
             << " writes=" << store.write_calls() << " budget_before=" << before
             << " budget_after=" << staged << '\n';
 }
+#endif
 
 void verify_deferred_ram_reclaim(const std::filesystem::path& directory) {
   using Backing = reverse_windows::AndroidRamBacking;
