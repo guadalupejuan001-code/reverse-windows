@@ -9,8 +9,11 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <fcntl.h>
+#include <sys/resource.h>
+#include <time.h>
 #include <unistd.h>
 
 using Session = reverse_windows::AndroidBootSession;
@@ -29,6 +32,28 @@ struct MaintenanceSlice {
 template <typename Unit>
 std::uint64_t count_since(Clock::time_point start, Clock::time_point end) {
   return std::chrono::duration_cast<Unit>(end - start).count();
+}
+
+std::uint64_t process_cpu_ns() {
+  timespec stamp{};
+  if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &stamp) != 0)
+    throw std::runtime_error("Could not read process CPU time");
+  return std::uint64_t(stamp.tv_sec) * 1'000'000'000 + stamp.tv_nsec;
+}
+
+std::uint64_t peak_rss_bytes() {
+  struct rusage resources {};
+  if (getrusage(RUSAGE_SELF, &resources) != 0)
+    throw std::runtime_error("Could not read process RSS");
+  return std::uint64_t(resources.ru_maxrss) * 1024;
+}
+
+std::string_view checkpoint_field(std::string_view diagnostic, std::string_view prefix) {
+  const auto field = diagnostic.find(prefix);
+  if (field == std::string_view::npos) return "unavailable";
+  const auto start = field + prefix.size();
+  const auto finish = diagnostic.find('"', start);
+  return finish == std::string_view::npos ? "unavailable" : diagnostic.substr(start, finish - start);
 }
 
 int main(int argc, char** argv) {
@@ -61,13 +86,21 @@ int main(int argc, char** argv) {
     if (!snapshots) throw std::runtime_error("Could not open the snapshot log");
     std::ofstream milestones(run_dir / "milestones.jsonl");
     if (!milestones) throw std::runtime_error("Could not open the milestone log");
-    constexpr std::array<std::uint64_t, 3> milestone_steps{350'000'000, 400'000'000, 700'000'000};
+    std::vector<std::uint64_t> milestone_steps{350'000'000, 400'000'000, 700'000'000};
+    for (std::uint64_t point = 750'000'000; point <= 1'000'000'000; point += 50'000'000)
+      milestone_steps.push_back(point);
+    for (std::uint64_t point = 1'500'000'000; point <= 8'000'000'000; point += 500'000'000)
+      milestone_steps.push_back(point);
+    for (std::uint64_t point = 8'200'000'000; point <= 8'650'000'000; point += 50'000'000)
+      milestone_steps.push_back(point);
     std::size_t next_milestone = 0;
     std::vector<GuestSlice> windows;
     windows.reserve(60000);
     std::vector<MaintenanceSlice> maintenance;
     maintenance.reserve(4096);
     const auto start = Clock::now();
+    const auto cpu_start = process_cpu_ns();
+    std::uint64_t engine_elapsed_ns = 0;
     auto status = Session::Step::Running;
     std::uint64_t next_sample = 0, next_maintenance = 0, next_snapshot = 0;
     bool reclaim_pending = false;
@@ -107,14 +140,26 @@ int main(int argc, char** argv) {
       status = session.step_engine_window(Milliseconds(8));
       const auto slice_end = Clock::now();
       const auto retired_after = session.session_steps();
-      windows.push_back({count_since<Milliseconds>(start, slice_end),
-                         count_since<Nanoseconds>(slice_start, slice_end), retired_after,
+      const auto slice_ns = count_since<Nanoseconds>(slice_start, slice_end);
+      engine_elapsed_ns += slice_ns;
+      windows.push_back({count_since<Milliseconds>(start, slice_end), slice_ns, retired_after,
                          retired_after - retired_before});
       while (next_milestone < milestone_steps.size() && retired_after >= milestone_steps[next_milestone]) {
-        milestones << "{\"target_steps\":" << milestone_steps[next_milestone++]
-                   << ",\"elapsed_ns\":" << count_since<Nanoseconds>(start, slice_end)
-                   << ",\"session\":" << session.diagnostic(false) << "}\n";
+        const auto threshold = milestone_steps[next_milestone++];
+        const auto elapsed_ns = count_since<Nanoseconds>(start, slice_end);
+        const auto diagnostic = session.diagnostic(false);
+        milestones << "{\"target_steps\":" << threshold
+                   << ",\"elapsed_ns\":" << elapsed_ns
+                   << ",\"process_cpu_ns\":" << process_cpu_ns() - cpu_start
+                   << ",\"engine_window_ns\":" << engine_elapsed_ns
+                   << ",\"process_peak_rss_bytes\":" << peak_rss_bytes()
+                   << ",\"session\":" << diagnostic << "}\n";
+        milestones.flush();
         if (!milestones) throw std::runtime_error("Could not write the milestone log");
+        std::cout << "PRIME_ISO_PROGRESS threshold=" << threshold << " guest_steps=" << retired_after
+                  << " mode=" << checkpoint_field(diagnostic, "\"cpu_mode\":\"")
+                  << " rip=" << checkpoint_field(diagnostic, "\"rip_hex\":\"")
+                  << " elapsed_ms=" << elapsed_ns / 1'000'000 << '\n' << std::flush;
       }
     }
     const auto elapsed_ms = count_since<Milliseconds>(start, Clock::now());

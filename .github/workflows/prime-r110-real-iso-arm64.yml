@@ -1,8 +1,9 @@
-name: Prime R110 real ISO ARM64 native sample
+name: Prime R110 official ISO ARM64 long64 measurement
 
 on:
   push:
-    branches: [ci/prime-r110-real-iso-arm64-slice]
+    branches: [ci/prime-r110-real-iso-arm64-long64]
+    paths: [.github/workflows/prime-r110-real-iso-arm64.yml]
 
 permissions:
   contents: read
@@ -10,14 +11,15 @@ permissions:
 env:
   PRODUCT_SHA: e3d971be5e8610d1c06ac5d74f2b18368ca3b773
   MUNDO_X_SHA: 5158b206b0904b96838323e6628cdaf83b22c129
-  AVAILABLE_MIB: '2048'
-  THRESHOLD_MIB: '256'
-  STOP_TARGET: '1000000000'
+  AVAILABLE_MIB: '510'
+  THRESHOLD_MIB: '128'
+  STOP_TARGET: '8650000000'
+  PROBE_TIMEOUT_SECONDS: '2700'
 
 jobs:
   real-iso-slice:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 25
+    timeout-minutes: 55
     steps:
       - name: Check out the benchmark
         uses: actions/checkout@v7
@@ -58,22 +60,24 @@ jobs:
           chmod 400 "$iso"
           export PROBE_CPU
           PROBE_CPU="$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')"
-          probe=("$RUNNER_TEMP/build/session_probe" "$iso" "$output" "$STOP_TARGET" 600
+          probe=("$RUNNER_TEMP/build/session_probe" "$iso" "$output" "$STOP_TARGET" "$PROBE_TIMEOUT_SECONDS"
                  "$AVAILABLE_MIB" "$THRESHOLD_MIB")
           optical_env=(EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1
                        LD_PRELOAD="$RUNNER_TEMP/verified_iso.so" R110_REMOTE_ISO_STUB="$iso")
-          if timeout 650s taskset -c "$PROBE_CPU" env "${optical_env[@]}" "${probe[@]}" > "$RUNNER_TEMP/probe.stdout" 2> "$RUNNER_TEMP/probe.stderr"; then
+          if timeout "$((PROBE_TIMEOUT_SECONDS + 120))s" taskset -c "$PROBE_CPU" env "${optical_env[@]}" "${probe[@]}" \
+            2> "$evidence/probe.stderr" | tee "$evidence/probe.stdout"; then
             probe_exit=0
           else
-            probe_exit=$?
+            probe_exit=${PIPESTATUS[0]}
+            if ((probe_exit == 0)); then probe_exit=1; fi
           fi
-          report=(--run "$output" --transport-log "$RUNNER_TEMP/probe.stderr"
-                  --output "$evidence/arm64-slice.json" --exit-code "$probe_exit")
+          report=(--run "$output" --transport-log "$evidence/probe.stderr"
+                  --output "$evidence/r110-arm64-long64.json" --exit-code "$probe_exit")
           python3 .github/benchmarks/prime-iso-arm64/summarize.py "${report[@]}"
-      - name: Upload only the dedicated counter report
+      - name: Upload the counter report and probe progress
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-real-iso-slice
-          path: ${{ runner.temp }}/evidence/arm64-slice.json
+          name: prime-r110-arm64-real-iso-long64
+          path: ${{ runner.temp }}/evidence/
           if-no-files-found: warn

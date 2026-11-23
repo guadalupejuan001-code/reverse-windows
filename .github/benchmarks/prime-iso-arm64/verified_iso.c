@@ -19,7 +19,7 @@ static const char url[] =
 static const char etag[] =
     "\"0x10B3D1548F58FA2A3866686CB570F06A16F6734DD99BBA1C7F0542A849EDD8E4\"";
 static const uint64_t image_size = UINT64_C(5550497792);
-enum { chunk_bytes = 1024 * 1024, slots = 12, max_download_chunks = 1024 };
+enum { chunk_bytes = 1024 * 1024, slots = 12, max_download_chunks = 8192 };
 struct chunk {
     uint64_t start, size, last_use;
     unsigned char data[chunk_bytes];
