@@ -67,6 +67,7 @@ std::string preparation_report(const std::string& json) {
 
 void verify_ram_profile() {
   constexpr std::uint64_t mib = 1024 * 1024;
+  constexpr auto prime_ceiling = 256 * mib;
   const auto modest = Session::ram_profile(768 * mib, 256 * mib, false);
   require(modest.physical_bytes == 2048 * mib && modest.backing_bytes == 256 * mib,
           "RAM budget must leave headroom for Android");
@@ -86,33 +87,47 @@ void verify_ram_profile() {
   require(counter(report, "ram_clock_hz") == 4'500'000'000'000ULL, "RAM clock in hardware preflight");
   require(counter(report, "usable_bytes") == Session::kPrimeRamBytes &&
               counter(report, "address_space_bytes") == prime.physical_bytes &&
-              counter(report, "backing_budget_bytes") == 2880 * mib &&
-              report.find("\"resident_policy\":\"android-surplus\"") != std::string::npos &&
-              counter(report, "resident_bytes") < mib,
-          "Prime must expose 64 GiB while reserving host memory");
+              counter(report, "resident_ceiling_bytes") == prime_ceiling &&
+              counter(report, "resident_budget_bytes") == prime_ceiling &&
+              counter(report, "backing_budget_bytes") == prime_ceiling &&
+              report.find("\"resident_policy\":\"prime-fixed-working-set\"") != std::string::npos &&
+              counter(report, "resident_payload_bytes") < mib &&
+              counter(report, "resident_working_set_bytes") == counter(report, "resident_payload_bytes") &&
+              counter(report, "pages_per_state_vector") == 1,
+          "Prime must expose 64 GiB with a separate fixed ceiling for working data and cache");
   const auto phone = Session::ram_profile(768 * mib, 256 * mib, false, true);
-  require(phone.backing_bytes == 384 * mib, "Prime must reserve 128 MiB above the Android threshold");
   const auto abundant_prime = Session::ram_profile(UINT64_MAX, 0, false, true);
-  require(abundant_prime.backing_bytes == abundant_prime.physical_bytes,
-          "Overflow must not limit backing on a host with abundant RAM");
+  const auto constrained = Session::ram_profile(128 * mib, 64 * mib, false, true);
+  require(phone.backing_bytes == prime_ceiling && abundant_prime.backing_bytes == prime_ceiling &&
+              phone.physical_bytes == abundant_prime.physical_bytes &&
+              constrained.physical_bytes == phone.physical_bytes && constrained.backing_bytes == 32 * mib,
+          "Host headroom may lower the Prime resident budget but cannot grow it or change the guest map");
+  const Session::RamProfile oversized{prime.physical_bytes, prime.physical_bytes};
+  require(counter(Session::check_hardware({}, -1, 0, {}, oversized), "resident_budget_bytes") == prime_ceiling,
+          "Prime hardware preflight must apply the working-set ceiling to explicit profiles");
+  const Session direct({}, 0, Session::BootSource::SelfTest, -1, 0, oversized);
+  require(counter(direct.diagnostic(false), "resident_budget_bytes") == prime_ceiling,
+          "An explicit Prime session profile must also honor the fixed ceiling");
   Session live({}, 0, Session::BootSource::SelfTest, -1, 0, phone);
   require(counter(live.diagnostic(), "ram_clock_hz") == 4'500'000'000'000ULL, "RAM clock in live telemetry");
   const auto used = counter(live.diagnostic(), "resident_bytes");
-  constexpr std::uint64_t page = cosmic_pc::MemoryFabric::kPageSize;
   live.sample_ram_pressure(768 * mib - used, 256 * mib, false);
   require(!live.maintain_ram_budget() &&
               counter(live.diagnostic(), "backing_budget_bytes") == phone.backing_bytes,
           "Accounting for already resident bytes must not grow the budget on a stable host");
   live.sample_ram_pressure(1024 * mib, 256 * mib, false);
-  const auto surplus = 768 * mib + used;
   require(!live.maintain_ram_budget() &&
-              counter(live.diagnostic(), "backing_budget_bytes") == (surplus - surplus / 4) / page * page,
-          "Prime must use only the live surplus left after the reserve");
+              counter(live.diagnostic(), "resident_budget_bytes") == prime_ceiling,
+          "A healthy host sample must never grow the Prime budget above its ceiling");
   live.sample_ram_pressure(256 * mib, 256 * mib, false);
   require(!live.maintain_ram_budget() &&
               counter(live.diagnostic(), "backing_budget_bytes") == 16 * mib &&
               counter(live.diagnostic(), "usable_bytes") == Session::kPrimeRamBytes,
           "Reaching the Android threshold must reclaim payload without reducing guest RAM");
+  live.sample_ram_pressure(UINT64_MAX, 0, false);
+  require(!live.maintain_ram_budget() &&
+              counter(live.diagnostic(false), "resident_budget_bytes") == prime_ceiling,
+          "Prime must restore recovered headroom only up to the hard ceiling");
   try {
     (void)Session::ram_profile(300 * mib, 256 * mib, true);
   } catch (const std::runtime_error&) { return; }
@@ -321,7 +336,7 @@ void verify_packed_ram64(const std::filesystem::path& directory) {
   Session live({}, 0, Session::BootSource::SelfTest, -1, 0, prime, cache);
   const auto initial = live.diagnostic();
   require(initial.find("\"spill_compression\":true") != std::string::npos &&
-              counter(initial, "backing_budget_bytes") == 450 * mib &&
+              counter(initial, "resident_budget_bytes") == 256 * mib &&
               counter(initial, "spill_cache_capacity_bytes") == 2 * mib,
           "A normal Prime session must attach the compressed QSSD store");
   live.sample_ram_pressure(0, 0, true);
@@ -332,7 +347,7 @@ void verify_packed_ram64(const std::filesystem::path& directory) {
           "Explicit background trim must still reclaim all but the floor");
   live.sample_ram_pressure(threshold + 600 * mib - 32 * 1024, threshold, false);
   require(!live.maintain_ram_budget() &&
-              counter(live.diagnostic(), "pressure_target_bytes") >= 449 * mib &&
+              counter(live.diagnostic(), "pressure_target_bytes") == 256 * mib &&
               counter(live.diagnostic(), "usable_bytes") == Session::kPrimeRamBytes,
           "Prime must restore its resident budget with the same E820 map");
 
@@ -951,6 +966,69 @@ void measure_engine_window(std::uint64_t rounds, bool paced, bool mixed=false) {
             << " active_ns=" << active_ns << " wall_ns=" << wall_ns << '\n';
 }
 
+#ifndef PRIME_PREVIOUS_ENGINE_WINDOW
+void verify_prime_guest_writeback(const std::filesystem::path& path) {
+  // Each of 256 consecutive high physical pages gets 40 distinctive words.
+  // Halfway through, the guest modifies the first spilled page. It then
+  // compares the updated word, restores it, and reads all 40 words per page.
+  const std::uint8_t guest[]{
+      0x48,0xb8,0x83,0,0,0,0x10,0,0,0, 0x48,0x89,0x04,0x25,0x08,0x30,0,0, // Map linear 2 MiB to physical 64 GiB.
+      0xbf,0,0,0x20,0, 0xbb,0,1,0,0, 0xb8,0xdf,0x9b,0x57,0x13,
+      0xb9,0x28,0,0,0, 0xf3,0x48,0xab, 0x48,0x81,0xc7,0xc0,0x0e,0,0, // REP STOSQ then skip to the next page.
+      0xff,0xc0, 0xff,0xcb, 0x80,0xfb,0x80, 0x75,0x0b,
+      0xc7,0x04,0x25,0x08,0,0x20,0,0xef,0xbe,0xad,0x7b, // Store into an already evicted page.
+      0x85,0xdb, 0x75,0xd9,
+      0x48,0x81,0x3c,0x25,0x08,0,0x20,0,0xef,0xbe,0xad,0x7b, 0x75,0x3f,
+      0x48,0xc7,0x04,0x25,0x08,0,0x20,0,0xdf,0x9b,0x57,0x13,
+      0xbf,0,0,0x20,0, 0xbb,0,1,0,0, 0xb8,0xdf,0x9b,0x57,0x13,
+      0xb9,0x28,0,0,0, 0xf3,0x48,0xaf, 0x75,0x1a, // REPE SCASQ, fail on any changed word.
+      0x48,0x83,0x3f,0, 0x75,0x14,                // The first unwritten word must remain zero.
+      0x48,0x81,0xc7,0xc0,0x0e,0,0, 0xff,0xc0, 0xff,0xcb, 0x75,0xe3,
+      0xba,0x21,0xdf,0xc0,0x8e, 0xfa,0xf4,        // Success marker in EDX.
+      0xba,0xad,0x0b,0x50,0, 0xfa,0xf4};           // Failure marker in EDX.
+  const auto boot = long_mode_test_sector(guest);
+  Session::create_disk(path, 1);
+  {
+    reverse_windows::QssdDisk disk(path);
+    require(disk.write(0, 1, boot.data()) && disk.flush(), "Could not persist the RAM write-back test sector");
+  }
+  constexpr std::size_t budget = 512 * 1024;
+  const Session::RamProfile profile{
+      std::size_t(cosmic_pc::PcMachine::high_ram_address_space(Session::kPrimeRamBytes, true)), budget};
+  const auto run = [&](const std::filesystem::path& ram_cache) {
+    Session session(path, 0, Session::BootSource::Disk, -1, 0, profile, ram_cache);
+    auto status = Session::Step::Running;
+    for (unsigned slice = 0; slice < 32 && status == Session::Step::Running; ++slice)
+      status = session.step(4096);
+    return std::make_pair(status, session.diagnostic(false));
+  };
+  const auto [status, report] = run(path.parent_path());
+  if (status != Session::Step::Halted || report.find("\"000000008EC0DF21\"") == std::string::npos)
+    throw std::runtime_error("The guest did not recover the high RAM writes exactly: " + report);
+  require(counter(report, "usable_bytes") == Session::kPrimeRamBytes &&
+              counter(report, "resident_budget_bytes") == budget &&
+              counter(report, "resident_working_set_bytes") <= budget &&
+              counter(report, "resident_working_set_bytes") ==
+                  counter(report, "resident_payload_bytes") + counter(report, "resident_cache_bytes") &&
+              counter(report, "spilled_pages") > 0 && counter(report, "spill_reads") > 0 &&
+              counter(report, "spill_file_payload_bytes") > 0 &&
+              report.find("\"spill_compression\":true") != std::string::npos,
+          "High guest RAM must use compressed write-back under the same bounded resident budget");
+
+  const auto [unbacked, unbacked_report] = run(path / "missing-cache");
+  require(unbacked == Session::Step::Fault &&
+              unbacked_report.find("\"spill_mode\":\"unavailable\"") != std::string::npos &&
+              unbacked_report.find("EtherStateRam payload budget exceeded") != std::string::npos &&
+              counter(unbacked_report, "resident_budget_bytes") == budget &&
+              counter(unbacked_report, "resident_working_set_bytes") <= budget,
+          "An unavailable backing store must report the limit without extending resident RAM");
+  std::cout << "PRIME_FIXED_RAM_WRITEBACK_PASS logical_bytes=" << Session::kPrimeRamBytes
+            << " guest_pages=256 resident_cap_bytes=" << budget
+            << " spilled_pages=" << counter(report, "spilled_pages")
+            << " recovered_current_bytes=1 unavailable_fault=1\n";
+}
+#endif
+
 void verify_late_prime_pressure(const std::filesystem::path& path) {
   constexpr std::uint64_t mib = 1024 * 1024;
   constexpr auto threshold = 64 * mib;
@@ -1025,7 +1103,7 @@ void verify_late_prime_pressure(const std::filesystem::path& path) {
           "A fresh healthy reading must cancel stale pressure maintenance");
   const auto recovered = live.diagnostic(false);
   require(counter(recovered, "spill_writes") == spills &&
-              counter(recovered, "pressure_target_bytes") >= 380 * mib &&
+              counter(recovered, "pressure_target_bytes") == 256 * mib &&
               counter(recovered, "pressure_first_released_bytes") == 0 &&
               recovered.find("\"pressure_first_release_batch_us\":null") != std::string::npos &&
               recovered.find("\"pressure_target_applied_us\":null") == std::string::npos &&
@@ -1062,8 +1140,8 @@ void verify_late_prime_pressure(const std::filesystem::path& path) {
 
   live.sample_ram_pressure(UINT64_MAX, 0, false);
   require(!live.maintain_ram_budget() &&
-              counter(live.diagnostic(false), "backing_budget_bytes") == profile.physical_bytes,
-          "Live surplus accounting must saturate before adding resident bytes");
+              counter(live.diagnostic(false), "resident_budget_bytes") == 256 * mib,
+          "Live surplus accounting must saturate at the fixed ceiling");
   std::cout << "PRIME_FOREGROUND_RAM_PRESSURE_PASS target_bytes=" << target
             << " first_batch_spills=" << spills
             << " maintenance_us=" << counter(partial, "pressure_maintenance_us")
@@ -1312,6 +1390,7 @@ int main(int argc, char** argv) {
 #ifndef PRIME_PREVIOUS_ENGINE_WINDOW
     verify_ram_timing_option(dir.path);
     verify_state_ram_reclaim_batches(dir.path);
+    verify_prime_guest_writeback(dir.path / "prime-writeback.rqvd");
 #endif
     verify_ram_spill(dir.path);
     verify_packed_ram64(dir.path);

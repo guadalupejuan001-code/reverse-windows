@@ -44,7 +44,6 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private static final int ISO_PICKER = 21;
     private static final int DIAGNOSTIC_PICKER = 22;
     private static final int SETTINGS_LOG_TAB = 3;
-    private static final long MIB = 1024L * 1024L;
     private static final int BG = 0xff101a20;
     private static final int PANEL = 0xb8132026;
     static final int BORDER = 0x66c4e4eb;
@@ -503,22 +502,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
                 if (!detail.isEmpty()) result.append('\n').append(detail);
                 result.append('\n');
             }
-            JSONObject ram = preflight.optJSONObject("ram_profile");
-            if (ram != null) {
-                result.append("\nRAM utilizable por el invitado: ")
-                        .append(ram.getLong("usable_bytes") / MIB).append(" MiB")
-                        .append("\nLímite de RAM residente en Android: ")
-                        .append(ram.getLong("backing_budget_bytes") / MIB).append(" MiB");
-                String spill = ram.optString("spill_mode");
-                if ("file".equals(spill)) {
-                    result.append("\nQSSD temporal para RAM · hasta ")
-                            .append(ram.optLong("spill_limit_bytes") / MIB).append(" MiB");
-                } else if ("unavailable".equals(spill)) {
-                    result.append("\nRespaldo temporal de RAM no disponible.");
-                    String spillError = ram.optString("spill_error");
-                    if (!spillError.isEmpty()) result.append('\n').append(spillError);
-                }
-            }
+            VmTelemetry.appendRamSummary(result, preflight.optJSONObject("ram_profile"));
             JSONObject quantumRam = preflight.optJSONObject("quantum_ram_probe");
             if (quantumRam != null && quantumRam.optBoolean("passed")) {
                 result.append(String.format(Locale.getDefault(),
@@ -648,7 +632,6 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         JSONObject irq = diagnostic.optJSONObject("irq");
         JSONObject volume = diagnostic.optJSONObject("disk");
         JSONObject ether = diagnostic.optJSONObject("ether_next");
-        JSONObject ram = diagnostic.optJSONObject("ram_profile");
         long steps = machine.optLong("instructions", -1);
         long sessionSteps = boot == null ? steps : boot.optLong("session_steps", steps);
         JSONObject workerTiming = diagnostic.optJSONObject("worker_timing");
@@ -715,18 +698,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
                     coverage.optLong("translated_steps"), coverage.optLong("batched_steps"),
                     coverage.optLong("interpreted_steps")));
         }
-        if (ram != null) {
-            progress.append(String.format(Locale.getDefault(), "\nRAM del invitado · %,d MiB",
-                    ram.optLong("usable_bytes") / MIB));
-            progress.append(String.format(Locale.getDefault(), "\nDatos de RAM residentes · %,d / %,d MiB",
-                    ram.optLong("resident_bytes") / MIB, ram.optLong("backing_budget_bytes") / MIB));
-            if ("file".equals(ram.optString("spill_mode"))) {
-                progress.append(String.format(Locale.getDefault(), " · Temporal: %,d MiB",
-                        ram.optLong("spilled_bytes") / MIB));
-            } else if ("unavailable".equals(ram.optString("spill_mode"))) {
-                progress.append("\nRespaldo temporal de RAM no disponible.");
-            }
-        }
+        VmTelemetry.appendRamSummary(progress, diagnostic.optJSONObject("ram_profile"));
         if (batchedElements > 0) {
             progress.append(String.format(Locale.getDefault(),
                     "\nEther · %,d elementos de copia o relleno en bloque", batchedElements));
@@ -875,7 +847,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         storage.setText(dataDiskReady ? bootStorage + "\nQSSD de datos · 8 PiB lógicos" : bootStorage);
         boolean setup = !session && !pending;
         setupPanel.setVisibility(session ? View.GONE : View.VISIBLE);
-        ramProfile.setText(primeRam ? "RAM del invitado · 64 GiB" : "RAM del invitado · Automática");
+        ramProfile.setText(primeRam ? "RAM Éter lógica · 64 GiB" : "RAM lógica · Automática");
         ramProfile.setEnabled(setup);
         selectIso.setEnabled(setup);
         ejectIso.setEnabled(setup && iso != null);

@@ -53,6 +53,7 @@ class AndroidBootSession final {
   static_assert(kEngineTargetHz % 1'000'000'000 == 0);
   static constexpr unsigned kPrimeHostWorkers = 8;
   static constexpr std::uint64_t kPrimeRamBytes = 64ULL << 30;
+  static constexpr std::uint64_t kPrimeResidentCeilingBytes = 256ULL << 20;
   static constexpr std::uint64_t kMaxResidentBytes = 1024ULL * 1024 * 1024;
   static constexpr std::uint64_t kMinResidentBytes = 16ULL * 1024 * 1024;
 
@@ -229,7 +230,7 @@ class AndroidBootSession final {
                      const std::filesystem::path& data_disk={},
                      cosmic_pc::CpuTopology topology={}, bool active_guest_clock=false,
                      PcMotherboardC06::CpuClock cpu_clock=PcMotherboardC06::CpuClock::Standard)
-      : source_(source), pc_(profile.physical_bytes, profile.backing_bytes), vga_(pc_), vbe_(pc_) {
+      : source_(source), pc_(profile.physical_bytes, resident_budget(profile)), vga_(pc_), vbe_(pc_) {
     if (disk.empty() && (create_gib || source != BootSource::SelfTest))
       throw std::invalid_argument("Selecciona o crea un disco QSSD para iniciar.");
     attach_state_ram(pc_);
@@ -302,7 +303,7 @@ class AndroidBootSession final {
                                     RamProfile profile=kDefaultRamProfile,
                                     const std::filesystem::path& ram_cache={},
                                     cosmic_pc::CpuTopology topology={}) {
-    cosmic_pc::PcMachine pc(profile.physical_bytes, profile.backing_bytes);
+    cosmic_pc::PcMachine pc(profile.physical_bytes, resident_budget(profile));
     attach_state_ram(pc);
     const auto quantum_probe = run_quantum_ram_guest_probe();
     if (profile.physical_bytes > cosmic_pc::PcMachine::kLegacyPhysicalLimit) pc.reserve_pci_mmio(true);
@@ -941,8 +942,13 @@ class AndroidBootSession final {
   }
 
   static std::uint64_t resident_limit(std::uint64_t physical) noexcept {
-    return high_ram_profile(physical)
-        ? physical : std::min(physical, kMaxResidentBytes);
+    return std::min(physical, high_ram_profile(physical) ? kPrimeResidentCeilingBytes : kMaxResidentBytes);
+  }
+
+  static std::uint64_t resident_budget(RamProfile profile) noexcept {
+    return high_ram_profile(profile.physical_bytes)
+        ? std::min<std::uint64_t>(profile.backing_bytes, kPrimeResidentCeilingBytes)
+        : profile.backing_bytes;
   }
 
   static std::uint64_t page_floor(std::uint64_t bytes) noexcept {
@@ -1040,15 +1046,23 @@ class AndroidBootSession final {
         << ",\"quantum_state_bytes\":" << pc.cpu.memory.quantum_state_bytes()
         << ",\"usable_bytes\":" << usable
         << ",\"ram_clock_hz\":" << PcMotherboardC06::kRamClockHz
-        << ",\"backing_budget_bytes\":" << pc.cpu.memory.budget_bytes()
+        << ",\"resident_ceiling_bytes\":" << resident_limit(pc.cpu.memory.size())
+        << ",\"resident_budget_bytes\":" << metrics.budget_bytes
+        << ",\"backing_budget_bytes\":" << metrics.budget_bytes
         << ",\"raw_backing_capacity_bytes\":" << raw_backing_capacity
         << ",\"resident_policy\":\""
         << (high_ram_profile(pc.cpu.memory.size())
-            ? "android-surplus" : "android-half-surplus") << "\""
+            ? "prime-fixed-working-set" : "android-half-surplus") << "\""
         << ",\"resident_bytes\":" << metrics.allocated_bytes
+        << ",\"resident_payload_bytes\":" << metrics.allocated_bytes
+        << ",\"resident_cache_bytes\":" << metrics.backing_cache_bytes
+        << ",\"resident_working_set_bytes\":" << metrics.allocated_bytes + metrics.backing_cache_bytes
+        << ",\"resident_dense_pages\":" << metrics.allocated_pages
         << ",\"resident_metadata_bytes\":" << metrics.metadata_bytes
+        << ",\"spilled_pages\":" << metrics.spilled_pages
         << ",\"page_state_vectors\":" << metrics.page_state_vectors
-        << ",\"pages_per_state_vector\":" << cosmic_pc::SparseRam::kPagesPerTable
+        << ",\"pages_per_state_vector\":"
+        << (cosmic_pc::MemoryFabric::kUsesStateRam ? 1 : cosmic_pc::SparseRam::kPagesPerTable)
         << ",\"pattern_pages\":" << metrics.pattern_pages
         << ",\"sparse_word_pages\":" << metrics.sparse_word_pages
         << ",\"pattern_delta_pages\":" << metrics.pattern_delta_pages

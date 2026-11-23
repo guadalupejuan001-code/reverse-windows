@@ -35,7 +35,7 @@ final class VmTelemetry extends LinearLayout {
     private final TextView caption;
     private final TextView headline;
     private final TextView note;
-    private final LinearLayout backing;
+    private final LinearLayout residentPanel;
     private final TextView resident;
     private final TextView occupancy;
     private final ProgressBar meter;
@@ -81,27 +81,27 @@ final class VmTelemetry extends LinearLayout {
         note = activity.label("", 11, MainActivity.MUTED);
         addView(note);
 
-        backing = new LinearLayout(activity);
-        backing.setOrientation(VERTICAL);
-        activity.add(this, backing, 5);
-        LinearLayout backingHeader = activity.row(backing);
-        TextView residentLabel = activity.label("Datos de RAM residentes", 12, MainActivity.TEXT);
+        residentPanel = new LinearLayout(activity);
+        residentPanel.setOrientation(VERTICAL);
+        activity.add(this, residentPanel, 5);
+        LinearLayout residentHeader = activity.row(residentPanel);
+        TextView residentLabel = activity.label("Caché de páginas en RAM física", 12, MainActivity.TEXT);
         residentLabel.setTypeface(Typeface.DEFAULT_BOLD);
-        backingHeader.addView(residentLabel, new LayoutParams(0, -2, 1));
+        residentHeader.addView(residentLabel, new LayoutParams(0, -2, 1));
         occupancy = activity.label("", 11, MainActivity.ERROR);
         occupancy.setTypeface(Typeface.MONOSPACE);
-        backingHeader.addView(occupancy);
+        residentHeader.addView(occupancy);
         resident = activity.label("", 15, MainActivity.TEXT);
         resident.setTypeface(Typeface.MONOSPACE);
-        backing.addView(resident);
+        residentPanel.addView(resident);
 
         meter = new ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal);
         meter.setIndeterminate(false);
         meter.setMax(1000);
         meter.setProgressTintList(ColorStateList.valueOf(MainActivity.ERROR));
         meter.setProgressBackgroundTintList(ColorStateList.valueOf(0x6688b5b7));
-        meter.setContentDescription("Ocupación del presupuesto de RAM residente");
-        backing.addView(meter, new LayoutParams(-1, activity.dp(5)));
+        meter.setContentDescription("Ocupación del presupuesto de caché de páginas");
+        residentPanel.addView(meter, new LayoutParams(-1, activity.dp(5)));
 
         for (int index = 0; index < rows.length; index++) {
             LinearLayout row = activity.row(this);
@@ -148,7 +148,7 @@ final class VmTelemetry extends LinearLayout {
     }
 
     void render() {
-        backing.setVisibility(snapshot != null && category == Category.RAM ? View.VISIBLE : View.GONE);
+        residentPanel.setVisibility(snapshot != null && category == Category.RAM ? View.VISIBLE : View.GONE);
         if (snapshot == null) {
             heading(category.label, UNKNOWN, "Sin sesión");
             showRows(0);
@@ -164,42 +164,99 @@ final class VmTelemetry extends LinearLayout {
 
     private void renderRam() {
         JSONObject ram = snapshot.optJSONObject("ram_profile");
-        long logical = number(ram, "address_space_bytes", number(machine, "ram_bytes"));
         long usable = number(ram, "usable_bytes", number(machine, "ram_usable_bytes"));
-        long used = number(ram, "resident_bytes", number(machine, "ram_allocated_bytes"));
-        long limit = number(ram, "backing_budget_bytes", number(machine, "ram_budget_bytes"));
-        long rawCapacity = number(ram, "raw_backing_capacity_bytes");
+        long used = residentWorkingSet(ram, machine);
+        long limit = residentBudget(ram, machine);
         boolean etherRam = ram != null && "ether-state-ram".equals(ram.optString("memory_backend"));
         boolean knownOccupancy = used >= 0 && limit > 0;
         double ratio = knownOccupancy ? (double) used / limit : 0;
-        heading(etherRam ? "RAM Éter del invitado" : "RAM utilizable por el invitado",
-                units(usable >= 0 ? usable : logical, GIB, "GiB", 2),
-                rawCapacity >= 0 ? "Capacidad estimada sin comprimir · " + units(rawCapacity, GIB, "GiB", 2) : "");
-        put(resident, formatted(used, MIB, 1) + " / " + formatted(limit, MIB, 1) + " MiB");
+        heading(etherRam ? "RAM Éter lógica del invitado" : "RAM lógica del invitado",
+                ramCapacity(usable), "");
+        put(resident, residentUsage(used, limit));
         put(occupancy, knownOccupancy ? String.format(Locale.getDefault(), "%.1f %%", ratio * 100) : "");
         meter.setVisibility(knownOccupancy ? View.VISIBLE : View.GONE);
         if (knownOccupancy) meter.setProgress((int) Math.round(Math.min(ratio, 1) * 1000));
         long pssKiB = number(snapshot, "android_pss_kib");
-        metric(0, "Datos lógicos en respaldo", units(number(ram, "spilled_bytes"), MIB, "MiB", 1));
-        metric(1, "Datos en el archivo temporal", storage(number(ram, "spill_file_payload_bytes")));
-        metric(2, "Metadatos de RAM", storage(number(ram, "resident_metadata_bytes")));
-        metric(3, etherRam ? "Páginas con estado" : "Tablas de páginas",
-                count(number(ram, "page_state_vectors")));
-        metric(4, "Proceso Android (PSS)", pssKiB > 0 ? units(pssKiB, KIB, "MiB", 1) : UNKNOWN);
-        metric(5, "Reloj de la RAM virtual", frequency(number(ram, "ram_clock_hz")));
-        JSONObject pressure = ram == null ? null : ram.optJSONObject("access_pressure");
-        if (pressure == null) { showRows(6); return; }
-        metric(6, "Escrituras que necesitaron espacio", count(number(pressure, "forced_reclaims")));
-        metric(7, "Tiempo consiguiendo espacio · total",
-                units(number(pressure, "forced_reclaim_ns"), 1_000_000, "ms", 3));
-        metric(8, "Mayor demora al conseguir espacio",
-                units(number(pressure, "forced_reclaim_max_ns"), 1_000_000, "ms", 3));
-        metric(9, "Lecturas del respaldo", count(number(ram, "spill_reads")));
-        metric(10, "Aciertos de caché del respaldo", count(number(ram, "spill_cache_hits")));
-        metric(11, "Caché del respaldo · usada / límite",
-                storage(number(ram, "spill_cache_bytes")) + " / "
+        metric(0, "Tope de caché de páginas", storage(number(ram, "resident_ceiling_bytes")));
+        metric(1, "Respaldo temporal QSSD", spillStatus(ram));
+        metric(2, "Datos en el archivo temporal", storage(number(ram, "spill_file_payload_bytes")));
+        metric(3, "Datos lógicos desplazados a QSSD", storage(number(ram, "spilled_bytes")));
+        metric(4, "Datos de páginas residentes", storage(number(ram, "resident_payload_bytes",
+                number(ram, "resident_bytes"))));
+        metric(5, "Caché de lectura QSSD · usada / límite",
+                storage(number(ram, "resident_cache_bytes", number(ram, "spill_cache_bytes"))) + " / "
                 + storage(number(ram, "spill_cache_capacity_bytes")));
-        showRows(12);
+        metric(6, "Lecturas / escrituras de respaldo", count(number(ram, "spill_reads"))
+                + " / " + count(number(ram, "spill_writes")));
+        metric(7, "Tiempo en archivo · lectura / escritura", units(number(ram, "spill_read_us"), 1000, "ms", 3)
+                + " / " + units(number(ram, "spill_write_us"), 1000, "ms", 3));
+        metric(8, "Aciertos de caché de lectura QSSD", count(number(ram, "spill_cache_hits")));
+        metric(9, "Metadatos de RAM", storage(number(ram, "resident_metadata_bytes")));
+        metric(10, etherRam ? "Páginas con estado Éter" : "Tablas de páginas",
+                count(number(ram, "page_state_vectors")));
+        metric(11, "Proceso Android (PSS)", pssKiB > 0 ? units(pssKiB, KIB, "MiB", 1) : UNKNOWN);
+        metric(12, "Reloj de la RAM virtual", frequency(number(ram, "ram_clock_hz")));
+        JSONObject pressure = ram == null ? null : ram.optJSONObject("access_pressure");
+        if (pressure == null) { showRows(13); return; }
+        metric(13, "Escrituras que necesitaron espacio", count(number(pressure, "forced_reclaims")));
+        metric(14, "Tiempo consiguiendo espacio · total",
+                units(number(pressure, "forced_reclaim_ns"), 1_000_000, "ms", 3));
+        metric(15, "Mayor demora al conseguir espacio",
+                units(number(pressure, "forced_reclaim_max_ns"), 1_000_000, "ms", 3));
+        long timedReads = number(pressure, "backing_timed_attempts");
+        if (timedReads <= 0) { showRows(16); return; }
+        metric(16, "Lecturas cronometradas", count(timedReads));
+        metric(17, "Lecturas cronometradas · total / máximo",
+                units(number(pressure, "backing_read_ns"), 1_000_000, "ms", 3) + " / "
+                + units(number(pressure, "backing_read_max_ns"), 1_000_000, "ms", 3));
+        metric(18, "Espera de bloqueo del respaldo",
+                units(number(pressure, "backing_lock_wait_ns"), 1_000_000, "ms", 3));
+        showRows(19);
+    }
+
+    static void appendRamSummary(StringBuilder text, JSONObject ram) {
+        if (ram == null) return;
+        text.append("\nRAM lógica del invitado · ").append(ramCapacity(number(ram, "usable_bytes")))
+                .append("\nCaché de páginas en RAM física · ")
+                .append(residentUsage(residentWorkingSet(ram, null), residentBudget(ram, null)))
+                .append("\nRespaldo temporal QSSD · ").append(spillStatus(ram));
+        if ("file".equals(ram.optString("spill_mode"))) {
+            text.append(" · ").append(storage(number(ram, "spill_file_payload_bytes"))).append(" en archivo");
+        } else if ("unavailable".equals(ram.optString("spill_mode"))) {
+            String detail = ram.optString("spill_error");
+            if (!detail.isEmpty()) text.append('\n').append(detail);
+        }
+    }
+
+    private static long residentWorkingSet(JSONObject ram, JSONObject machine) {
+        long workingSet = number(ram, "resident_working_set_bytes");
+        if (workingSet >= 0) return workingSet;
+        long payload = number(ram, "resident_bytes", number(machine, "ram_allocated_bytes"));
+        return payload < 0 ? payload : payload + number(ram, "spill_cache_bytes", 0);
+    }
+
+    private static long residentBudget(JSONObject ram, JSONObject machine) {
+        return number(ram, "resident_budget_bytes",
+                number(ram, "backing_budget_bytes", number(machine, "ram_budget_bytes")));
+    }
+
+    private static String residentUsage(long used, long limit) {
+        return units(used, MIB, "MiB", 1) + " / " + units(limit, MIB, "MiB", 1);
+    }
+
+    private static String ramCapacity(long bytes) {
+        if (bytes >= GIB && bytes % GIB == 0) return units(bytes, GIB, "GiB", 0);
+        return storage(bytes);
+    }
+
+    private static String spillStatus(JSONObject ram) {
+        if (ram == null) return UNKNOWN;
+        return switch (ram.optString("spill_mode")) {
+            case "file" -> "Límite " + storage(number(ram, "spill_limit_bytes"));
+            case "unavailable" -> "No disponible";
+            case "disabled" -> "Desactivado";
+            default -> UNKNOWN;
+        };
     }
 
     private void renderCpu() {

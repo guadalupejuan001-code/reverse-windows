@@ -381,6 +381,10 @@ jobs:
           assert quantum_probe["stored_value"] == 42, quantum_probe
           assert ram["usable_bytes"] == 64 << 30, ram
           assert ram["resident_bytes"] <= ram["backing_budget_bytes"], ram
+          assert ram["resident_policy"] == "prime-fixed-working-set", ram
+          assert ram["resident_ceiling_bytes"] == 256 << 20, ram
+          assert ram["resident_working_set_bytes"] == ram["resident_payload_bytes"] + ram["resident_cache_bytes"], ram
+          assert ram["resident_working_set_bytes"] <= ram["resident_budget_bytes"] <= ram["resident_ceiling_bytes"], ram
           assert ram["spilled_bytes"] == 0 and ram["spill_writes"] == 0, ram
           assert ram["spill_mode"] in {"file", "disabled", "unavailable"}, ram
           if ram["spill_mode"] == "file":
@@ -539,6 +543,9 @@ jobs:
           assert report["ram_profile"]["usable_bytes"] == 64 << 30, report["ram_profile"]
           assert report["ram_profile"]["memory_backend"] == "ether-state-ram", report["ram_profile"]
           assert report["ram_profile"]["ram_clock_hz"] == 4_500_000_000_000
+          ram = report["ram_profile"]
+          assert ram["resident_ceiling_bytes"] == 256 << 20, ram
+          assert ram["resident_working_set_bytes"] <= ram["resident_budget_bytes"] <= ram["resident_ceiling_bytes"], ram
           ether = report["ether_arm64"]
           assert ether["mundo_x_source_sha"] == os.environ["MUNDO_X_SHA"]
           assert ether["protected32_guest_steps"] == 0
