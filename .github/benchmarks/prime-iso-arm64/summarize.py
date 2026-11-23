@@ -10,7 +10,9 @@ COVERAGE = ("translated_steps", "batched_steps", "projected_steps", "interpreted
 NATIVE = ("translated", "executed_blocks", "cache_hits", "data_fallbacks", "guest_steps",
           "invalidated", "compiled_evictions", "code_byte_checks", "ram_read_callbacks",
           "resident_read_hits", "off_bus_register_steps", "repeated_loop_steps", "repeated_loop_dispatches",
-          "staged_ram_blocks", "staged_ram_steps", "coalesced_ram_writes", "ram_add_guest_steps")
+          "staged_ram_blocks", "staged_ram_steps", "coalesced_ram_writes", "ram_add_guest_steps",
+          "on_bus_register_steps", "register_bus_reacquisitions", "register_bus_reacquire_samples",
+          "register_bus_reacquire_contentions", "register_bus_reacquire_wait_ns")
 BOOT_LOOPS = ("boot_scan_loop_steps", "boot_forward_copy_loop_steps", "boot_zero_loop_steps",
               "boot_rep_elements", "boot_rep_direct_page_copy_bytes", "boot_counter_loop_steps")
 RAM = ("usable_bytes", "resident_bytes", "resident_metadata_bytes", "backing_budget_bytes",
@@ -35,6 +37,9 @@ SMP = ("started", "host_workers", "host_workers_capacity", "host_workers_peak_di
 RTC = ("register_a", "register_b", "irq8_assertions", "irq8_acknowledgements", "irq8_delivered")
 IRQ_VECTOR = ("deliveries", "eois", "entry_to_eoi_ticks", "entry_to_eoi_steps")
 IRQ_CLOCK = ("clock_source", "virtual_clock_hz", "active_clock_elapsed_ns", "active_clock_ticks")
+BOOT_PROFILE_STATE = ("steps", "total_processor_steps", "ether_arm64_steps", "started_vcpus",
+                      "rtc_irq8_delivered", "host_elapsed_ns", "sipi_targets_applied", "mode",
+                      "ip_hex", "run_ns", "irq_delivered", "spill_reads", "spill_writes")
 EARLY_LONG64 = tuple(range(750_000_000, 1_000_000_001, 50_000_000))
 LATE_LONG64 = tuple(range(8_200_000_000, 8_650_000_001, 50_000_000))
 AFTER_8_65B = (8_650_000_000, 9_000_000_000, 9_250_000_000, 9_500_000_000)
@@ -56,6 +61,7 @@ def load_checkpoint(record):
     storage = vm["storage_io"]
     topology = vm["cpu_topology"]
     irq = vm["irq"]
+    profile = vm.get("boot_profile", {})
     return {
         "target_steps": record["target_steps"],
         "actual_steps": boot["session_steps"],
@@ -79,10 +85,14 @@ def load_checkpoint(record):
         "vcpu_states": topology.get("states_by_logical_processor", []),
         "vcpu_steps": topology.get("steps_by_logical_processor", []),
         "vcpu_arm64_steps": topology.get("ether_arm64_steps_by_logical_processor", []),
+        "vcpu_execution": topology.get("execution_by_logical_processor", []),
         "rtc": pick(vm.get("rtc", {}), RTC),
         "irq_clock": pick(irq, IRQ_CLOCK),
+        "irq_counters": pick(irq, ("irq64_bulk_frames",)),
         "irq_vectors": {str(vector["vector"]): pick(vector, IRQ_VECTOR)
                         for vector in irq.get("lapic_vectors", [])},
+        "boot_profile_current": pick(profile.get("current", {}), BOOT_PROFILE_STATE),
+        "first_ap_start_observed": profile.get("first_ap_start_observed"),
         "windows_ready": machine["windows_ready"],
         "qssd_commits": vm["disk"]["commits"],
         "system_qssd_journal": pick(storage.get("qssd_journal", {}), JOURNAL),
@@ -148,6 +158,8 @@ def compare(first, last):
         "irq_vectors_delta": irq_vectors,
         "rtc_delta": compute_delta(first["rtc"], last["rtc"], RTC[2:]),
         "irq_clock_delta": compute_delta(first["irq_clock"], last["irq_clock"], IRQ_CLOCK[2:]),
+        "irq_counters_delta": compute_delta(first["irq_counters"], last["irq_counters"],
+                                            ("irq64_bulk_frames",)),
         "guest_steps_per_second_excluding_measured_optical_io":
             steps * 1e9 / remaining_ns if remaining_ns > 0 else None,
         "native_arm64_delta": native_counts,
@@ -216,6 +228,33 @@ def continuation_record(run_dir, target):
     }
 
 
+def first_ap_start_snapshot(run_dir):
+    snapshots = run_dir / "snapshots.jsonl"
+    if not snapshots.is_file():
+        return None
+    with snapshots.open() as stream:
+        for line in stream:
+            if not line.endswith("\n"):
+                break
+            record = json.loads(line)
+            vm = record["session"]
+            topology = vm["cpu_topology"]
+            startup = topology.get("startup_ipis", {})
+            if topology["started"] < 2 or not startup.get("sipi_targets_applied"):
+                continue
+            return {
+                "elapsed_ms": record["elapsed_ms"],
+                "total_processor_steps": vm["boot_progress"]["session_steps"],
+                "primary_steps": vm["machine"]["instructions"],
+                "started_vcpus": topology["started"],
+                "startup_ipis": startup,
+                "vcpu_steps": topology.get("steps_by_logical_processor", []),
+                "rtc_irq8_delivered": vm.get("rtc", {}).get("irq8_delivered"),
+                "lapic_irq_delivered": vm["irq"]["delivered"],
+            }
+    return None
+
+
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--run", type=Path, required=True)
@@ -276,6 +315,7 @@ def main():
         summary["protected32_warmup"] = compare(checkpoints[350_000_000], checkpoints[400_000_000])
         summary["protected32_control"] = compare(checkpoints[400_000_000], checkpoints[700_000_000])
     summary["continuation"] = continuation_record(args.run, stop_target)
+    summary["first_ap_start_snapshot"] = first_ap_start_snapshot(args.run)
     summary["early_long64_per_50m"] = long64_intervals(checkpoints, EARLY_LONG64)
     summary["late_long64_per_50m"] = long64_intervals(checkpoints, LATE_LONG64)
     summary["continuation_after_8_65b"] = long64_intervals(checkpoints, AFTER_8_65B)

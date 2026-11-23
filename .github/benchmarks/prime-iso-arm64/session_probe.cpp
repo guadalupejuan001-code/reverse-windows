@@ -183,7 +183,7 @@ int main(int argc, char** argv) {
       while (next_milestone < milestone_steps.size() && retired_after >= milestone_steps[next_milestone]) {
         const auto threshold = milestone_steps[next_milestone++];
         const auto elapsed_ns = count_since<Nanoseconds>(start, slice_end);
-        const auto diagnostic = session.diagnostic(false);
+        const auto diagnostic = session.diagnostic(threshold >= 9'500'000'000ULL);
         milestones << "{\"target_steps\":" << threshold
                    << ",\"elapsed_ns\":" << elapsed_ns
                    << ",\"process_cpu_ns\":" << process_cpu_ns() - cpu_start

@@ -99,16 +99,50 @@ jobs:
           done
           if [[ -s "$evidence/reference.stdout" ]]; then tail -n1 "$evidence/reference.stdout"; fi
           test "$(cat "$RUNNER_TEMP/reference.exit")" = 0
-      - name: Observe the pinned candidate on the same host CPUs
-        if: steps.revisions.outputs.candidate == 'true'
+      - name: Start the pinned candidate on the same host CPUs
+        if: always() && steps.revisions.outcome == 'success' && steps.revisions.outputs.candidate == 'true'
+        id: candidate_progress
         shell: bash
         run: |
           set -euo pipefail
           bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
           evidence="$RUNNER_TEMP/evidence"
-          bash "$bench/run-combined-role.sh" candidate
-          python3 "$bench/compare-combined.py" "$evidence/reference.json" "$evidence/candidate.json" \
-            "$evidence/paired-comparison.json"
+          test -s "$RUNNER_TEMP/probe-cpu"
+          test -f "$RUNNER_TEMP/reference.exit"
+          nohup bash "$bench/run-combined-role.sh" candidate < /dev/null > "$evidence/candidate-driver.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/candidate.pid"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/candidate-progress" \
+            10500000000 candidate
+      - name: Upload the late observation from the still-running candidate
+        if: always() && steps.candidate_progress.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-iso-late-candidate-provisional
+          path: ${{ runner.temp }}/candidate-progress/
+      - name: Continue observing the same candidate to 11B and compare
+        if: always() && steps.candidate_progress.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          pid=$(cat "$RUNNER_TEMP/candidate.pid")
+          while [[ ! -f "$RUNNER_TEMP/candidate.exit" ]]; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo 'Candidate driver ended before recording its exit code' >&2
+              exit 1
+            fi
+            if [[ -s "$evidence/candidate.stdout" ]]; then
+              tail -n1 "$evidence/candidate.stdout"
+            fi
+            sleep 20
+          done
+          if [[ -s "$evidence/candidate.stdout" ]]; then tail -n1 "$evidence/candidate.stdout"; fi
+          if [[ -s "$evidence/reference.json" && -s "$evidence/candidate.json" ]]; then
+            python3 "$bench/compare-combined.py" "$evidence/reference.json" "$evidence/candidate.json" \
+              "$evidence/paired-comparison.json"
+          fi
+          test "$(cat "$RUNNER_TEMP/candidate.exit")" = 0
       - name: Preserve late per-vCPU execution and IRQ evidence
         if: always()
         uses: actions/upload-artifact@v7

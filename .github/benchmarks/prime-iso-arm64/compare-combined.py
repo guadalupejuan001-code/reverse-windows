@@ -16,7 +16,7 @@ SPAN_FIELDS = ("actual_steps", "wall_ns", "process_cpu_ns", "engine_window_ns", 
                "ram_access_pressure_delta", "system_qssd_journal_delta", "system_qssd_parallel_io_delta",
                "ata_backend_delta", "bsp_steps_per_wall_second", "vcpu_steps", "vcpu_arm64_steps",
                "started_vcpus", "smp_delta", "startup_ipis_delta", "irq_vectors_delta", "rtc_delta",
-               "irq_clock_delta")
+               "irq_clock_delta", "irq_counters_delta")
 
 
 def pick(record, fields):
@@ -51,13 +51,13 @@ def compare_series(reference, candidate, key):
 def terminal(run):
     latest = run["checkpoints"][-1] if run["checkpoints"] else None
     identity = pick(run, ("product_sha", "mundo_x_sha", "probe_exit_code", "transport", "continuation",
-                          "observed_two_live_vcpus"))
+                          "observed_two_live_vcpus", "first_ap_start_snapshot"))
     if latest:
         identity["last_checkpoint"] = pick(latest, ("actual_steps", "cpu_mode", "rip_hex", "irq_delivered",
             "started_vcpus", "bios_reads", "qssd_commits", "process_peak_rss_bytes", "ram",
             "ram_access_pressure", "spill_codec", "system_qssd_journal", "system_qssd_parallel_io", "ata_backend",
             "windows_ready", "smp", "startup_ipis", "vcpu_states", "vcpu_steps", "vcpu_arm64_steps", "irq_vectors",
-            "irq_clock"))
+            "vcpu_execution", "irq_clock", "irq_counters", "first_ap_start_observed", "boot_profile_current"))
     return identity
 
 
