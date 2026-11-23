@@ -39,7 +39,7 @@ IRQ_VECTOR = ("deliveries", "eois", "entry_to_eoi_ticks", "entry_to_eoi_steps")
 IRQ_CLOCK = ("clock_source", "virtual_clock_hz", "active_clock_elapsed_ns", "active_clock_ticks")
 BOOT_PROFILE_STATE = ("steps", "total_processor_steps", "ether_arm64_steps", "started_vcpus",
                       "rtc_irq8_delivered", "host_elapsed_ns", "sipi_targets_applied", "mode",
-                      "ip_hex", "run_ns", "irq_delivered", "spill_reads", "spill_writes")
+                      "ip_hex", "run_ns", "irq_delivered", "spill_reads", "spill_writes", "registers")
 EARLY_LONG64 = tuple(range(750_000_000, 1_000_000_001, 50_000_000))
 LATE_LONG64 = tuple(range(8_200_000_000, 8_650_000_001, 50_000_000))
 AFTER_8_65B = (8_650_000_000, 9_000_000_000, 9_250_000_000, 9_500_000_000)
@@ -80,6 +80,7 @@ def load_checkpoint(record):
         "bios_bytes": vm["storage_io"]["bios_boot_media"]["read_bytes"],
         "irq_delivered": vm["irq"]["delivered"],
         "started_vcpus": topology["started"],
+        "guest_tsc_hz": topology.get("guest_tsc_hz"),
         "smp": pick(topology, SMP),
         "startup_ipis": topology.get("startup_ipis", {}),
         "vcpu_states": topology.get("states_by_logical_processor", []),
@@ -319,7 +320,8 @@ def main():
     summary["early_long64_per_50m"] = long64_intervals(checkpoints, EARLY_LONG64)
     summary["late_long64_per_50m"] = long64_intervals(checkpoints, LATE_LONG64)
     summary["continuation_after_8_65b"] = long64_intervals(checkpoints, AFTER_8_65B)
-    late_smp_targets = tuple(range(9_500_000_000, stop_target + 1, 50_000_000))
+    late_smp_targets = tuple(range(9_500_000_000, min(11_500_000_000, stop_target) + 1, 50_000_000))
+    late_smp_targets += tuple(range(12_000_000_000, stop_target + 1, 500_000_000))
     summary["sustained_long64_per_50m"] = long64_intervals(checkpoints, late_smp_targets)
     summary["observed_two_live_vcpus"] = any(
         min(interval["started_vcpus"]) >= 2
