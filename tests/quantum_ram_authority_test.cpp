@@ -62,6 +62,36 @@ void capacity_and_bytes() {
   check(!owner.contains(7) && owner.state_bytes() == 0, "reset retained a guest authority");
 }
 
+void binding_index_follows_topology() {
+  Authority owner;
+  constexpr std::uint64_t address = 17;
+  const auto visible = [&] {
+    return owner.contains(address) && owner.intersects(address - 1, 2) &&
+        !owner.contains(address - 1) && !owner.intersects(address - 1, 1);
+  };
+  const auto empty = [&] {
+    return !owner.contains(address) && !owner.intersects(address - 1, 2);
+  };
+  const auto empty_snapshot = owner.snapshot();
+  rejects([&] { owner.bind(address, "invalid", 0); }, "invalid first binding was accepted");
+  check(empty(), "failed first binding changed the empty index");
+
+  owner.begin_write_scope();
+  rejects([&] { owner.bind(address, "0", 0); }, "empty write scope allowed a binding change");
+  owner.end_write_scope();
+  owner.bind(address, "0", 0);
+  check(visible() && owner.read(address) == 0, "first binding with a zero byte was hidden");
+  const auto bound_snapshot = owner.snapshot();
+  check(owner.unbind(address) == 0 && empty(), "last unbind did not clear the index");
+  owner.restore(bound_snapshot);
+  check(visible(), "restoring a bound snapshot did not publish its index");
+  owner.restore(empty_snapshot);
+  check(empty(), "restoring an empty snapshot retained a binding");
+  owner.bind(address, "0", 0);
+  owner.reset();
+  check(empty(), "reset retained a binding");
+}
+
 void vectors_and_involution_optimizer() {
   Authority owner;
   owner.bind(0, "0", 0);
@@ -195,6 +225,7 @@ void independent_public_runtime() {
 int main() {
   try {
     run("capacity_and_bytes", capacity_and_bytes);
+    run("binding_index_follows_topology", binding_index_follows_topology);
     run("vectors_and_involution_optimizer", vectors_and_involution_optimizer);
     run("transactions_and_ownership", transactions_and_ownership);
     run("entanglement_checkpoint_and_rng", entanglement_checkpoint_and_rng);

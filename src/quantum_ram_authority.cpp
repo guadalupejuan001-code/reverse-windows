@@ -115,8 +115,13 @@ struct QuantumRamAuthority::Impl {
   std::size_t scope_depth = 0, pinned_payload = 0;
   bool scope_restored = false;
   Bindings bindings;
+  std::atomic<bool> has_bindings{false};
   std::atomic<std::uint64_t> revision{0};
   std::atomic<std::size_t> payload_bytes{0};
+
+  void publish_binding_index() noexcept {
+    has_bindings.store(!bindings.empty(), std::memory_order_release);
+  }
 
   void require_revision() const {
     if (revision.load(std::memory_order_relaxed) == std::numeric_limits<std::uint64_t>::max())
@@ -163,11 +168,15 @@ QuantumRamAuthority::QuantumRamAuthority(Limits limits) : impl_(std::make_unique
 QuantumRamAuthority::~QuantumRamAuthority() = default;
 
 bool QuantumRamAuthority::contains(std::uint64_t address) const noexcept {
+  // Ordinary RAM can reject an empty binding index without taking the
+  // authority mutex. A nonempty index is always examined under the lock.
+  if (!impl_->has_bindings.load(std::memory_order_acquire)) return false;
   std::lock_guard<std::mutex> lock(impl_->mutex);
   return impl_->bindings.count(address) != 0;
 }
 
 bool QuantumRamAuthority::intersects(std::uint64_t first, std::size_t count) const noexcept {
+  if (!count || !impl_->has_bindings.load(std::memory_order_acquire)) return false;
   std::lock_guard<std::mutex> lock(impl_->mutex);
   const auto it = impl_->bindings.lower_bound(first);
   return it != impl_->bindings.end() && it->first - first < count;
@@ -214,6 +223,7 @@ void QuantumRamAuthority::reset() noexcept {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   impl_->runtime = impl_->empty;
   impl_->bindings.clear();
+  impl_->publish_binding_index();
   impl_->payload_bytes.store(0, std::memory_order_release);
   if (impl_->revision.load(std::memory_order_relaxed) != std::numeric_limits<std::uint64_t>::max())
     impl_->revision.fetch_add(1, std::memory_order_release);
@@ -289,6 +299,7 @@ void QuantumRamAuthority::bind(std::uint64_t address, const std::string& qbase,
     bytes.store(address, initial_value);
   });
   impl_->bindings.swap(next_bindings);
+  impl_->publish_binding_index();
   impl_->committed();
 }
 
@@ -300,6 +311,7 @@ std::uint8_t QuantumRamAuthority::unbind(std::uint64_t address) {
   const auto value = deterministic(impl_->runtime.memory().read(std::to_string(address), impl_->runtime.core()));
   impl_->runtime.transact_bytes([&](Runtime::ByteAccess& bytes) { bytes.unbind(address); });
   impl_->bindings.erase(address);
+  impl_->publish_binding_index();
   impl_->committed();
   return value;
 }
@@ -401,6 +413,7 @@ void QuantumRamAuthority::restore(const std::string& saved) {
   auto bindings = recover_bindings(candidate, impl_->limits.logical_bytes);
   impl_->runtime = std::move(candidate);
   impl_->bindings.swap(bindings);
+  impl_->publish_binding_index();
   impl_->committed();
 }
 
