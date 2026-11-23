@@ -57,13 +57,11 @@ jobs:
           chmod 400 "$iso"
           export PROBE_CPU
           PROBE_CPU="$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')"
-          probe_exit=0
           probe=("$RUNNER_TEMP/build/session_probe" "$iso" "$output" 700000000 600
                  "$AVAILABLE_MIB" "$THRESHOLD_MIB")
           optical_env=(EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1
                        LD_PRELOAD="$RUNNER_TEMP/verified_iso.so" R110_REMOTE_ISO_STUB="$iso")
-          if timeout 650s taskset -c "$PROBE_CPU" env "${optical_env[@]}" "${probe[@]}"
-            > "$RUNNER_TEMP/probe.stdout" 2> "$RUNNER_TEMP/probe.stderr"; then
+          if timeout 650s taskset -c "$PROBE_CPU" env "${optical_env[@]}" "${probe[@]}" > "$RUNNER_TEMP/probe.stdout" 2> "$RUNNER_TEMP/probe.stderr"; then
             probe_exit=0
           else
             probe_exit=$?
