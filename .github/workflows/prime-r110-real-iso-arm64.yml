@@ -1,0 +1,80 @@
+name: Prime R110 real ISO ARM64 native sample
+
+on:
+  push:
+    branches: [ci/prime-r110-real-iso-arm64-slice]
+
+permissions:
+  contents: read
+
+env:
+  PRODUCT_SHA: 08913574fc21976ba88bbbde924728059f38eeef
+  MUNDO_X_SHA: 7f82c90460c46674d7c0b26952637d88cad0ce76
+  AVAILABLE_MIB: '448'
+  THRESHOLD_MIB: '256'
+
+jobs:
+  real-iso-slice:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - name: Check out the benchmark
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify the product checkout and pinned dependencies
+        shell: bash
+        run: |
+          test "$(uname -m)" = aarch64
+          git init "$RUNNER_TEMP/product"
+          git -C "$RUNNER_TEMP/product" fetch --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$PRODUCT_SHA"
+          git -C "$RUNNER_TEMP/product" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/product" rev-parse HEAD)" = "$PRODUCT_SHA"
+          cd "$RUNNER_TEMP/product"
+          python3 scripts/verify_deps.py --checkout
+          test "$(git -C deps/mundo-X rev-parse HEAD)" = "$MUNDO_X_SHA"
+      - name: Build the production native session on AArch64
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          packages=(ninja-build libcurl4-openssl-dev zlib1g-dev
+                    libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri)
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${packages[@]}"
+          cmake_flags=(-DREVERSE_WINDOWS_SOURCE="$RUNNER_TEMP/product"
+                       -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG')
+          cmake -S .github/benchmarks/prime-iso-arm64 -B "$RUNNER_TEMP/build" -G Ninja "${cmake_flags[@]}"
+          cmake --build "$RUNNER_TEMP/build" --target session_probe --parallel 2
+          cc_flags=(-std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -o "$RUNNER_TEMP/verified_iso.so")
+          cc "${cc_flags[@]}" .github/benchmarks/prime-iso-arm64/verified_iso.c -lcurl -pthread
+      - name: Measure the production session against verified Microsoft ISO bytes
+        shell: bash
+        run: |
+          iso="$RUNNER_TEMP/windows-eval.sparse"
+          output="$RUNNER_TEMP/session"
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence"
+          truncate -s 5550497792 "$iso"
+          chmod 400 "$iso"
+          export PROBE_CPU
+          PROBE_CPU="$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          probe_exit=0
+          probe=("$RUNNER_TEMP/build/session_probe" "$iso" "$output" 700000000 600
+                 "$AVAILABLE_MIB" "$THRESHOLD_MIB")
+          optical_env=(EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1
+                       LD_PRELOAD="$RUNNER_TEMP/verified_iso.so" R110_REMOTE_ISO_STUB="$iso")
+          if timeout 650s taskset -c "$PROBE_CPU" env "${optical_env[@]}" "${probe[@]}"
+            > "$RUNNER_TEMP/probe.stdout" 2> "$RUNNER_TEMP/probe.stderr"; then
+            probe_exit=0
+          else
+            probe_exit=$?
+          fi
+          report=(--run "$output" --transport-log "$RUNNER_TEMP/probe.stderr"
+                  --output "$evidence/arm64-slice.json" --exit-code "$probe_exit")
+          python3 .github/benchmarks/prime-iso-arm64/summarize.py "${report[@]}"
+      - name: Upload only the dedicated counter report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-real-iso-slice
+          path: ${{ runner.temp }}/evidence/arm64-slice.json
+          if-no-files-found: warn
