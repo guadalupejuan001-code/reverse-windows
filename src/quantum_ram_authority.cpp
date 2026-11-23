@@ -17,6 +17,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
@@ -102,7 +103,7 @@ struct QuantumRamAuthority::Impl {
   explicit Impl(Limits requested)
       : limits(requested), empty(mx::InfiniteCore::Background::Zero,
                                  core_limits(requested), memory_limits(requested)),
-        runtime(empty), pinned_runtime(empty) {
+        runtime(empty) {
     if (!limits.logical_bytes || !limits.max_bound_bytes)
       throw std::invalid_argument("quantum RAM logical capacity and binding budget must be positive");
   }
@@ -111,9 +112,10 @@ struct QuantumRamAuthority::Impl {
   // Reset uses this immutable empty owner; it performs no allocating rebuild.
   const Runtime empty;
   Runtime runtime;
-  Runtime pinned_runtime;
+  std::optional<Runtime> pinned_runtime;
   std::size_t scope_depth = 0, pinned_payload = 0;
   bool scope_restored = false;
+  std::atomic<bool> scope_commit_required{false};
   Bindings bindings;
   std::atomic<bool> has_bindings{false};
   std::atomic<std::uint64_t> revision{0};
@@ -141,6 +143,23 @@ struct QuantumRamAuthority::Impl {
     if (scope_depth) throw std::logic_error("quantum RAM ownership cannot change during a guest write scope");
   }
 
+  // The authority mutex serializes the first mutation with scope boundaries.
+  // An untouched scope already has the current runtime as its undo baseline.
+  void save_scope_baseline() noexcept {
+    static_assert(std::is_nothrow_copy_constructible<Runtime>::value,
+                  "quantum RAM scope checkpoints must not allocate or throw");
+    if (!scope_depth || pinned_runtime) return;
+    pinned_runtime.emplace(runtime);
+    pinned_payload = payload_bytes.load(std::memory_order_relaxed);
+    scope_commit_required.store(true, std::memory_order_release);
+  }
+
+  void clear_scope_baseline() noexcept {
+    pinned_runtime.reset();
+    scope_restored = false;
+    scope_commit_required.store(false, std::memory_order_release);
+  }
+
   // A nested fabric operation can fail while an outer CPU instruction still
   // owns the write pin. Keep its local rollback independent of that CPU's
   // retirement baseline. The fabric retains the owner and joins readers for
@@ -151,11 +170,12 @@ struct QuantumRamAuthority::Impl {
           payload(state.payload_bytes.load(std::memory_order_relaxed)) {}
     void restore() noexcept override {
       std::lock_guard<std::mutex> lock(owner.mutex);
+      owner.save_scope_baseline();
       owner.runtime = saved;
       owner.payload_bytes.store(payload, std::memory_order_release);
       if (owner.revision.load(std::memory_order_relaxed) != std::numeric_limits<std::uint64_t>::max())
         owner.revision.fetch_add(1, std::memory_order_release);
-      // Do not move pinned_runtime, scope_depth or the outer rollback flag.
+      // Keep any earlier outer baseline and its rollback flag.
     }
     Impl& owner;
     Runtime saved;
@@ -203,6 +223,7 @@ void QuantumRamAuthority::write(const std::vector<std::pair<std::uint64_t, std::
   std::lock_guard<std::mutex> lock(impl_->mutex);
   impl_->require_revision();
   for (const auto& value : values) impl_->require_bound(value.first);
+  impl_->save_scope_baseline();
   impl_->runtime.transact_bytes([&](Runtime::ByteAccess& bytes) {
     for (const auto& value : values) bytes.store(value.first, value.second);
   });
@@ -221,6 +242,7 @@ void QuantumRamAuthority::reset() noexcept {
   static_assert(std::is_nothrow_copy_assignable<Runtime>::value,
                 "quantum RAM reset must not allocate or throw");
   std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->save_scope_baseline();
   impl_->runtime = impl_->empty;
   impl_->bindings.clear();
   impl_->publish_binding_index();
@@ -231,38 +253,33 @@ void QuantumRamAuthority::reset() noexcept {
 
 void QuantumRamAuthority::begin_write_scope() noexcept {
   std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (impl_->scope_depth++ == 0) {
-    impl_->pinned_runtime = impl_->runtime;
-    impl_->pinned_payload = impl_->payload_bytes.load(std::memory_order_relaxed);
-    impl_->scope_restored = false;
-  }
+  ++impl_->scope_depth;
 }
 
 void QuantumRamAuthority::end_write_scope() noexcept {
   std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (impl_->scope_depth && --impl_->scope_depth == 0) {
-    impl_->pinned_runtime = impl_->empty;
-    impl_->scope_restored = false;
-  }
+  if (impl_->scope_depth && --impl_->scope_depth == 0 &&
+      impl_->scope_commit_required.load(std::memory_order_relaxed))
+    impl_->clear_scope_baseline();
 }
 
 void QuantumRamAuthority::commit_write_scope() noexcept {
+  // A clean commit changes nothing. A concurrent mutation or restore must
+  // publish the flag before it changes state, so a clean read can precede it.
+  if (!impl_->scope_commit_required.load(std::memory_order_acquire)) return;
   std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (impl_->scope_depth) {
-    // The CPU calls this at an explicit journal retirement/begin boundary.
-    // Retired guest stores become the rollback baseline for fault delivery.
-    impl_->pinned_runtime = impl_->runtime;
-    impl_->pinned_payload = impl_->payload_bytes.load(std::memory_order_relaxed);
-    impl_->scope_restored = false;
-  }
+  if (impl_->scope_depth) impl_->clear_scope_baseline();
 }
 
 bool QuantumRamAuthority::restore_write_scope() noexcept {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   if (!impl_->scope_depth) return false;
   if (!impl_->scope_restored) {
-    impl_->runtime = impl_->pinned_runtime;
-    impl_->payload_bytes.store(impl_->pinned_payload, std::memory_order_release);
+    impl_->scope_commit_required.store(true, std::memory_order_release);
+    if (impl_->pinned_runtime) {
+      impl_->runtime = *impl_->pinned_runtime;
+      impl_->payload_bytes.store(impl_->pinned_payload, std::memory_order_release);
+    }
     // Consumers may have observed a provisional write. Never reuse their
     // cached revision even though all quantum state is restored exactly.
     if (impl_->revision.load(std::memory_order_relaxed) != std::numeric_limits<std::uint64_t>::max())
@@ -346,6 +363,7 @@ std::string QuantumRamAuthority::execute_xi(const std::string& program) {
   impl_->require_revision();
   const auto old_core_revision = impl_->runtime.core().stats().revision;
   const auto old_memory_revision = impl_->runtime.memory().stats().revision;
+  impl_->save_scope_baseline();
   auto output = impl_->runtime.execute(program, true);
   if (impl_->runtime.core().stats().revision != old_core_revision ||
       impl_->runtime.memory().stats().revision != old_memory_revision)

@@ -184,6 +184,45 @@ void entanglement_checkpoint_and_rng() {
   check(owner.snapshot() == before_bad_restore, "failed restore changed live authority");
 }
 
+void lazy_scope_checkpoint() {
+  Authority owner;
+  const auto empty = owner.snapshot();
+  owner.begin_write_scope();
+  owner.commit_write_scope();
+  const auto before_clean_restore = owner.revision();
+  check(owner.restore_write_scope() && owner.revision() == before_clean_restore + 1,
+        "clean rollback did not invalidate an existing scope");
+  check(owner.restore_write_scope() && owner.revision() == before_clean_restore + 1,
+        "repeated clean rollback invalidated the same scope twice");
+  owner.commit_write_scope();
+  check(owner.restore_write_scope() && owner.revision() == before_clean_restore + 2,
+        "clean retirement after a fault did not start a new rollback boundary");
+  owner.begin_write_scope();
+  owner.execute_xi("seed 1234\nh 0\nt 0\n");
+  check(owner.stats().bound_bytes == 0 && owner.stats().active_qubits != 0,
+        "unbound gate mutation did not exercise the lazy undo baseline");
+  owner.end_write_scope();
+  check(owner.restore_write_scope() && same_quantum_payload(owner.snapshot(), empty),
+        "ending a nested scope discarded unbound quantum undo state");
+
+  const auto local = owner.checkpoint();
+  owner.execute_xi("h 1\nt 1\n");
+  owner.commit_write_scope();
+  const auto retired = owner.snapshot();
+  local->restore();
+  check(same_quantum_payload(owner.snapshot(), empty), "local rollback retained retired quantum state");
+  check(owner.restore_write_scope() && same_quantum_payload(owner.snapshot(), retired),
+        "a local rollback replaced the retirement baseline");
+
+  owner.commit_write_scope();
+  owner.reset();
+  check(same_quantum_payload(owner.snapshot(), empty), "reset leaked quantum state from the undo baseline");
+  check(owner.restore_write_scope() && same_quantum_payload(owner.snapshot(), retired),
+        "reset within a live scope lost its prior quantum state");
+  owner.end_write_scope();
+  check(!owner.restore_write_scope(), "lazy undo state escaped its scope");
+}
+
 void large_component_and_address() {
   Authority owner;
   owner.bind(0, "0", 0);
@@ -228,6 +267,7 @@ int main() {
     run("binding_index_follows_topology", binding_index_follows_topology);
     run("vectors_and_involution_optimizer", vectors_and_involution_optimizer);
     run("transactions_and_ownership", transactions_and_ownership);
+    run("lazy_scope_checkpoint", lazy_scope_checkpoint);
     run("entanglement_checkpoint_and_rng", entanglement_checkpoint_and_rng);
     run("large_component_and_address", large_component_and_address);
     run("independent_public_runtime", independent_public_runtime);
