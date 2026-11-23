@@ -83,6 +83,14 @@ def load_checkpoint(record):
         "irq_delivered": vm["irq"]["delivered"],
         "started_vcpus": topology["started"],
         "guest_tsc_hz": topology.get("guest_tsc_hz"),
+        "engine_window": pick(vm.get("ether_execution", {}),
+                              ("target_virtual_cycles_per_second", "last_requested_steps",
+                               "last_retired_steps", "last_active_ns")),
+        "device_clocks_hz": {
+            "ata": vm.get("ata", {}).get("clock_hz"),
+            "system_disk": vm.get("disk", {}).get("clock_hz"),
+            "gpu": vm.get("guest_gpu", {}).get("virtual_clock_hz"),
+        },
         "tsc_access": topology.get("tsc_access"),
         "tsc_access_by_logical_processor": topology.get("tsc_access_by_logical_processor"),
         "smp": pick(topology, SMP),
@@ -359,7 +367,12 @@ def main():
     if wall_completion.is_file():
         wall = json.loads(wall_completion.read_text())
         vm = json.loads((args.run / "session.json").read_text())
+        expected_tsc_hz = int(os.environ["EXPECTED_TSC_HZ"])
+        wall_points = [args.run / f"wall-{point}.json" for point in (720000, 1080000)]
+        checked_wall = [load_checkpoint(json.loads(point.read_text()))
+                        for point in wall_points if point.is_file()]
         summary["wall_probe"] = wall
+        summary["expected_tsc_hz"] = expected_tsc_hz
         summary["terminal_observation"] = load_checkpoint({
             "target_steps": vm["boot_progress"]["session_steps"],
             "elapsed_ns": wall["elapsed_ms"] * 1_000_000,
@@ -372,7 +385,10 @@ def main():
             args.exit_code == 0 and valid_source
             and wall["elapsed_ms"] >= wall["requested_wall_ms"]
             and summary["terminal_observation"]["mundo_x_source_sha"] == core_sha
-            and all((args.run / f"wall-{point}.json").is_file() for point in (720000, 1080000))
+            and summary["terminal_observation"]["guest_tsc_hz"] == expected_tsc_hz
+            and len(checked_wall) == len(wall_points)
+            and all(point["guest_tsc_hz"] == expected_tsc_hz for point in checked_wall)
+            and all(point["guest_tsc_hz"] == expected_tsc_hz for point in checkpoints.values())
         )
     args.output.write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
