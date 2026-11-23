@@ -678,6 +678,9 @@ class AndroidBootSession final {
         << ",\"host_workers_peak_dispatch\":" << threaded.peak_workers
         << ",\"threaded_dispatches\":" << threaded.dispatches
         << ",\"threaded_guest_steps\":" << threaded.guest_steps
+        << ",\"threaded_pause_yields\":" << threaded.pause_yields
+        << ",\"threaded_pause_turn_steps\":" << threaded.pause_steps
+        << ",\"threaded_pause_admissions\":" << threaded.pause_admissions
         << ",\"phase_x86_steps\":" << execution.guest_steps
         << ",\"phase_ether_arm64_steps\":" << execution.ether_steps
         << ",\"phase_projected_steps\":" << execution.projected_steps
