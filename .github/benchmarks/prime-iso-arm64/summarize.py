@@ -221,11 +221,14 @@ def main():
                          ("late_long64_total", (LATE_LONG64[0], LATE_LONG64[-1]))):
         if valid_targets(bounds):
             summary[name] = long64_interval(checkpoints[bounds[0]], checkpoints[bounds[-1]])
+    required_targets = EARLY_LONG64 if stop_target == EARLY_LONG64[-1] else EARLY_LONG64 + LATE_LONG64
+    required_intervals = summary["early_long64_per_50m"]
+    if stop_target != EARLY_LONG64[-1]:
+        required_intervals = required_intervals + summary["late_long64_per_50m"]
     summary["validated_measurement"] = bool(
         args.exit_code == 0 and valid_source and summary["continuation"]["complete"]
-        and valid_targets(EARLY_LONG64 + LATE_LONG64)
-        and all(interval["long64_endpoints_no_restart"] for interval in
-                summary["early_long64_per_50m"] + summary["late_long64_per_50m"])
+        and valid_targets(required_targets)
+        and all(interval["long64_endpoints_no_restart"] for interval in required_intervals)
     )
     args.output.write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))

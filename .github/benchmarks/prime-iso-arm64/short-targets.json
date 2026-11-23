@@ -1,0 +1,10 @@
+{
+  "reference": {
+    "product_sha": "e3d971be5e8610d1c06ac5d74f2b18368ca3b773",
+    "mundo_x_sha": "5158b206b0904b96838323e6628cdaf83b22c129"
+  },
+  "candidate": {
+    "product_sha": "a495474d84945bc2df4f62d444455d7b58674e0f",
+    "mundo_x_sha": "1d31a6b8bcf1c72b48536f5365f7f5dacbc42a7c"
+  }
+}

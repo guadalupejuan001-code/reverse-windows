@@ -1,0 +1,127 @@
+name: Prime R110 physical ARM64 short paired measurement
+
+on:
+  push:
+    branches: [ci/prime-r110-real-iso-arm64-long64]
+    paths:
+      - .github/workflows/prime-r110-real-iso-arm64-short.yml
+      - .github/benchmarks/prime-iso-arm64/short-targets.json
+
+permissions:
+  contents: read
+
+env:
+  AVAILABLE_MIB: '510'
+  THRESHOLD_MIB: '128'
+  STOP_TARGET: '1000000000'
+
+jobs:
+  matched-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Build both exact ARM64 products
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 - "$bench/short-targets.json" > "$RUNNER_TEMP/targets.tsv" <<'PY'
+          import json, re, sys
+          from pathlib import Path
+          targets = json.loads(Path(sys.argv[1]).read_text())
+          for role in ('reference', 'candidate'):
+              product = targets[role]['product_sha']
+              core = targets[role]['mundo_x_sha']
+              if not all(re.fullmatch('[0-9a-f]{40}', value) for value in (product, core)):
+                  raise SystemExit(f'Expected complete published {role} revisions')
+              print(role, product, core, sep='\t')
+          PY
+          sudo apt-get update -qq
+          packages=(ninja-build libcurl4-openssl-dev zlib1g-dev
+                    libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri)
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${packages[@]}"
+          while IFS=$'\t' read -r role product_sha core_sha; do
+            product="$RUNNER_TEMP/product-$role"
+            git init "$product"
+            git -C "$product" fetch --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$product_sha"
+            git -C "$product" checkout --detach FETCH_HEAD
+            test "$(git -C "$product" rev-parse HEAD)" = "$product_sha"
+            (cd "$product" && python3 scripts/verify_deps.py --checkout)
+            test "$(git -C "$product/deps/mundo-X" rev-parse HEAD)" = "$core_sha"
+            cmake -S "$bench" -B "$RUNNER_TEMP/build-$role" -G Ninja \
+              -DREVERSE_WINDOWS_SOURCE="$product" -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
+            cmake --build "$RUNNER_TEMP/build-$role" --target session_probe --parallel 2
+          done < "$RUNNER_TEMP/targets.tsv"
+          cc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -o "$RUNNER_TEMP/verified_iso.so" \
+            "$bench/verified_iso.c" -lcurl -pthread
+      - name: Run both official ISO probes on the same CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence"
+          export PROBE_CPU
+          PROBE_CPU="$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          pair_status=0
+          while IFS=$'\t' read -r role product_sha core_sha; do
+            iso="$RUNNER_TEMP/windows-eval-$role.sparse"
+            output="$RUNNER_TEMP/session-$role"
+            truncate -s 5550497792 "$iso"
+            chmod 400 "$iso"
+            echo "::group::$role $product_sha"
+            probe=("$RUNNER_TEMP/build-$role/session_probe" "$iso" "$output" "$STOP_TARGET" 600
+                   "$AVAILABLE_MIB" "$THRESHOLD_MIB")
+            optical_env=(EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1
+                         LD_PRELOAD="$RUNNER_TEMP/verified_iso.so" R110_REMOTE_ISO_STUB="$iso")
+            if timeout 650s taskset -c "$PROBE_CPU" env "${optical_env[@]}" "${probe[@]}" \
+              2> "$evidence/$role.stderr" | tee "$evidence/$role.stdout"; then
+              probe_exit=0
+            else
+              probe_exit=${PIPESTATUS[0]}
+              if ((probe_exit == 0)); then probe_exit=1; fi
+            fi
+            if ! PRODUCT_SHA="$product_sha" MUNDO_X_SHA="$core_sha" python3 "$bench/summarize.py" \
+              --run "$output" --transport-log "$evidence/$role.stderr" \
+              --output "$evidence/$role.json" --exit-code "$probe_exit"; then
+              pair_status=1
+            fi
+            echo '::endgroup::'
+          done < "$RUNNER_TEMP/targets.tsv"
+          if ! python3 "$bench/compare-short.py" "$evidence/reference.json" "$evidence/candidate.json" \
+            "$evidence/paired-comparison.json"; then
+            pair_status=1
+          fi
+          exit "$pair_status"
+      - name: Verify the physical ARM64 long64 oracle and RAM
+        if: ${{ success() || failure() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          product="$RUNNER_TEMP/product-candidate"
+          tests="$RUNNER_TEMP/native-tests"
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence"
+          cmake -S "$product" -B "$tests" -G Ninja -DBUILD_TESTING=ON \
+            -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
+          cmake --build "$tests" --parallel 2 --target reverse_windows_prime_ether_arm64_test \
+            reverse_windows_x86_ether_next_guest_test reverse_windows_ether_state_ram_test \
+            reverse_windows_pc_memory_fabric_test reverse_windows_pc_memory_test
+          ctest --test-dir "$tests" --parallel 1 --output-on-failure --no-tests=error \
+            -R '^reverse_windows_(prime_ether_arm64|x86_ether_next_guest|ether_state_ram|pc_memory_fabric|pc_memory)$' \
+            --output-junit "$evidence/candidate-native-arm64.xml" | tee "$evidence/candidate-native-arm64.log"
+      - name: Upload both counter reports and native test evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-real-iso-short-pair
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
