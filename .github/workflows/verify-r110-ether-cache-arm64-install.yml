@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       apk_sha256:
-        description: SHA-256 of the existing release APK from run 45136712395
+        description: SHA-256 of the existing release APK from run 45138390384
         required: true
         type: string
 
@@ -21,16 +21,16 @@ jobs:
     timeout-minutes: 20
     env:
       APP_ID: com.reversewindows.android.prime.smp.r110.ethercache
-      SOURCE_SHA: 19173e9d92a4ed0d419987415c9e7717590e00b7
-      APK_NAME: REVERSE-Windows-Prime-0.3.87-ether-cache.2-19173e9d92a4-arm64-v8a-release.apk
-      EXPECTED_APK_SHA256: ${{ inputs.apk_sha256 || '7015bb7c239db43497cc8332cf5382a5aa06718447d201f6dcfa7b4f7acd4117' }}
+      SOURCE_SHA: 08913574fc21976ba88bbbde924728059f38eeef
+      APK_NAME: REVERSE-Windows-Prime-0.3.87-ether-cache.3-08913574fc21-arm64-v8a-release.apk
+      EXPECTED_APK_SHA256: ${{ inputs.apk_sha256 || 'fea3ccea127d468a4b3b274bbdcca095e08ac3cbc5ec4e885a07fadd00168631' }}
     steps:
       - name: Download the existing ARM64 release
         uses: actions/download-artifact@v4
         with:
-          name: REVERSE-Windows-Prime-0.3.87-ether-cache.2-19173e9d92a4-ARM64
+          name: REVERSE-Windows-Prime-0.3.87-ether-cache.3-08913574fc21-ARM64
           path: arm64-release
-          run-id: 45136712395
+          run-id: 45138390384
           github-token: ${{ github.token }}
 
       - name: Enable KVM for the x86 Android emulator
@@ -63,7 +63,7 @@ jobs:
           tools="$ANDROID_HOME/build-tools/35.0.0"
           "$tools/apksigner" verify --verbose --print-certs "$apk" > "$evidence/signature.txt"
           "$tools/aapt" dump badging "$apk" > "$evidence/manifest.txt"
-          grep -Fq "package: name='$APP_ID' versionCode='118' versionName='0.3.87-ether-cache.2'" "$evidence/manifest.txt"
+          grep -Fq "package: name='$APP_ID' versionCode='119' versionName='0.3.87-ether-cache.3'" "$evidence/manifest.txt"
           grep -Fxq "native-code: 'arm64-v8a'" "$evidence/manifest.txt"
 
       - name: Prepare installation and BIOS checks
@@ -100,7 +100,7 @@ jobs:
             grep -Fxq 'Status: ok' "$evidence/launch.txt"
             adb shell dumpsys package "$APP_ID" > "$evidence/package.txt"
             grep -Fq 'primaryCpuAbi=arm64-v8a' "$evidence/package.txt"
-            grep -Fq 'versionName=0.3.87-ether-cache.2' "$evidence/package.txt"
+            grep -Fq 'versionName=0.3.87-ether-cache.3' "$evidence/package.txt"
             adb shell pidof "$APP_ID"
           } 2>&1 | tee "$evidence/install.txt"
           adb exec-out screencap -p > "$evidence/launch.png"
@@ -205,6 +205,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: prime-r110-arm64-bridge-install-19173e9d92a4
+          name: prime-r110-arm64-bridge-install-08913574fc21
           path: ${{ runner.temp }}/r110-install-evidence
           if-no-files-found: warn
