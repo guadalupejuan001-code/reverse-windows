@@ -48,9 +48,8 @@ std::string_view checkpoint_field(std::string_view diagnostic, std::string_view 
   return finish == std::string_view::npos ? "unavailable" : diagnostic.substr(start, finish - start);
 }
 
-void save_full_frame(const Session::VideoUpdate& frame, const std::filesystem::path& path,
-                     std::uint64_t* last_signature = nullptr) {
-  if (!frame.graphics || !frame.width || !frame.height) return;
+bool save_full_frame(const Session::VideoUpdate& frame, const std::filesystem::path& path) {
+  if (!frame.graphics || !frame.width || !frame.height) return false;
   const auto& packet = *frame.graphics;
   const auto pixels = std::size_t(frame.width) * frame.height;
   if (packet.empty() || packet[0] > pixels) throw std::runtime_error("Invalid frame rectangle count");
@@ -75,16 +74,6 @@ void save_full_frame(const Session::VideoUpdate& frame, const std::filesystem::p
   }
   if (at != packet.size() || std::find(covered.begin(), covered.end(), 0) != covered.end())
     throw std::runtime_error("Requested full frame has missing RGB pixels");
-  if (last_signature) {
-    // Preserve meaningful changes to the upper screen even when the lower
-    // part contains the animated loading indicator.
-    auto signature = (std::uint64_t(frame.width) << 32) | frame.height;
-    for (std::size_t pixel = 0; pixel < pixels * 2 / 3; pixel += 19)
-      for (unsigned color = 0; color < 3; ++color)
-        signature = (signature ^ rgb[pixel * 3 + color]) * UINT64_C(1099511628211);
-    if (signature == *last_signature) return;
-    *last_signature = signature;
-  }
   const auto temporary = path.string() + ".tmp";
   std::ofstream out(temporary, std::ios::binary);
   out << "P6\n" << frame.width << ' ' << frame.height << "\n255\n";
@@ -92,6 +81,7 @@ void save_full_frame(const Session::VideoUpdate& frame, const std::filesystem::p
   out.close();
   if (!out) throw std::runtime_error("Could not write the terminal RGB frame");
   std::filesystem::rename(temporary, path);
+  return true;
 }
 
 int main(int argc, char** argv) {
@@ -138,8 +128,7 @@ int main(int argc, char** argv) {
       milestone_steps.push_back(point);
     for (std::uint64_t point = 12'000'000'000ULL; point <= target; point += 500'000'000ULL)
       milestone_steps.push_back(point);
-    constexpr std::array<std::uint64_t, 4> frame_checkpoints{
-        11'500'000'000ULL, 20'000'000'000ULL, 30'000'000'000ULL, 37'000'000'000ULL};
+    constexpr std::array<std::uint64_t, 2> frame_checkpoints{11'500'000'000ULL, 16'500'000'000ULL};
     std::size_t next_milestone = 0;
     std::array<std::uint8_t, 4000> text{};
     const auto start = Clock::now();
@@ -147,7 +136,6 @@ int main(int argc, char** argv) {
     std::uint64_t engine_elapsed_ns = 0, windows = 0, maintenance_calls = 0;
     auto status = Session::Step::Running;
     std::uint64_t next_sample = 0, next_maintenance = 0, next_snapshot = 0, next_video = 0;
-    std::uint64_t video_signature = 0;
     bool reclaim_pending = false;
     while (status == Session::Step::Running && session.session_steps() < target &&
            Clock::now() - start < run_time) {
@@ -174,16 +162,25 @@ int main(int argc, char** argv) {
         ++maintenance_calls;
       }
       if (uptime >= next_snapshot) {
-        snapshots << "{\"elapsed_ms\":" << uptime << ",\"session\":" << session.diagnostic(false) << "}\n";
+        const bool near_previous_fault = session.session_steps() >= 15'500'000'000ULL;
+        snapshots << "{\"elapsed_ms\":" << uptime << ",\"session\":"
+                  << session.diagnostic(near_previous_fault) << "}\n";
+        snapshots.flush();
         if (!snapshots) throw std::runtime_error("Could not write a session snapshot");
-        next_snapshot = uptime + (session.session_steps() < 11'500'000'000ULL ? 1000U : 30000U);
+        const auto early_boot = session.session_steps() < 11'500'000'000ULL;
+        next_snapshot = uptime + (early_boot || near_previous_fault ? 1000U : 30000U);
       }
       if (session.session_steps() >= 11'500'000'000ULL && uptime >= next_video) {
         next_video = uptime + 10000;
         try {
           session.retry_video();
-          save_full_frame(session.capture_video(text.data(), text.size()),
-                          run_dir / "display-latest.ppm", &video_signature);
+          if (save_full_frame(session.capture_video(text.data(), text.size()),
+                              run_dir / "pre-fault-latest.ppm")) {
+            std::ofstream frame_info(run_dir / "pre-fault-frame.json");
+            frame_info << "{\"elapsed_ms\":" << uptime << ",\"guest_steps\":"
+                       << session.session_steps() << "}\n";
+            if (!frame_info) throw std::runtime_error("Could not write pre-fault frame timestamp");
+          }
         } catch (const std::exception& error) {
           std::cerr << "PRIME_VIDEO_OBSERVATION_ERROR " << error.what() << '\n';
         }
@@ -222,17 +219,32 @@ int main(int argc, char** argv) {
                   << " elapsed_ms=" << elapsed_ns / 1'000'000 << '\n' << std::flush;
       }
     }
-    const auto elapsed_ms = count_since<Milliseconds>(start, Clock::now());
+    const auto terminal_ns = count_since<Nanoseconds>(start, Clock::now());
+    const auto elapsed_ms = terminal_ns / 1'000'000;
+    {
+      std::ofstream report(run_dir / "session.json");
+      report << session.diagnostic(true) << '\n';
+      report.close();
+      if (!report) throw std::runtime_error("Could not write raw terminal session evidence");
+      std::ofstream terminal(run_dir / "terminal-meta.json");
+      terminal << "{\"elapsed_ns\":" << terminal_ns << ",\"native_status\":" << int(status)
+               << ",\"guest_steps\":" << session.session_steps()
+               << ",\"engine_window_ns\":" << engine_elapsed_ns << "}\n";
+      terminal.close();
+      if (!terminal) throw std::runtime_error("Could not write terminal timing evidence");
+    }
     milestones.close();
     if (!milestones) throw std::runtime_error("Could not finish the milestone log");
     snapshots.close();
     if (!snapshots) throw std::runtime_error("Could not finish the snapshot log");
-    session.retry_video();
-    const auto video = session.capture_video(text.data(), text.size());
-    save_full_frame(video, run_dir / "terminal.ppm");
-    std::ofstream report(run_dir / "session.json");
-    report << session.diagnostic(true) << '\n';
-    if (!report) throw std::runtime_error("Could not write session evidence");
+    Session::VideoUpdate video{};
+    try {
+      session.retry_video();
+      video = session.capture_video(text.data(), text.size());
+      save_full_frame(video, run_dir / "terminal.ppm");
+    } catch (const std::exception& error) {
+      std::cerr << "PRIME_TERMINAL_FRAME_ERROR " << error.what() << '\n';
+    }
     std::cout << "PRIME_NATIVE_REAL_ISO status=" << int(status) << " guest_steps="
               << session.session_steps() << " host_elapsed_ms=" << elapsed_ms << " slices=" << windows
               << " maintenance_calls=" << maintenance_calls

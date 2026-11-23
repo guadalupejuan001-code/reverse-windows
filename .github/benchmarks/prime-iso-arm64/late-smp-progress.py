@@ -38,7 +38,8 @@ summary = {
     "checkpoints": [point for point in checkpoints if point["target_steps"] >= 9_500_000_000],
 }
 (output / f"{role}-progress.json").write_text(json.dumps(summary, indent=2) + "\n")
-for name in (f"screen-{target}.ppm", "display-latest.ppm", "terminal.ppm", "text-screen.txt"):
+for name in (f"screen-{target}.ppm", "pre-fault-latest.ppm", "pre-fault-frame.json",
+             "terminal.ppm", "text-screen.txt"):
     frame = milestones.with_name(name)
     if frame.is_file():
         shutil.copyfile(frame, output / name)

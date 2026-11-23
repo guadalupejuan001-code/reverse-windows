@@ -29,7 +29,9 @@ else
   probe_exit=${PIPESTATUS[0]}
   if ((probe_exit == 0)); then probe_exit=1; fi
 fi
-for screen in "$output"/screen-*.ppm "$output/display-latest.ppm" "$output/terminal.ppm" "$output/text-screen.txt"; do
+python3 "$bench/archive-terminal-fault.py" "$output" "$evidence" "$role" "$probe_exit"
+for screen in "$output"/screen-*.ppm "$output/pre-fault-latest.ppm" "$output/pre-fault-frame.json" \
+              "$output/terminal.ppm" "$output/text-screen.txt"; do
   if [[ -f "$screen" ]]; then
     cp "$screen" "$evidence/$role-${screen##*/}"
   fi

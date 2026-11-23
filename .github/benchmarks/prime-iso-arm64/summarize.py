@@ -227,6 +227,7 @@ def continuation_record(run_dir, target):
         "rip_hex": machine["rip_hex"],
         "pending": machine["pending"],
         "message": machine["message"],
+        "cpu_fault": vm.get("cpu_fault"),
         "long64_observed": machine["cpu_mode"] == "long64" or any(p["mode"] == "long64" for p in phases),
         "restarts": boot["restarts"],
         "bios_reads": machine["disk_reads"],
