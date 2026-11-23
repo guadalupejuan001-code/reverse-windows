@@ -170,14 +170,15 @@ jobs:
               left, top, right, bottom = map(int, re.findall(r'\d+', node.get('bounds', '')))
               return (left, top, right, bottom) if right > left and bottom > top else None
 
-          def visible(field, value, *, tap=False, scroll=False, focused=False, row=False):
+          def window_xml():
+              adb('shell', 'uiautomator', 'dump', ui)
+              return adb('exec-out', 'cat', ui)
+
+          def visible(field, value, *, tap=False, scroll=False, focused=False):
               deadline = time.monotonic() + 60
               while time.monotonic() < deadline:
                   try:
-                      adb('shell', 'uiautomator', 'dump', ui)
-                      raw = adb('exec-out', 'cat', ui)
-                      root = ET.fromstring(raw)
-                      tree = list(root.iter('node'))
+                      tree = list(ET.fromstring(window_xml()).iter('node'))
                   except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ET.ParseError):
                       continue
                   for node in tree:
@@ -185,13 +186,6 @@ jobs:
                           continue
                       if focused and node.get('focused') != 'true':
                           continue
-                      if row:
-                          parents = {child: parent for parent in tree for child in parent}
-                          ancestor = node
-                          while ancestor.get('clickable') != 'true' and ancestor in parents:
-                              ancestor = parents[ancestor]
-                          if ancestor.get('clickable') == 'true':
-                              node = ancestor
                       bounds = center(node)
                       if bounds is None:
                           continue
@@ -217,6 +211,26 @@ jobs:
               (evidence / 'last-window.xml').write_bytes(adb('exec-out', 'cat', ui))
               screenshot('last-window.png')
               raise AssertionError(f'Visible {field} did not reach {value}')
+
+          def open_document(name):
+              # Android 11 DocumentsUI opens the focused RecyclerView row on Enter.
+              for _ in range(14):
+                  raw = window_xml()
+                  rows = ET.fromstring(raw).iter('node')
+                  for row in rows:
+                      if row.get('resource-id') != 'com.google.android.documentsui:id/item_root':
+                          continue
+                      if row.get('focused') != 'true' or row.get('enabled') != 'true':
+                          continue
+                      if any(node.get('text') == name for node in row.iter('node')):
+                          (evidence / 'iso-picker-focused.xml').write_bytes(raw)
+                          screenshot('iso-picker-list.png')
+                          adb('shell', 'input', 'keyevent', 'KEYCODE_ENTER')
+                          return
+                  adb('shell', 'input', 'keyevent', 'KEYCODE_TAB')
+              (evidence / 'last-window.xml').write_bytes(window_xml())
+              screenshot('last-window.png')
+              raise AssertionError(f'Document row did not receive focus: {name}')
 
           def settings():
               visible('resource-id', f'{package}:id/vm_console_menu', tap=True)
@@ -306,7 +320,8 @@ jobs:
 
           iso = Path(os.environ['RUNNER_TEMP']) / 'r110-boot-profile.iso'
           adb('push', str(iso), f'/sdcard/Download/{iso.name}')
-          # Keep touch coordinates in the same orientation during the picker handoff.
+          # Allow the file picker to display the full row on this disposable emulator.
+          adb('shell', 'wm', 'size', '720x1280')
           adb('shell', 'settings', 'put', 'system', 'accelerometer_rotation', '0')
           adb('shell', 'settings', 'put', 'system', 'user_rotation', '1')
           adb('shell', 'am', 'force-stop', package)
@@ -315,8 +330,7 @@ jobs:
           visible('resource-id', f'{package}:id/vm_select_iso', tap=True, scroll=True)
           visible('resource-id', 'com.google.android.documentsui:id/sub_menu_list', tap=True)
           visible('text', iso.name)
-          screenshot('iso-picker-list.png')
-          visible('text', iso.name, tap=True, row=True)
+          open_document(iso.name)
           visible('resource-id', f'{package}:id/vm_boot_iso', tap=True, scroll=True)
           report = verify_diagnostic('iso', 'halted')
           assert report['iso_bytes'] == iso.stat().st_size
