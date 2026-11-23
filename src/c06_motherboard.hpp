@@ -2323,6 +2323,9 @@ class PcMotherboardC06 {
   }
   void run(unsigned budget, cosmic_pc::PcMachine::RunClock::time_point deadline=
            cosmic_pc::PcMachine::RunClock::time_point::max()) {
+    // Firmware input pauses the whole VM even if a secondary CPU is first
+    // in the ready rotation.
+    if (!pc_.guest_execution_available()) return;
     const ActiveClockRun elapsed(*this);
     using Clock=cosmic_pc::PcMachine::RunClock;
     const bool timed=deadline!=Clock::time_point::max();
