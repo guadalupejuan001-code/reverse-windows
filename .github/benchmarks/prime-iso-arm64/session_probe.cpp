@@ -48,6 +48,14 @@ std::string_view checkpoint_field(std::string_view diagnostic, std::string_view 
   return finish == std::string_view::npos ? "unavailable" : diagnostic.substr(start, finish - start);
 }
 
+std::string_view checkpoint_counter(std::string_view diagnostic, std::string_view prefix) {
+  const auto field = diagnostic.find(prefix);
+  if (field == std::string_view::npos) return "unavailable";
+  const auto start = field + prefix.size();
+  const auto finish = diagnostic.find_first_not_of("0123456789", start);
+  return finish == start ? "unavailable" : diagnostic.substr(start, finish - start);
+}
+
 void save_full_frame(const Session::VideoUpdate& frame, const std::filesystem::path& path,
                      std::uint64_t* last_signature = nullptr) {
   if (!frame.graphics || !frame.width || !frame.height) return;
@@ -175,7 +183,7 @@ int main(int argc, char** argv) {
       milestone_steps.push_back(point);
     constexpr std::array<std::uint64_t, 4> frame_checkpoints{
         11'500'000'000ULL, 20'000'000'000ULL, 30'000'000'000ULL, 37'000'000'000ULL};
-    constexpr std::array<std::uint64_t, 2> wall_observations{720000, 1080000};
+    constexpr std::array<std::uint64_t, 3> wall_observations{720000, 1080000, 1320000};
     std::size_t next_milestone = 0, next_wall_observation = 0;
     std::array<std::uint8_t, 4000> text{};
     const auto start = Clock::now();
@@ -260,6 +268,8 @@ int main(int argc, char** argv) {
         std::cout << "PRIME_ISO_PROGRESS threshold=" << threshold << " guest_steps=" << retired_after
                   << " mode=" << checkpoint_field(diagnostic, "\"cpu_mode\":\"")
                   << " rip=" << checkpoint_field(diagnostic, "\"rip_hex\":\"")
+                  << " streaming_fill_bsp_steps=" << checkpoint_counter(diagnostic, "\"boot_streaming_sse_fill_steps\":")
+                  << " streaming_fill_ap_steps=" << checkpoint_counter(diagnostic, "\"secondary_streaming_sse_fill_steps\":")
                   << " elapsed_ms=" << elapsed_ns / 1'000'000 << '\n' << std::flush;
       }
     }

@@ -1,0 +1,133 @@
+name: Prime R110 ARM64 streaming fill ISO pair
+
+on:
+  push:
+    branches: [ci/prime-r110-arm64-streaming-fill]
+    paths:
+      - .github/benchmarks/prime-iso-arm64/streaming-fill-targets.json
+      - .github/workflows/prime-r110-real-iso-arm64-streaming-fill.yml
+
+permissions:
+  contents: read
+
+env:
+  AVAILABLE_MIB: '749'
+  THRESHOLD_MIB: '128'
+  STOP_TARGET: '40000000000'
+  PROBE_TIMEOUT_SECONDS: '1440'
+
+jobs:
+  native-iso-pair:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 68
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify and build both exact checkouts on the same ARM64 runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence"
+          python3 "$bench/resolve-combined.py" "$bench/streaming-fill-targets.json" > "$RUNNER_TEMP/targets.tsv"
+          cp "$bench/streaming-fill-targets.json" "$evidence/targets.json"
+          python3 - <<'PY' > "$RUNNER_TEMP/probe-cpu"
+          import os
+          cpus = sorted(os.sched_getaffinity(0))[:2]
+          if len(cpus) != 2:
+              raise SystemExit("Two physical ARM64 runner CPU slots are required")
+          print(",".join(map(str, cpus)))
+          PY
+          {
+            uname -m
+            lscpu
+            c++ --version
+            printf 'CPU affinity %s\n' "$(cat "$RUNNER_TEMP/probe-cpu")"
+            cat "$RUNNER_TEMP/targets.tsv"
+          } > "$evidence/runner.txt"
+          sudo apt-get update -qq
+          packages=(ninja-build libcurl4-openssl-dev zlib1g-dev
+                    libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri)
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${packages[@]}"
+          while IFS=$'\t' read -r role product_sha core_sha; do
+            product="$RUNNER_TEMP/product-$role"
+            bash "$bench/checkout-product.sh" "$product" "$product_sha" "$core_sha" | tee "$evidence/$role-checkout.log"
+            git -C "$product" diff --exit-code
+            git -C "$product/deps/mundo-X" diff --exit-code
+            cp "$product/config/dependencies.lock.json" "$evidence/$role-dependencies.lock.json"
+            cmake -S "$bench" -B "$RUNNER_TEMP/build-$role" -G Ninja \
+              -DREVERSE_WINDOWS_SOURCE="$product" -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
+            cmake --build "$RUNNER_TEMP/build-$role" --target session_probe --parallel 2
+          done < "$RUNNER_TEMP/targets.tsv"
+          python3 - "$evidence" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          def external_pins(role):
+              lock = json.loads((Path(sys.argv[1]) / f"{role}-dependencies.lock.json").read_text())
+              return {item["key"]: item for item in lock["components"] if item["key"] != "mundo_x"}
+          if external_pins("candidate") != external_pins("reference"):
+              raise SystemExit("The exact external dependency pins outside Mundo X differ")
+          PY
+          cc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -o "$RUNNER_TEMP/verified_iso.so" \
+            "$bench/verified_iso.c" -lcurl -pthread
+          sha256sum "$RUNNER_TEMP"/build-*/session_probe "$RUNNER_TEMP/verified_iso.so" > "$evidence/native-sha256.txt"
+      - name: Gate the ISO runs on native streaming-fill and AP correctness
+        id: native_ap
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/evidence"
+          core_test=reverse_windows_x86_ether_counter_loop_test
+          smp_test=reverse_windows_smp_guest_test
+          build="$RUNNER_TEMP/gate-candidate"
+          cmake -S "$RUNNER_TEMP/product-candidate" -B "$build" -G Ninja \
+            -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
+          cmake --build "$build" --target "$core_test" "$smp_test" --parallel 2
+          affinity=$(cut -d, -f1 "$RUNNER_TEMP/probe-cpu")
+          taskset -c "$affinity" "$build/$smp_test" --test-secondary-streaming-fill \
+            | tee "$evidence/native-ap-streaming-fill.log"
+          taskset -c "$affinity" ctest --test-dir "$build" --output-on-failure -V \
+            -R '^reverse_windows_(x86_ether_counter_loop|smp_guest)$' \
+            --no-tests=error --output-junit "$evidence/native-ap-oracles.xml" | tee "$evidence/native-ap-oracles.log"
+      - name: Observe the exact streaming-fill candidate for 24 minutes
+        shell: bash
+        run: |
+          bash "$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64/run-combined-role.sh" candidate
+      - name: Summarize the experimental counters before the same-runner control
+        if: ${{ (success() || failure()) && steps.native_ap.outcome == 'success' }}
+        shell: bash
+        run: |
+          python3 "$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64/streaming-fill-progress.py" \
+            "$RUNNER_TEMP/evidence" --candidate-only
+      - name: Preserve the candidate observation
+        if: ${{ (success() || failure()) && steps.native_ap.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-streaming-fill-candidate
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
+      - name: Observe the unchanged .7 control on the same CPUs for 24 minutes
+        if: ${{ (success() || failure()) && steps.native_ap.outcome == 'success' }}
+        shell: bash
+        run: |
+          # The candidate already exported its evidence. Reclaim the disposable
+          # VM disk and RAM backing before requesting the same profile again.
+          rm -rf -- "$RUNNER_TEMP/session-candidate"
+          bash "$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64/run-combined-role.sh" reference
+      - name: Compare matched fixed-time and 10B to 11.5B observations
+        if: ${{ (success() || failure()) && steps.native_ap.outcome == 'success' }}
+        shell: bash
+        run: |
+          python3 "$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64/streaming-fill-progress.py" \
+            "$RUNNER_TEMP/evidence"
+      - name: Preserve pinned native tests and both real ISO observations
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-streaming-fill-pair
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn

@@ -14,7 +14,8 @@ NATIVE = ("translated", "executed_blocks", "cache_hits", "data_fallbacks", "gues
           "on_bus_register_steps", "register_bus_reacquisitions", "register_bus_reacquire_samples",
           "register_bus_reacquire_contentions", "register_bus_reacquire_wait_ns")
 BOOT_LOOPS = ("boot_scan_loop_steps", "boot_forward_copy_loop_steps", "boot_zero_loop_steps",
-              "boot_rep_elements", "boot_rep_direct_page_copy_bytes", "boot_counter_loop_steps")
+              "boot_rep_elements", "boot_rep_direct_page_copy_bytes", "boot_counter_loop_steps",
+              "boot_streaming_sse_fill_steps", "secondary_streaming_sse_fill_steps")
 RAM = ("usable_bytes", "resident_bytes", "resident_metadata_bytes", "backing_budget_bytes",
        "spill_limit_bytes", "spilled_bytes", "spill_file_payload_bytes", "spill_reads", "spill_writes",
        "spill_write_calls", "spill_cache_bytes", "spill_cache_capacity_bytes", "spill_grouped_pages",
@@ -45,6 +46,7 @@ BOOT_PROFILE_STATE = ("steps", "total_processor_steps", "ether_arm64_steps", "st
 EARLY_LONG64 = tuple(range(750_000_000, 1_000_000_001, 50_000_000))
 LATE_LONG64 = tuple(range(8_200_000_000, 8_650_000_001, 50_000_000))
 AFTER_8_65B = (8_650_000_000, 9_000_000_000, 9_250_000_000, 9_500_000_000)
+WALL_OBSERVATIONS_MS = (720000, 1080000, 1320000)
 RANGES = re.compile(
     r"REMOTE_ISO requests=(\d+) verified_ranges=(\d+) downloaded=(\d+) delivered=(\d+) failed=(\d+)"
     r" first_offset=(\d+) last_byte=(\d+)"
@@ -83,6 +85,18 @@ def load_checkpoint(record):
         "irq_delivered": vm["irq"]["delivered"],
         "started_vcpus": topology["started"],
         "guest_tsc_hz": topology.get("guest_tsc_hz"),
+        "machine_inputs": {
+            "media_bytes": vm.get("iso_bytes"),
+            "boot_kind": machine.get("boot_kind"),
+            "guest_tsc_hz": topology.get("guest_tsc_hz"),
+            "logical_processors": topology.get("logical_processors"),
+            "ram_usable_bytes": vm["ram_profile"].get("usable_bytes"),
+            "ram_address_space_bytes": vm["ram_profile"].get("address_space_bytes"),
+            "ram_backend": vm["ram_profile"].get("memory_backend"),
+            "ram_spill_backend": vm["ram_profile"].get("spill_backend") or "none",
+            "system_disk_bytes": vm["disk"].get("logical_bytes"),
+            "data_disk_bytes": vm.get("data_disk", {}).get("logical_bytes", 0),
+        },
         "tsc_access": topology.get("tsc_access"),
         "tsc_access_by_logical_processor": topology.get("tsc_access_by_logical_processor"),
         "smp": pick(topology, SMP),
@@ -368,11 +382,17 @@ def main():
             "process_peak_rss_bytes": wall["process_peak_rss_bytes"],
             "session": vm,
         })
+        summary["wall_observations"] = {
+            str(point): load_checkpoint(json.loads(observation.read_text()))
+            for point in WALL_OBSERVATIONS_MS
+            if (observation := args.run / f"wall-{point}.json").is_file()
+        }
         summary["validated_measurement"] = bool(
             args.exit_code == 0 and valid_source
             and wall["elapsed_ms"] >= wall["requested_wall_ms"]
-            and summary["terminal_observation"]["mundo_x_source_sha"] == core_sha
-            and all((args.run / f"wall-{point}.json").is_file() for point in (720000, 1080000))
+            and {point["mundo_x_source_sha"] for point in [summary["terminal_observation"],
+                 *checkpoints.values(), *summary["wall_observations"].values()]} == {core_sha}
+            and set(summary["wall_observations"]) == set(map(str, WALL_OBSERVATIONS_MS))
         )
     args.output.write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))

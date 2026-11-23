@@ -37,4 +37,5 @@ for screen in "$output"/screen-*.ppm "$output"/wall-*.ppm "$output"/wall-*.txt "
   fi
 done
 PRODUCT_SHA="$product_sha" MUNDO_X_SHA="$core_sha" python3 "$bench/summarize.py" \
-  --run "$output" --transport-log "$evidence/$role.stderr" --output "$evidence/$role.json" --exit-code "$probe_exit"
+  --run "$output" --transport-log "$evidence/$role.stderr" --output "$evidence/$role.json" --exit-code "$probe_exit" \
+  > /dev/null
