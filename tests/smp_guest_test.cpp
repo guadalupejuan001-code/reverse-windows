@@ -678,9 +678,15 @@ void test_ether_worker_block() {
         steps = cpu.try_ether_arm64_block(3,&lock);
     }
     require(steps == 3 && cpu.regs[Cpu::EAX] == 42 && lock.owns_lock(),
-            "the private ARM64 block retires and returns with the bus lock held");
+            "the ARM64 block retires and returns with the bus lock held");
+#if PRIME_HAS_C06_READY_WAKE_TESTS
+    require(cpu.ether_arm64_stats().on_bus_register_steps == steps &&
+            cpu.ether_arm64_stats().off_bus_register_steps == 0,
+            "a short native block must keep the current bus grant");
+#else
     require(cpu.ether_arm64_stats().off_bus_register_steps == steps,
             "the retired register work must have run outside the bus lock");
+#endif
 
     constexpr unsigned loop = address + 32;
     constexpr std::uint8_t loop_code[] = {
@@ -1242,6 +1248,9 @@ void test_signed_projection_with_smp_quantum(bool threaded) {
     const auto ap_start = board.processor_steps(1);
     const auto projected_start = board.processor_state_vector_steps(0);
     const auto off_bus_start = cpu.ether_arm64_stats().off_bus_register_steps;
+#if PRIME_HAS_C06_READY_WAKE_TESTS
+    const auto on_bus_start = cpu.ether_arm64_stats().on_bus_register_steps;
+#endif
     board.run(2 * quantum);
     const auto projected = board.processor_state_vector_steps(0) - projected_start;
     require(!cpu.fault && !board.faulted_cpu() && cpu.flag(Cpu::IF) && cpu.eip == loop &&
@@ -1253,10 +1262,18 @@ void test_signed_projection_with_smp_quantum(bool threaded) {
             "both CPUs must receive exactly one quantum");
     if (threaded) {
         const auto off_bus = cpu.ether_arm64_stats().off_bus_register_steps - off_bus_start;
+#if PRIME_HAS_C06_READY_WAKE_TESTS
+        const auto on_bus = cpu.ether_arm64_stats().on_bus_register_steps - on_bus_start;
+        require(board.worker_count() == 2 && board.threaded_smp_stats().peak_workers == 2 &&
+                    on_bus == quantum && off_bus == 0 && !projected,
+                "short interruptible blocks keep their native bus grant while the AP has a worker");
+        std::cout << "SMP_THREADED_ARM64_PASS workers=2 on_bus_steps=" << on_bus << '\n';
+#else
         require(board.worker_count() == 2 && board.threaded_smp_stats().peak_workers == 2 &&
                     off_bus == quantum && !projected,
                 "the BSP must run native register blocks outside the bus while the scalar AP has a worker");
         std::cout << "SMP_THREADED_ARM64_PASS workers=2 off_bus_steps=" << off_bus << '\n';
+#endif
     } else {
         require(board.worker_count() == 1 && projected == 28,
                 "the serial 32-step SMP grant must project the signed loop");
