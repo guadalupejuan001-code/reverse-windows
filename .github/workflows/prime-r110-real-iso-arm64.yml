@@ -1,8 +1,8 @@
-name: Prime R110 official ISO boot diagnostic on physical ARM64
+name: Prime R110 early boot module scan on physical ARM64
 
 on:
   push:
-    branches: [ci/prime-r110-real-iso-boot-diagnostic]
+    branches: [ci/prime-r110-real-iso-early-module]
     paths: [.github/workflows/prime-r110-real-iso-arm64.yml]
 
 permissions:
@@ -13,13 +13,13 @@ env:
   MUNDO_X_SHA: 5158b206b0904b96838323e6628cdaf83b22c129
   AVAILABLE_MIB: '510'
   THRESHOLD_MIB: '128'
-  STOP_TARGET: '9500000000'
-  PROBE_TIMEOUT_SECONDS: '1800'
+  STOP_TARGET: '1000000000'
+  PROBE_TIMEOUT_SECONDS: '600'
 
 jobs:
   real-iso-slice:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 40
+    timeout-minutes: 20
     steps:
       - name: Check out the benchmark
         uses: actions/checkout@v7
@@ -78,6 +78,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-real-iso-boot-diagnostic
-          path: ${{ runner.temp }}/evidence/
+          name: prime-r110-arm64-real-iso-early-module
+          path: |
+            ${{ runner.temp }}/evidence/boot-diagnostic.json
+            ${{ runner.temp }}/evidence/guest-*.png
           if-no-files-found: warn

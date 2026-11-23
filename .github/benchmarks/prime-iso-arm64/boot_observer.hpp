@@ -105,6 +105,7 @@ inline std::string basename(const std::uint8_t* data, std::size_t size) {
 
 struct Module {
   std::uint64_t base = 0, rva = 0;
+  std::uint64_t timestamp = 0, image_size = 0, entrypoint_rva = 0;
   std::string header_sha256, export_name, pdb_basename, debug_id_sha256;
   bool named() const noexcept { return !export_name.empty() || !pdb_basename.empty(); }
 };
@@ -146,6 +147,9 @@ inline std::optional<Module> containing_image(const GuestView& view, std::uint64
   Module module;
   module.base = base;
   module.rva = rip_rva;
+  module.timestamp = little(nt.data() + 8, 4);
+  module.image_size = image_size;
+  module.entrypoint_rva = little(optional.data() + 16, 4);
   module.header_sha256 = digest(optional.data(), optional_size);
   const auto directories = little(optional.data() + 108, 4);
   if (directories && optional_size >= 120) {
@@ -257,6 +261,9 @@ inline bool sample(Session& session, std::ostream& out, const std::filesystem::p
       << ",\"error\":" << Pc::quote(frame.error) << "},\"module\":";
   if (module) {
     out << "{\"image_base\":" << Pc::quote(hex(module->base)) << ",\"rip_rva\":" << Pc::quote(hex(module->rva))
+        << ",\"machine\":\"0x8664\",\"timestamp\":" << module->timestamp
+        << ",\"size_of_image\":" << module->image_size
+        << ",\"entrypoint_rva\":" << Pc::quote(hex(module->entrypoint_rva))
         << ",\"pe_optional_header_sha256\":" << Pc::quote(module->header_sha256) << ",\"export_name\":"
         << Pc::quote(module->export_name) << ",\"pdb_basename\":" << Pc::quote(module->pdb_basename)
         << ",\"codeview_identifier_sha256\":" << Pc::quote(module->debug_id_sha256) << '}';

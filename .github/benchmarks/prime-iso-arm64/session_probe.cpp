@@ -89,13 +89,9 @@ int main(int argc, char** argv) {
     std::ofstream observations(run_dir / "boot-observations.jsonl");
     if (!observations) throw std::runtime_error("Could not open boot observations");
     std::vector<std::uint64_t> milestone_steps{350'000'000, 400'000'000, 700'000'000};
+    for (std::uint64_t point = 710'000'000; point <= 740'000'000; point += 10'000'000)
+      milestone_steps.push_back(point);
     for (std::uint64_t point = 750'000'000; point <= 1'000'000'000; point += 50'000'000)
-      milestone_steps.push_back(point);
-    for (std::uint64_t point = 1'500'000'000; point <= 8'000'000'000; point += 500'000'000)
-      milestone_steps.push_back(point);
-    for (std::uint64_t point = 8'200'000'000; point <= 8'650'000'000; point += 50'000'000)
-      milestone_steps.push_back(point);
-    for (const auto point : {9'000'000'000ULL, 9'250'000'000ULL, 9'500'000'000ULL})
       milestone_steps.push_back(point);
     std::size_t next_milestone = 0;
     std::vector<GuestSlice> windows;
@@ -164,16 +160,8 @@ int main(int argc, char** argv) {
                   << " mode=" << checkpoint_field(diagnostic, "\"cpu_mode\":\"")
                   << " rip=" << checkpoint_field(diagnostic, "\"rip_hex\":\"")
                   << " elapsed_ms=" << elapsed_ns / 1'000'000 << '\n' << std::flush;
-        if (threshold == 8'500'000'000 || threshold == 8'550'000'000 || threshold == 8'650'000'000 ||
-            threshold >= 9'000'000'000) {
-          const bool named = boot_observer::sample(session, observations, run_dir, std::to_string(threshold));
-          if (!named && threshold == 8'650'000'000 && status == Session::Step::Running &&
-              !session.diagnostic_restarts()) {
-            std::ofstream trace(run_dir / "bounded-trace.jsonl");
-            if (!trace) throw std::runtime_error("Could not open the bounded diagnostic trace");
-            status = boot_observer::trace(session, trace);
-          }
-        }
+        if (threshold >= 700'000'000)
+          boot_observer::sample(session, observations, run_dir, std::to_string(threshold));
       }
     }
     const auto elapsed_ms = count_since<Milliseconds>(start, Clock::now());

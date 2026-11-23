@@ -53,9 +53,6 @@ frames = {}
 for observation in observations:
     render(observation["frame"], observation["label"], args.run, args.output, frames)
 checkpoints = [load_checkpoint(row) for row in lines(args.run / "milestones.jsonl")]
-trace = list(lines(args.run / "bounded-trace.jsonl"))
-if len(trace) > 64:
-    raise ValueError("Instruction trace exceeded its fixed limit")
 transport_log = args.transport_log.read_text()
 transport = RANGES.search(transport_log)
 extents = re.search(r"REMOTE_ISO_BOOT_RANGES el_torito_image=(\d+) bootmgr=(\d+) bcd=(\d+) boot_wim=(\d+)",
@@ -86,7 +83,6 @@ summary = {
     "continuation": continuation_record(args.run, int(os.environ["STOP_TARGET"])),
     "checkpoints": checkpoints,
     "boot_observations": observations,
-    "trace_at_8_65b_if_module_unnamed": trace,
 }
 if checkpoints:
     summary["last_sampled_steps"] = checkpoints[-1]["actual_steps"]
