@@ -1,0 +1,73 @@
+name: R110 native ARM64 shared bus A-B
+on:
+  push:
+    branches: [ci/prime-r110-native-smp-sustained]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  short-blocks:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    env:
+      REFERENCE_PRODUCT: 433b2d7d6cd7d785c3c8cfe186e9f60c06f25387
+      REFERENCE_MUNDO: 5e460d2971068535c2cd9a68f25fb143034de92c
+      CANDIDATE_PRODUCT: 64b24f000e1774fb8fb0c28ea130180192baac6b
+      CANDIDATE_MUNDO: 9bda35773a1d634fcf1c29566da9093f62d6c70b
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REFERENCE_PRODUCT }}
+          path: reference
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANDIDATE_PRODUCT }}
+          path: candidate
+          persist-credentials: false
+      - name: Verify revisions and compile the same workload for both engines
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          bench="$PWD/.github/benchmarks/prime-r110-native-smp"
+          mkdir build evidence
+          for flavor in reference candidate; do
+            if [[ "$flavor" == reference ]]; then
+              product="$REFERENCE_PRODUCT"
+              engine="$REFERENCE_MUNDO"
+              stats=()
+            else
+              product="$CANDIDATE_PRODUCT"
+              engine="$CANDIDATE_MUNDO"
+              stats=(-DREGISTER_BUS_STATS=1)
+            fi
+            checkout="$PWD/$flavor"
+            test "$(git -C "$checkout" rev-parse HEAD)" = "$product"
+            (cd "$checkout" && python3 scripts/verify_deps.py --checkout)
+            test "$(git -C "$checkout/deps/mundo-X" rev-parse HEAD)" = "$engine"
+            cp "$checkout/config/dependencies.lock.json" "evidence/$flavor-dependencies.lock.json"
+            printf '%s product=%s mundo_x=%s\n' "$flavor" "$product" "$engine" | tee -a evidence/revisions.txt
+            c++ -std=c++17 -O2 -DNDEBUG -DMUNDO_X_PC_STATE_RAM=1 -frounding-math -pthread "${stats[@]}" \
+              -I"$checkout/src" -I"$PWD/reference/tests" -I"$checkout/deps/mundo-X/pc-android/native" \
+              -I"$checkout/deps/mundo-X/native/include" -I"$checkout/deps/Virtual-qSSD-/include" \
+              -I"$checkout/deps/GPU-VIRTUAL/include" "$bench/short-bus-bench.cpp" -lz -o "build/$flavor"
+          done
+          (uname -a && lscpu && c++ --version) > evidence/runner.txt
+          sha256sum build/reference build/candidate "$bench/short-bus-bench.cpp" "$bench/compare.py" \
+            > evidence/SHA256SUMS
+      - name: Compare the two native lanes with fixed guest work
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/benchmarks/prime-r110-native-smp/compare.py \
+            build/reference build/candidate evidence/paired-smp.json | tee evidence/paired-smp.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: r110-native-arm64-shared-bus-paired
+          path: evidence
+          if-no-files-found: error
