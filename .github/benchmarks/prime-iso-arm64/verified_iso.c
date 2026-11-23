@@ -39,6 +39,28 @@ static uint64_t clock_id, requests, downloads, delivered, downloaded_bytes;
 static uint64_t first_fetched_offset = UINT64_MAX, last_fetched_byte;
 static int active, failed;
 
+// Independently verified extents of the pinned lab ISO. These counters sum
+// bytes that guest reads successfully receive, including repeated accesses.
+static struct {
+    const char* label;
+    uint64_t start, length, returned;
+} boot_extents[] = {
+    { "el_torito_image", UINT64_C(514) * 2048, 4096, 0 },
+    { "bootmgr", UINT64_C(2230) * 2048, 413738, 0 },
+    { "bcd", UINT64_C(3223) * 2048, 16384, 0 },
+    { "boot_wim", UINT64_C(11113) * 2048, 673876802, 0 },
+};
+
+static void count_boot_extents(uint64_t start, uint64_t length) {
+    for (size_t i = 0; i < sizeof(boot_extents) / sizeof(boot_extents[0]); ++i) {
+        const uint64_t begin = start > boot_extents[i].start ? start : boot_extents[i].start;
+        const uint64_t extent_end = boot_extents[i].start + boot_extents[i].length;
+        const uint64_t end = start + length < extent_end ? start + length : extent_end;
+        if (end > begin) boot_extents[i].returned += end - begin;
+    }
+}
+
+
 static size_t write_bytes(char* data, size_t size, size_t count, void* opaque) {
     struct download* dl = opaque;
     const size_t amount = size * count;
@@ -137,6 +159,10 @@ static void close_remote_iso(void) {
         " first_offset=%" PRIu64 " last_byte=%" PRIu64 "\n",
         requests, downloads, downloaded_bytes, delivered, failed,
         downloads ? first_fetched_offset : 0, last_fetched_byte);
+    fputs("REMOTE_ISO_BOOT_RANGES", stderr);
+    for (size_t i = 0; i < sizeof(boot_extents) / sizeof(boot_extents[0]); ++i)
+        fprintf(stderr, " %s=%" PRIu64, boot_extents[i].label, boot_extents[i].returned);
+    fputc('\n', stderr);
     if (transfer) curl_easy_cleanup(transfer);
     curl_global_cleanup();
 }
@@ -167,6 +193,7 @@ static ssize_t read_remote_locked(void* into, size_t size, off64_t offset) {
         copied += take;
     }
     delivered += copied;
+    count_boot_extents((uint64_t)offset, copied);
     return (ssize_t)copied;
 }
 

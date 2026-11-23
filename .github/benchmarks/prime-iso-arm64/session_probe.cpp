@@ -1,4 +1,4 @@
-#include "android_boot_session.hpp"
+#include "boot_observer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -86,12 +86,16 @@ int main(int argc, char** argv) {
     if (!snapshots) throw std::runtime_error("Could not open the snapshot log");
     std::ofstream milestones(run_dir / "milestones.jsonl");
     if (!milestones) throw std::runtime_error("Could not open the milestone log");
+    std::ofstream observations(run_dir / "boot-observations.jsonl");
+    if (!observations) throw std::runtime_error("Could not open boot observations");
     std::vector<std::uint64_t> milestone_steps{350'000'000, 400'000'000, 700'000'000};
     for (std::uint64_t point = 750'000'000; point <= 1'000'000'000; point += 50'000'000)
       milestone_steps.push_back(point);
     for (std::uint64_t point = 1'500'000'000; point <= 8'000'000'000; point += 500'000'000)
       milestone_steps.push_back(point);
     for (std::uint64_t point = 8'200'000'000; point <= 8'650'000'000; point += 50'000'000)
+      milestone_steps.push_back(point);
+    for (const auto point : {9'000'000'000ULL, 9'250'000'000ULL, 9'500'000'000ULL})
       milestone_steps.push_back(point);
     std::size_t next_milestone = 0;
     std::vector<GuestSlice> windows;
@@ -105,7 +109,7 @@ int main(int argc, char** argv) {
     std::uint64_t next_sample = 0, next_maintenance = 0, next_snapshot = 0;
     bool reclaim_pending = false;
     while (status == Session::Step::Running && session.session_steps() < target &&
-           Clock::now() - start < run_time) {
+           !session.diagnostic_restarts() && Clock::now() - start < run_time) {
       const auto due_at = Clock::now();
       const auto uptime = count_since<Milliseconds>(start, due_at);
       if (uptime >= next_maintenance) {
@@ -160,6 +164,16 @@ int main(int argc, char** argv) {
                   << " mode=" << checkpoint_field(diagnostic, "\"cpu_mode\":\"")
                   << " rip=" << checkpoint_field(diagnostic, "\"rip_hex\":\"")
                   << " elapsed_ms=" << elapsed_ns / 1'000'000 << '\n' << std::flush;
+        if (threshold == 8'500'000'000 || threshold == 8'550'000'000 || threshold == 8'650'000'000 ||
+            threshold >= 9'000'000'000) {
+          const bool named = boot_observer::sample(session, observations, run_dir, std::to_string(threshold));
+          if (!named && threshold == 8'650'000'000 && status == Session::Step::Running &&
+              !session.diagnostic_restarts()) {
+            std::ofstream trace(run_dir / "bounded-trace.jsonl");
+            if (!trace) throw std::runtime_error("Could not open the bounded diagnostic trace");
+            status = boot_observer::trace(session, trace);
+          }
+        }
       }
     }
     const auto elapsed_ms = count_since<Milliseconds>(start, Clock::now());
@@ -180,32 +194,22 @@ int main(int argc, char** argv) {
                       << row.sampled_pressure << ',' << row.pending_reclaim << ',' << row.preparing << '\n';
     maintenance_log.close();
     if (!maintenance_log) throw std::runtime_error("Could not write the maintenance timing log");
-    std::array<std::uint8_t,4000> text{};
-    const auto video = session.capture_video(text.data(), text.size());
+    boot_observer::sample(session, observations, run_dir, "terminal");
     std::ofstream report(run_dir / "session.json");
     report << session.diagnostic(true) << '\n';
     if (!report) throw std::runtime_error("Could not write session evidence");
-    std::cout << "PRIME_NATIVE_REAL_ISO status=" << int(status) << " guest_steps="
-              << session.session_steps() << " host_elapsed_ms=" << elapsed_ms << " slices=" << windows.size()
-              << " maintenance_calls=" << maintenance.size()
-              << " available_mib=" << available_mib << " threshold_mib=" << threshold_mib
-              << " initial_budget_bytes=" << ram.backing_bytes
-              << " screen=" << video.width << 'x' << video.height << " text_bytes=" << video.text_bytes
-              << " graphics_words=" << (video.graphics ? video.graphics->size() : 0) << '\n';
-    if (video.text_bytes) {
-      std::ofstream output(run_dir / "text-screen.txt");
-      for (unsigned row=0; row<25; ++row) {
-        std::string line;
-        for (unsigned col=0; col<80; ++col) {
-          const auto ch = text[(row*80+col)*2];
-          line += ch >= 32 && ch <= 126 ? char(ch) : ' ';
-        }
-        const auto last = line.find_last_not_of(' ');
-        if (last != std::string::npos) output << line.substr(0,last+1);
-        output << '\n';
-      }
-      if (!output) throw std::runtime_error("Could not write text screen evidence");
-    }
+    const char* stop_reason = session.diagnostic_restarts() ? "guest_restart" :
+        status == Session::Step::Fault ? "guest_fault" :
+        status == Session::Step::WaitingKey ? "waiting_for_key" :
+        status == Session::Step::Halted ? "guest_halted" :
+        session.session_steps() >= target ? "target_reached" : "time_cap";
+    std::ofstream stop(run_dir / "stop.json");
+    stop << "{\"stop_reason\":\"" << stop_reason << "\",\"elapsed_ms\":" << elapsed_ms
+         << ",\"actual_steps\":" << session.session_steps() << ",\"target_steps\":" << target << "}\n";
+    if (!stop) throw std::runtime_error("Could not write stop evidence");
+    std::cout << "PRIME_NATIVE_REAL_ISO stop=" << stop_reason << " guest_steps=" << session.session_steps()
+              << " host_elapsed_ms=" << elapsed_ms << " initial_budget_bytes=" << ram.backing_bytes
+              << '\n' << std::flush;
     session.flush();
     return status == Session::Step::Fault ? 2 : 0;
   } catch (const std::exception& error) {

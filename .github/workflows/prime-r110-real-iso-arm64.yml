@@ -1,8 +1,8 @@
-name: Prime R110 official ISO ARM64 long64 measurement
+name: Prime R110 official ISO boot diagnostic on physical ARM64
 
 on:
   push:
-    branches: [ci/prime-r110-real-iso-arm64-long64]
+    branches: [ci/prime-r110-real-iso-boot-diagnostic]
     paths: [.github/workflows/prime-r110-real-iso-arm64.yml]
 
 permissions:
@@ -13,13 +13,13 @@ env:
   MUNDO_X_SHA: 5158b206b0904b96838323e6628cdaf83b22c129
   AVAILABLE_MIB: '510'
   THRESHOLD_MIB: '128'
-  STOP_TARGET: '8650000000'
-  PROBE_TIMEOUT_SECONDS: '2700'
+  STOP_TARGET: '9500000000'
+  PROBE_TIMEOUT_SECONDS: '1800'
 
 jobs:
   real-iso-slice:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 55
+    timeout-minutes: 40
     steps:
       - name: Check out the benchmark
         uses: actions/checkout@v7
@@ -40,7 +40,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update -qq
-          packages=(ninja-build libcurl4-openssl-dev zlib1g-dev
+          packages=(ninja-build libcurl4-openssl-dev libssl-dev zlib1g-dev python3-pil
                     libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri)
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${packages[@]}"
           cmake_flags=(-DREVERSE_WINDOWS_SOURCE="$RUNNER_TEMP/product"
@@ -49,7 +49,7 @@ jobs:
           cmake --build "$RUNNER_TEMP/build" --target session_probe --parallel 2
           cc_flags=(-std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -o "$RUNNER_TEMP/verified_iso.so")
           cc "${cc_flags[@]}" .github/benchmarks/prime-iso-arm64/verified_iso.c -lcurl -pthread
-      - name: Measure the production session against verified Microsoft ISO bytes
+      - name: Observe the production session against verified Microsoft ISO bytes
         shell: bash
         run: |
           iso="$RUNNER_TEMP/windows-eval.sparse"
@@ -72,12 +72,12 @@ jobs:
             if ((probe_exit == 0)); then probe_exit=1; fi
           fi
           report=(--run "$output" --transport-log "$evidence/probe.stderr"
-                  --output "$evidence/r110-arm64-long64.json" --exit-code "$probe_exit")
-          python3 .github/benchmarks/prime-iso-arm64/summarize.py "${report[@]}"
-      - name: Upload the counter report and probe progress
+                  --output "$evidence" --exit-code "$probe_exit")
+          /usr/bin/python3 .github/benchmarks/prime-iso-arm64/export-observations.py "${report[@]}"
+      - name: Upload only boot observations and guest screenshots
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-real-iso-long64
+          name: prime-r110-arm64-real-iso-boot-diagnostic
           path: ${{ runner.temp }}/evidence/
           if-no-files-found: warn
