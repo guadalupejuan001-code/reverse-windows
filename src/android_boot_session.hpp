@@ -700,6 +700,8 @@ class AndroidBootSession final {
         << ",\"init_targets_queued\":" << startup.init_targets_queued
         << ",\"sipi_targets_queued\":" << startup.sipi_targets_queued
         << ",\"sipi_targets_applied\":" << startup.sipi_targets_applied << '}';
+    out << ",\"tsc_access\":";
+    write_tsc_access(out, execution.tsc_access);
     if (detailed) {
       out << ",\"states_by_logical_processor\":[";
       for (unsigned id = 0; id < topology.logical_processors(); ++id)
@@ -733,7 +735,10 @@ class AndroidBootSession final {
             << "\",\"cr3_hex\":\"" << std::setw(16) << position.cr3
             << std::dec << std::setfill(' ') << "\",\"flags\":" << position.flags
             << ",\"steps\":" << board_->processor_steps(id)
-            << ",\"ether_arm64_steps\":" << board_->processor_ether_arm64_steps(id) << '}';
+            << ",\"ether_arm64_steps\":" << board_->processor_ether_arm64_steps(id)
+            << ",\"tsc_access\":";
+        write_tsc_access(out, board_->processor_tsc_access_stats(id));
+        out << '}';
       }
       out << ']';
     }

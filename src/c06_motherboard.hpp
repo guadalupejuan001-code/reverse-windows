@@ -2297,6 +2297,9 @@ class PcMotherboardC06 {
   std::uint64_t processor_steps(unsigned id) const noexcept {
     return apics_[id].cpu->instructions + retired_before_init_[id];
   }
+  const cosmic_pc::Cpu::TscAccessStats& processor_tsc_access_stats(unsigned id) const noexcept {
+    return apics_[id].cpu->tsc_access_stats();
+  }
   const BusWaitStats& processor_bus_wait(unsigned id) const noexcept { return bus_wait_[id]; }
   RamViewStats processor_ram_views(unsigned id) const noexcept {
     auto result = ram_views_before_init_[id];
@@ -2320,6 +2323,7 @@ class PcMotherboardC06 {
     std::uint64_t state_vector_interpreter_steps = 0;
     unsigned processors_with_projected_steps = 0;
     RamViewStats ram_views;
+    cosmic_pc::Cpu::TscAccessStats tsc_access;
     std::uint64_t bus_samples = 0, bus_contended = 0, bus_wait_ns = 0;
   };
   CpuExecutionTotals cpu_execution_totals() const noexcept {
@@ -2331,6 +2335,12 @@ class PcMotherboardC06 {
       totals.bus_contended += wait.contended;
       totals.bus_wait_ns += wait.wait_ns;
       const auto projected = processor_state_vector_steps(id);
+      const auto& tsc = processor_tsc_access_stats(id);
+      totals.tsc_access.rdtsc += tsc.rdtsc;
+      totals.tsc_access.read_tsc += tsc.read_tsc;
+      totals.tsc_access.write_tsc += tsc.write_tsc;
+      totals.tsc_access.read_adjust += tsc.read_adjust;
+      totals.tsc_access.write_adjust += tsc.write_adjust;
       totals.guest_steps += processor_steps(id);
       totals.ether_steps += processor_ether_arm64_steps(id);
       totals.projected_steps += projected;

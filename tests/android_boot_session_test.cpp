@@ -142,8 +142,15 @@ void verify_profile_first_secondary() {
   pc.boot_demo();
   pc.cpu.reset(0, 0x7100);
   pc.cpu.a20_enabled = true;
-  pc.cpu.write16(0x7100, 0xfeeb);  // BSP spins in a short branch.
-  pc.cpu.write16(0x8000, 0xf4fa);  // Secondary disables interrupts and halts.
+  pc.cpu.use_windows_x64_profile();
+  constexpr std::uint8_t boot[] = {0x0f, 0x31, 0xeb, 0xfe};  // RDTSC; spin.
+  constexpr std::uint8_t ap[] = {
+      0x0f, 0x31, 0x0f, 0x31,                          // RDTSC twice.
+      0x66, 0x31, 0xc0, 0x66, 0x31, 0xd2,              // Clear EAX and EDX.
+      0x66, 0xb9, 0x3b, 0x00, 0x00, 0x00,              // ECX = IA32_TSC_ADJUST.
+      0x0f, 0x30, 0x0f, 0x32, 0xfa, 0xf4};             // WRMSR; RDMSR; CLI; HLT.
+  pc.cpu.memory.write_block(0x7100, boot, sizeof(boot));
+  pc.cpu.memory.write_block(0x8000, ap, sizeof(ap));
   Board board(pc, nullptr, {}, 0, {}, nullptr, {1, 2});
   reverse_windows::BootProfile profile(4096);
   profile.begin(pc, board);
@@ -153,9 +160,13 @@ void verify_profile_first_secondary() {
   board.run(64);
   profile.after_run(pc, board);
   const auto secondary = board.processor_position(1);
-  require(std::string(secondary.mode) == "real16" && secondary.cs == 0x800 && secondary.rip == 2 &&
-              secondary.flags == 2 && board.processor_steps(1) == 2,
+  require(std::string(secondary.mode) == "real16" && secondary.cs == 0x800 && secondary.rip == sizeof(ap) &&
+              !(secondary.flags & cosmic_pc::Cpu::IF) && board.processor_steps(1) == 9,
           "Position and steps must describe the secondary's executed startup instructions");
+  const auto& ap_tsc = board.processor_tsc_access_stats(1);
+  require(board.processor_tsc_access_stats(0).rdtsc == 1 &&
+              ap_tsc.rdtsc == 2 && ap_tsc.read_adjust == 1 && ap_tsc.write_adjust == 1,
+          "Each processor must report its own retired clock instructions");
   std::ostringstream out;
   profile.write_json(out, pc, board);
   const auto report = out.str();
@@ -165,6 +176,10 @@ void verify_profile_first_secondary() {
   require(counter(observation, "started_vcpus") == 2 && counter(observation, "sipi_targets_applied") == 1 &&
               counter(observation, "total_processor_steps") == pc.cpu.instructions + board.processor_steps(1),
           "SIPI observation must count both started processors and preserve BSP accounting");
+  require(counter(observation, "rdtsc") == 3 &&
+              counter(observation, "rdmsr_tsc_adjust") == 1 && counter(observation, "wrmsr_tsc_adjust") == 1 &&
+              counter(observation, "rdmsr_tsc") == 0 && counter(observation, "wrmsr_tsc") == 0,
+          "SIPI checkpoint must sum real TSC and TSC_ADJUST instructions across both processors");
 }
 
 // The historical engine-window benchmark compiles this harness against the

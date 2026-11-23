@@ -13,6 +13,14 @@
 
 namespace reverse_windows {
 
+inline void write_tsc_access(std::ostream& out, const cosmic_pc::Cpu::TscAccessStats& access) {
+  out << "{\"rdtsc\":" << access.rdtsc
+      << ",\"rdmsr_tsc\":" << access.read_tsc
+      << ",\"wrmsr_tsc\":" << access.write_tsc
+      << ",\"rdmsr_tsc_adjust\":" << access.read_adjust
+      << ",\"wrmsr_tsc_adjust\":" << access.write_adjust << '}';
+}
+
 inline void write_ether_arm64(std::ostream& out, const cosmic_pc::Cpu& cpu) {
   const auto& stats = cpu.ether_arm64_stats();
   const auto space = cpu.ether_arm64_virtual_stats();
@@ -129,6 +137,7 @@ class BootProfile {
     std::uint64_t total_processor_steps = 0, ether_arm64_steps = 0, rtc_irq8_delivered = 0;
     std::uint64_t host_elapsed_ns = 0, sipi_targets_applied = 0;
     unsigned started_vcpus = 0;
+    cosmic_pc::Cpu::TscAccessStats tsc_access;
     std::uint64_t disk_reads = 0, ata_commands = 0, atapi_packets = 0;
     std::uint64_t page_walks = 0, page_hits = 0, instruction_page_hits = 0, batched = 0;
     std::uint64_t instruction_page_reuses = 0;
@@ -156,6 +165,7 @@ class BootProfile {
     out.steps = cpu.instructions;
     out.total_processor_steps = execution.guest_steps;
     out.ether_arm64_steps = execution.ether_steps;
+    out.tsc_access = execution.tsc_access;
     out.started_vcpus = board.processors_started();
     out.rtc_irq8_delivered = board.rtc_evidence().irq8_delivered;
     out.sipi_targets_applied = board.startup_ipis().sipi_targets_applied;
@@ -213,7 +223,9 @@ class BootProfile {
         << ",\"neon_steps\":" << s.neon_steps
         << ",\"mode_changes\":" << s.mode_changes
         << ",\"run_ns\":" << s.timing.ns(cosmic_pc::BootTimePart::Run)
-        << ",\"sampled_iterations\":" << s.timing.iterations << ",\"registers\":[";
+        << ",\"sampled_iterations\":" << s.timing.iterations << ",\"tsc_access\":";
+    write_tsc_access(out, s.tsc_access);
+    out << ",\"registers\":[";
     for (std::size_t i = 0; i < s.regs.size(); ++i) {
       if (i) out << ',';
       out << '"' << std::hex << s.regs[i] << std::dec << '"';
