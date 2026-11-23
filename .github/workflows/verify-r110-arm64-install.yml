@@ -1,0 +1,212 @@
+name: Verify existing Prime R110 ARM64 APK installation
+
+on:
+  push:
+    branches: [ci/prime-r110-arm64-install-9dbd27a]
+    paths: [.github/workflows/verify-r110-arm64-install.yml]
+  workflow_dispatch:
+    inputs:
+      apk_sha256:
+        description: SHA-256 of the existing release APK from run 45116113316
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  verify-existing-arm64-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      APP_ID: com.reversewindows.android.prime.smp.r110
+      SOURCE_SHA: 9dbd27a86620f03146ecc63de6c9f1c933395e37
+      APK_NAME: REVERSE-Windows-Prime-0.3.86-9dbd27a86620-arm64-v8a-release.apk
+      EXPECTED_APK_SHA256: ${{ inputs.apk_sha256 || '4d9d7395414127ae2c228ea4f5615e1ee056c47e9db3f0e4e7bde924272dd257' }}
+    steps:
+      - name: Download the existing ARM64 release
+        uses: actions/download-artifact@v4
+        with:
+          name: REVERSE-Windows-Prime-0.3.86-9dbd27a86620-ARM64
+          path: arm64-release
+          run-id: 45116113316
+          github-token: ${{ github.token }}
+
+      - name: Enable KVM for the x86 Android emulator
+        run: |
+          test -c /dev/kvm
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm && test -w /dev/kvm
+
+      - name: Set up Android platform tools
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '11076708'
+          packages: 'platform-tools build-tools;35.0.0'
+
+      - name: Check the exact bytes to be installed
+        shell: bash
+        run: |
+          set -eu
+          evidence="$RUNNER_TEMP/r110-install-evidence"
+          mkdir -p "$evidence"
+          apk="arm64-release/$APK_NAME"
+          [[ "$EXPECTED_APK_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]
+          printf '%s  %s\n' "$EXPECTED_APK_SHA256" "$apk" | sha256sum --check
+          awk -v name="$APK_NAME" '$2 == name {print $1 "  arm64-release/" name}' \
+            arm64-release/SHA256SUMS > "$evidence/archive-checksum.txt"
+          sha256sum --check "$evidence/archive-checksum.txt"
+          unzip -p "$apk" assets/build-source.txt | diff -u <(printf '%s\n' "$SOURCE_SHA") -
+          grep -Fxq "source_sha=$SOURCE_SHA" arm64-release/build.txt
+          tools="$ANDROID_HOME/build-tools/35.0.0"
+          "$tools/apksigner" verify --verbose --print-certs "$apk" > "$evidence/signature.txt"
+          "$tools/aapt" dump badging "$apk" > "$evidence/manifest.txt"
+          grep -Fq "package: name='$APP_ID' versionCode='116' versionName='0.3.86'" "$evidence/manifest.txt"
+          grep -Fxq "native-code: 'arm64-v8a'" "$evidence/manifest.txt"
+
+      - name: Prepare installation and BIOS checks
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/r110-install.sh" <<'BASH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/r110-install-evidence"
+          apk="arm64-release/$APK_NAME"
+          trap 'adb logcat -d -t 5000 > "$evidence/logcat.txt" || true' EXIT
+          {
+            adb shell uname -m | tr -d '\r' | tee "$evidence/architecture.txt"
+            grep -Fxq 'x86_64' "$evidence/architecture.txt"
+            adb shell getprop ro.build.version.sdk | tr -d '\r' | grep -Fx '30'
+            abis=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')
+            printf 'Android advertised ABIs %s\n' "$abis"
+            [[ ",$abis," == *,arm64-v8a,* ]]
+            adb shell getprop ro.dalvik.vm.native.bridge | tr -d '\r' | grep -Fx 'libndk_translation.so'
+            adb install --no-incremental "$apk" | tee "$evidence/package-installer.txt"
+            grep -Fxq 'Success' "$evidence/package-installer.txt"
+            adb shell settings put secure immersive_mode_confirmations confirmed
+            adb shell wm dismiss-keyguard
+            activity="$APP_ID/com.reversewindows.android.MainActivity"
+            for attempt in {1..20}; do
+              if adb shell cmd package resolve-activity --brief "$APP_ID" | tr -d '\r' > "$evidence/activity.txt" &&
+                grep -Fxq "$activity" "$evidence/activity.txt"; then
+                break
+              fi
+              sleep 1
+            done
+            grep -Fxq "$activity" "$evidence/activity.txt"
+            adb shell am start -W -n "$activity" | tr -d '\r' | tee "$evidence/launch.txt"
+            grep -Fxq 'Status: ok' "$evidence/launch.txt"
+            adb shell dumpsys package "$APP_ID" > "$evidence/package.txt"
+            grep -Fq 'primaryCpuAbi=arm64-v8a' "$evidence/package.txt"
+            grep -Fq 'versionName=0.3.86' "$evidence/package.txt"
+            adb shell pidof "$APP_ID"
+          } 2>&1 | tee "$evidence/install.txt"
+          adb exec-out screencap -p > "$evidence/launch.png"
+          python3 "$RUNNER_TEMP/r110-bios-check.py" | tee "$evidence/bios.txt"
+          BASH
+          cat > "$RUNNER_TEMP/r110-bios-check.py" <<'PY'
+          import os
+          import re
+          import subprocess
+          import time
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          package = os.environ['APP_ID']
+          activity = f'{package}/com.reversewindows.android.MainActivity'
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'r110-install-evidence'
+          ui = '/sdcard/r110-install-ui.xml'
+
+          def adb(*args):
+              return subprocess.check_output(['adb', *args], timeout=25)
+
+          def center(node):
+              left, top, right, bottom = map(int, re.findall(r'\d+', node.get('bounds', '')))
+              return (left, top, right, bottom) if right > left and bottom > top else None
+
+          def visible(field, value, *, tap=False, scroll=False, focused=False):
+              deadline = time.monotonic() + 60
+              while time.monotonic() < deadline:
+                  try:
+                      adb('shell', 'uiautomator', 'dump', ui)
+                      tree = list(ET.fromstring(adb('exec-out', 'cat', ui)).iter('node'))
+                  except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ET.ParseError):
+                      continue
+                  for node in tree:
+                      if node.get(field) != value or node.get('enabled') != 'true':
+                          continue
+                      if focused and node.get('focused') != 'true':
+                          continue
+                      bounds = center(node)
+                      if bounds is None:
+                          continue
+                      if tap:
+                          left, top, right, bottom = bounds
+                          adb('shell', 'input', 'tap', str((left + right) // 2), str((top + bottom) // 2))
+                      return
+                  if scroll:
+                      for node in tree:
+                          if node.get('class') != 'android.widget.ScrollView' or node.get('scrollable') != 'true':
+                              continue
+                          bounds = center(node)
+                          if bounds is None:
+                              continue
+                          left, top, right, bottom = bounds
+                          if right - left < 250:
+                              continue
+                          x = str((left + right) // 2)
+                          adb('shell', 'input', 'swipe', x, str(top + (bottom-top)*4//5),
+                              x, str(top + (bottom-top)//5), '300')
+                          break
+                  time.sleep(1)
+              raise AssertionError(f'Visible {field} did not reach {value}')
+
+          def settings():
+              visible('resource-id', f'{package}:id/vm_console_menu', tap=True)
+              visible('text', 'Configuración', tap=True)
+
+          def screenshot(name):
+              image = adb('exec-out', 'screencap', '-p')
+              assert image.startswith(b'\x89PNG\r\n\x1a\n')
+              (evidence / name).write_bytes(image)
+
+          settings()
+          visible('resource-id', f'{package}:id/vm_bios_test', tap=True, scroll=True)
+          settings()
+          visible('text', 'BIOS espera una tecla')
+          screenshot('bios-wait.png')
+          visible('text', '‹  Consola', tap=True)
+          visible('resource-id', f'{package}:id/vm_monitor', focused=True)
+          adb('shell', 'input', 'keyevent', 'KEYCODE_HOME')
+          time.sleep(2)
+          adb('shell', 'am', 'start', '-W', '-n', activity)
+          visible('resource-id', f'{package}:id/vm_monitor', focused=True)
+          adb('shell', 'input', 'keyevent', 'KEYCODE_ENTER')
+          settings()
+          visible('text', 'La CPU invitada se detuvo')
+          screenshot('bios-halted.png')
+          print('PRIME_ARM64_APK_BRIDGE_BIOS_PASS host=x86_64 android=30 bridge=libndk_translation.so')
+          PY
+
+      - name: Install and run the ARM64 APK through Android native translation
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          enable-hw-keyboard: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: bash "$RUNNER_TEMP/r110-install.sh"
+
+      - name: Preserve installation and BIOS evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prime-r110-arm64-bridge-install-9dbd27a86620
+          path: ${{ runner.temp }}/r110-install-evidence
+          if-no-files-found: warn
