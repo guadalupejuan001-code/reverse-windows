@@ -1447,7 +1447,7 @@ class PcMotherboardC06 {
       state_vector_steps_before_init_[id] += cpu.ether_arm64_stats().state_vector_steps +
                                               interpreter.projected_steps;
       interpreter_vector_steps_before_init_[id] += interpreter.steps;
-      cpu.reset(0, 0);
+      cpu.reset_for_startup_ipi(0, 0);
       apic = LocalApic{&cpu};
       apic.startup_vector = sipi;
       for (unsigned line = 0; line < io_remote_targets_.size(); ++line) {
@@ -1456,7 +1456,7 @@ class PcMotherboardC06 {
       }
     }
     if (apic.startup_vector) {
-      cpu.reset(std::uint16_t(*apic.startup_vector) << 8, 0);
+      cpu.reset_for_startup_ipi(std::uint16_t(*apic.startup_vector) << 8, 0);
       cpu.a20_enabled = pc_.cpu.a20_enabled;
       apic.started = true;
       apic.startup_vector.reset();
