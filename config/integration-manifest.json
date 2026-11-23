@@ -1,8 +1,8 @@
 {
   "schema": "reverse-windows-integration-v1",
   "revision": "r110",
-  "version_name": "0.3.87-ether-cache",
-  "version_code": 117,
+  "version_name": "0.3.87-ether-cache.2",
+  "version_code": 118,
   "application_id": "com.reversewindows.android.prime.smp.r110.ethercache",
   "memory_backend": "ether-state-ram",
   "source_commits": {
