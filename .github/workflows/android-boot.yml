@@ -162,7 +162,7 @@ jobs:
           version = artifact['versionName']
           code = artifact['versionCode']
           if (artifact['outputFile'] != f'app-{variant}.apk'
-              or not re.fullmatch(r'com\.reversewindows\.android\.prime\.smp\.r\d+', app_id)
+              or not re.fullmatch(r'com\.reversewindows\.android\.prime\.smp\.r\d+(?:\.[a-z][a-z0-9]*)?', app_id)
               or not re.fullmatch(r'\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?', version)
               or type(code) is not int or code < 1):
               raise SystemExit('Unexpected Prime APK metadata')
