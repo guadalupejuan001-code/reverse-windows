@@ -39,7 +39,7 @@ IRQ_VECTOR = ("deliveries", "eois", "entry_to_eoi_ticks", "entry_to_eoi_steps")
 IRQ_CLOCK = ("clock_source", "virtual_clock_hz", "active_clock_elapsed_ns", "active_clock_ticks")
 BOOT_PROFILE_STATE = ("steps", "total_processor_steps", "ether_arm64_steps", "started_vcpus",
                       "rtc_irq8_delivered", "host_elapsed_ns", "sipi_targets_applied", "mode",
-                      "ip_hex", "run_ns", "irq_delivered", "spill_reads", "spill_writes")
+                      "ip_hex", "run_ns", "irq_delivered", "spill_reads", "spill_writes", "registers")
 EARLY_LONG64 = tuple(range(750_000_000, 1_000_000_001, 50_000_000))
 LATE_LONG64 = tuple(range(8_200_000_000, 8_650_000_001, 50_000_000))
 AFTER_8_65B = (8_650_000_000, 9_000_000_000, 9_250_000_000, 9_500_000_000)
@@ -80,6 +80,7 @@ def load_checkpoint(record):
         "bios_bytes": vm["storage_io"]["bios_boot_media"]["read_bytes"],
         "irq_delivered": vm["irq"]["delivered"],
         "started_vcpus": topology["started"],
+        "guest_tsc_hz": topology.get("guest_tsc_hz"),
         "smp": pick(topology, SMP),
         "startup_ipis": topology.get("startup_ipis", {}),
         "vcpu_states": topology.get("states_by_logical_processor", []),
@@ -284,11 +285,13 @@ def main():
     product_sha = os.environ["PRODUCT_SHA"]
     core_sha = os.environ["MUNDO_X_SHA"]
     stop_target = int(os.environ.get("STOP_TARGET", "700000000"))
+    expected_tsc_hz = int(os.environ.get("EXPECTED_TSC_HZ", "0"))
     def valid_targets(targets):
         return all(
             target in checkpoints and checkpoints[target]["native_arm64_supported"]
             and checkpoints[target]["native_arm64_enabled"]
             and checkpoints[target]["mundo_x_source_sha"] == core_sha
+            and (not expected_tsc_hz or checkpoints[target]["guest_tsc_hz"] == expected_tsc_hz)
             for target in targets
         )
     valid_source = verified and verified["requests"] == verified["verified_ranges"] > 0 and not verified["failed"]
@@ -302,6 +305,7 @@ def main():
         "host_threshold_mib": int(os.environ["THRESHOLD_MIB"]),
         "probe_exit_code": args.exit_code,
         "probe_timeout_seconds": int(os.environ.get("PROBE_TIMEOUT_SECONDS", "600")),
+        "expected_guest_tsc_hz": expected_tsc_hz or None,
         "optical_media": "Microsoft Windows 10 22H2 Enterprise Evaluation x64, verified HTTPS 206 ranges",
         "optical_media_bytes": 5_550_497_792,
         "optical_media_etag": "0x10B3D1548F58FA2A3866686CB570F06A16F6734DD99BBA1C7F0542A849EDD8E4",
