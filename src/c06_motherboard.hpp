@@ -2396,7 +2396,6 @@ class PcMotherboardC06 {
         poll_parked_processors();
         const auto retired = static_cast<unsigned>(pc_.cpu.instructions - before);
         budget -= wake_pending_.any() ? retired : grant;
-        if (!pc_.guest_execution_available()) return;
         continue;
       }
       const auto dispatch_budget = sleeping && !active_clock_running_
@@ -2442,7 +2441,7 @@ class PcMotherboardC06 {
         poll_parked_processors();
         const auto retired = static_cast<unsigned>(processor_steps(id) - before);
         budget -= wake_pending_.any() ? retired : grant;
-        if ((!sleeping && !parked_processors_.any()) || !pc_.guest_execution_available()) return;
+        if (!sleeping && !parked_processors_.any()) return;
         continue;
       }
       if (const auto completed = run_parallel_ether_loops(runnable, count, dispatch_budget, deadline)) {
