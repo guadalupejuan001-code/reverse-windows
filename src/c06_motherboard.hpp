@@ -320,6 +320,8 @@ class PcMotherboardC06 {
   static constexpr auto kMaxProcessors = cosmic_pc::CpuTopology::kMaxLogical;
   static constexpr unsigned kMinParallelLoopSteps = 128;
   static constexpr unsigned kMixedParallelLoopSteps = 1024;
+  static constexpr unsigned kParkedParallelLoopSteps = 2048;
+  static constexpr std::chrono::nanoseconds kParkedParallelWindow = std::chrono::microseconds(100);
   static constexpr auto kParallelLoopAccess = cosmic_pc::Cpu::EtherLoopAccess::ReadOnlyRam;
   std::array<std::unique_ptr<cosmic_pc::Cpu>, kMaxProcessors> secondary_cpus_{};
   std::array<LocalApic, kMaxProcessors> apics_;
@@ -1349,15 +1351,20 @@ class PcMotherboardC06 {
     return device_batch_limit(steps);
   }
 
-  unsigned device_batch_limit(unsigned steps) const {
-    if(prior_tick_ || powered_off_ || pc_.cpu.x87_ferr_asserted()!=ferr_was_asserted_ ||
-       (keyboard_ && keyboard_->needs_irq()) || aux_irq()) return std::min(steps, 1U);
+  std::uint64_t ticks_to_device_edge() const {
     std::uint64_t edge = pm_timer_edge_in();
     if (pit_.enabled) edge = std::min<std::uint64_t>(edge, pit_.counter*kPitClockDivider-pit_phase_);
     if ((rtc_b_ & kRtcPeriodic) && !(rtc_c_ & kRtcIrq))
       edge = std::min(edge, rtc_next_periodic_tick_-ticks_);
     if (local_timer_irq_armed(bsp()))
       edge = std::min<std::uint64_t>(edge, bsp().timer_cycles);
+    return edge;
+  }
+
+  unsigned device_batch_limit(unsigned steps) const {
+    if(prior_tick_ || powered_off_ || pc_.cpu.x87_ferr_asserted()!=ferr_was_asserted_ ||
+       (keyboard_ && keyboard_->needs_irq()) || aux_irq()) return std::min(steps, 1U);
+    auto edge = ticks_to_device_edge();
     if (!edge) return std::min(1U, steps);
     if (!active_clock_running_) edge = edge * cpu_clock_ratio_ - cpu_cycle_phase_;
     return static_cast<unsigned>(std::min<std::uint64_t>(steps, edge));
@@ -1496,13 +1503,11 @@ class PcMotherboardC06 {
   // The dispatch owns this snapshot. Its CPUs have no worker, so their timers
   // can be sampled under the device bus without touching another worker's CPU.
   // Queue a wake; only the target's executor may enter its interrupt handler.
-  void poll_parked_processors() {
+  void poll_parked_processors(bool poll_devices = false) {
     if (!active_clock_running_ || parked_processors_.none()) return;
     sync_active_clock();
-    if (parked_processors_[0]) {
-      if (prior_tick_) prior_tick_();
-      poll(false);
-    }
+    if (parked_processors_[0] && prior_tick_) prior_tick_();
+    if (parked_processors_[0] || poll_devices) poll(false);
     for (unsigned id = 0, mask = parked_processors_.to_ulong(); mask; ++id, mask >>= 1) {
       if (!(mask & 1U)) continue;
       auto& apic = apics_[id];
@@ -1748,20 +1753,46 @@ class PcMotherboardC06 {
     return fixed_jobs + (position - fixed_jobs + rotation) % (count - fixed_jobs);
   }
 
+  Clock::time_point parked_parallel_deadline(Clock::time_point start) const {
+    auto edge = ticks_to_device_edge();
+    for (unsigned id = 1; id < processor_count_; ++id) {
+      const auto& apic = apics_[id];
+      if (!apic.started || !apic.cpu->flag(cosmic_pc::Cpu::IF)) continue;
+      if (deliverable_lapic_vector(apic)) return start;
+      if (!local_timer_irq_armed(apic)) continue;
+      const auto elapsed = ticks_ - apic.last_tick;
+      if (elapsed >= apic.timer_cycles) return start;
+      edge = std::min(edge, apic.timer_cycles - elapsed);
+    }
+    constexpr std::uint64_t second = 1'000'000'000ULL;
+    constexpr auto frequency = cosmic_pc::PcMachine::kVirtualCyclesPerSecond;
+    // Leave a device tick for the clock sample at the dispatch boundary.
+    if (edge <= 1) return start;
+    const auto until_edge = ((edge - 1) * second - clock_tick_remainder_) / frequency;
+    return start + std::min(kParkedParallelWindow, std::chrono::nanoseconds(until_edge));
+  }
+
   unsigned run_parallel_ether_loops(const std::array<unsigned, kMaxProcessors>& runnable,
                                     unsigned count, unsigned budget,
-                                    cosmic_pc::PcMachine::RunClock::time_point deadline) {
-    if (count < 2 || parked_needs_short_grant() ||
+                                    cosmic_pc::PcMachine::RunClock::time_point deadline,
+                                    bool& defer_parked_parallel) {
+    if (count < 2 || prior_tick_ || wake_pending_.any() ||
         budget < 2 * kMinParallelLoopSteps || !cosmic_pc::Cpu::ether_arm64_host() ||
         !pc_.boot_acceleration_enabled() || !pc_.guest_execution_available() ||
         (sci_active_ && (io_redir_low_[AcpiC06::sci_irq] & 0x18000U) == 0x8000U &&
          !io_remote_targets_[AcpiC06::sci_irq])) return 0;
 
-    auto limit = budget;
+    const bool watch_parked_irqs = parked_irq_processors_.any();
+    if (watch_parked_irqs && defer_parked_parallel) return 0;
+    // A read-only RAM loop can still block on page backing. While an IRQ
+    // target sleeps, admit only bounded native work on private registers.
+    const auto access = watch_parked_irqs ? cosmic_pc::Cpu::EtherLoopAccess::Registers : kParallelLoopAccess;
+    const bool allow_mixed = experimental_mixed_smp_ && !watch_parked_irqs;
+    auto limit = watch_parked_irqs ? std::min(budget, kParkedParallelLoopSteps) : budget;
     std::array<unsigned, kMaxProcessors> candidates{};
     unsigned candidate_count = 0, active_count = 0;
     const auto consider = [&](unsigned id) {
-      if (!apics_[id].cpu->ether_arm64_loop_length(kParallelLoopAccess)) return false;
+      if (!apics_[id].cpu->ether_arm64_loop_length(access)) return false;
       candidates[candidate_count++] = id;
       return true;
     };
@@ -1778,9 +1809,17 @@ class PcMotherboardC06 {
       }
       if (cpu.halted) continue;
       ++active_count;
-      if (!consider(id) && !experimental_mixed_smp_) return 0;
+      if (!consider(id) && !allow_mixed) return 0;
     }
     if (candidate_count < 2) return 0;
+    auto work_deadline = deadline;
+    if (watch_parked_irqs) {
+      const auto sample_start = Clock::now();
+      poll_parked_processors(true);
+      if (wake_pending_.any()) return 0;
+      work_deadline = std::min(deadline, parked_parallel_deadline(sample_start));
+      if (Clock::now() >= work_deadline) return 0;
+    }
     // Bound one independent execution by the earliest device edge and the
     // aggregate budget, including the processors that need serial service.
     limit = batch_limit(std::min(limit, budget / active_count) + 1) - 1;
@@ -1793,23 +1832,24 @@ class PcMotherboardC06 {
       for (unsigned i = 0; i < candidate_count; ++i) {
         const auto id = candidates[i];
         const auto accepted = id
-            ? apics_[id].cpu->prepare_ether_arm64_loop(limit, work[ready], kParallelLoopAccess)
-            : pc_.prepare_ether_loop(limit, work[ready], kParallelLoopAccess);
+            ? apics_[id].cpu->prepare_ether_arm64_loop(limit, work[ready], access)
+            : pc_.prepare_ether_loop(limit, work[ready], access);
         if (accepted && (!ram_only || work[ready].reads_ram())) jobs[ready++] = id;
-        else if (!experimental_mixed_smp_) return 0U;
+        else if (!allow_mixed) return 0U;
       }
       return ready;
     };
     const auto prepare_mixed = [&] {
       // Projected register rounds can be cheaper than starting workers.
       // Give distinct RAM readers a full grant before paying for a mixed batch.
-      if (!experimental_mixed_smp_ || limit < kMixedParallelLoopSteps) return 0U;
+      if (!allow_mixed || limit < kMixedParallelLoopSteps) return 0U;
       limit = kMixedParallelLoopSteps;
       return prepare(true);
     };
     auto job_count = candidate_count == active_count ? prepare(false) : 0U;
     if (job_count < active_count) job_count = prepare_mixed();
     if (job_count < 2) return 0;
+    if (watch_parked_irqs && Clock::now() >= work_deadline) return 0;
     if (!workers_) workers_ = std::make_shared<SmpWorkers>(host_workers_capacity());
 
     // A worker publishes register state to its own vCPU and can use the
@@ -1835,7 +1875,7 @@ class PcMotherboardC06 {
         bool continued = false;
         do {
           const auto start = measure ? Clock::now() : Clock::time_point{};
-          block.run(deadline);
+          block.run(work_deadline);
           const auto elapsed = measure ? Clock::now() - start : Clock::duration{};
           const auto completed = id == 0 ? pc_.retire_ether_loop(block, elapsed, true)
                                          : cpu.retire_ether_arm64_loop(block);
@@ -1867,14 +1907,23 @@ class PcMotherboardC06 {
       ram_steps += result.ram_steps;
       parallel_register_continuations_ += result.continuations;
     }
-    if (bsp_steps) {
+    if (watch_parked_irqs) {
+      // Worker retirement is private. Poll the devices at the join before
+      // RAM maintenance or another guest grant.
+      if (bsp_steps) advance_batch(bsp_steps);
+      poll_parked_processors(true);
+      if (bsp_steps && wake_pending_.none()) pc_.finish_parallel_ether_work();
+      // A lane can miss the time window. Serve the skipped vCPU through
+      // normal threaded grants for the rest of this run() call.
+      if (processors < active_count) defer_parked_parallel = true;
+    } else if (bsp_steps) {
       pc_.finish_parallel_ether_work();
       advance_batch(bsp_steps);
     }
     if (threaded_smp_enabled_)
       record_threaded_dispatch(std::count(active_lanes.begin(), active_lanes.begin() + lanes, true), total);
     if (processors > 1) {
-      parallel_mixed_batches_ += experimental_mixed_smp_ && processors < active_count;
+      parallel_mixed_batches_ += allow_mixed && processors < active_count;
       if (ram_steps) {
         ++parallel_ram_batches_;
         parallel_ram_steps_ += ram_steps;
@@ -1886,7 +1935,7 @@ class PcMotherboardC06 {
     }
 
     // Only now can the other processors execute memory writes and device I/O.
-    if (!experimental_mixed_smp_ || !total || processors == active_count) return total;
+    if (!allow_mixed || !total || processors == active_count) return total;
     const auto serial_limit = std::min(limit, kMixedParallelLoopSteps);
     for (unsigned i = 0; i < count && !faulted_processor_ && pc_.guest_execution_available(); ++i) {
       const auto id = runnable[i];
@@ -2395,6 +2444,7 @@ class PcMotherboardC06 {
     // position so that every runnable processor gets a turn.
     bool register_peer = false;
     bool pause_admitted = false;
+    bool defer_parked_parallel = false;
     while (budget && !faulted_processor_ && !powered_off_ && pc_.guest_execution_available()) {
       if(timed&&Clock::now()>=deadline)return;
       refresh_parked_processors();
@@ -2510,10 +2560,12 @@ class PcMotherboardC06 {
       if (pause_admission) {
         pause_admitted = true;
       } else {
-        if (const auto completed = run_parallel_ether_loops(runnable, count, dispatch_budget, deadline)) {
+        if (const auto completed = run_parallel_ether_loops(runnable, count, dispatch_budget, deadline,
+                                                           defer_parked_parallel)) {
           budget -= completed;
           continue;
         }
+        if (wake_pending_.any()) continue;
         if (const auto scheduled = run_threaded_smp(runnable, count, dispatch_budget, deadline, cooperative_pauses)) {
           budget -= scheduled;
           continue;

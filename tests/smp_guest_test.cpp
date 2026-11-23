@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -799,6 +800,144 @@ void start_long_mode_smp_guest(Cpu& cpu) {
     cpu.write32(kLapic + 0x300, 0x000c8500);
     cpu.write32(kLapic + 0x300, 0x000c0600 | kStartupVector);
 }
+
+#if PRIME_HAS_C06_READY_WAKE_TESTS
+void test_parallel_work_with_parked_irq(bool expire_timer, bool require_parallel, bool near_edge = false) {
+    using Clock = PcMachine::RunClock;
+    constexpr unsigned rounds = 32768, vector = 0x51, idt = 0x16000, handler = 0x18000;
+    constexpr unsigned irq_count = 0x4600, gate_address = 0xa000, slice = 8192;
+    const auto timer_low = std::uint8_t(near_edge ? 1 : 0xe8);
+    const auto timer_high = std::uint8_t(near_edge ? 0 : 3);
+    const std::uint8_t guest[] = {
+        0xb8,1,0,0,0,0x0f,0xa2,0xc1,0xeb,0x18,              // CPUID.1 gives each vCPU its APIC ID.
+        0x83,0xfb,2,0x75,0x3f,                             // vCPU 2 waits for its LAPIC timer.
+        0xbc,0,0,0x1e,0,0x0f,0x01,0x1c,0x25,0x80,0x51,0,0, // Private RSP; LIDT [5180h].
+        0xbb,0,0,0xe0,0xfe,0xc7,0x83,0xf0,0,0,0,0xff,1,0,0, // Software-enable LAPIC.
+        0xc7,0x83,0x20,3,0,0,vector,0,0,0,                 // One-shot vector 51h.
+        0xc7,0x83,0xe0,3,0,0,0x0b,0,0,0,                   // Divide by one.
+        0xc7,0x83,0x80,3,0,0,timer_low,timer_high,0,0,        // One or 1000 device ticks.
+        0xfb,0x90,0xf4,0xeb,0xfd,                          // STI; NOP; HLT; return to HLT.
+        0x89,0xdf,0xc1,0xe7,5,0x81,0xc7,0,0x45,0,0,         // vCPUs 0 and 1 have private result slots.
+        0xb9,64,0,0,0,0x31,0xc0,                           // Warm the same loop for 64 rounds.
+        0x48,0x83,0xc0,7,0x83,0xe9,1,0x75,0xf7,             // ADD RAX,7; SUB ECX,1; JNZ back.
+        0x80,0x3c,0x25,0,0x44,0,0,0,0x75,0x15,             // Publish the sum only after the measured loop.
+        0xc7,0x47,8,1,0,0,0,                               // Mark this vCPU warm.
+        0xe9,0x81,0x1e,0,0,                               // Wait at the measurement gate on another page.
+        0xb9,0,0x80,0,0,0x31,0xc0,0xeb,0xd8,               // Run 32768 rounds at the cached address.
+        0x48,0x89,0x07,0xfa,0xf4                          // Publish the sum; CLI; HLT.
+    };
+    constexpr std::uint8_t gate[] = {0xeb,0xfe,0xe9,0x78,0xe1,0xff,0xff}; // Wait at JMP; then jump to measured loop.
+    constexpr std::uint8_t isr[] = {
+        0x50,0xb8,0xb0,0,0xe0,0xfe,                         // Save RAX; point EAX at LAPIC EOI.
+        0xff,0x04,0x25,0,0x46,0,0,0xc7,0,0,0,0,0,           // Count entries; EOI.
+        0x58,0x48,0xcf                                     // Restore RAX; IRETQ.
+    };
+    PcMachine pc(4U << 20);
+    pc.boot_long_mode_demo();
+    pc.run(4000);
+    auto& cpu = pc.cpu;
+    require(cpu.is_long_mode() && cpu.halted && !cpu.fault, "parked native fixture must boot in long mode");
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {3,1}, true);
+    board.enable_threaded_smp(2);
+    bool measured = false, timer_elapsed = false;
+    const bool expire_in_prepared_work = require_parallel && Cpu::ether_arm64_host() && !near_edge;
+    std::uint64_t before = 0, last_clock_sample = 0;
+    std::uint64_t victim_before = 0, peers_at_expiry = 0, native_at_expiry = 0;
+    std::optional<std::uint64_t> peer_delay;
+    board.enable_active_clock([&] {
+        if (expire_timer && measured) {
+            const auto retired = board.total_processor_steps();
+            // The ordinary parked-IRQ grants check the clock in <=32 steps.
+            // A larger jump observes retirement at the prepared worker join.
+            const auto retired_since_sample = retired - last_clock_sample;
+            const bool expired = expire_in_prepared_work ? retired_since_sample >= 256 : retired - before >= 4096;
+            const auto victim_steps = board.processor_steps(2);
+            if (!timer_elapsed && expired) {
+                timer_elapsed = true;
+                peers_at_expiry = retired - victim_steps;
+                native_at_expiry = board.parallel_register_steps();
+            }
+            if (timer_elapsed && !peer_delay && victim_steps > victim_before)
+                peer_delay = retired - victim_steps - peers_at_expiry;
+            last_clock_sample = retired;
+        }
+        return Clock::time_point{} + std::chrono::milliseconds(timer_elapsed ? 1 : 0);
+    });
+    pc.enable_boot_acceleration();
+    cpu.enable_page_translation_cache();
+    cpu.enable_ether_arm64_blocks();
+    cpu.out_hook(0x21, 1, 0xff);
+    cpu.out_hook(0xa1, 1, 0xff);
+    cpu.write64(0x2000 + 3 * 8, 0x6003);
+    cpu.write64(0x6000 + ((kLapic >> 21) & 511) * 8, kLapic | 0x83);
+    cpu.write16(0x5180, 4095);
+    cpu.write64(0x5182, idt);
+    cpu.write64(idt + 16 * vector, (handler & 0xffffU) | (0x18ULL << 16) |
+                                  (0x8eULL << 40) | (std::uint64_t(handler >> 16) << 48));
+    cpu.write64(idt + 16 * vector + 8, 0);
+    cpu.memory.write_block(handler, isr, sizeof(isr));
+    install_long_mode_smp_guest(cpu, guest, sizeof(guest));
+    cpu.memory.write_block(gate_address, gate, sizeof(gate));
+    start_long_mode_smp_guest(cpu);
+    const auto check_guest = [&] {
+        if (const auto* fault = board.faulted_cpu()) throw std::runtime_error(fault->fault->describe());
+        if (cpu.fault) throw std::runtime_error(cpu.fault->describe());
+        require(pc.host_error.empty(), pc.host_error);
+    };
+    const auto sleeping = [&](unsigned id) { return std::string_view(board.processor_state(id)) == "halted"; };
+    const auto warmed = [&] {
+        return cpu.read32(kJobs + 8) && cpu.read32(kJobs + kJobBytes + 8) && sleeping(2) &&
+               board.processor_position(0).rip == gate_address && board.processor_position(1).rip == gate_address;
+    };
+    for (unsigned turn = 0; turn < 32 && !warmed(); ++turn) {
+        board.run(1024);
+        check_guest();
+    }
+    require(warmed() && board.processors_started() == 3 && (board.processor_position(2).flags & Cpu::IF),
+            "both native loops must warm while vCPU 2 reaches interruptible HLT");
+    require(!cpu.read32(irq_count) && !board.evidence().irq_delivered, "timer fired before measurement");
+
+    const auto native_before = board.parallel_register_steps();
+    const auto batches_before = board.parallel_register_batches();
+    const auto bsp_before = board.processor_steps(0), ap_before = board.processor_steps(1);
+    victim_before = board.processor_steps(2);
+    before = last_clock_sample = board.total_processor_steps();
+    measured = true;
+    cpu.write8(kStartFlag, 1);
+    // Unblock both streams at the same RIP without invalidating the warm loop.
+    cpu.write16(gate_address, 0x9090);
+    const auto started = Clock::now();
+    for (unsigned turn = 0; turn < 128 && (!sleeping(0) || !sleeping(1)); ++turn) {
+        const auto slice_before = board.total_processor_steps();
+        board.run(slice);
+        check_guest();
+        require(board.total_processor_steps() - slice_before <= slice, "parked wake exceeded the global budget");
+    }
+    const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count();
+    require(sleeping(0) && sleeping(1) && sleeping(2), "both loops and the IRQ handler must finish");
+    require(cpu.read64(kJobs) == 7ULL * rounds && cpu.read64(kJobs + kJobBytes) == 7ULL * rounds,
+            "prepared dispatch changed a guest register result");
+    for (const auto retired : {board.processor_steps(0) - bsp_before, board.processor_steps(1) - ap_before})
+        require(retired == 3 * rounds + 11,
+                "each vCPU must retire the entire loop and only its surrounding instructions");
+    const auto irq = board.lapic_vector_stats()[vector];
+    require(timer_elapsed == expire_timer && cpu.read32(irq_count) == unsigned(expire_timer) &&
+                irq.deliveries == unsigned(expire_timer) && irq.eois == unsigned(expire_timer) &&
+                board.evidence().irq_delivered == unsigned(expire_timer), "parked timer must enter and EOI exactly once");
+    if (expire_timer && expire_in_prepared_work)
+        require(peer_delay && *peer_delay == 0, "the parked timer must be serviced before another prepared grant");
+    if (near_edge)
+        require(native_at_expiry == native_before, "a one-tick timer must prevent the prepared batch until delivery");
+    const auto native_steps = board.parallel_register_steps() - native_before;
+    const auto native_batches = board.parallel_register_batches() - batches_before;
+    std::cout << (near_edge ? "C06_PARKED_NATIVE_NEAR_EDGE timer=" : "C06_PARKED_NATIVE_SAMPLE timer=") << expire_timer
+              << " guest_steps=" << board.total_processor_steps() - before
+              << " parallel_steps=" << native_steps << " parallel_batches=" << native_batches
+              << " irq=" << irq.deliveries << " eoi=" << irq.eois << " elapsed_us=" << elapsed_us << '\n';
+    if (require_parallel && Cpu::ether_arm64_host())
+        require(native_steps && native_batches, "quiet HLT/IF must permit useful prepared native work");
+}
+#endif
 
 #if PRIME_HAS_R107_GRANTS
 enum class RamWork { Independent, Readers, Counter };
@@ -1986,6 +2125,16 @@ int main(int argc, char** argv) {
             return 0;
         }
 #if PRIME_HAS_C06_READY_WAKE_TESTS
+        if (argc == 2 && (std::string_view(argv[1]) == "--test-parked-native" ||
+                          std::string_view(argv[1]) == "--measure-parked-native")) {
+            const bool require_parallel = std::string_view(argv[1]) == "--test-parked-native";
+            for (const bool timer : {false, true}) test_parallel_work_with_parked_irq(timer, require_parallel);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--test-parked-native-near-edge") {
+            test_parallel_work_with_parked_irq(true, true, true);
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--test-ready-budget") {
             for (const bool threaded : {false, true})
                 for (const unsigned active_aps : {1U, 2U}) test_ready_budget_with_parked_bsp(threaded, active_aps);
@@ -2035,6 +2184,8 @@ int main(int argc, char** argv) {
         }
         test_serial_deadline_rotates_ready_cpus();
         test_sleeping_ap_irq_dispatches();
+        for (const bool timer : {false, true}) test_parallel_work_with_parked_irq(timer, true);
+        test_parallel_work_with_parked_irq(true, true, true);
 #endif
         check_cpu_clock(Profile::Standard, 1);
         check_cpu_clock(Profile::Double, 2);
