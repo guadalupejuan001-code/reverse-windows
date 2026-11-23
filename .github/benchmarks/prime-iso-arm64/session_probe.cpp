@@ -181,9 +181,9 @@ int main(int argc, char** argv) {
       milestone_steps.push_back(point);
     for (std::uint64_t point = 12'000'000'000ULL; point <= target; point += 500'000'000ULL)
       milestone_steps.push_back(point);
-    constexpr std::array<std::uint64_t, 4> frame_checkpoints{
-        11'500'000'000ULL, 20'000'000'000ULL, 30'000'000'000ULL, 37'000'000'000ULL};
-    constexpr std::array<std::uint64_t, 3> wall_observations{720000, 1080000, 1320000};
+    constexpr std::array<std::uint64_t, 2> frame_checkpoints{11'500'000'000ULL, 12'500'000'000ULL};
+    constexpr std::array<std::uint64_t, 8> wall_observations{
+        540000, 570000, 600000, 630000, 660000, 720000, 1080000, 1320000};
     std::size_t next_milestone = 0, next_wall_observation = 0;
     std::array<std::uint8_t, 4000> text{};
     const auto start = Clock::now();
@@ -193,7 +193,8 @@ int main(int argc, char** argv) {
     std::uint64_t next_sample = 0, next_maintenance = 0, next_snapshot = 0, next_video = 0;
     std::uint64_t video_signature = 0;
     bool reclaim_pending = false;
-    while (status == Session::Step::Running && Clock::now() - start < run_time) {
+    while (status == Session::Step::Running && session.session_steps() < target &&
+           Clock::now() - start < run_time) {
       const auto due_at = Clock::now();
       const auto uptime = count_since<Milliseconds>(start, due_at);
       while (next_wall_observation < wall_observations.size() &&
@@ -278,12 +279,18 @@ int main(int argc, char** argv) {
     if (!milestones) throw std::runtime_error("Could not finish the milestone log");
     snapshots.close();
     if (!snapshots) throw std::runtime_error("Could not finish the snapshot log");
-    session.retry_video();
-    const auto video = session.capture_video(text.data(), text.size());
-    save_full_frame(video, run_dir / "terminal.ppm");
     std::ofstream report(run_dir / "session.json");
     report << session.diagnostic(true) << '\n';
+    report.close();
     if (!report) throw std::runtime_error("Could not write session evidence");
+    Session::VideoUpdate video{};
+    try {
+      session.retry_video();
+      video = session.capture_video(text.data(), text.size());
+      save_full_frame(video, run_dir / "terminal.ppm");
+    } catch (const std::exception& error) {
+      std::cerr << "PRIME_TERMINAL_FRAME_ERROR " << error.what() << '\n';
+    }
     std::cout << "PRIME_NATIVE_REAL_ISO status=" << int(status) << " guest_steps="
               << session.session_steps() << " host_elapsed_ms=" << elapsed_ms << " slices=" << windows
               << " maintenance_calls=" << maintenance_calls

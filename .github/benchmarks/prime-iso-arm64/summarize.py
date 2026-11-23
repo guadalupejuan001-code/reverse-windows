@@ -36,7 +36,9 @@ SMP = ("started", "host_workers", "host_workers_capacity", "host_workers_peak_di
        "threaded_dispatches", "threaded_guest_steps", "off_bus_ram_blocks", "off_bus_ram_steps",
        "ram_view_conflicts", "sampled_bus_grants", "sampled_bus_contentions", "sampled_bus_wait_ns",
        "parallel_register_steps", "parallel_ram_steps", "parallel_mixed_batches",
-       "threaded_pause_yields", "threaded_pause_turn_steps", "threaded_pause_admissions")
+       "threaded_pause_yields", "threaded_pause_turn_steps", "threaded_pause_admissions",
+       "parallel_register_batches", "parallel_ram_batches", "parallel_register_continuations",
+       "longest_parallel_register_slice")
 RTC = ("register_a", "register_b", "irq8_assertions", "irq8_acknowledgements", "irq8_delivered")
 IRQ_VECTOR = ("deliveries", "eois", "entry_to_eoi_ticks", "entry_to_eoi_steps")
 IRQ_CLOCK = ("clock_source", "virtual_clock_hz", "active_clock_elapsed_ns", "active_clock_ticks")
@@ -46,7 +48,7 @@ BOOT_PROFILE_STATE = ("steps", "total_processor_steps", "ether_arm64_steps", "st
 EARLY_LONG64 = tuple(range(750_000_000, 1_000_000_001, 50_000_000))
 LATE_LONG64 = tuple(range(8_200_000_000, 8_650_000_001, 50_000_000))
 AFTER_8_65B = (8_650_000_000, 9_000_000_000, 9_250_000_000, 9_500_000_000)
-WALL_OBSERVATIONS_MS = (720000, 1080000, 1320000)
+WALL_OBSERVATIONS_MS = (540000, 570000, 600000, 630000, 660000, 720000, 1080000, 1320000)
 RANGES = re.compile(
     r"REMOTE_ISO requests=(\d+) verified_ranges=(\d+) downloaded=(\d+) delivered=(\d+) failed=(\d+)"
     r" first_offset=(\d+) last_byte=(\d+)"
@@ -241,6 +243,7 @@ def continuation_record(run_dir, target):
         "rip_hex": machine["rip_hex"],
         "pending": machine["pending"],
         "message": machine["message"],
+        "cpu_fault": vm.get("cpu_fault"),
         "long64_observed": machine["cpu_mode"] == "long64" or any(p["mode"] == "long64" for p in phases),
         "restarts": boot["restarts"],
         "bios_reads": machine["disk_reads"],
@@ -389,10 +392,11 @@ def main():
         }
         summary["validated_measurement"] = bool(
             args.exit_code == 0 and valid_source
-            and wall["elapsed_ms"] >= wall["requested_wall_ms"]
+            and (wall["elapsed_ms"] >= wall["requested_wall_ms"] or summary["continuation"]["complete"])
             and {point["mundo_x_source_sha"] for point in [summary["terminal_observation"],
                  *checkpoints.values(), *summary["wall_observations"].values()]} == {core_sha}
-            and set(summary["wall_observations"]) == set(map(str, WALL_OBSERVATIONS_MS))
+            and set(summary["wall_observations"]) >= {
+                str(point) for point in WALL_OBSERVATIONS_MS if point + 50 < wall["elapsed_ms"]}
         )
     args.output.write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))

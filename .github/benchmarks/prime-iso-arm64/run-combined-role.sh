@@ -31,7 +31,8 @@ else
   if ((probe_exit == 0)); then probe_exit=1; fi
 fi
 for screen in "$output"/screen-*.ppm "$output"/wall-*.ppm "$output"/wall-*.txt "$output/display-latest.ppm" \
-              "$output/terminal.ppm" "$output/text-screen.txt" "$output/wall-completion.json"; do
+              "$output/terminal.ppm" "$output/text-screen.txt" "$output/wall-completion.json" \
+              "$output/session.json" "$output/milestones.jsonl"; do
   if [[ -f "$screen" ]]; then
     cp "$screen" "$evidence/$role-${screen##*/}"
   fi
