@@ -350,6 +350,7 @@ class PcMotherboardC06 {
   std::uint64_t secondary_rep_elements_ = 0, secondary_rep_bytes_ = 0;
   std::uint64_t secondary_scan_steps_ = 0;
   std::uint64_t secondary_shift_steps_ = 0, secondary_zero_steps_ = 0, secondary_multiply_steps_ = 0;
+  std::uint64_t secondary_streaming_sse_fill_steps_ = 0;
   std::uint64_t paired_loop_blocks_ = 0, paired_loop_steps_ = 0;
   std::uint64_t worker_loop_blocks_ = 0, worker_loop_steps_ = 0;
   std::uint64_t loop_timing_attempts_ = 0;
@@ -431,6 +432,7 @@ class PcMotherboardC06 {
     secondary_rep_elements_ = secondary_rep_bytes_ = 0;
     secondary_scan_steps_ = 0;
     secondary_shift_steps_ = secondary_zero_steps_ = secondary_multiply_steps_ = 0;
+    secondary_streaming_sse_fill_steps_ = 0;
     paired_loop_blocks_ = paired_loop_steps_ = worker_loop_blocks_ = worker_loop_steps_ = 0;
     loop_timing_attempts_ = 0;
     loop_timing_ = {};
@@ -1536,7 +1538,8 @@ class PcMotherboardC06 {
 
   static bool grouped_loop_candidate(const cosmic_pc::Cpu& cpu) {
     return cpu.scan_loop_batch_candidate() || cpu.shift_loop_batch_candidate() ||
-           cpu.zero_loop_batch_candidate() || cpu.wide_multiply_loop_batch_candidate();
+           cpu.zero_loop_batch_candidate() || cpu.wide_multiply_loop_batch_candidate() ||
+           cpu.streaming_sse_fill_loop_batch_candidate();
   }
 
   unsigned retire_secondary_loop(cosmic_pc::Cpu& cpu, unsigned limit) {
@@ -1555,9 +1558,11 @@ class PcMotherboardC06 {
       secondary_zero_steps_ += steps;
       return steps;
     }
-    if (!cpu.wide_multiply_loop_batch_candidate()) return 0;
+    const bool multiply = cpu.wide_multiply_loop_batch_candidate();
+    if (!multiply && !cpu.streaming_sse_fill_loop_batch_candidate()) return 0;
     const auto steps = unsigned(cpu.try_counter_loop_batch(limit));
-    secondary_multiply_steps_ += steps;
+    if (multiply) secondary_multiply_steps_ += steps;
+    else secondary_streaming_sse_fill_steps_ += steps;
     return steps;
   }
 
@@ -2229,6 +2234,7 @@ class PcMotherboardC06 {
   std::uint64_t secondary_shift_steps() const noexcept { return secondary_shift_steps_; }
   std::uint64_t secondary_zero_steps() const noexcept { return secondary_zero_steps_; }
   std::uint64_t secondary_multiply_steps() const noexcept { return secondary_multiply_steps_; }
+  std::uint64_t secondary_streaming_sse_fill_steps() const noexcept { return secondary_streaming_sse_fill_steps_; }
   std::uint64_t parallel_mixed_batches() const noexcept { return parallel_mixed_batches_; }
   std::uint64_t paired_loop_blocks() const noexcept { return paired_loop_blocks_; }
   std::uint64_t paired_loop_steps() const noexcept { return paired_loop_steps_; }

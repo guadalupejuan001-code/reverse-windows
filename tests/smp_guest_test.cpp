@@ -1153,7 +1153,7 @@ void test_multi_ap_scans() {
 }
 #endif
 
-void test_secondary_streaming_stores(bool threaded) {
+void test_secondary_streaming_stores(bool threaded, bool whole_rounds = false) {
     constexpr unsigned source = 0xa000, destination = 0xb000, rounds = 16;
     // Enable OSFXSR, load two distinct XMM values, then write eight consecutive
     // 16-byte values per iteration. Only the secondary CPU runs this code.
@@ -1167,7 +1167,19 @@ void test_secondary_streaming_stores(bool threaded) {
         0x66,0x0f,0xe7,0x47,0x60, 0x66,0x0f,0xe7,0x4f,0x70,
         0x81,0xc7,0x80,0,0,0, 0xff,0xc9, 0x75,0xcf, 0xf4,
     };
+    constexpr std::uint8_t streaming_fill[] = {
+        0x0f,0x20,0xe0, 0x0d,0,0x02,0,0, 0x0f,0x22,0xe0,
+        0xbe,0,0xa0,0,0, 0xb9,0,0xb0,0,0, 0xba,rounds,0,0,0, 0xb8,0x80,0,0,0,
+        0xf3,0x0f,0x6f,0x06,
+        0x66,0x0f,0xe7,0x01, 0x66,0x0f,0xe7,0x41,0x10, 0x66,0x0f,0xe7,0x41,0x20, 0x66,0x0f,0xe7,0x41,0x30,
+        0x48,0x03,0xc8, 0x66,0x0f,0xe7,0x41,0xc0, 0x66,0x0f,0xe7,0x41,0xd0, 0x48,0xff,0xca,
+        0x66,0x0f,0xe7,0x41,0xe0, 0x66,0x0f,0xe7,0x41,0xf0, 0x75,0xd1,
+        0x0f,0xae,0xf8, 0xf4, // SFENCE; HLT
+    };
+    const auto bytes = whole_rounds ? sizeof(streaming_fill) : sizeof(guest);
+    const unsigned vector_cycle = whole_rounds ? 16 : 32;
     std::uint64_t scalar_steps = 0;
+    unsigned scalar_flags = 0;
     for (bool accelerated : {false, true}) {
         PcMachine pc(4U << 20);
         pc.boot_long_mode_demo();
@@ -1176,7 +1188,7 @@ void test_secondary_streaming_stores(bool threaded) {
         PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {2,1});
         if (threaded) board.enable_threaded_smp(2);
         if (accelerated) pc.enable_boot_acceleration();
-        install_long_mode_smp_guest(cpu, guest, sizeof(guest));
+        install_long_mode_smp_guest(cpu, whole_rounds ? streaming_fill : guest, bytes);
         for (unsigned i = 0; i < 32; ++i) cpu.write8(source + i, std::uint8_t(0xa0 + i));
         cpu.write8(destination - 1, 0x71);
         cpu.write8(destination + 128 * rounds, 0x72);
@@ -1192,18 +1204,37 @@ void test_secondary_streaming_stores(bool threaded) {
         require(board.processors_started() == 2 && !board.secondary_can_run() &&
                 !board.faulted_cpu() && !cpu.fault, "secondary XMM stream must halt successfully");
         for (unsigned i = 0; i < 128 * rounds; ++i)
-            require(cpu.read8(destination + i) == 0xa0 + i % 32, "AP XMM bytes diverged");
+            require(cpu.read8(destination + i) == 0xa0 + i % vector_cycle, "AP XMM bytes diverged");
         require(cpu.read8(destination - 1) == 0x71 && cpu.read8(destination + 128 * rounds) == 0x72,
                 "secondary XMM stream overwrote its boundaries");
         const auto batches = board.secondary_store_batches(), steps = board.secondary_store_steps();
+#if PRIME_HAS_C06_READY_WAKE_TESTS
+        const auto full_steps = board.secondary_streaming_sse_fill_steps();
+        const auto position = board.processor_position(1);
+        require(position.rip == kSmpEntry + bytes, "AP stopped before its terminal instruction");
+        const auto flags = position.flags;
+#else
+        constexpr auto full_steps = 0ULL;
+        constexpr unsigned flags = 0;
+#endif
         if (accelerated) {
             require(steps > 0 && steps >= 2 * batches && steps <= 8 * batches &&
-                    board.processor_steps(1) == scalar_steps, "secondary stores must coalesce with exact retirement");
-            std::cout << "SMP_MOVNTDQ_PASS threaded=" << threaded << " stores=" << steps
-                      << " batches=" << batches << " guest_steps=" << scalar_steps << '\n';
+                    board.processor_steps(1) == scalar_steps && flags == scalar_flags,
+                    "secondary stores must coalesce with exact retirement and flags");
+            if (whole_rounds) {
+                require(full_steps >= 22 && full_steps % 11 == 0 && full_steps < rounds * 11,
+                        "the AP must retire complete streaming fill rounds through C06");
+                std::cout << "SMP_STREAMING_SSE_FILL_PASS threaded=" << threaded << " grouped_steps="
+                          << full_steps << " guest_steps=" << scalar_steps << '\n';
+            } else {
+                require(!full_steps, "irregular MOVNTDQ stores entered the whole-fill path");
+                std::cout << "SMP_MOVNTDQ_PASS threaded=" << threaded << " stores=" << steps
+                          << " batches=" << batches << " guest_steps=" << scalar_steps << '\n';
+            }
         } else {
-            require(!batches && !steps, "scalar secondary must skip XMM batches");
+            require(!batches && !steps && !full_steps, "scalar secondary must skip XMM batches");
             scalar_steps = board.processor_steps(1);
+            scalar_flags = flags;
         }
     }
 }
@@ -1831,6 +1862,13 @@ int main(int argc, char** argv) {
             return 0;
         }
 #endif
+#if PRIME_HAS_C06_READY_WAKE_TESTS
+        if (argc == 2 && std::string(argv[1]) == "--test-secondary-streaming-fill") {
+            test_secondary_streaming_stores(false, true);
+            test_secondary_streaming_stores(true, true);
+            return 0;
+        }
+#endif
         if (argc == 2 && std::string(argv[1]) == "--measure-irq-work") {
             measure_secondary_irq_work(SecondaryWork::Registers, false);
             measure_secondary_irq_work(SecondaryWork::Registers, true);
@@ -1929,6 +1967,10 @@ int main(int argc, char** argv) {
         test_ether_worker_block();
         test_secondary_streaming_stores(false);
         test_secondary_streaming_stores(true);
+#if PRIME_HAS_C06_READY_WAKE_TESTS
+        test_secondary_streaming_stores(false, true);
+        test_secondary_streaming_stores(true, true);
+#endif
         test_signed_projection_with_smp_quantum(false);
         test_signed_projection_with_smp_quantum(true);
         test_secondary_interpreter_projection();

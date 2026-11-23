@@ -783,7 +783,8 @@ class AndroidBootSession final {
         boot_work.counter_loop_steps +
         boot_work.affine_ram_rotate_steps + boot_work.movntdq_store_steps + board_->secondary_store_steps() +
         board_->secondary_rep_elements() + board_->secondary_scan_steps() + board_->secondary_shift_steps() +
-        board_->secondary_zero_steps() + board_->secondary_multiply_steps() + execution.state_vector_interpreter_steps;
+        board_->secondary_zero_steps() + board_->secondary_multiply_steps() +
+        board_->secondary_streaming_sse_fill_steps() + execution.state_vector_interpreter_steps;
     const auto accelerated_steps = execution.ether_steps + batched_steps;
     out << ",\"ether_coverage\":{\"phase_steps\":" << execution.guest_steps
         << ",\"translated_steps\":" << execution.ether_steps
@@ -811,6 +812,7 @@ class AndroidBootSession final {
         << ",\"boot_forward_copy_loop_steps\":" << boot_work.forward_copy_loop_steps
         << ",\"boot_counter_loop_batches\":" << boot_work.counter_loop_batches
         << ",\"boot_counter_loop_steps\":" << boot_work.counter_loop_steps
+        << ",\"boot_streaming_sse_fill_steps\":" << boot_work.streaming_sse_fill_loop_steps
         << ",\"boot_wide_multiply_loop_batches\":" << boot_work.wide_multiply_loop_batches
         << ",\"boot_wide_multiply_loop_steps\":" << boot_work.wide_multiply_loop_steps
         << ",\"boot_rotate_xor_loop_batches\":" << boot_work.rotate_xor_loop_batches
@@ -827,6 +829,7 @@ class AndroidBootSession final {
         << ",\"secondary_shift_loop_steps\":" << board_->secondary_shift_steps()
         << ",\"secondary_zero_loop_steps\":" << board_->secondary_zero_steps()
         << ",\"secondary_wide_multiply_loop_steps\":" << board_->secondary_multiply_steps()
+        << ",\"secondary_streaming_sse_fill_steps\":" << board_->secondary_streaming_sse_fill_steps()
         << ",\"cooperative_loop_blocks\":" << board_->paired_loop_blocks()
         << ",\"cooperative_loop_steps\":" << board_->paired_loop_steps()
         << ",\"worker_loop_blocks\":" << board_->worker_loop_blocks()
