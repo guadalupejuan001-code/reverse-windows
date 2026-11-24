@@ -36,6 +36,9 @@ inline void write_storage_profile(std::ostream& out, const cosmic_pc::PcMachine&
       << ",\"pwrite_calls\":" << io.write_calls << ",\"pwrite_bytes\":" << io.write_bytes
       << ",\"pwrite_ns\":" << io.write_ns << ",\"fsync_calls\":" << io.sync_calls
       << ",\"fsync_ns\":" << io.sync_ns
+      << ",\"serial_read_run_limit_blocks\":" << QssdDisk::kMaxSerialReadRunBlocks
+      << ",\"verified_read_run_limit_blocks\":" << QssdDisk::kMaxVerifiedReadRunBlocks
+      << ",\"peak_raw_read_blocks\":" << (disk ? disk->peak_raw_read_blocks() : 0)
       << "},\"qssd_xor64\":{\"revision\":" << aggregate.revision
       << ",\"value\":\"" << cosmic_pc::PcMachine::hex64(aggregate.word) << "\""
       << ",\"bit_parity\":" << aggregate.parity

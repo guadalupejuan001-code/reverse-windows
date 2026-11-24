@@ -28,6 +28,9 @@ inline void write_ether_arm64(std::ostream& out, const cosmic_pc::Cpu& cpu) {
       << ",\"enabled\":" << (cpu.ether_arm64_blocks_enabled() ? "true" : "false")
       << ",\"translated\":" << stats.translated << ",\"cache_hits\":" << stats.hits
       << ",\"executed_blocks\":" << stats.blocks << ",\"guest_steps\":" << stats.steps
+      << ",\"expanded_blocks\":" << stats.expanded_blocks
+      << ",\"largest_block_instructions\":" << stats.largest_block_instructions
+      << ",\"block_instruction_limit\":" << cosmic_pc::ether_arm64::Block::kMaxInstructions
       << ",\"protected32_guest_steps\":" << stats.protected32_steps
       << ",\"invalidated\":" << stats.invalidated << ",\"data_fallbacks\":" << stats.data_fallbacks
       << ",\"compiled_evictions\":" << stats.compiled_evictions

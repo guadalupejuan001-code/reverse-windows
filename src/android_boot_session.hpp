@@ -915,7 +915,9 @@ class AndroidBootSession final {
           << ",\"last_asc\":" << unsigned(cd.last_asc)
           << ",\"irqs_signaled\":" << cd.irqs_signaled
           << ",\"irq_pending\":" << (optical->irq_pending() ? "true" : "false")
-          << ",\"read_bytes\":" << cd.read_sectors * AtapiCdrom::sector_bytes << '}';
+          << ",\"read_bytes\":" << cd.read_sectors * AtapiCdrom::sector_bytes
+          << ",\"batched_pio_bytes\":" << cd.batched_pio_bytes
+          << ",\"max_pio_batch_elements\":" << cd.max_pio_batch_elements << '}';
     }
     const auto rtc = board_->rtc_evidence();
     out << ",\"rtc\":{\"selected_register\":" << rtc.selected_register
@@ -935,6 +937,8 @@ class AndroidBootSession final {
         << ",\"clock_hz\":" << ata_hz
         << ",\"clock_cycles\":" << board_->device_clock_cycles(ata_hz)
         << ",\"last_command_cycle\":" << counts.last_command_cycle
+        << ",\"batched_pio_bytes\":" << counts.batched_pio_bytes
+        << ",\"max_pio_batch_elements\":" << counts.max_pio_batch_elements
         << "},\"irq\":{\"ticks\":" << platform.ticks << ",\"delivered\":" << platform.irq_delivered
         << ",\"irq14\":" << platform.ata_irqs << ",\"irq15\":" << platform.atapi_irqs
         << ",\"lapic_delivered\":" << platform.apic_irqs

@@ -46,6 +46,8 @@ class QssdDisk final : public BlockDisk {
   static constexpr std::size_t kMaxTransactionBytes = kMaxTransactionBlocks * kBlockSize;
   static constexpr std::size_t kMaxBulkTransactionBlocks = 2048;
   static constexpr std::size_t kMaxBulkTransactionBytes = kMaxBulkTransactionBlocks * kBlockSize;
+  static constexpr std::size_t kMaxVerifiedReadRunBlocks = 64;
+  static constexpr std::size_t kMaxSerialReadRunBlocks = 256;
   struct Stats {
     std::uint64_t logical_bytes, physical_bytes, commits, raw_blocks;
     std::uint64_t zero_blocks, pattern_blocks, deduplicated_blocks, qssd_serial;
@@ -112,8 +114,7 @@ class QssdDisk final : public BlockDisk {
   static constexpr std::size_t kDedupWindow=4096;
   static constexpr std::size_t kReadCacheBlocks=128; // 512 KiB bounded data
   static constexpr std::size_t kReadCacheBytes=kReadCacheBlocks*kBlockSize;
-  static constexpr std::size_t kVerifiedRunBlocks=16;
-  static_assert(kVerifiedRunBlocks*kRawRecordBytes + kBlockSize <= kReadCacheBytes);
+  static_assert(kMaxVerifiedReadRunBlocks*kRawRecordBytes + kBlockSize <= kReadCacheBytes);
   int fd_=-1;
   const Access access_;
   std::filesystem::path path_;
@@ -137,6 +138,7 @@ class QssdDisk final : public BlockDisk {
   mutable std::vector<std::uint8_t> verified_raw_;
   mutable std::uint64_t verified_offset_=0,verified_block_=0;
   mutable std::atomic<std::uint64_t> cache_hits_{0},cache_misses_{0};
+  mutable std::atomic<std::size_t> peak_raw_read_blocks_{0};
   struct IoCounters {
     std::atomic<std::uint64_t> calls{0},bytes{0},ns{0};
     void add(std::size_t length,std::chrono::steady_clock::time_point started) noexcept {
@@ -549,7 +551,10 @@ class QssdDisk final : public BlockDisk {
     const auto size=count*kRawRecordBytes;
     if(offset>limit||size>limit-offset)
       throw std::runtime_error("QSSD truncated contiguous RAW records");
-    if (access_ == Access::ReadWrite && read_cached_raw_run(offset,count,target)) return;
+    if (access_ == Access::ReadWrite && read_cached_raw_run(offset,count,target)) {
+      record_raw_read_peak(count);
+      return;
+    }
     buffer.resize(size);
     read_all(fd_,offset,buffer.data(),size,&physical_reads_);
 
@@ -577,7 +582,7 @@ class QssdDisk final : public BlockDisk {
     // Copy only after the raw run has passed both checksum checks.
     for(std::size_t i=0;i<count;++i)
       std::memcpy(target+i*kBlockSize,buffer.data()+i*kRawRecordBytes+kRecHeader,kBlockSize);
-    if (!verified && cache_request && buffer.capacity() <= kVerifiedRunBlocks*kRawRecordBytes) {
+    if (!verified && cache_request && buffer.capacity() <= kMaxVerifiedReadRunBlocks*kRawRecordBytes) {
       std::lock_guard<std::mutex> guard(cache_mutex_);
       trim_decoded_cache_locked((kReadCacheBytes - buffer.capacity()) / kBlockSize);
       verified_raw_.swap(buffer);
@@ -585,7 +590,13 @@ class QssdDisk final : public BlockDisk {
       verified_block_ = block;
     }
     (verified ? cache_hits_ : cache_misses_).fetch_add(count,std::memory_order_relaxed);
+    record_raw_read_peak(count);
     record_parallel(parallel_reads_,lanes,count*kBlockSize);
+  }
+
+  void record_raw_read_peak(std::size_t count) const noexcept {
+    auto peak = peak_raw_read_blocks_.load(std::memory_order_relaxed);
+    while (count > peak && !peak_raw_read_blocks_.compare_exchange_weak(peak, count, std::memory_order_relaxed)) {}
   }
 
   std::shared_ptr<const BlockData> cached_decode(std::uint64_t off,
@@ -1084,6 +1095,9 @@ class QssdDisk final : public BlockDisk {
             parallel_writes_.bytes.load(std::memory_order_relaxed),
             bulk_peak_workers_.load(std::memory_order_relaxed)};
   }
+  std::size_t peak_raw_read_blocks() const noexcept {
+    return peak_raw_read_blocks_.load(std::memory_order_relaxed);
+  }
 
   bool read_bytes(std::uint64_t offset,std::uint8_t* target,std::size_t size) override {
     if((!target&&size)||offset>capacity_||size>capacity_-offset)return false;
@@ -1097,7 +1111,7 @@ class QssdDisk final : public BlockDisk {
         const auto n=std::min<std::size_t>(size-done,kBlockSize-start);
         const auto ref=locate(view->value->root,block);
         if(start==0&&ref.kind==Raw&&(size-done)/kBlockSize>=kDigestLanes){
-          const auto max_blocks=bulk_workers_?kMaxBulkTransactionBlocks:kMaxTransactionBlocks;
+          const auto max_blocks=bulk_workers_?kMaxBulkTransactionBlocks:kMaxSerialReadRunBlocks;
           const auto max_count=std::min(max_blocks,(size-done)/kBlockSize);
           std::size_t count=1;
           for(;count<max_count;++count){
@@ -1105,7 +1119,7 @@ class QssdDisk final : public BlockDisk {
             if(next.kind!=Raw||next.offset!=ref.offset+count*kRawRecordBytes)break;
           }
           if(count>=kDigestLanes){
-            read_raw_run(ref.offset,block,count,view->value->end,size<=kVerifiedRunBlocks*kBlockSize,
+            read_raw_run(ref.offset,block,count,view->value->end,size<=kMaxVerifiedReadRunBlocks*kBlockSize,
                          raw_buffer,target+done);
             done+=count*kBlockSize;
             continue;

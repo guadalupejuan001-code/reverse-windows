@@ -1736,7 +1736,8 @@ class PcMotherboardC06 {
       }
       if (faulted_processor_ || powered_off_ ||
           pc_.guest_restart() != cosmic_pc::PcMachine::GuestRestart::None) return;
-      if (preserve_ether_loop_entry && used && budget - used < cosmic_pc::ether_arm64::Block::kMaxInstructions &&
+      if (preserve_ether_loop_entry && used &&
+          budget - used < cosmic_pc::ether_arm64::Block::kNarrowMaxInstructions &&
           budget - used < cpu.ether_arm64_loop_length(kParallelLoopAccess)) return;
       apply_startup(apic);
       if (!apic.started) return;
@@ -2172,16 +2173,28 @@ class PcMotherboardC06 {
       if(p==0xf0||owned_port(p))return io_write(p,w,v);
       return prior_out_&&prior_out_(p,w,v);
     };
-    if(ata_){
+    if (ata_ || optical_) {
       pc_.cpu.pio_batch_limit_hook=[this](std::uint16_t p,unsigned width,bool input,unsigned count){
-        if(p==AtaC07::kData&&(ata_cfg_[4]&1U))
-          return selected_ata()->pio_batch_limit(width,input,count);
+        if (ata_cfg_[4] & 1U) {
+          if (p == AtaC07::kData && ata_)
+            return selected_ata()->pio_batch_limit(width, input, count);
+          if (p == AtapiCdrom::kData && optical_ && input)
+            return optical_->pio_batch_limit(width, count);
+        }
+        if (!ata_ && !owned_port(p) && prior_pio_batch_limit_)
+          return prior_pio_batch_limit_(p, width, input, count);
         return 0U;
       };
       pc_.cpu.pio_batch_transfer_hook=[this](std::uint16_t p,unsigned width,bool input,
                                              std::uint8_t* data,unsigned count){
-        return p==AtaC07::kData&&(ata_cfg_[4]&1U)&&
-               selected_ata()->pio_batch_transfer(width,input,data,count);
+        if (ata_cfg_[4] & 1U) {
+          if (p == AtaC07::kData && ata_)
+            return selected_ata()->pio_batch_transfer(width, input, data, count);
+          if (p == AtapiCdrom::kData && optical_ && input)
+            return optical_->pio_batch_read(width, data, count);
+        }
+        return !ata_ && !owned_port(p) && prior_pio_batch_transfer_ &&
+            prior_pio_batch_transfer_(p, width, input, data, count);
       };
     }
     attach_mmio(pc_.cpu, bsp());

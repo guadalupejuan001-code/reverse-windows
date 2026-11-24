@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <stdexcept>
@@ -16,10 +17,12 @@ namespace reverse_windows {
 class AtapiCdrom {
  public:
   using Reader = std::function<bool(std::uint64_t, std::uint8_t*, std::size_t)>;
+  static constexpr std::uint16_t kData = 0x170;
   static constexpr std::size_t sector_bytes = 2048;
   struct Activity {
     std::uint64_t packets=0, read_sectors=0, rejected_packets=0;
-    std::uint64_t irqs_signaled=0;
+    std::uint64_t irqs_signaled=0, batched_pio_bytes=0;
+    unsigned max_pio_batch_elements=0;
     std::uint8_t last_packet=0, last_rejected_packet=0, last_sense=0, last_asc=0;
   };
 
@@ -31,7 +34,7 @@ class AtapiCdrom {
   }
 
   static bool handles(std::uint16_t port) {
-    return (port >= 0x170 && port <= 0x177) || port == 0x376;
+    return (port >= kData && port <= 0x177) || port == 0x376;
   }
 
   void reset() {
@@ -43,9 +46,29 @@ class AtapiCdrom {
   const Activity& activity() const noexcept { return activity_; }
   bool irq_pending() const noexcept { return interrupt_pending_; }
 
+  unsigned pio_batch_limit(unsigned width, unsigned elements) const noexcept {
+    if ((width != 2 && width != 4) || (drive_ & 0x10U) || !(status_ & drq) ||
+        (phase_ != Phase::Identify && phase_ != Phase::DataIn) || position_ >= phase_end_)
+      return 0;
+    // The scalar access that reaches the end owns all status/IRQ changes,
+    // including the case where one dword consumes the final padded word.
+    return std::min(elements, static_cast<unsigned>((phase_end_ - position_ - 1) / width));
+  }
+
+  bool pio_batch_read(unsigned width, std::uint8_t* target, unsigned elements) noexcept {
+    if (!target || elements < 2 || pio_batch_limit(width, elements) != elements)
+      return false;
+    const auto size = width * elements;
+    std::memcpy(target, data_.data() + position_, size);
+    position_ += size;
+    activity_.batched_pio_bytes += size;
+    activity_.max_pio_batch_elements = std::max(activity_.max_pio_batch_elements, elements);
+    return true;
+  }
+
   std::uint32_t input(std::uint16_t port, unsigned width) {
     if (drive_ & 0x10U) return 0; // No secondary slave.
-    if (port == 0x170 && (width == 2 || width == 4)) {
+    if (port == kData && (width == 2 || width == 4)) {
       std::uint32_t value = 0;
       for (unsigned lane = 0; lane < width; lane += 2)
         value |= std::uint32_t(data_word()) << (8 * lane);
@@ -68,7 +91,7 @@ class AtapiCdrom {
   }
 
   bool output(std::uint16_t port, unsigned width, std::uint32_t value) {
-    if (port == 0x170 && (width == 2 || width == 4)) {
+    if (port == kData && (width == 2 || width == 4)) {
       if (!(drive_ & 0x10U)) {
         packet_word(static_cast<std::uint16_t>(value));
         if (width == 4) packet_word(static_cast<std::uint16_t>(value >> 16U));

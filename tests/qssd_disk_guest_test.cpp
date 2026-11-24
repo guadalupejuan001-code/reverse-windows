@@ -62,7 +62,7 @@ void verify_parallel_io(const std::filesystem::path& path) {
          volume.read_bytes(retry_at,actual.data(),bytes)&&actual==payload,
          "Replaying the journal changed an exact parallel or nested write");
     constexpr auto offset = (first / Disk::kBlockSize + 16) * Disk::kBlockSize;
-    std::vector<std::uint8_t> reread(8 * Disk::kBlockSize);
+    std::vector<std::uint8_t> reread(64 * Disk::kBlockSize);
     const auto before = volume.io_stats().read_calls;
     need(volume.read_bytes(offset, reread.data(), reread.size()) &&
          std::equal(reread.begin(), reread.end(), payload.begin() + (offset - first)),
@@ -74,10 +74,20 @@ void verify_parallel_io(const std::filesystem::path& path) {
          std::equal(reread.begin(), reread.end(), payload.begin() + (offset - first)),
          "Cached contiguous RAW read changed bytes");
     const auto warm = volume.io_stats().read_calls - before - cold;
-    need(cold == 1 && warm == 1 && volume.cache_stats().hits - hits == 8 &&
+    need(cold == 1 && warm == 1 && volume.cache_stats().hits - hits == 64 &&
          volume.cache_stats().resident_bytes <= 512 * 1024, "RAW reread did not verify the current record");
     std::cout << "PRIME_QSSD_RAW_REREAD_PASS bytes=" << reread.size()
               << " cold_reads=" << cold << " warm_reads=" << warm << '\n';
+  }
+  {
+    Disk volume(path, Disk::Access::ReadOnly);
+    constexpr auto offset = (first / Disk::kBlockSize + 16) * Disk::kBlockSize;
+    std::vector<std::uint8_t> run(256 * Disk::kBlockSize);
+    const auto before = volume.io_stats().read_calls;
+    need(volume.read_bytes(offset, run.data(), run.size()) &&
+         std::equal(run.begin(), run.end(), payload.begin() + (offset - first)) &&
+         volume.io_stats().read_calls - before == 1 && volume.peak_raw_read_blocks() == 256,
+         "A serial 256-block RAW run must read exactly one journal chunk");
   }
   std::filesystem::remove(path);
   std::cout<<"PRIME_QSSD_PARALLEL_PASS offset="<<first<<" bytes="<<bytes

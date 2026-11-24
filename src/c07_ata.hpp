@@ -31,6 +31,7 @@ class AtaC07 {
     std::uint64_t flushes=0,aborts=0,irqs_signaled=0;
     std::uint64_t identify_data_transfers=0;
     std::uint64_t batched_pio_bytes=0;
+    unsigned max_pio_batch_elements=0;
   };
   struct Backend {
     std::uint64_t reads=0,writes=0,flushes=0;
@@ -304,18 +305,21 @@ class AtaC07 {
   }
   bool selected() const noexcept {return bool(drive_&0x10U)==(unit_==Unit::Slave);}
   unsigned pio_batch_limit(unsigned width,bool input,unsigned elements) const noexcept {
-    if((width!=2&&width!=4)||!selected()||!(status_&kDrq)||
-       transfer_!=(input?Transfer::Read:Transfer::Write))return 0;
+    const bool matching = input ? (transfer_ == Transfer::Read || transfer_ == Transfer::Identify)
+                                : transfer_ == Transfer::Write;
+    if ((width != 2 && width != 4) || !selected() || !(status_ & kDrq) || !matching)
+      return 0;
     const auto available=(active_sectors_*512-pos_)/width;
     return available>1?std::min(elements,unsigned(available-1)):0;
   }
   bool pio_batch_transfer(unsigned width,bool input,std::uint8_t* bytes,unsigned elements) noexcept {
-    if(elements<2||pio_batch_limit(width,input,elements)!=elements)return false;
+    if(!bytes||elements<2||pio_batch_limit(width,input,elements)!=elements)return false;
     const auto size=width*elements;
     if(input)std::memcpy(bytes,buffer_.data()+pos_,size);
     else std::memcpy(buffer_.data()+pos_,bytes,size);
     pos_+=size;
     stats_.batched_pio_bytes+=size;
+    stats_.max_pio_batch_elements=std::max(stats_.max_pio_batch_elements,elements);
     return true;
   }
   std::optional<std::uint32_t> input(std::uint16_t p,unsigned width) {

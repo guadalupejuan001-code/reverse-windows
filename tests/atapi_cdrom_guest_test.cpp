@@ -60,6 +60,7 @@ int main() {
   try {
     cosmic_pc::PcMachine machine(16 * 1024 * 1024);
     protected_mode(machine);
+    machine.enable_boot_acceleration();
     auto& cpu = machine.cpu;
     std::array<std::uint8_t,4096> cd{};
     for (unsigned i = 0; i < cd.size(); ++i) cd[i] = std::uint8_t(i * 29 + i / 2048);
@@ -157,6 +158,9 @@ int main() {
             activity.last_rejected_packet == 0x5a && activity.last_sense == 5 &&
             activity.last_asc == 0x24,
             "ATAPI diagnostics did not preserve the optical command results");
+    require(activity.batched_pio_bytes > cd.size() / 2 &&
+            activity.max_pio_batch_elements > 1 && activity.max_pio_batch_elements < 256,
+            "ATAPI REP batches must move data and leave the final word of each phase to scalar PIO");
     const auto initial_irqs = cpu.read32(0x9040);
     require(initial_irqs >= 8 && initial_irqs == board.evidence().atapi_irqs,
             "IRQ15 did not reach the guest IDT or match motherboard accounting");
