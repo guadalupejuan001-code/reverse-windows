@@ -421,7 +421,7 @@ jobs:
           assert cpu_us is None or cpu_us > 0
           thermal = snapshot["android_thermal_status"]
           assert thermal is None or 0 <= thermal <= 6
-          assert snapshot["cpu_topology"]["guest_tsc_hz"] == 4_500_000_000_000
+          assert snapshot["cpu_topology"]["guest_tsc_hz"] == 4_581_817_600
           host = snapshot["host_cpu"]
           assert host["hint_threads"] == 0, "Android hints must close when the guest stops"
           if host["readable_policies"]:
@@ -538,7 +538,7 @@ jobs:
           assert timing["diagnostic_save_interval_ms"] == 5_000
           topology = report["cpu_topology"]
           assert (topology["cores"], topology["threads_per_core"], topology["logical_processors"]) == (8, 2, 16)
-          assert topology["guest_tsc_hz"] == 4_500_000_000_000
+          assert topology["guest_tsc_hz"] == 4_581_817_600
           assert report["irq"]["clock_source"] == "host-active-monotonic" and report["irq"]["active_clock_ticks"] > 0
           assert report["ram_profile"]["usable_bytes"] == 64 << 30, report["ram_profile"]
           assert report["ram_profile"]["memory_backend"] == "ether-state-ram", report["ram_profile"]
@@ -560,7 +560,7 @@ jobs:
                 f"protected32_tsc_hz={topology['guest_tsc_hz']}")
           PY
           python3 tests/android_rgb_console.py settings
-          for rate in 4581817600 4500000000000; do
+          for rate in 4500000000000 4581817600; do
             tap_visible resource-id "$ANDROID_APP_ID:id/vm_experimental_clock" down
             live="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/iso-clock-$rate.json"
             for attempt in {1..20}; do

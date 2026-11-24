@@ -47,7 +47,7 @@ class AndroidBootSession final {
   static constexpr unsigned kMaxVideoWidth = 960, kMaxVideoHeight = 720;
   static constexpr RamProfile kDefaultRamProfile{2048ULL * 1024 * 1024, 256ULL * 1024 * 1024};
   static constexpr cosmic_pc::CpuTopology kPrimeCpuTopology{8, 2};
-  static constexpr auto kPrimeCpuClock = PcMotherboardC06::CpuClock::Experimental4_5THz;
+  static constexpr auto kPrimeCpuClock = PcMotherboardC06::CpuClock::Twentyfold;
   static constexpr auto kEngineTargetHz = cosmic_pc::ether_arm64::kExecutionTargetHz;
   static constexpr auto kMaxEngineWindow = std::chrono::milliseconds(8);
   static_assert(kEngineTargetHz % 1'000'000'000 == 0);

@@ -180,7 +180,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         setupPanel=card(body,8);
         controls=card(body,8);
         experimentalClock=new Switch(this);experimentalClock.setId(R.id.vm_experimental_clock);
-        experimentalClock.setText("Reloj virtual de 4,5 THz");experimentalClock.setTextColor(TEXT);
+        experimentalClock.setText("Reloj experimental de 4,5 THz");experimentalClock.setTextColor(TEXT);
         experimentalClock.setOnClickListener(v->worker.setExperimentalClock(experimentalClock.isChecked()));add(controls,experimentalClock,0);
         primaryActions=row(controls);
         pause=action("Pausar",false,()->{console.release();worker.setRunning(!running);});
@@ -422,7 +422,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
 
     private void start(int bootSource, boolean debug) {
         if (session || pending) return;
-        experimentalClock.setChecked(true);
+        experimentalClock.setChecked(false);
         pending = true;
         fault = false;
         terminal = false;
