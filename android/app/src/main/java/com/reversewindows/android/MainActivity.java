@@ -448,7 +448,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         console.bootStatus(status.getText());
         status.setTextColor(TEXT);
         bootLogDiagnostic = null;
-        stats.setText("");
+        stats.setText(status.getText());
         updateControls();
         worker.start(bootSource, iso, debug, primeRam);
         showBootStatus();
@@ -559,6 +559,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         if (!pending || session) return;
         status.setText(message);
         console.bootStatus(message);
+        stats.setText(message);
     }
 
     @Override
@@ -654,16 +655,14 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
                     sessionSteps, stepsPerSecond, motorStepsPerSecond);
             sessionSummary.setText(VmTelemetry.summary(diagnostic, machine, sessionSteps));
             sessionSummary.setVisibility(View.VISIBLE);
-            if (console.isShown()) {
-                String summary = String.format(Locale.getDefault(), "%s · %s · %,d pasos",
-                        status.getText(), modeName(machine.optString("cpu_mode")), sessionSteps);
-                if (stepsPerSecond >= 0)
-                    summary += String.format(Locale.getDefault(), " · %,d pasos/s", stepsPerSecond);
-                if (restarts > 0)
-                    summary += String.format(Locale.getDefault(), " · reinicios %,d (%s)", restarts,
-                            boot.optString("last_restart", "origen desconocido"));
-                console.bootStatus(summary);
-            }
+            String summary = String.format(Locale.getDefault(), "%s · %s · %,d pasos",
+                    status.getText(), modeName(machine.optString("cpu_mode")), sessionSteps);
+            if (stepsPerSecond >= 0)
+                summary += String.format(Locale.getDefault(), " · %,d pasos/s", stepsPerSecond);
+            if (restarts > 0)
+                summary += String.format(Locale.getDefault(), " · reinicios %,d (%s)", restarts,
+                        boot.optString("last_restart", "origen desconocido"));
+            console.bootStatus(summary);
         }
         bootLogDiagnostic = diagnostic;
         bootLogStepsPerSecond = stepsPerSecond;
