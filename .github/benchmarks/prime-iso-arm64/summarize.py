@@ -88,6 +88,7 @@ def load_checkpoint(record):
         "bios_bytes": vm["storage_io"]["bios_boot_media"]["read_bytes"],
         "irq_delivered": vm["irq"]["delivered"],
         "started_vcpus": topology["started"],
+        "guest_topology": pick(topology, ("sockets", "cores", "threads_per_core", "logical_processors")),
         "guest_tsc_hz": topology.get("guest_tsc_hz"),
         "crc32c_retired": topology.get("crc32c_retired"),
         "lsl_retired": topology.get("lsl_retired"),

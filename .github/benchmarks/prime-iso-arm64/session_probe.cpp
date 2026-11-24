@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
     if (fd < 0) throw std::runtime_error("Could not open the read-only optical image");
     struct Close { int fd; ~Close() { ::close(fd); } } optical{fd};
     Session session(run_dir / "system.rqvd", 64, Session::BootSource::Iso, fd, 5550497792ULL,
-        ram, ram_cache, run_dir / "vram.rqvd", {}, Session::kPrimeCpuTopology, true, Session::kPrimeCpuClock);
+        ram, ram_cache, run_dir / "vram.rqvd", {}, cosmic_pc::CpuTopology{1, 1}, true, Session::kPrimeCpuClock);
     std::ofstream snapshots(run_dir / "snapshots.jsonl");
     if (!snapshots) throw std::runtime_error("Could not open the snapshot log");
     std::ofstream milestones(run_dir / "milestones.jsonl");
