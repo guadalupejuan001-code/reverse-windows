@@ -1,8 +1,8 @@
-name: Prime R110 ARM64 guest exception replay
+name: Prime R110 .16 ARM64 guest exception replay
 
 on:
   push:
-    branches: [ci/prime-r110-arm64-irql-trace]
+    branches: [ci/prime-r110-arm64-perf16-irql-trace]
     paths:
       - .github/benchmarks/prime-iso-arm64/**
       - .github/workflows/prime-r110-real-iso-arm64-irql-trace.yml
@@ -13,14 +13,13 @@ permissions:
 env:
   AVAILABLE_MIB: '749'
   THRESHOLD_MIB: '128'
-  STOP_TARGET: '20000000000'
-  PROBE_TIMEOUT_SECONDS: '4800'
-  EXCEPTION_REPLAY_POST_NMI_STEPS: '500000000'
+  STOP_TARGET: '40000000000'
+  PROBE_TIMEOUT_SECONDS: '6600'
 
 jobs:
   exception-replay:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 100
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
         with:
@@ -90,7 +89,7 @@ jobs:
       - name: Upload the 11.5B observation
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-irql-trace-11-5b
+          name: prime-r110-arm64-perf16-irql-trace-11-5b
           path: ${{ runner.temp }}/reference-progress/
       - name: Wait for the first delivered NMI capture
         id: nmi
@@ -115,7 +114,7 @@ jobs:
         if: steps.nmi.outputs.captured == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-irql-trace-first-nmi
+          name: prime-r110-arm64-perf16-irql-trace-first-nmi
           path: ${{ runner.temp }}/first-nmi/
           if-no-files-found: error
       - name: Verify the bounded replay finished and archived its trace
@@ -136,6 +135,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-irql-trace-final
+          name: prime-r110-arm64-perf16-irql-trace-final
           path: ${{ runner.temp }}/evidence/
           if-no-files-found: warn
