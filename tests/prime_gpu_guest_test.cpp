@@ -463,31 +463,38 @@ void verify_pci_clocks(const std::filesystem::path& directory) {
     const auto low = read(dev, offset);
     return low | (std::uint64_t(read(dev, offset + 4)) << 32);
   };
-  constexpr std::uint64_t hz = 4'500'000'000'000ULL;
+  constexpr std::uint64_t ram_hz = 4'800'000'000ULL;
+  constexpr std::uint64_t ata_hz = 33'333'333ULL;
+  constexpr std::uint64_t gpu_hz = 4'500'000'000'000ULL;
   constexpr unsigned gpu = GuestGpuC08::pci_device;
+  constexpr std::array<std::pair<unsigned, std::uint64_t>, 3> clocks{{
+      {0U, ram_hz}, {2U, ata_hz}, {gpu, gpu_hz}}};
+  require(RW_PRIME_DDR5_TRANSFERS_PER_SECOND == 9'600'000'000ULL,
+          "DDR5 must expose two transfers per 4.8 GHz clock cycle");
   advance = 1s;
   board.run(1);
-  for (const unsigned dev : {0U, 2U, gpu}) {
+  for (const auto& [dev, hz] : clocks) {
     require(read64(dev, RW_PRIME_PCI_CLOCK_HZ) == hz &&
             read64(dev, RW_PRIME_PCI_CLOCK_CYCLES) == hz,
-            "RAM, IDE and GPU must sample the same active second");
+            "Each PCI clock must advance by its own frequency in one active second");
   }
-  require(read(gpu, RW_PRIME_PCI_CLOCK_HZ + 5, 2) == ((hz >> 40) & 0xffff) &&
+  require(read(gpu, RW_PRIME_PCI_CLOCK_HZ + 5, 2) == ((gpu_hz >> 40) & 0xffff) &&
           !pc.cpu.in_hook(0xcff, 2) && !pc.cpu.in_hook(0xcff, 4),
           "PCI clock reads must stay inside the selected four-byte port window");
   now += 1h;
   advance = 2s;
   board.run(1);
-  require(read64(0, RW_PRIME_PCI_CLOCK_CYCLES) == 3 * hz &&
-          read64(2, RW_PRIME_PCI_CLOCK_CYCLES) == 3 * hz &&
-          read(gpu, RW_PRIME_PCI_CLOCK_CYCLES + 4) == hz >> 32 &&
-          read(gpu, RW_PRIME_PCI_CLOCK_CYCLES + 1, 2) == ((hz >> 8) & 0xffff) &&
-          read(gpu, RW_PRIME_PCI_CLOCK_CYCLES, 1) == ((3 * hz) & 0xff) &&
-          read(gpu, RW_PRIME_PCI_CLOCK_CYCLES + 4) == (3 * hz) >> 32 &&
-          read64(gpu, RW_PRIME_PCI_CLOCK_CYCLES) == 3 * hz &&
+  require(read64(0, RW_PRIME_PCI_CLOCK_CYCLES) == 3 * ram_hz &&
+          read64(2, RW_PRIME_PCI_CLOCK_CYCLES) == 3 * ata_hz &&
+          read(gpu, RW_PRIME_PCI_CLOCK_CYCLES + 4) == gpu_hz >> 32 &&
+          read(gpu, RW_PRIME_PCI_CLOCK_CYCLES + 1, 2) == ((gpu_hz >> 8) & 0xffff) &&
+          read(gpu, RW_PRIME_PCI_CLOCK_CYCLES, 1) == ((3 * gpu_hz) & 0xff) &&
+          read(gpu, RW_PRIME_PCI_CLOCK_CYCLES + 4) == (3 * gpu_hz) >> 32 &&
+          read64(gpu, RW_PRIME_PCI_CLOCK_CYCLES) == 3 * gpu_hz &&
           board.active_clock_ticks() == 3ULL * PcMachine::kVirtualCyclesPerSecond,
           "PCI clock latches, VM pauses or peripheral time diverged");
-  std::cout << "PRIME_PCI_CLOCK_PASS active_seconds=3 guest_hz=" << hz << " devices=3\n";
+  std::cout << "PRIME_PCI_CLOCK_PASS active_seconds=3 ram_hz=" << ram_hz << " ata_hz=" << ata_hz
+            << " gpu_hz=" << gpu_hz << " devices=3\n";
 }
 
 void verify(const std::filesystem::path& volume) {

@@ -2396,6 +2396,11 @@ class PcMotherboardC06 {
   std::uint64_t secondary_zero_steps() const noexcept { return secondary_zero_steps_; }
   std::uint64_t secondary_multiply_steps() const noexcept { return secondary_multiply_steps_; }
   std::uint64_t secondary_streaming_sse_fill_steps() const noexcept { return secondary_streaming_sse_fill_steps_; }
+  std::uint64_t secondary_sse_zero_fill_bytes() const noexcept {
+    std::uint64_t bytes = 0;
+    for (unsigned id = 1; id < processor_count_; ++id) bytes += apics_[id].cpu->sse_zero_fill_bytes();
+    return bytes;
+  }
   std::uint64_t parallel_mixed_batches() const noexcept { return parallel_mixed_batches_; }
   std::uint64_t paired_loop_blocks() const noexcept { return paired_loop_blocks_; }
   std::uint64_t paired_loop_steps() const noexcept { return paired_loop_steps_; }

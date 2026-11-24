@@ -848,6 +848,7 @@ class AndroidBootSession final {
         << ",\"boot_counter_loop_steps\":" << boot_work.counter_loop_steps
         << ",\"boot_streaming_sse_fill_steps\":" << boot_work.streaming_sse_fill_loop_steps
         << ",\"boot_streaming_sse_triplet_steps\":" << pc_.cpu.streaming_sse_triplet_steps()
+        << ",\"boot_sse_zero_fill_bytes\":" << pc_.cpu.sse_zero_fill_bytes()
         << ",\"boot_wide_multiply_loop_batches\":" << boot_work.wide_multiply_loop_batches
         << ",\"boot_wide_multiply_loop_steps\":" << boot_work.wide_multiply_loop_steps
         << ",\"boot_rotate_xor_loop_batches\":" << boot_work.rotate_xor_loop_batches
@@ -869,6 +870,7 @@ class AndroidBootSession final {
         << ",\"secondary_zero_loop_steps\":" << board_->secondary_zero_steps()
         << ",\"secondary_wide_multiply_loop_steps\":" << board_->secondary_multiply_steps()
         << ",\"secondary_streaming_sse_fill_steps\":" << board_->secondary_streaming_sse_fill_steps()
+        << ",\"secondary_sse_zero_fill_bytes\":" << board_->secondary_sse_zero_fill_bytes()
         << ",\"cooperative_loop_blocks\":" << board_->paired_loop_blocks()
         << ",\"cooperative_loop_steps\":" << board_->paired_loop_steps()
         << ",\"worker_loop_blocks\":" << board_->worker_loop_blocks()
