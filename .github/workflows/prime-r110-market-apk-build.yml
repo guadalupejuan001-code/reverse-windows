@@ -1,18 +1,19 @@
-name: Prime R110 component clocks ARM64 APK
+name: Prime R110 page fault resume ARM64 APK
 
 on:
   push:
-    branches: [ci/prime-r110-market-apk-build]
+    branches: [ci/prime-r110-page-resume-apk-build]
     paths: [.github/workflows/prime-r110-market-apk-build.yml]
 
 permissions:
   contents: read
 
 env:
-  PRODUCT_SHA: 1e1be01dd9c797aa37b4e21c69321354aef9d95e
-  APP_ID: com.reversewindows.android.prime.smp.r110.marketclocks
-  APK_VERSION: 0.3.88-perf-test.11
-  APK_VERSION_CODE: '130'
+  PRODUCT_SHA: 6fe4282fc7cb0dcd761cdbbaaacd1681dd41cdd0
+  MUNDO_X_SHA: 88144ca47d75c86a12be9aacdc720db872c1d074
+  APP_ID: com.reversewindows.android.prime.smp.r110.pageresume
+  APK_VERSION: 0.3.88-perf-test.12
+  APK_VERSION_CODE: '131'
   ANDROID_ABI: arm64-v8a
 
 jobs:
@@ -29,7 +30,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$PRODUCT_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$PRODUCT_SHA" =~ ^[a-f0-9]{40}$ && "$MUNDO_X_SHA" =~ ^[a-f0-9]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
           python3 - <<'PY'
           import json
@@ -42,7 +43,7 @@ jobs:
               os.environ['APP_ID'], os.environ['APK_VERSION'], int(os.environ['APK_VERSION_CODE']))
           PY
           python3 scripts/verify_deps.py --checkout
-          printf 'MUNDO_X_SHA=%s\n' "$(git -C deps/mundo-X rev-parse HEAD)" >> "$GITHUB_ENV"
+          test "$(git -C deps/mundo-X rev-parse HEAD)" = "$MUNDO_X_SHA"
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
