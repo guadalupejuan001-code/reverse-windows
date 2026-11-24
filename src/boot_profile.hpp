@@ -38,6 +38,8 @@ inline void write_ether_arm64(std::ostream& out, const cosmic_pc::Cpu& cpu) {
       << ",\"long_block_steps\":" << stats.long_block_steps
       << ",\"long_block_compile_attempts\":" << stats.long_block_compile_attempts
       << ",\"long_block_rejections\":" << stats.long_block_rejections
+      << ",\"long_block_cache_hits\":" << stats.long_block_cache_hits
+      << ",\"long_block_deadline_deferrals\":" << stats.long_block_deadline_deferrals
       << ",\"protected32_guest_steps\":" << stats.protected32_steps
       << ",\"invalidated\":" << stats.invalidated << ",\"data_fallbacks\":" << stats.data_fallbacks
       << ",\"compiled_evictions\":" << stats.compiled_evictions
