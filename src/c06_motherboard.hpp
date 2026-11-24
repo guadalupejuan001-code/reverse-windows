@@ -90,6 +90,12 @@ class PcMotherboardC06 {
     std::uint32_t irq8_redirection_low;
     std::uint64_t irq8_delivered;
   };
+  struct Ps2IrqEvidence {
+    struct Channel {
+      std::uint64_t assertions = 0, pic_delivered = 0, lapic_delivered = 0;
+    };
+    Channel keyboard, aux;
+  };
   struct LoopTiming {
     std::uint64_t samples = 0, last_ns = 0;
     unsigned last_steps = 0;
@@ -104,6 +110,10 @@ class PcMotherboardC06 {
   };
   struct alignas(64) BusWaitStats {
     std::uint64_t grants = 0, samples = 0, contended = 0, wait_ns = 0, max_ns = 0;
+  };
+  struct SecondaryBatchStats {
+    std::uint64_t ether_attempts = 0, ether_short_grants = 0, ether_no_retirement = 0;
+    std::uint64_t affine_ram_steps = 0, counter_steps = 0;
   };
   struct ThreadedSmpStats {
     std::uint64_t dispatches = 0, guest_steps = 0;
@@ -258,6 +268,8 @@ class PcMotherboardC06 {
   std::array<std::uint64_t, GuestGpuC08::pci_device + 1> pci_clock_samples_{};
   std::uint64_t ata_irq_delivered_=0;
   std::uint64_t atapi_irq_delivered_=0;
+  static constexpr unsigned kKeyboardLine = 1, kAuxLine = 12;
+  Ps2IrqEvidence ps2_irqs_;
   Pit pit_{},pit2_{};
   unsigned pit_phase_=0;
   std::uint8_t speaker_control_=0;
@@ -334,6 +346,7 @@ class PcMotherboardC06 {
     struct Delivery { std::uint64_t id=0, tick=0, steps=0; };
     std::array<Delivery,16> delivery_by_priority{};
     std::bitset<256> pending_level, in_service_level, pending_ata, pending_atapi, pending_sci, pending_rtc;
+    std::bitset<256> pending_keyboard, pending_aux;
     PendingWrite mmio_pending;
   };
   static constexpr auto kMaxProcessors = cosmic_pc::CpuTopology::kMaxLogical;
@@ -346,6 +359,7 @@ class PcMotherboardC06 {
   std::optional<LapicNmiDelivery> last_lapic_nmi_;
   std::array<RamViewStats, kMaxProcessors> ram_views_before_init_{};
   std::array<BusWaitStats, kMaxProcessors> bus_wait_{};
+  std::array<SecondaryBatchStats, kMaxProcessors> secondary_batch_stats_{};
   std::array<std::uint64_t, kMaxProcessors> retired_before_init_{};
   std::array<std::uint64_t, kMaxProcessors> ether_steps_before_init_{};
   std::array<std::uint64_t, kMaxProcessors> state_vector_steps_before_init_{};
@@ -406,6 +420,7 @@ class PcMotherboardC06 {
   void reset_devices(){
     if(keyboard_) keyboard_->reset();
     mouse_ = {}; aux_command_ = aux_test_reply_ = false;
+    ps2_irqs_ = {};
     master_=Pic{};slave_=Pic{};slave_.vector=0x70;
     pit_=Pit{};pit2_=Pit{};pit_phase_=0;speaker_control_=0;pci_selector_=0;
     cmos_index_=rtc_c_=0;rtc_a_=0x26;rtc_b_=0x02;pm_control_=0x0001;powered_off_=false;
@@ -435,6 +450,7 @@ class PcMotherboardC06 {
     }
     ram_views_before_init_.fill({});
     bus_wait_.fill({});
+    secondary_batch_stats_.fill({});
     retired_before_init_.fill(0);
     ether_steps_before_init_.fill(0);
     state_vector_steps_before_init_.fill(0);
@@ -1166,6 +1182,8 @@ class PcMotherboardC06 {
       if (line == 15) apic.pending_atapi.set(vector);
       if (line == AcpiC06::sci_irq) apic.pending_sci.set(vector);
       if (line == kRtcLine) apic.pending_rtc.set(vector);
+      if (line == kKeyboardLine) apic.pending_keyboard.set(vector);
+      if (line == kAuxLine) apic.pending_aux.set(vector);
     }
   }
   void deliver_sci() {
@@ -1211,6 +1229,14 @@ class PcMotherboardC06 {
       if (apic.pending_atapi[vector]) ++atapi_irq_delivered_;
       if (apic.pending_sci[vector]) ++sci_irqs_;
       if (apic.pending_rtc[vector]) ++rtc_irq8_delivered_;
+      if (apic.pending_keyboard[vector]) {
+        ++ps2_irqs_.keyboard.lapic_delivered;
+        apic.pending_keyboard.reset(vector);
+      }
+      if (apic.pending_aux[vector]) {
+        ++ps2_irqs_.aux.lapic_delivered;
+        apic.pending_aux.reset(vector);
+      }
       apic.pending_ata.reset(vector);
       apic.pending_atapi.reset(vector);
       apic.pending_sci.reset(vector);
@@ -1374,11 +1400,13 @@ class PcMotherboardC06 {
     resample_rtc_level();
     if(sci_active_&&(io_redir_low_[AcpiC06::sci_irq]&0x8000U))deliver_sci();
     if(keyboard_&&keyboard_->needs_irq()&&!(prior_in_(0x64,1).value_or(0)&1U)){
-      signal_isa_irq(1);
+      ++ps2_irqs_.keyboard.assertions;
+      signal_isa_irq(kKeyboardLine);
       keyboard_->mark_irq();
     }
     if(aux_irq() && !(prior_in_(0x64,1).value_or(0)&1U)){
-      signal_isa_irq(12);
+      ++ps2_irqs_.aux.assertions;
+      signal_isa_irq(kAuxLine);
       mouse_.mark_irq();
     }
     if(device_tick)advance_apic_timer(bsp(),1);
@@ -1403,9 +1431,11 @@ class PcMotherboardC06 {
           if(sn==7)++atapi_irq_delivered_;
           if(sn==AcpiC06::sci_irq-8)++sci_irqs_;
           if(sn==kRtcLine-8)++rtc_irq8_delivered_;
+          if (sn == kAuxLine - 8) ++ps2_irqs_.aux.pic_delivered;
         }
       }else if(cpu.raise_external_irq(std::uint8_t(master_.vector+n))){
         master_.accepted(n);++irq_delivered_;
+        if (n == kKeyboardLine) ++ps2_irqs_.keyboard.pic_delivered;
       }
     }
   }
@@ -1727,6 +1757,7 @@ class PcMotherboardC06 {
     const bool timed = deadline != Clock::time_point::max();
     auto& apic = apics_[id];
     auto& cpu = *apic.cpu;
+    auto& stats = secondary_batch_stats_[id];
     unsigned dispatches = 0;
     std::optional<std::uint64_t> rejected_vector_ip;
     for (unsigned used = 0; used < budget;) {
@@ -1785,13 +1816,34 @@ class PcMotherboardC06 {
           continue;
         }
       }
+      // These are the same guarded non-I/O batches used by the BSP. Keep
+      // them inside this AP's grant and leave shared-bus admission unchanged.
+      if (pc_.boot_acceleration_enabled() && cpu.affine_ram_rotate_loop_candidate()) {
+        if (const auto steps = unsigned(cpu.try_affine_ram_rotate_loop(secondary_batch_limit(apic, remaining)))) {
+          stats.affine_ram_steps += steps;
+          used += steps;
+          continue;
+        }
+      }
+      if (pc_.boot_acceleration_enabled() && cpu.counter_loop_batch_candidate() && !grouped_loop_candidate(cpu)) {
+        if (const auto steps = unsigned(cpu.try_counter_loop_batch(secondary_batch_limit(apic, remaining)))) {
+          stats.counter_steps += steps;
+          used += steps;
+          continue;
+        }
+      }
       if (remaining > 1 && cpu.ether_arm64_block_candidate()) {
         // A scheduler turn can span a local timer edge. Native blocks do not
         // poll the APIC internally, so bound their grant when IF is set.
         const auto limit = cpu.flag(cosmic_pc::Cpu::IF) ? secondary_batch_limit(apic, remaining) : remaining;
-        if (const auto native_steps = cpu.try_ether_arm64_block(limit, bus)) {
+        ++stats.ether_attempts;
+        if (limit < 2) {
+          ++stats.ether_short_grants;
+        } else if (const auto native_steps = cpu.try_ether_arm64_block(limit, bus)) {
           used += native_steps;
           continue;
+        } else {
+          ++stats.ether_no_retirement;
         }
       }
       if (pc_.boot_acceleration_enabled() && cpu.state_vector_batch_candidate() &&
@@ -2261,6 +2313,7 @@ class PcMotherboardC06 {
     return {ticks_,irq_delivered_,pit_irqs_,apic_irqs_,true,true,powered_off_,ata_irq_delivered_,
             sci_irqs_,atapi_irq_delivered_,lapic_nmis_};
   }
+  const Ps2IrqEvidence& ps2_irq_evidence() const noexcept { return ps2_irqs_; }
   const auto& lapic_vector_stats() const noexcept { return lapic_vectors_; }
   std::optional<LapicNmiDelivery> last_lapic_nmi() const noexcept { return last_lapic_nmi_; }
   InterruptState interrupt_state()const{
@@ -2286,6 +2339,12 @@ class PcMotherboardC06 {
     const auto* cpu = apics_.at(id).cpu;
     if (!cpu) throw std::out_of_range("Unknown vCPU");
     return {cpu->mode_name(), cpu->segments[cosmic_pc::Cpu::CS], cpu->eip, cpu->cr3, cpu->eflags};
+  }
+  bool processor_pause_wait_hint(unsigned id) const noexcept {
+    return apics_[id].cpu->pause_wait_hint();
+  }
+  const SecondaryBatchStats& processor_secondary_batch_stats(unsigned id) const noexcept {
+    return secondary_batch_stats_[id];
   }
   unsigned processors_started() const noexcept {
     return static_cast<unsigned>(std::count_if(apics_.begin(), apics_.begin() + processor_count_,
@@ -2613,13 +2672,21 @@ class PcMotherboardC06 {
         if (!sleeping && !parked_processors_.any()) return;
         continue;
       }
-      // A quiet pair keeps its normal dispatch. In a large group of
-      // pollers, the existing serial rotation admits ready CPUs through one
-      // short turn before a worker can exhaust the window on an early job.
-      const bool cooperative_pauses = timed && active_clock_running_ && threaded_smp_enabled_ && count > 2 &&
-          std::count_if(runnable.begin(), runnable.begin() + count, [&](unsigned id) {
+      // An IRQ-enabled AP repeatedly polling with PAUSE can give the BSP
+      // more bus time. Both CPUs still retire real instructions each turn.
+      // IRQ-disabled pairs retain their reciprocal exchange behavior.
+      bool cooperative_pauses = false;
+      if (timed && active_clock_running_ && threaded_smp_enabled_) {
+        if (count == 2 && runnable[0] == 0) {
+          const auto& secondary = *apics_[runnable[1]].cpu;
+          cooperative_pauses = secondary.is_long_mode() && secondary.flag(cosmic_pc::Cpu::IF) &&
+              secondary.pause_wait_hint() && !pc_.cpu.pause_wait_hint();
+        } else if (count > 2) {
+          cooperative_pauses = std::count_if(runnable.begin(), runnable.begin() + count, [&](unsigned id) {
             return apics_[id].cpu->pause_wait_hint();
           }) >= 2;
+        }
+      }
       const bool pause_admission = cooperative_pauses && !pause_admitted && count > host_workers_capacity();
       if (pause_admission) {
         pause_admitted = true;

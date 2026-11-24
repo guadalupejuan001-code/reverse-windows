@@ -495,6 +495,11 @@ class AndroidBootSession final {
   }
 #ifdef __ANDROID__
   std::vector<int> host_thread_ids() const { return workers_->android_thread_ids(); }
+  std::array<std::uint64_t, 4> input_irq_counters() const noexcept {
+    const auto& ps2 = board_->ps2_irq_evidence();
+    return {ps2.keyboard.assertions, ps2.keyboard.pic_delivered + ps2.keyboard.lapic_delivered,
+            ps2.aux.assertions, ps2.aux.pic_delivered + ps2.aux.lapic_delivered};
+  }
 #endif
 
   std::optional<EtherX86Sessions::Ticket> submit_ether_x86_session(unsigned vcpu, EtherX86Sessions::Job job) {
@@ -731,12 +736,19 @@ class AndroidBootSession final {
       out << "],\"execution_by_logical_processor\":[";
       for (unsigned id = 0; id < topology.logical_processors(); ++id) {
         const auto position = board_->processor_position(id);
+        const auto& secondary = board_->processor_secondary_batch_stats(id);
         out << (id ? "," : "") << "{\"mode\":\"" << position.mode << "\",\"cs\":" << position.cs
             << ",\"rip_hex\":\"" << std::hex << std::setw(16) << std::setfill('0') << position.rip
             << "\",\"cr3_hex\":\"" << std::setw(16) << position.cr3
             << std::dec << std::setfill(' ') << "\",\"flags\":" << position.flags
             << ",\"steps\":" << board_->processor_steps(id)
             << ",\"ether_arm64_steps\":" << board_->processor_ether_arm64_steps(id)
+            << ",\"pause_wait_hint\":" << (board_->processor_pause_wait_hint(id) ? "true" : "false")
+            << ",\"secondary_ether_attempts\":" << secondary.ether_attempts
+            << ",\"secondary_ether_short_grants\":" << secondary.ether_short_grants
+            << ",\"secondary_ether_no_retirement\":" << secondary.ether_no_retirement
+            << ",\"secondary_affine_ram_steps\":" << secondary.affine_ram_steps
+            << ",\"secondary_counter_steps\":" << secondary.counter_steps
             << ",\"crc32c_retired\":" << board_->processor_crc32c_retired(id)
             << ",\"lsl_retired\":" << board_->processor_lsl_retired(id)
             << ",\"tsc_access\":";
@@ -835,6 +847,7 @@ class AndroidBootSession final {
         << ",\"boot_counter_loop_batches\":" << boot_work.counter_loop_batches
         << ",\"boot_counter_loop_steps\":" << boot_work.counter_loop_steps
         << ",\"boot_streaming_sse_fill_steps\":" << boot_work.streaming_sse_fill_loop_steps
+        << ",\"boot_streaming_sse_triplet_steps\":" << pc_.cpu.streaming_sse_triplet_steps()
         << ",\"boot_wide_multiply_loop_batches\":" << boot_work.wide_multiply_loop_batches
         << ",\"boot_wide_multiply_loop_steps\":" << boot_work.wide_multiply_loop_steps
         << ",\"boot_rotate_xor_loop_batches\":" << boot_work.rotate_xor_loop_batches
@@ -920,6 +933,7 @@ class AndroidBootSession final {
           << ",\"max_pio_batch_elements\":" << cd.max_pio_batch_elements << '}';
     }
     const auto rtc = board_->rtc_evidence();
+    const auto& ps2 = board_->ps2_irq_evidence();
     out << ",\"rtc\":{\"selected_register\":" << rtc.selected_register
         << ",\"nmi_masked\":" << (rtc.nmi_masked ? "true" : "false")
         << ",\"register_a\":" << rtc.register_a
@@ -940,7 +954,15 @@ class AndroidBootSession final {
         << ",\"batched_pio_bytes\":" << counts.batched_pio_bytes
         << ",\"max_pio_batch_elements\":" << counts.max_pio_batch_elements
         << "},\"irq\":{\"ticks\":" << platform.ticks << ",\"delivered\":" << platform.irq_delivered
+        << ",\"irq1\":" << ps2.keyboard.pic_delivered + ps2.keyboard.lapic_delivered
+        << ",\"irq12\":" << ps2.aux.pic_delivered + ps2.aux.lapic_delivered
         << ",\"irq14\":" << platform.ata_irqs << ",\"irq15\":" << platform.atapi_irqs
+        << ",\"ps2\":{\"irq1_assertions\":" << ps2.keyboard.assertions
+        << ",\"irq1_pic_delivered\":" << ps2.keyboard.pic_delivered
+        << ",\"irq1_lapic_delivered\":" << ps2.keyboard.lapic_delivered
+        << ",\"irq12_assertions\":" << ps2.aux.assertions
+        << ",\"irq12_pic_delivered\":" << ps2.aux.pic_delivered
+        << ",\"irq12_lapic_delivered\":" << ps2.aux.lapic_delivered << '}'
         << ",\"lapic_delivered\":" << platform.apic_irqs
         << ",\"lapic_nmi_delivered\":" << platform.lapic_nmis
         << ",\"irq64_bulk_frames\":" << pc_.cpu.irq64_bulk_frames

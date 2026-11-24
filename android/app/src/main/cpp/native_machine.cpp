@@ -2,6 +2,7 @@
 
 #include <jni.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -198,6 +199,21 @@ JNIEXPORT jintArray JNICALL Java_com_reversewindows_android_NativeMachine_cpuThr
             const auto count = static_cast<jsize>(tids.size());
             auto array = env->NewIntArray(count);
             if (array) env->SetIntArrayRegion(array, 0, count, tids.data());
+            return array;
+        });
+    });
+}
+
+JNIEXPORT jlongArray JNICALL Java_com_reversewindows_android_NativeMachine_inputIrqCounters(
+        JNIEnv* env, jclass, jlong handle) {
+    return call<jlongArray>(env, nullptr, [&] {
+        return session(handle, [env](Session& machine) {
+            const auto counts = machine.input_irq_counters();
+            const std::array<jlong, 4> values{static_cast<jlong>(counts[0]), static_cast<jlong>(counts[1]),
+                                              static_cast<jlong>(counts[2]), static_cast<jlong>(counts[3])};
+            const auto size = static_cast<jsize>(values.size());
+            auto array = env->NewLongArray(size);
+            if (array) env->SetLongArrayRegion(array, 0, size, values.data());
             return array;
         });
     });

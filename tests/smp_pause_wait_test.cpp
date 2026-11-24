@@ -252,6 +252,88 @@ void run_exchange(unsigned processors) {
     std::cout << '\n';
 }
 
+#ifndef PRIME_BASELINE_PAUSE_SCHEDULER
+void run_asymmetric_pair() {
+    PcMachine pc(4U << 20);
+    pc.boot_long_mode_demo();
+    pc.run(4000);
+    auto& cpu = pc.cpu;
+    require(cpu.is_long_mode() && cpu.halted && !cpu.fault, "long64 pair setup failed");
+    PcMotherboardC06 board(pc, nullptr, {}, 0, {}, nullptr, {1, 2}, true);
+    pc.enable_boot_acceleration();
+    cpu.enable_page_translation_cache();
+    cpu.enable_ether_arm64_blocks();
+    board.enable_active_clock();
+    board.enable_threaded_smp(2);
+    board.enable_execution_target();
+    cpu.write64(0x2000 + 3 * 8, 0x6003);
+    cpu.write64(0x6000 + ((lapic >> 21) & 511) * 8, lapic | 0x83);
+    install_ap_trampoline(cpu);
+    install_ap_dispatch(cpu);
+
+    // The BSP retires independent guest work before publishing the release.
+    std::vector<std::uint8_t> primary{0xb9}; // MOV ECX,16384.
+    append_word(primary, 16384);
+    primary.insert(primary.end(), {0x90,0xff,0xc9,0x75,0xfb,0xc7,0x04,0x25});
+    append_word(primary, release_word);
+    append_word(primary, 1);
+    primary.insert(primary.end(), {0xfa,0xf4});
+    cpu.memory.write_block(bsp_entry, primary.data(), primary.size());
+
+    std::vector<std::uint8_t> secondary{0xfb}; // STI.
+    append_poll(secondary, release_word);
+    secondary.insert(secondary.end(), {0x89,0x04,0x25});
+    append_word(secondary, done_table + 4); // Publish the value actually read.
+    secondary.insert(secondary.end(), {0xfa,0xf4});
+    cpu.memory.write_block(ap_entry, secondary.data(), secondary.size());
+    cpu.eip = bsp_entry;
+    cpu.eflags = 2;
+    cpu.halted = false;
+    cpu.write32(lapic + 0x300, 0x000cc500);
+    cpu.write32(lapic + 0x300, 0x000c8500);
+    cpu.write32(lapic + 0x300, 0x000c0608);
+
+    std::uint64_t waiting_start = 0;
+    const auto warm_deadline = Clock::now() + std::chrono::seconds(4);
+    while (Clock::now() < warm_deadline && !board.faulted_cpu()) {
+        board.run(63, std::min(warm_deadline, Clock::now() + slice_budget));
+        const auto ap = board.processor_position(1);
+        if (!waiting_start && std::string_view(ap.mode) == "long64" && (ap.flags & Cpu::IF) &&
+            ap.rip >= ap_entry && ap.rip < ap_entry + secondary.size())
+            waiting_start = board.processor_steps(1);
+        if (waiting_start && board.processor_steps(1) - waiting_start >= 32) break;
+    }
+    require(waiting_start && board.processor_steps(1) - waiting_start >= 32 &&
+            !board.faulted_cpu() && cpu.read32(release_word) == 0 && cpu.read32(done_table + 4) == 0,
+            "the secondary did not warm its PAUSE loop before the BSP publication");
+
+    const auto before = board.threaded_smp_stats();
+    const auto ap_before = board.processor_steps(1);
+    for (unsigned slices = 0; slices < max_slices && !board.faulted_cpu() &&
+         board.threaded_smp_stats().pause_yields == before.pause_yields &&
+         cpu.read32(release_word) == 0; ++slices)
+        board.run(4096, Clock::now() + slice_budget);
+    const auto& stats = board.threaded_smp_stats();
+    const auto yields = stats.pause_yields - before.pause_yields;
+    const auto yielded_steps = stats.pause_steps - before.pause_steps;
+    require(yields && yielded_steps >= yields && yielded_steps <= 32 * yields &&
+            board.processor_steps(1) > ap_before && !cpu.pause_wait_hint() &&
+            cpu.read32(release_word) == 0 && cpu.read32(done_table + 4) == 0,
+            "the waiting secondary did not yield a short turn while the BSP still had independent work");
+
+    for (unsigned slices = 0; slices < max_slices && !board.faulted_cpu() &&
+         (!cpu.halted || board.secondary_can_run()); ++slices)
+        board.run(4096, Clock::now() + slice_budget);
+    require(!board.faulted_cpu() && cpu.halted && board.processors_started() == 2 &&
+            board.startup_ipis().sipi_targets_applied == 1 && !board.secondary_can_run() &&
+            std::string_view(board.processor_state(1)) == "halted" && cpu.regs[Cpu::ECX] == 0 &&
+            cpu.read32(release_word) == 1 && cpu.read32(done_table + 4) == 1,
+            "the shortened AP turns lost progress or the guest's published value");
+    std::cout << "SMP_ASYMMETRIC_PAUSE_PAIR_PASS yields=" << yields
+              << " yielded_steps=" << yielded_steps << '\n';
+}
+#endif
+
 int main() {
     try {
 #ifndef PRIME_BASELINE_PAUSE_SCHEDULER
@@ -259,6 +341,9 @@ int main() {
 #endif
         run_exchange(2);
         run_exchange(16);
+#ifndef PRIME_BASELINE_PAUSE_SCHEDULER
+        run_asymmetric_pair();
+#endif
     } catch (const std::exception& error) {
         std::cerr << "SMP_PAUSE_WAIT_FAILURE " << error.what() << '\n';
         return 1;

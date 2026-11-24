@@ -18,6 +18,7 @@ final class VmCpuPerformance {
     private final PowerManager power;
     private final Hints hints;
     private long nextSampleMs;
+    private long hostSampleUs = -1;
     private long nextThreadCheckMs;
     private int thermal = -1;
     private long lowKhz;
@@ -32,6 +33,7 @@ final class VmCpuPerformance {
     void sample(long now) {
         if (now < nextSampleMs) return;
         nextSampleMs = now + 1000;
+        hostSampleUs = now * 1000;
         if (power != null && Build.VERSION.SDK_INT >= 29) {
             try {
                 thermal = power.getCurrentThermalStatus();
@@ -94,6 +96,12 @@ final class VmCpuPerformance {
         if (hints != null) hints.close();
         nextThreadCheckMs = 0;
     }
+
+    long hostSampleElapsedUs() { return hostSampleUs; }
+    long minReportedKhz() { return policies == 0 ? -1 : lowKhz; }
+    long maxReportedKhz() { return policies == 0 ? -1 : highKhz; }
+    int thermalStatus() { return thermal; }
+    int hintThreadCount() { return hints == null ? 0 : hints.tids.length; }
 
     String diagnosticFields() {
         return ",\"android_thermal_status\":" + (thermal < 0 ? "null" : Integer.toString(thermal))

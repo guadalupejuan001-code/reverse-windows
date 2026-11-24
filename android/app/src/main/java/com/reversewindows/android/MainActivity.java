@@ -21,7 +21,9 @@ import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.text.TextUtils;
 import android.view.Gravity;
+import android.view.InputDevice;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowManager;
@@ -1022,6 +1024,15 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     public boolean dispatchKeyEvent(KeyEvent event) {
         if (monitor != null && monitor.hasFocus() && onKey(event)) return true;
         return super.dispatchKeyEvent(event);
+    }
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent event) {
+        if (worker != null && session && !terminal && event.getActionMasked() == MotionEvent.ACTION_DOWN
+                && event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN)) {
+            worker.noteAndroidTouchDown();
+        }
+        return super.dispatchTouchEvent(event);
     }
 
     @Override

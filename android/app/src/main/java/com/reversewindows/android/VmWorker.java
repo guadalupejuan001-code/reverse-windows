@@ -76,6 +76,7 @@ final class VmWorker {
     private final Context context;
     private final ContentResolver resolver;
     private final VmCpuPerformance cpuPerformance;
+    private final VmInputTiming inputTiming = new VmInputTiming();
     private final File disk;
     private final File dataDisk;
     private final AtomicFile diagnosticFile;
@@ -100,6 +101,7 @@ final class VmWorker {
     private long nextAndroidSample;
     private long androidPssKiB;
     private long stepNanos;
+    private long retiredSteps;
     private long lastSliceNanos;
     private long lastSliceSteps;
     private long lastSliceCompleted;
@@ -292,6 +294,8 @@ final class VmWorker {
                 lastStatus = 0;
                 lastDiagnosticSave = 0;
                 sessionStarted = SystemClock.elapsedRealtime();
+                inputTiming.begin(SystemClock.elapsedRealtimeNanos() / 1000);
+                retiredSteps = 0;
                 sessionWorkerCpuStartNs = Debug.threadCpuTimeNanos();
                 sessionProcessCpuStartMs = Process.getElapsedCpuTime();
                 nextAndroidSample = sessionStarted;
@@ -372,11 +376,17 @@ final class VmWorker {
         });
     }
 
+    void noteAndroidTouchDown() {
+        if (handle != 0) inputTiming.androidTouchDown(SystemClock.elapsedRealtimeNanos() / 1000);
+    }
+
     void pointer(int dx, int dy, int buttons) {
         worker.post(() -> {
             if (handle == 0 || !running || !foreground || isTerminal()) return;
-            try { NativeMachine.pointer(handle, dx, dy, buttons); }
-            catch (RuntimeException | LinkageError error) { report(error); }
+            try {
+                NativeMachine.pointer(handle, dx, dy, buttons);
+                inputTiming.guestPointerForwarded();
+            } catch (RuntimeException | LinkageError error) { report(error); }
         });
     }
 
@@ -385,6 +395,7 @@ final class VmWorker {
             if (handle == 0 || !running || !foreground || isTerminal()) return;
             try {
                 boolean wokeBios = NativeMachine.key(handle, ascii, scan, pressed);
+                if (pressed) inputTiming.guestKeyDownForwarded();
                 requestFrame();
                 if (outcome == NativeMachine.WAITING_KEY && wokeBios) {
                     outcome = NativeMachine.RUNNING;
@@ -484,6 +495,7 @@ final class VmWorker {
             long step = NativeMachine.step(handle, TARGET_SLICE_NS);
             int updated = (int) (step & 0x1ff);
             lastSliceCompleted = step >>> 9;
+            retiredSteps += lastSliceCompleted;
             peakSliceCompleted = Math.max(peakSliceCompleted, lastSliceCompleted);
             outcome = updated & ~NativeMachine.STEP_VIDEO_DIRTY;
             videoDirty = (updated & NativeMachine.STEP_VIDEO_DIRTY) != 0;
@@ -614,13 +626,19 @@ final class VmWorker {
                 ? Long.toString((workerCpuNs - sessionWorkerCpuStartNs) / 1000) : "null";
         long processCpuMs = Process.getElapsedCpuTime() - sessionProcessCpuStartMs;
         ++statusSnapshots;
-        return withBuildMetadata(NativeMachine.diagnostic(handle, detailed),
+        String diagnostic = NativeMachine.diagnostic(handle, detailed);
+        long[] inputIrqs = NativeMachine.inputIrqCounters(handle);
+        long sampleUs = SystemClock.elapsedRealtimeNanos() / 1000;
+        inputTiming.sample(sampleUs, retiredSteps, stepNanos / 1000,
+                running && foreground && outcome == NativeMachine.RUNNING, cpuPerformance, inputIrqs);
+        return withBuildMetadata(diagnostic,
                 ",\"elapsed_ms\":" + (now - sessionStarted)
                 + ",\"android_pss_kib\":" + androidPssKiB
                 + cpuPerformance.diagnosticFields()
+                + (detailed ? ",\"input_timing\":" + inputTiming.json() : "")
                 + ",\"host_vbe\":" + vbePresentation.json()
                 + ",\"worker_timing\":{\"step_us\":" + stepNanos / 1000
-                + ",\"sample_elapsed_us\":" + SystemClock.elapsedRealtimeNanos() / 1000
+                + ",\"sample_elapsed_us\":" + sampleUs
                 + ",\"host_thread_cpu_us\":" + workerCpuUs
                 + ",\"host_process_cpu_ms\":" + processCpuMs
                 + ",\"frame_us\":" + frameNanos / 1000
