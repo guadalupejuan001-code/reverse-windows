@@ -1573,7 +1573,7 @@ int main(int argc, char** argv) {
                              Session::kDefaultRamProfile, {}, {}, broken_data);
         throw std::logic_error("Invalid data QSSD unexpectedly booted");
       } catch (const std::runtime_error& error) {
-        require(std::string_view(error.what()).starts_with("No se pudo abrir el QSSD de datos: "),
+        require(std::string_view(error.what()).find("No se pudo abrir el QSSD de datos: ") == 0,
                 "Boot must report a failed data QSSD open separately from the ISO and boot QSSD");
       }
       auto session = [&] {
