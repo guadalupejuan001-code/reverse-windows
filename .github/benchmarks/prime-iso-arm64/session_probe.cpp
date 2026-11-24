@@ -1,4 +1,7 @@
 #include "android_boot_session.hpp"
+#if defined(MUNDO_X_PC_EXCEPTION_EVENTS)
+#include "exception_replay.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -7,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -85,14 +89,25 @@ bool save_full_frame(const Session::VideoUpdate& frame, const std::filesystem::p
 }
 
 int main(int argc, char** argv) {
+#if defined(MUNDO_X_PC_EXCEPTION_EVENTS)
+  if (argc != 7 && argc != 8) {
+    std::cerr << "usage: session_probe ISO OUTPUT_DIR RETIRED_TARGET TIMEOUT_S AVAILABLE_MIB THRESHOLD_MIB [POST_NMI_STEPS]\n";
+#else
   if (argc != 7) {
     std::cerr << "usage: session_probe ISO OUTPUT_DIR RETIRED_TARGET TIMEOUT_S AVAILABLE_MIB THRESHOLD_MIB\n";
+#endif
     return 1;
   }
   const std::filesystem::path run_dir(argv[2]);
   const auto target = std::stoull(argv[3]);
   const auto run_time = std::chrono::seconds(std::stoull(argv[4]));
   try {
+    auto stop_target = target;
+    std::uint64_t observed_nmi_at_steps = 0;
+#if defined(MUNDO_X_PC_EXCEPTION_EVENTS)
+    const auto post_nmi_steps = argc == 8 ? std::stoull(argv[7]) : 0;
+    bool first_nmi_captured = false;
+#endif
     const auto available_mib = std::stoull(argv[5]);
     const auto threshold_mib = std::stoull(argv[6]);
     if (!available_mib || !threshold_mib || available_mib > (1ULL << 30) || threshold_mib > (1ULL << 30))
@@ -110,6 +125,9 @@ int main(int argc, char** argv) {
     struct Close { int fd; ~Close() { ::close(fd); } } optical{fd};
     Session session(run_dir / "system.rqvd", 64, Session::BootSource::Iso, fd, 5550497792ULL,
         ram, ram_cache, run_dir / "vram.rqvd", {}, Session::kPrimeCpuTopology, true, Session::kPrimeCpuClock);
+#if defined(MUNDO_X_PC_EXCEPTION_EVENTS)
+    const auto exceptions = std::make_unique<ExceptionReplay>();
+#endif
     std::ofstream snapshots(run_dir / "snapshots.jsonl");
     if (!snapshots) throw std::runtime_error("Could not open the snapshot log");
     std::ofstream milestones(run_dir / "milestones.jsonl");
@@ -145,7 +163,7 @@ int main(int argc, char** argv) {
     auto status = Session::Step::Running;
     std::uint64_t next_sample = 0, next_maintenance = 0, next_snapshot = 0, next_video = 0;
     bool reclaim_pending = false;
-    while (status == Session::Step::Running && session.session_steps() < target &&
+    while (status == Session::Step::Running && session.session_steps() < stop_target &&
            Clock::now() - start < run_time) {
       const auto due_at = Clock::now();
       const auto uptime = count_since<Milliseconds>(start, due_at);
@@ -200,6 +218,31 @@ int main(int argc, char** argv) {
       const auto slice_ns = count_since<Nanoseconds>(slice_start, slice_end);
       engine_elapsed_ns += slice_ns;
       ++windows;
+#if defined(MUNDO_X_PC_EXCEPTION_EVENTS)
+      if (!first_nmi_captured && exceptions->observed_nmi()) {
+        first_nmi_captured = true;
+        observed_nmi_at_steps = retired_after;
+        if (post_nmi_steps && retired_after < target)
+          stop_target = retired_after + std::min<std::uint64_t>(target - retired_after, post_nmi_steps);
+        {
+          std::ofstream evidence(run_dir / "first-nmi-session.json");
+          evidence << "{\"elapsed_ns\":" << count_since<Nanoseconds>(start, slice_end)
+                   << ",\"window_retired_steps\":" << retired_after << ",\"session\":"
+                   << session.diagnostic(true) << "}\n";
+          evidence.close();
+          if (!evidence) throw std::runtime_error("Could not write first delivered NMI session evidence");
+        }
+        try {
+          session.retry_video();
+          save_full_frame(session.capture_video(text.data(), text.size()), run_dir / "first-nmi.ppm");
+        } catch (const std::exception& error) {
+          std::cerr << "PRIME_NMI_FRAME_ERROR " << error.what() << '\n';
+        }
+        exceptions->write(run_dir / "exceptions-first-nmi.json", retired_after);
+        std::cout << "PRIME_FIRST_NMI guest_steps=" << retired_after << " stop_target=" << stop_target
+                  << " elapsed_ms=" << count_since<Milliseconds>(start, slice_end) << '\n' << std::flush;
+      }
+#endif
       while (next_milestone < milestone_steps.size() && retired_after >= milestone_steps[next_milestone]) {
         const auto threshold = milestone_steps[next_milestone++];
         const auto elapsed_ns = count_since<Nanoseconds>(start, slice_end);
@@ -229,6 +272,9 @@ int main(int argc, char** argv) {
     }
     const auto terminal_ns = count_since<Nanoseconds>(start, Clock::now());
     const auto elapsed_ms = terminal_ns / 1'000'000;
+#if defined(MUNDO_X_PC_EXCEPTION_EVENTS)
+    exceptions->write(run_dir / "exceptions-terminal.json", session.session_steps());
+#endif
     {
       std::ofstream report(run_dir / "session.json");
       report << session.diagnostic(true) << '\n';
@@ -237,7 +283,9 @@ int main(int argc, char** argv) {
       std::ofstream terminal(run_dir / "terminal-meta.json");
       terminal << "{\"elapsed_ns\":" << terminal_ns << ",\"native_status\":" << int(status)
                << ",\"guest_steps\":" << session.session_steps()
-               << ",\"engine_window_ns\":" << engine_elapsed_ns << "}\n";
+               << ",\"engine_window_ns\":" << engine_elapsed_ns
+               << ",\"retired_stop_target\":" << stop_target
+               << ",\"first_nmi_observed_at_window_end_steps\":" << observed_nmi_at_steps << "}\n";
       terminal.close();
       if (!terminal) throw std::runtime_error("Could not write terminal timing evidence");
     }

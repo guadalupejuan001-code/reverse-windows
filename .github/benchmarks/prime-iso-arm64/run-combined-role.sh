@@ -20,6 +20,9 @@ truncate -s 5550497792 "$iso"
 chmod 400 "$iso"
 probe=("$RUNNER_TEMP/build-$role/session_probe" "$iso" "$output" "$STOP_TARGET" "$PROBE_TIMEOUT_SECONDS"
        "$AVAILABLE_MIB" "$THRESHOLD_MIB")
+if [[ -n "${EXCEPTION_REPLAY_POST_NMI_STEPS:-}" ]]; then
+  probe+=("$EXCEPTION_REPLAY_POST_NMI_STEPS")
+fi
 optical_env=(EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1
              LD_PRELOAD="$RUNNER_TEMP/verified_iso.so" R110_REMOTE_ISO_STUB="$iso")
 if timeout "$((PROBE_TIMEOUT_SECONDS + 120))s" taskset -c "$PROBE_CPU" env "${optical_env[@]}" "${probe[@]}" \
@@ -30,11 +33,16 @@ else
   if ((probe_exit == 0)); then probe_exit=1; fi
 fi
 python3 "$bench/archive-terminal-fault.py" "$output" "$evidence" "$role" "$probe_exit"
-for screen in "$output"/screen-*.ppm "$output/pre-fault-latest.ppm" "$output/pre-fault-frame.json" \
-              "$output/terminal.ppm" "$output/text-screen.txt"; do
-  if [[ -f "$screen" ]]; then
-    cp "$screen" "$evidence/$role-${screen##*/}"
+for artifact in "$output"/screen-*.ppm "$output/pre-fault-latest.ppm" "$output/pre-fault-frame.json" \
+                "$output/terminal.ppm" "$output/text-screen.txt" "$output/first-nmi.ppm" \
+                "$output/first-nmi-session.json" "$output"/exceptions-*.json; do
+  if [[ -f "$artifact" ]]; then
+    cp "$artifact" "$evidence/$role-${artifact##*/}"
   fi
 done
+if [[ -n "${EXCEPTION_REPLAY_POST_NMI_STEPS:-}" && -f "$output/terminal-meta.json" ]]; then
+  STOP_TARGET=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["retired_stop_target"])' \
+    "$output/terminal-meta.json")
+fi
 PRODUCT_SHA="$product_sha" MUNDO_X_SHA="$core_sha" python3 "$bench/summarize.py" \
   --run "$output" --transport-log "$evidence/$role.stderr" --output "$evidence/$role.json" --exit-code "$probe_exit"
