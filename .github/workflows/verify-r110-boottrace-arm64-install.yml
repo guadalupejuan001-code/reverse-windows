@@ -1,4 +1,4 @@
-name: Verify Prime R110 .18 ARM64 APK in Android
+name: Verify Prime R110 .19 ARM64 APK in Android
 
 on:
   push:
@@ -10,17 +10,17 @@ permissions:
   contents: read
 
 env:
-  BUILD_RUN_ID: '45366488575'
-  BUILD_CI_SHA: 30e29088b6021f871544fe5caf986f2a91bdb868
-  BUILD_ARTIFACT_ID: '14906313568'
-  BUILD_ARCHIVE_SHA256: defbf25ed9fc9989a5bc878f22cd43f1ee2b33445fe8528a9c2aee843b6b97ed
-  APK_SHA256: 98a35c75eae4a84a618e778e0c1e4184843713def93b0fd9985c74d1ff58b241
-  SIGNER_SHA256: 2fefa3db07255dab6f5341f9c93d345f4f35f2e3dc8798e1e72c3e44df16bb5d
-  PRODUCT_SHA: df836d5d938d70e605a1ae0f672b2a0fc83c6ba3
+  BUILD_RUN_ID: '45367522616'
+  BUILD_CI_SHA: ab1647fa0601c71d5771c3add98548027b1b8125
+  BUILD_ARTIFACT_ID: '14907831243'
+  BUILD_ARCHIVE_SHA256: 3487d2841469e0ebd469a8b5f0ace65bdaee09a45125f4b3bff3a55f8c103fa0
+  APK_SHA256: f43805714cbd2a54cbf207b612b044ae19a6869f6c278b8aee4236cfbff82117
+  SIGNER_SHA256: 5467bbb24ef14151408bacfc75cbcd287be485d41cd2be2c0faaf770b2e72cd4
+  PRODUCT_SHA: ba461db7915da262e17b86e55da316a39dbe8995
   MUNDO_X_SHA: 99dc645b80b23212f8e59603fa029caca3a07145
   APP_ID: com.reversewindows.android.prime.smp.r110.boottrace
-  APK_VERSION: 0.3.88-perf-test.18
-  APK_VERSION_CODE: '137'
+  APK_VERSION: 0.3.88-perf-test.19
+  APK_VERSION_CODE: '138'
 
 jobs:
   arm64-bridge-install:
@@ -237,6 +237,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: prime-r110-perf18-arm64-bridge-install-df836d5d938d
+          name: prime-r110-perf19-arm64-bridge-install-ba461db7915d
           path: ${{ runner.temp }}/r110-boottrace-install
           if-no-files-found: error
