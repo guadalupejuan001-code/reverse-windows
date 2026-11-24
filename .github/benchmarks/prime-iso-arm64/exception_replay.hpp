@@ -106,6 +106,9 @@ class ExceptionReplay {
     out << "],\"instruction_hex\":\"" << std::setfill('0');
     for (unsigned i = 0; i < std::min<std::size_t>(event.byte_count, event.bytes.size()); ++i)
       out << std::setw(2) << unsigned(event.bytes[i]);
+    out << "\",\"caller_stack_hex\":\"";
+    for (unsigned i = 0; i < std::min<std::size_t>(event.caller_stack_bytes, event.caller_stack.size()); ++i)
+      out << std::setw(2) << unsigned(event.caller_stack[i]);
     out << "\"}" << std::dec;
   }
 

@@ -1,8 +1,8 @@
 {
   "reference": {
-    "product_sha": "ca82b8de27ccb2bc0aebd6eb33ddfa3d339619fd",
-    "mundo_x_sha": "763ee5e4e23576d177820f65ca6a48ad727f18b1",
-    "diagnostic_mundo_x_sha": "29adc7029a374fae88c2c2621ecefa5b7107200a"
+    "product_sha": "0d3434d5adf7aadb946464f3af382ec810822dd7",
+    "mundo_x_sha": "99dc645b80b23212f8e59603fa029caca3a07145",
+    "diagnostic_mundo_x_sha": "3e3d8256049851522e8ee97a61d2a859b7794eed"
   },
   "candidate": null
 }
