@@ -17,6 +17,7 @@ BOOT_LOOPS = ("boot_scan_loop_steps", "boot_forward_copy_loop_steps", "boot_zero
               "boot_rep_elements", "boot_rep_direct_page_copy_bytes", "boot_counter_loop_steps",
               "boot_streaming_sse_fill_steps", "secondary_streaming_sse_fill_steps",
               "boot_streaming_sse_triplet_steps", "secondary_streaming_sse_triplet_steps",
+              "boot_sse_zero_fill_bytes", "secondary_sse_zero_fill_bytes",
               "boot_streaming_sse_triplet_batches", "secondary_streaming_sse_triplet_batches",
               "boot_movaps_store_batches", "boot_movaps_store_steps",
               "secondary_movaps_store_batches", "secondary_movaps_store_steps")

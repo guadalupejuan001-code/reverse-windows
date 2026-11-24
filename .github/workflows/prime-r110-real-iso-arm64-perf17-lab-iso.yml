@@ -1,0 +1,242 @@
+name: Prime R110 .17 ARM64 extended Windows 10 installer trace
+
+on:
+  push:
+    branches: [ci/prime-r110-arm64-perf17-lab-iso]
+    paths:
+      - .github/benchmarks/prime-iso-arm64/perf17-lab-iso-targets.json
+      - .github/benchmarks/prime-iso-arm64/session_probe.cpp
+      - .github/workflows/prime-r110-real-iso-arm64-perf17-lab-iso.yml
+
+permissions:
+  contents: read
+
+env:
+  AVAILABLE_MIB: '749'
+  THRESHOLD_MIB: '128'
+  STOP_TARGET: '40000000000'
+  PROBE_TIMEOUT_SECONDS: '7200'
+
+jobs:
+  sustained-official-iso:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 137
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify pins and test native ARM64 LSL, NMI, trap flag and CRC32C
+        id: revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence"
+          python3 "$bench/resolve-combined.py" "$bench/perf17-lab-iso-targets.json" --reference-only-allowed \
+            > "$RUNNER_TEMP/targets.tsv"
+          cp "$bench/perf17-lab-iso-targets.json" "$evidence/targets.json"
+          sudo apt-get update -qq
+          packages=(ninja-build libcurl4-openssl-dev zlib1g-dev
+                    libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri tesseract-ocr)
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${packages[@]}"
+          while IFS=$'\t' read -r role product_sha core_sha; do
+            product="$RUNNER_TEMP/product-$role"
+            bash "$bench/checkout-product.sh" "$product" "$product_sha" "$core_sha"
+            cp "$product/config/dependencies.lock.json" "$evidence/$role-dependencies.lock.json"
+            gate="$RUNNER_TEMP/gate-$role"
+            cmake -S "$product" -B "$gate" -G Ninja -DBUILD_TESTING=ON \
+              -DREVERSE_WINDOWS_GLES_GUEST=OFF -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
+            cmake --build "$gate" --target reverse_windows_c09r_cpu_features \
+              reverse_windows_x86_system64_test reverse_windows_smp_guest_test --parallel 2
+            ctest --test-dir "$gate" --no-tests=error --verbose \
+              -R '^reverse_windows_(c09r_real_cpu_cx16_prefetchw|x86_system64|smp_guest)$' | tee "$evidence/$role-native-gates.log"
+            grep -q 'WINDOWS_X64_TRAP_FLAG_PASS' "$evidence/$role-native-gates.log"
+            grep -q 'WINDOWS_X64_CRC32C_PASS' "$evidence/$role-native-gates.log"
+            grep -q 'X86_SYSTEM64_PASS' "$evidence/$role-native-gates.log"
+            grep -q 'X86_LSL_PASS' "$evidence/$role-native-gates.log"
+            grep -q 'SMP_ICR_REJECTION_PASS' "$evidence/$role-native-gates.log"
+            grep -q 'SMP_LAPIC_NMI_PRIORITY_PASS' "$evidence/$role-native-gates.log"
+            cmake -S "$bench" -B "$RUNNER_TEMP/build-$role" -G Ninja \
+              -DREVERSE_WINDOWS_SOURCE="$product" -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
+            cmake --build "$RUNNER_TEMP/build-$role" --target session_probe --parallel 2
+          done < "$RUNNER_TEMP/targets.tsv"
+          cc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -o "$RUNNER_TEMP/verified_iso.so" \
+            "$bench/verified_iso.c" -lcurl -pthread
+          sha256sum "$RUNNER_TEMP"/build-*/session_probe "$RUNNER_TEMP/verified_iso.so" > "$evidence/native-sha256.txt"
+      - name: Start the pinned candidate engine and observe 8.5B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          python3 - <<'PY' > "$RUNNER_TEMP/probe-cpu"
+          import os
+          cpus = sorted(os.sched_getaffinity(0))[:2]
+          if len(cpus) < 2:
+              raise SystemExit("At least two host CPUs are required for this SMP probe")
+          print(",".join(map(str, cpus)))
+          PY
+          {
+            uname -m
+            lscpu
+            c++ --version
+            printf 'CPU affinity %s\n' "$(cat "$RUNNER_TEMP/probe-cpu")"
+          } > "$evidence/runner.txt"
+          nohup bash "$bench/run-combined-role.sh" reference < /dev/null > "$evidence/reference-driver.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/reference.pid"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/8-5b-checkpoint" 8500000000
+      - name: Upload the 8.5B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf17-lab-iso-8-5b-target
+          path: ${{ runner.temp }}/8-5b-checkpoint/
+      - name: Observe the same session at 11.5B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/reference-progress" 11500000000
+      - name: Upload the 11.5B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf17-lab-iso-11-5b-target
+          path: ${{ runner.temp }}/reference-progress/
+      - name: Observe the same session at 18B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/18b-checkpoint" 18000000000
+      - name: Upload the 18B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf17-lab-iso-18b-target
+          path: ${{ runner.temp }}/18b-checkpoint/
+      - name: Observe the same session at 20B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/20b-checkpoint" 20000000000
+      - name: Upload the 20B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf17-lab-iso-20b-target
+          path: ${{ runner.temp }}/20b-checkpoint/
+      - name: Observe the same session at 23B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/23b-checkpoint" 23000000000
+      - name: Upload the 23B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf17-lab-iso-23b-target
+          path: ${{ runner.temp }}/23b-checkpoint/
+      - name: Observe the same session at 26B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/26b-checkpoint" 26000000000
+      - name: Upload the 26B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf17-lab-iso-26b-target
+          path: ${{ runner.temp }}/26b-checkpoint/
+      - name: Observe the same session at 30B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/30b-checkpoint" 30000000000
+      - name: Upload the 30B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf17-lab-iso-30b-target
+          path: ${{ runner.temp }}/30b-checkpoint/
+      - name: Observe the same session at 33B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/33b-checkpoint" 33000000000
+      - name: Upload the 33B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf17-lab-iso-33b-target
+          path: ${{ runner.temp }}/33b-checkpoint/
+      - name: Observe the same session at 36B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/36b-checkpoint" 36000000000
+      - name: Upload the 36B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf17-lab-iso-36b-target
+          path: ${{ runner.temp }}/36b-checkpoint/
+      - name: Observe the same session at 39B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/39b-checkpoint" 39000000000
+      - name: Upload the 39B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf17-lab-iso-39b-target
+          path: ${{ runner.temp }}/39b-checkpoint/
+      - name: Observe the same session at 40B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/40b-checkpoint" 40000000000
+      - name: Upload the 40B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf17-lab-iso-40b-target
+          path: ${{ runner.temp }}/40b-checkpoint/
+      - name: Record the terminal state after a fault, 40B steps or 120 minutes
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/evidence"
+          pid=$(cat "$RUNNER_TEMP/reference.pid")
+          while [[ ! -f "$RUNNER_TEMP/reference.exit" ]]; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo 'Reference driver ended before recording its exit code' >&2
+              exit 1
+            fi
+            if [[ -s "$evidence/reference.stdout" ]]; then
+              tail -n1 "$evidence/reference.stdout"
+            fi
+            sleep 20
+          done
+          if [[ -s "$evidence/reference.stdout" ]]; then tail -n1 "$evidence/reference.stdout"; fi
+          test "$(cat "$RUNNER_TEMP/reference.exit")" = 0
+      - name: Read possible Setup or bugcheck text in the recorded frames
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/evidence"
+          if [[ -d "$evidence" ]] && command -v tesseract >/dev/null; then
+            for screen in "$evidence"/reference-screen-*.ppm "$evidence"/reference-pre-fault-latest.ppm "$evidence"/reference-terminal.ppm; do
+              if [[ -f "$screen" ]]; then
+                tesseract "$screen" "${screen%.ppm}-ocr" -l eng --psm 11 --dpi 144                   2>> "$evidence/ocr.stderr" || true
+              fi
+            done
+          fi
+      - name: Preserve late per-vCPU execution and IRQ evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf17-lab-iso-raw-final
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
