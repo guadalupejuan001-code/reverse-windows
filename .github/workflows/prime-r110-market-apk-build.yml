@@ -1,0 +1,127 @@
+name: Prime R110 component clocks ARM64 APK
+
+on:
+  push:
+    branches: [ci/prime-r110-market-apk-build]
+    paths: [.github/workflows/prime-r110-market-apk-build.yml]
+
+permissions:
+  contents: read
+
+env:
+  PRODUCT_SHA: 1e1be01dd9c797aa37b4e21c69321354aef9d95e
+  APP_ID: com.reversewindows.android.prime.smp.r110.marketclocks
+  APK_VERSION: 0.3.88-perf-test.11
+  APK_VERSION_CODE: '130'
+  ANDROID_ABI: arm64-v8a
+
+jobs:
+  arm64-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out the exact product revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          persist-credentials: false
+      - name: Verify pinned application identity and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PRODUCT_SHA" =~ ^[a-f0-9]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = json.loads(Path('config/integration-manifest.json').read_text())
+          assert manifest['schema'] == 'reverse-windows-integration-v1'
+          assert (manifest['application_id'], manifest['version_name'], manifest['version_code']) == (
+              os.environ['APP_ID'], os.environ['APK_VERSION'], int(os.environ['APK_VERSION_CODE']))
+          PY
+          python3 scripts/verify_deps.py --checkout
+          printf 'MUNDO_X_SHA=%s\n' "$(git -C deps/mundo-X rev-parse HEAD)" >> "$GITHUB_ENV"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '11076708'
+          packages: 'platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018 cmake;3.22.1'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Compile and sign the clean ARM64 release
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --stacktrace clean :app:assembleRelease \
+            "-PandroidAbi=$ANDROID_ABI" -PetherPreview=true -PtestSignRelease=true
+      - name: Verify APK signature, package, provenance and ABI
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code HEAD
+          apk=android/app/build/outputs/apk/release/app-release.apk
+          tools="$ANDROID_HOME/build-tools/35.0.0"
+          out="$RUNNER_TEMP/prime-r110-arm64-release"
+          mkdir -p "$out"
+          apk_name="REVERSE-Windows-Prime-$APK_VERSION-${PRODUCT_SHA:0:12}-$ANDROID_ABI-release.apk"
+          unzip -p "$apk" assets/integration-manifest.json | cmp - config/integration-manifest.json
+          unzip -p "$apk" assets/dependencies.lock.json | cmp - config/dependencies.lock.json
+          printf '%s\n' "$PRODUCT_SHA" | cmp - <(unzip -p "$apk" assets/build-source.txt)
+          "$tools/apksigner" verify --verbose --print-certs "$apk" > "$out/signature.txt"
+          grep -Fxq 'Verified using v2 scheme (APK Signature Scheme v2): true' "$out/signature.txt"
+          grep -Fxq 'Number of signers: 1' "$out/signature.txt"
+          grep -Fq 'CN=Android Debug' "$out/signature.txt"
+          signer_sha256=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$out/signature.txt")
+          [[ "$signer_sha256" =~ ^[[:xdigit:]]{64}$ ]]
+          "$tools/zipalign" -c -P 16 -v 4 "$apk" > "$out/alignment.txt"
+          "$tools/aapt" dump badging "$apk" > "$out/manifest.txt"
+          grep -Fq "package: name='$APP_ID' versionCode='$APK_VERSION_CODE' versionName='$APK_VERSION'" "$out/manifest.txt"
+          grep -Fxq "application-label:'REVERSE Windows Prime $APK_VERSION'" "$out/manifest.txt"
+          grep -Fxq "native-code: '$ANDROID_ABI'" "$out/manifest.txt"
+          if grep -Fxq 'application-debuggable' "$out/manifest.txt"; then
+            echo 'Unexpected debuggable flag in release manifest' >&2
+            exit 1
+          fi
+          elf="$RUNNER_TEMP/libreverse_windows_android.so"
+          unzip -p "$apk" "lib/$ANDROID_ABI/libreverse_windows_android.so" > "$elf"
+          grep -aFq "$MUNDO_X_SHA" "$elf"
+          for field in guest_tsc_hz ram_data_transfers_per_second \
+              sequential_read_reference_bytes_per_second sequential_write_reference_bytes_per_second; do
+            grep -aFq "$field" "$elf"
+          done
+          readelf -h -lW "$elf" > "$out/native-elf.txt"
+          grep -Fq AArch64 "$out/native-elf.txt"
+          python3 - "$out/native-elf.txt" <<'PY'
+          from pathlib import Path
+          import sys
+
+          rows = (line.split() for line in Path(sys.argv[1]).read_text().splitlines())
+          load_alignments = [int(row[-1], 16) for row in rows if row[:1] == ['LOAD']]
+          assert load_alignments and min(load_alignments) >= 16384, load_alignments
+          PY
+          cp "$apk" "$out/$apk_name"
+          cp config/dependencies.lock.json config/integration-manifest.json "$out/"
+          {
+            printf 'source_sha=%s\n' "$PRODUCT_SHA"
+            printf 'mundo_x_sha=%s\n' "$MUNDO_X_SHA"
+            printf 'android_application_id=%s\n' "$APP_ID"
+            printf 'android_version=%s\n' "$APK_VERSION"
+            printf 'android_version_code=%s\n' "$APK_VERSION_CODE"
+            printf 'android_signer_sha256=%s\n' "$signer_sha256"
+            printf 'android_abi=%s\n' "$ANDROID_ABI"
+            printf 'android_build_type=release\nandroid_signing_profile=test\nandroid_ndk=27.2.12479018\n'
+          } > "$out/build.txt"
+          (cd "$out" && sha256sum "$apk_name" > SHA256SUMS)
+          printf 'artifact=REVERSE-Windows-Prime-%s-%s-ARM64\n' "$APK_VERSION" "${PRODUCT_SHA:0:12}" >> "$GITHUB_OUTPUT"
+      - name: Upload the ARM64 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apk.outputs.artifact }}
+          path: ${{ runner.temp }}/prime-r110-arm64-release
+          if-no-files-found: error
