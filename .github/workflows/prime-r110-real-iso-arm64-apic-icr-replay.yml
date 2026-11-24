@@ -1,10 +1,11 @@
-name: Prime R110 ARM64 LSL replay up to 18B
+name: Prime R110 ARM64 Windows Setup observation up to 30B
 
 on:
   push:
-    branches: [ci/prime-r110-arm64-lsl-replay]
+    branches: [ci/prime-r110-arm64-windows-setup-replay]
     paths:
       - .github/benchmarks/prime-iso-arm64/apic-icr-replay-targets.json
+      - .github/benchmarks/prime-iso-arm64/session_probe.cpp
       - .github/workflows/prime-r110-real-iso-arm64-apic-icr-replay.yml
 
 permissions:
@@ -13,13 +14,13 @@ permissions:
 env:
   AVAILABLE_MIB: '749'
   THRESHOLD_MIB: '128'
-  STOP_TARGET: '18000000000'
-  PROBE_TIMEOUT_SECONDS: '4200'
+  STOP_TARGET: '30000000000'
+  PROBE_TIMEOUT_SECONDS: '6900'
 
 jobs:
   sustained-official-iso:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 85
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@v7
         with:
@@ -64,7 +65,7 @@ jobs:
           cc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -o "$RUNNER_TEMP/verified_iso.so" \
             "$bench/verified_iso.c" -lcurl -pthread
           sha256sum "$RUNNER_TEMP"/build-*/session_probe "$RUNNER_TEMP/verified_iso.so" > "$evidence/native-sha256.txt"
-      - name: Start the pinned LSL engine and observe 11.5B
+      - name: Start the pinned APK engine and observe 11.5B
         shell: bash
         run: |
           set -euo pipefail
@@ -89,42 +90,53 @@ jobs:
       - name: Upload the 11.5B observation
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-lsl-replay-11-5b-target
+          name: prime-r110-arm64-windows-setup-11-5b-target
           path: ${{ runner.temp }}/reference-progress/
-      - name: Observe the same session at 15.2B
+      - name: Observe the same session at 18B
         shell: bash
         run: |
           set -euo pipefail
           bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
-          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/post-popfq-checkpoint" 15200000000
-      - name: Upload the 15.2B observation
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/18b-checkpoint" 18000000000
+      - name: Upload the 18B observation
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-lsl-replay-15-2b-target
-          path: ${{ runner.temp }}/post-popfq-checkpoint/
-      - name: Observe the same session at 16.1B
+          name: prime-r110-arm64-windows-setup-18b-target
+          path: ${{ runner.temp }}/18b-checkpoint/
+      - name: Observe the same session at 20B
         shell: bash
         run: |
           set -euo pipefail
           bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
-          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/post-crc32c-checkpoint" 16100000000
-      - name: Upload the 16.1B observation
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/20b-checkpoint" 20000000000
+      - name: Upload the 20B observation
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-lsl-replay-16-1b-target
-          path: ${{ runner.temp }}/post-crc32c-checkpoint/
-      - name: Record the same session at 16.5B
+          name: prime-r110-arm64-windows-setup-20b-target
+          path: ${{ runner.temp }}/20b-checkpoint/
+      - name: Observe the same session at 23B
         shell: bash
         run: |
           set -euo pipefail
           bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
-          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/pre-fault-checkpoint" 16500000000
-      - name: Upload observation for the 16.5B target
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/23b-checkpoint" 23000000000
+      - name: Upload the 23B observation
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-lsl-replay-16-5b-target
-          path: ${{ runner.temp }}/pre-fault-checkpoint/
-      - name: Record the exact terminal state, or continue to 18B or 70 minutes
+          name: prime-r110-arm64-windows-setup-23b-target
+          path: ${{ runner.temp }}/23b-checkpoint/
+      - name: Observe the same session at 26B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/26b-checkpoint" 26000000000
+      - name: Upload the 26B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-windows-setup-26b-target
+          path: ${{ runner.temp }}/26b-checkpoint/
+      - name: Record the terminal state after a fault, 30B steps or 115 minutes
         shell: bash
         run: |
           set -euo pipefail
@@ -191,6 +203,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-lsl-replay-raw-final
+          name: prime-r110-arm64-windows-setup-raw-final
           path: ${{ runner.temp }}/evidence/
           if-no-files-found: warn
