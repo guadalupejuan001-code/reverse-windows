@@ -8,7 +8,9 @@ import struct
 import sys
 from uuid import UUID
 
-PDB_ID = "68A17FAF3012B7846079AEECDBE0A5831"
+PDB_GUID = "68A17FAF3012B7846079AEECDBE0A583"
+PE_AGE = 1
+MICROSOFT_VALIDATOR = "https://github.com/microsoft/microsoft-pdb/blob/805655a28bd8198004be2ac27e6e0290121a5e89/PDB/dbi/pdb.cpp#L826-L881"
 TEXT_SECTION = 8
 TEXT_RVA = 0x200000
 OBSERVED_RANGES = (
@@ -52,11 +54,13 @@ def read_msf_streams(data):
 
 def public_kernel_symbols(data):
     streams = read_msf_streams(data)
-    age = struct.unpack_from("<I", streams[1], 8)[0]
-    identity = UUID(bytes_le=streams[1][12:28]).hex.upper() + f"{age:X}"
-    if identity != PDB_ID:
-        dbi_age = struct.unpack_from("<I", streams[3], 8)[0]
-        raise ValueError(f"PDB Info identity {identity} and DBI age {dbi_age} do not match RSDS {PDB_ID}")
+    info_age = struct.unpack_from("<I", streams[1], 8)[0]
+    dbi_age = struct.unpack_from("<I", streams[3], 8)[0]
+    guid = UUID(bytes_le=streams[1][12:28]).hex.upper()
+    # Microsoft OpenValidate4 permits a later PDB Info age with the exact DBI age.
+    if guid != PDB_GUID or info_age < PE_AGE or dbi_age != PE_AGE:
+        raise ValueError(f"PDB GUID {guid}, Info age {info_age}, and DBI age {dbi_age} do not match the kernel")
+    identity = {"guid": guid, "pe_codeview_age": PE_AGE, "pdb_info_age": info_age, "pdb_dbi_age": dbi_age}
     symbol_stream_index = struct.unpack_from("<H", streams[3], 20)[0]
     records = streams[symbol_stream_index]
     symbols = {}
@@ -72,12 +76,12 @@ def public_kernel_symbols(data):
                 name = records[cursor + 14 : advance].split(b"\0", 1)[0].decode()
                 symbols.setdefault(TEXT_RVA + offset, []).append(name)
         cursor = advance
-    return symbols
+    return symbols, identity
 
 
 def main():
     data = Path(sys.argv[1]).read_bytes()
-    symbols = public_kernel_symbols(data)
+    symbols, identity = public_kernel_symbols(data)
     if len(symbols) < 1000:
         raise ValueError("Failed to recover the Windows kernel public text symbol table")
     addresses = sorted(symbols)
@@ -91,7 +95,8 @@ def main():
             "nearest_symbol_rva": f"0x{closest:x}",
             "nearest_public_symbol": symbols[closest],
         })
-    print(json.dumps({"pdb_identity": PDB_ID, "pdb_sha256": hashlib.sha256(data).hexdigest(),
+    print(json.dumps({"pdb_identity": identity, "validator": MICROSOFT_VALIDATOR,
+                      "pdb_sha256": hashlib.sha256(data).hexdigest(),
                       "text_symbol_count": len(symbols), "observations": result}, indent=2))
 
 
