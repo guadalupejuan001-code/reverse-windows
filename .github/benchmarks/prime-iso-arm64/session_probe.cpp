@@ -134,8 +134,8 @@ int main(int argc, char** argv) {
       if (point <= target)
         milestone_steps.insert(std::lower_bound(milestone_steps.begin(), milestone_steps.end(), point), point);
     }
-    constexpr std::array<std::uint64_t, 8> frame_checkpoints{
-        11'500'000'000ULL, post_popfq_checkpoint, post_crc32c_checkpoint, 16'500'000'000ULL,
+    constexpr std::array<std::uint64_t, 9> frame_checkpoints{
+        8'500'000'000ULL, 11'500'000'000ULL, post_popfq_checkpoint, post_crc32c_checkpoint, 16'500'000'000ULL,
         18'000'000'000ULL, 20'000'000'000ULL, 23'000'000'000ULL, 26'000'000'000ULL};
     std::size_t next_milestone = 0;
     std::array<std::uint8_t, 4000> text{};

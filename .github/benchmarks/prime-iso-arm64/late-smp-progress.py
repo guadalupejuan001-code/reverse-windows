@@ -6,7 +6,7 @@ import shutil
 import sys
 import time
 
-from summarize import load_checkpoint
+from summarize import first_ap_start_snapshot, load_checkpoint
 
 runner = Path(sys.argv[1])
 output = Path(sys.argv[2])
@@ -35,7 +35,9 @@ summary = {
     "target_steps": target,
     "observed": latest is not None and latest["target_steps"] >= target,
     "cpu_affinity": (runner / "probe-cpu").read_text().strip(),
-    "checkpoints": [point for point in checkpoints if point["target_steps"] >= 9_500_000_000],
+    "first_ap_start_snapshot": first_ap_start_snapshot(milestones.parent) if target >= 11_500_000_000 else None,
+    "checkpoints": [point for point in checkpoints
+                    if point["target_steps"] >= min(target, 9_500_000_000)],
 }
 (output / f"{role}-progress.json").write_text(json.dumps(summary, indent=2) + "\n")
 for name in (f"screen-{target}.ppm", "pre-fault-latest.ppm", "pre-fault-frame.json",
