@@ -1565,6 +1565,17 @@ int main(int argc, char** argv) {
     {
       using reverse_windows::QssdDisk;
       Session::create_disk(data_disk, QssdDisk::kMaxLogicalBytes / QssdDisk::kGiB);
+      const auto broken_data = dir.path / "invalid-data.rqvd";
+      std::ofstream(broken_data) << "invalid journal";
+      try {
+        FileDescriptor iso(fixture, O_RDONLY);
+        Session invalid_data(dir.path / "valid-system.rqvd", 1, Session::BootSource::Iso, iso.value, original.size(),
+                             Session::kDefaultRamProfile, {}, {}, broken_data);
+        throw std::logic_error("Invalid data QSSD unexpectedly booted");
+      } catch (const std::runtime_error& error) {
+        require(std::string_view(error.what()).starts_with("No se pudo abrir el QSSD de datos: "),
+                "Boot must report a failed data QSSD open separately from the ISO and boot QSSD");
+      }
       auto session = [&] {
         FileDescriptor iso(fixture, O_RDONLY);
         return Session(disk, 64, Session::BootSource::Iso, iso.value, original.size(),
@@ -1690,9 +1701,13 @@ int main(int argc, char** argv) {
                   counter(restarted.substr(previous), "sampled_windows") > 0,
               "Reboot must retain the ISO timing and start a new QSSD profile");
       for (const auto* marker : {"\"commits\":1", "\"source\":\"qssd\"", "\"restarts\":1",
-                                 "\"last_restart\":\"port92\"", "\"atapi_cdrom\":true",
+                                 "\"last_restart\":\"port92\"", "\"first_restart\":\"port92\"",
+                                 "\"atapi_cdrom\":true",
                                  "\"read_sectors\":1", "\"write_sectors\":0"})
         require(restarted.find(marker) != std::string::npos, marker);
+      require(counter(restarted, "first_restart_steps") == counter(restarted, "phase_start_steps") &&
+                  counter(restarted, "first_restart_steps") > 0,
+              "First restart must retain the retired step total across the new boot phase");
       session.flush();
     }
     require(bytes(fixture) == original, "Guest changed the read-only ISO");

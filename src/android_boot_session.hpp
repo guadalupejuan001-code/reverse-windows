@@ -257,11 +257,17 @@ class AndroidBootSession final {
         throw std::invalid_argument("Origen de arranque desconocido.");
     }
     if (!disk.empty()) {
-      if (create_gib) create_disk(disk, create_gib);
-      disk_ = std::make_unique<QssdDisk>(disk, QssdDisk::Access::ReadWrite, workers_);
+      if (create_gib) {
+        try {
+          create_disk(disk, create_gib);
+        } catch (const std::exception& error) {
+          throw std::runtime_error(std::string("No se pudo crear el QSSD de arranque: ") + error.what());
+        }
+      }
+      disk_ = open_disk(disk, "arranque");
     }
     if (!data_disk.empty())
-      data_disk_ = std::make_unique<QssdDisk>(data_disk, QssdDisk::Access::ReadWrite, workers_);
+      data_disk_ = open_disk(data_disk, "datos");
     if (source == BootSource::Disk) {
       pc_.mount([this](auto offset, auto* target, auto count) {
         return disk_->read_bytes(offset, target, count);
@@ -518,7 +524,7 @@ class AndroidBootSession final {
         pc_.guest_restart() != cosmic_pc::PcMachine::GuestRestart::None) {
       const auto steps = board_->total_processor_steps();
       const auto restart_count = restarts_;
-      restart_guest();
+      restart_guest(steps);
       if (restarts_ != restart_count) previous_boot_steps_ += steps;
     }
     if (board_->faulted_cpu() || pc_.cpu.fault || !pc_.host_error.empty()) return Step::Fault;
@@ -917,7 +923,10 @@ class AndroidBootSession final {
         << ",\"checkpoint_interval_steps\":" << (boot_profile_ ? BootProfile::kDefaultCheckpointSteps : 0)
         << ",\"mode_changes\":" << mode.changes << ",\"last_mode_from\":\"" << mode.from
         << "\",\"last_mode_to\":\"" << mode.to << "\",\"last_mode_step\":" << mode.step
-        << ",\"restarts\":" << restarts_ << ",\"last_restart\":\"" << last_restart_ << "\"}";
+        << ",\"restarts\":" << restarts_ << ",\"last_restart\":\"" << last_restart_
+        << "\",\"phase_start_steps\":" << previous_boot_steps_
+        << ",\"first_restart\":\"" << first_restart_
+        << "\",\"first_restart_steps\":" << first_restart_steps_ << '}';
     out << ",\"atapi_cdrom\":" << (board_->optical_attached() ? "true" : "false");
     if (const auto* optical = board_->attached_atapi()) {
       const auto& cd = optical->activity();
@@ -1361,7 +1370,7 @@ class AndroidBootSession final {
     return out.str();
   }
 
-  void restart_guest() {
+  void restart_guest(std::uint64_t steps_before_restart) {
     using Restart = cosmic_pc::PcMachine::GuestRestart;
     switch (pc_.guest_restart()) {
       case Restart::A20Port: last_restart_="port92"; break;
@@ -1393,6 +1402,10 @@ class AndroidBootSession final {
           return reader->read(off,into,count);
         },iso_->size(),"iso");
       }
+      if (restarts_ == 0) {
+        first_restart_ = last_restart_;
+        first_restart_steps_ = previous_boot_steps_ + steps_before_restart;
+      }
       source_=next;
       ++restarts_;
       key_routes_.fill(KeyRoute::None);
@@ -1403,6 +1416,14 @@ class AndroidBootSession final {
       }
     } catch (const std::exception& error) { pc_.host_error=error.what(); }
   }
+  std::unique_ptr<QssdDisk> open_disk(const std::filesystem::path& path, const char* role) {
+    try {
+      return std::make_unique<QssdDisk>(path, QssdDisk::Access::ReadWrite, workers_);
+    } catch (const std::exception& error) {
+      throw std::runtime_error(std::string("No se pudo abrir el QSSD de ") + role + ": " + error.what());
+    }
+  }
+
   class OpticalReader {
    public:
     OpticalReader(int fd, std::uint64_t expected_size) {
@@ -1510,9 +1531,11 @@ class AndroidBootSession final {
   std::uint64_t initial_disk_commits_ = 0;
   std::uint64_t restarts_ = 0;
   std::uint64_t previous_boot_steps_ = 0;
+  std::uint64_t first_restart_steps_ = 0;
   std::uint64_t engine_requested_ = 0, engine_retired_ = 0, engine_elapsed_ns_ = 0;
   cosmic_pc::PcMachine::RunClock::time_point next_engine_window_{};
   unsigned rapid_restarts_ = 0;
   const char* last_restart_ = "";
+  const char* first_restart_ = "";
 };
 } // namespace reverse_windows

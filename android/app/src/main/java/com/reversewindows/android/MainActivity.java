@@ -61,7 +61,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             {"ether_quantum_block", "Bloque cuántico Éter · par de Bell"},
             {"quantum_ram_guest", "RAM Éter · lectura y escritura x86"},
             {"ram", "RAM"}, {"pci_ide", "Controlador PCI IDE"}, {"vga", "Video VGA"},
-            {"iso_boot", "Arranque desde ISO"}, {"qssd", "Archivo QSSD"},
+            {"iso_boot", "Arranque desde ISO"}, {"qssd", "Lectura del QSSD de arranque"},
             {"qssd_ata", "Capacidad QSSD por ATA"},
     };
 
@@ -113,6 +113,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private boolean primeRam;
     private String lastJson = "";
     private String diagnosticToExport = "";
+    private JSONObject bootLogDiagnostic;
+    private long bootLogStepsPerSecond = -1;
     private final VmStepRate executionRate = new VmStepRate();
     private final VmStepRate motorRate = new VmStepRate();
 
@@ -226,7 +228,10 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             public void pointer(int dx,int dy,int buttons){if(canQueueGuestInput()){liveMetrics.input();worker.pointer(dx,dy,buttons);}}
         },initialMode,light,speed/10f,()->showPage(1),()->showPage(2),this::openLog);
         metricsWindow.changed(()->{telemetry.render();liveMetrics.render();});
-        settingsWindow.changed(this::updateDisplayValues);
+        settingsWindow.changed(() -> {
+            updateDisplayValues();
+            renderBootLog();
+        });
         pages.addView(console);pages.addView(settingsWindow);pages.addView(metricsWindow);
 
         LinearLayout setup = setupPanel;
@@ -440,7 +445,9 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         });
         status.setText(bootSource == NativeMachine.BOOT_ISO
                 ? "Abriendo la ISO y preparando el QSSD…" : "Cargando medio de arranque…");
+        console.bootStatus(status.getText());
         status.setTextColor(TEXT);
+        bootLogDiagnostic = null;
         stats.setText("");
         updateControls();
         worker.start(bootSource, iso, debug, primeRam);
@@ -548,6 +555,13 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     }
 
     @Override
+    public void onBootStage(String message) {
+        if (!pending || session) return;
+        status.setText(message);
+        console.bootStatus(message);
+    }
+
+    @Override
     public void onState(String json, boolean active, boolean hasSession, boolean stopped, boolean detailed) {
         boolean wasFault = fault;
         boolean wasSession = session;
@@ -566,6 +580,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             status.setTextColor(TEXT);
             status.setText("Máquina apagada");
             source.setText(BuildConfig.VERSION_NAME + " · Invitado x86-64");
+            console.bootStatus("");
             fault = false;
             telemetry.clear();
             sessionSummary.setVisibility(View.GONE);
@@ -599,6 +614,7 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
                 stats.setText("Diagnóstico disponible para copiar.");
             }
         } else if (!session) {
+            bootLogDiagnostic = null;
             stats.setText("");
         }
         if (wasPending || session != wasSession || running != wasRunning || terminal != wasTerminal ||
@@ -623,11 +639,6 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private void updateBootProgress(JSONObject diagnostic, JSONObject boot) {
         JSONObject machine = diagnostic.optJSONObject("machine");
         if (machine == null) machine = diagnostic;
-        JSONObject ata = diagnostic.optJSONObject("ata");
-        JSONObject atapi = diagnostic.optJSONObject("atapi");
-        JSONObject irq = diagnostic.optJSONObject("irq");
-        JSONObject volume = diagnostic.optJSONObject("disk");
-        JSONObject ether = diagnostic.optJSONObject("ether_next");
         long steps = machine.optLong("instructions", -1);
         long sessionSteps = boot == null ? steps : boot.optLong("session_steps", steps);
         JSONObject workerTiming = diagnostic.optJSONObject("worker_timing");
@@ -636,13 +647,45 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         long stepsPerSecond = executionRate.sample(executing, sessionSteps, sampleUs);
         long motorUs = workerTiming == null ? -1 : workerTiming.optLong("step_us", -1);
         long motorStepsPerSecond = motorRate.sample(executing, sessionSteps, motorUs);
+        long restarts = boot == null ? 0 : boot.optLong("restarts");
         if (session) {
             liveMetrics.signal(diagnostic);
             telemetry.update(diagnostic, machine, modeName(machine.optString("cpu_mode")),
                     sessionSteps, stepsPerSecond, motorStepsPerSecond);
             sessionSummary.setText(VmTelemetry.summary(diagnostic, machine, sessionSteps));
             sessionSummary.setVisibility(View.VISIBLE);
+            if (console.isShown()) {
+                String summary = String.format(Locale.getDefault(), "%s · %s · %,d pasos",
+                        status.getText(), modeName(machine.optString("cpu_mode")), sessionSteps);
+                if (stepsPerSecond >= 0)
+                    summary += String.format(Locale.getDefault(), " · %,d pasos/s", stepsPerSecond);
+                if (restarts > 0)
+                    summary += String.format(Locale.getDefault(), " · reinicios %,d (%s)", restarts,
+                            boot.optString("last_restart", "origen desconocido"));
+                console.bootStatus(summary);
+            }
         }
+        bootLogDiagnostic = diagnostic;
+        bootLogStepsPerSecond = stepsPerSecond;
+        renderBootLog();
+    }
+
+    private void renderBootLog() {
+        if (!stats.isShown() || bootLogDiagnostic == null) return;
+        JSONObject diagnostic = bootLogDiagnostic;
+        JSONObject boot = diagnostic.optJSONObject("boot_progress");
+        JSONObject machine = diagnostic.optJSONObject("machine");
+        if (machine == null) machine = diagnostic;
+        JSONObject ata = diagnostic.optJSONObject("ata");
+        JSONObject atapi = diagnostic.optJSONObject("atapi");
+        JSONObject irq = diagnostic.optJSONObject("irq");
+        JSONObject volume = diagnostic.optJSONObject("disk");
+        JSONObject ether = diagnostic.optJSONObject("ether_next");
+        JSONObject workerTiming = diagnostic.optJSONObject("worker_timing");
+        long steps = machine.optLong("instructions", -1);
+        long sessionSteps = boot == null ? steps : boot.optLong("session_steps", steps);
+        long restarts = boot == null ? 0 : boot.optLong("restarts");
+        long stepsPerSecond = bootLogStepsPerSecond;
         long reads = machine.optLong("disk_reads");
         long readSectors = ata == null ? 0 : ata.optLong("read_sectors");
         long identifyTransfers = ata == null ? 0 : ata.optLong("identify_data_transfers");
@@ -715,11 +758,12 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
             progress.append("\nÚltimo cambio: ").append(modeName(boot.optString("last_mode_from")))
                     .append(" → ").append(modeName(boot.optString("last_mode_to")));
         }
-        long restarts = boot == null ? 0 : boot.optLong("restarts");
         if (restarts > 0) {
+            long phaseSteps = topology == null ? steps : topology.optLong("phase_x86_steps", steps);
+            if (boot.has("phase_start_steps")) phaseSteps = sessionSteps - boot.optLong("phase_start_steps");
             progress.append(String.format(Locale.getDefault(),
-                    "\nReinicios automáticos · %,d · %,d pasos x86 desde el último", restarts,
-                    topology == null ? steps : topology.optLong("phase_x86_steps", steps)));
+                    "\nReinicios del invitado · %,d · %s · %,d pasos desde el último", restarts,
+                    boot.optString("last_restart", "origen desconocido"), phaseSteps));
         }
         if ("iso".equals(diagnostic.optString("source"))) {
             progress.append(String.format(Locale.getDefault(), "\nLecturas de la ISO por BIOS: %,d", reads));
@@ -735,8 +779,22 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
                 progress.append("\nEl invitado leyó la identificación ATA del QSSD.");
             }
             progress.append(String.format(Locale.getDefault(),
-                    "\nSectores leídos por ATA: %,d · Operaciones guardadas en QSSD: %,d", readSectors, commits));
+                    "\nATA · %,d comandos · %,d sectores leídos · %,d sectores escritos",
+                    ata == null ? 0 : ata.optLong("commands"), readSectors,
+                    ata == null ? 0 : ata.optLong("write_sectors")));
+            progress.append(String.format(Locale.getDefault(),
+                    "\nQSSD de arranque · %,d B en el teléfono · %,d operaciones confirmadas",
+                    volume.optLong("physical_bytes"), commits));
+            JSONObject io = diagnostic.optJSONObject("storage_io");
+            JSONObject biosDisk = io == null ? null : io.optJSONObject("bios_int13");
+            if (biosDisk != null) progress.append(String.format(Locale.getDefault(),
+                    "\nBIOS → QSSD · %,d B leídos · %,d B escritos",
+                    biosDisk.optLong("read_bytes"), biosDisk.optLong("written_bytes")));
         }
+        JSONObject dataVolume = diagnostic.optJSONObject("data_disk");
+        if (dataVolume != null) progress.append(String.format(Locale.getDefault(),
+                "\nQSSD de datos · %,d B en el teléfono · %,d operaciones confirmadas",
+                dataVolume.optLong("physical_bytes"), dataVolume.optLong("commits")));
         String detail = "fault".equals(diagnostic.optString("status")) ?
                 faultDetail(diagnostic) : machine.optString("message");
         if (irq != null && irq.optBoolean("halted_with_if")) {
@@ -806,6 +864,8 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         fault = true;
         status.setTextColor(ERROR);
         status.setText("Máquina detenida");
+        console.bootStatus(message);
+        bootLogDiagnostic = null;
         stats.setText("Último bloqueo: " + message);
         if (!session) {
             telemetry.clear();

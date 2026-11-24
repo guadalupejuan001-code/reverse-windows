@@ -23,6 +23,7 @@ final class ConsoleDeck extends LinearLayout {
     private final GuestMonitor screen;
     private final FrameLayout idle;
     private final TextView caption;
+    private final TextView bootStatus;
     private final Pad pad;
     private final Button keyboardToggle, pointerToggle, faultButton;
     private final Button leftClick, rightClick;
@@ -68,6 +69,11 @@ final class ConsoleDeck extends LinearLayout {
         captionBounds.bottomMargin = activity.dp(7);
         idle.addView(caption, captionBounds);
 
+        bootStatus = activity.label("", 12, MainActivity.TEXT);
+        bootStatus.setPadding(activity.dp(8), activity.dp(4), activity.dp(8), activity.dp(4));
+        bootStatus.setVisibility(GONE);
+        stage.addView(bootStatus, new LayoutParams(-1, -2));
+
         pad = new Pad(activity);
         display.addView(pad, new FrameLayout.LayoutParams(-1, -1));
         keyboard = new RgbKeyboard(activity, input, mode, light);
@@ -97,6 +103,9 @@ final class ConsoleDeck extends LinearLayout {
             popup.getMenu().add("Registro").setOnMenuItemClickListener(item -> { log.run(); return true; });
             popup.show();
         });
+        Button bootLog = railButton(rail, "Arranque", View.generateViewId());
+        bootLog.setContentDescription("Ver registro del arranque");
+        bootLog.setOnClickListener(v -> log.run());
         keyboardToggle = railButton(rail, "Teclado", R.id.vm_toggle_keyboard);
         keyboardToggle.setOnClickListener(v -> setKeyboardVisible(keyboard.getVisibility() != VISIBLE));
         pointerToggle = railButton(rail, "Ratón", R.id.vm_toggle_pointer);
@@ -150,6 +159,11 @@ final class ConsoleDeck extends LinearLayout {
         idle.setVisibility(live ? GONE : VISIBLE);
         if (!live) caption.setText(description);
         faultButton.setVisibility(fault ? VISIBLE : GONE);
+    }
+
+    void bootStatus(CharSequence status) {
+        if (!android.text.TextUtils.equals(bootStatus.getText(), status)) bootStatus.setText(status);
+        bootStatus.setVisibility(status.length() == 0 ? GONE : VISIBLE);
     }
 
     private void setKeyboardVisible(boolean visible) {

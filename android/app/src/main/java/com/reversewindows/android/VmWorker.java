@@ -28,6 +28,7 @@ import java.util.function.Consumer;
 
 final class VmWorker {
     interface Listener {
+        void onBootStage(String message);
         void onState(String json, boolean running, boolean hasSession, boolean stopped, boolean detailed);
         void onFrame(Frame frame);
         void onError(String message, boolean hasSession);
@@ -281,12 +282,15 @@ final class VmWorker {
                 String dataPath = !selfTest && dataDisk.isFile() ? dataDisk.getAbsolutePath() : "";
                 if (source == NativeMachine.BOOT_ISO) {
                     if (iso == null) throw new IOException("Elige primero una imagen ISO.");
+                    send(() -> listener.onBootStage("Abriendo la ISO seleccionada…"));
                     try (ParcelFileDescriptor fd = openIso(iso)) {
                         int createGiB = disk.exists() ? 0 : DISK_GIB;
+                        send(() -> listener.onBootStage("Comprobando la ISO y el QSSD de arranque…"));
                         handle = NativeMachine.open(context, path, createGiB, fd.getFd(),
                                 isoSize(iso, fd), source, primeRam, dataPath);
                     }
                 } else {
+                    if (!selfTest) send(() -> listener.onBootStage("Abriendo el QSSD de arranque…"));
                     handle = NativeMachine.open(context, path, 0, -1, 0, source, primeRam, dataPath);
                 }
                 if (handle == 0) throw new IllegalStateException("La máquina no se pudo iniciar.");
