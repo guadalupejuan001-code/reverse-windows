@@ -55,7 +55,8 @@ def public_kernel_symbols(data):
     age = struct.unpack_from("<I", streams[1], 8)[0]
     identity = UUID(bytes_le=streams[1][12:28]).hex.upper() + f"{age:X}"
     if identity != PDB_ID:
-        raise ValueError("PDB GUID and age disagree with the executable's RSDS entry")
+        dbi_age = struct.unpack_from("<I", streams[3], 8)[0]
+        raise ValueError(f"PDB Info identity {identity} and DBI age {dbi_age} do not match RSDS {PDB_ID}")
     symbol_stream_index = struct.unpack_from("<H", streams[3], 20)[0]
     records = streams[symbol_stream_index]
     symbols = {}
