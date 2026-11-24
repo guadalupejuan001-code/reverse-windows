@@ -37,7 +37,7 @@ summary = {
     "cpu_affinity": (runner / "probe-cpu").read_text().strip(),
     "first_ap_start_snapshot": first_ap_start_snapshot(milestones.parent) if target >= 11_500_000_000 else None,
     "checkpoints": [point for point in checkpoints
-                    if point["target_steps"] >= min(target, 9_500_000_000)],
+                    if point["target_steps"] >= min(target, 8_450_000_000)],
 }
 (output / f"{role}-progress.json").write_text(json.dumps(summary, indent=2) + "\n")
 for name in (f"screen-{target}.ppm", "pre-fault-latest.ppm", "pre-fault-frame.json",

@@ -16,6 +16,8 @@ NATIVE = ("translated", "executed_blocks", "cache_hits", "data_fallbacks", "gues
 BOOT_LOOPS = ("boot_scan_loop_steps", "boot_forward_copy_loop_steps", "boot_zero_loop_steps",
               "boot_rep_elements", "boot_rep_direct_page_copy_bytes", "boot_counter_loop_steps",
               "boot_streaming_sse_fill_steps", "secondary_streaming_sse_fill_steps",
+              "boot_streaming_sse_triplet_steps", "secondary_streaming_sse_triplet_steps",
+              "boot_streaming_sse_triplet_batches", "secondary_streaming_sse_triplet_batches",
               "boot_movaps_store_batches", "boot_movaps_store_steps",
               "secondary_movaps_store_batches", "secondary_movaps_store_steps")
 RAM = ("usable_bytes", "resident_bytes", "resident_metadata_bytes", "backing_budget_bytes",
