@@ -1,19 +1,19 @@
-name: Prime R110 Ether 8192 reuse ARM64 APK
+name: Prime R110 Input and SMP ARM64 APK
 
 on:
   push:
-    branches: [ci/prime-r110-ether8192-reuse-apk-build]
+    branches: [ci/prime-r110-input-smp-apk-build]
     paths: [.github/workflows/prime-r110-market-apk-build.yml]
 
 permissions:
   contents: read
 
 env:
-  PRODUCT_SHA: 17be41447a8deb956a3ee9673be29892dff0ca11
-  MUNDO_X_SHA: c6b9fa93178de93de213e43c4f339133d74db893
-  APP_ID: com.reversewindows.android.prime.smp.r110.ether8192reuse
-  APK_VERSION: 0.3.88-perf-test.15
-  APK_VERSION_CODE: '134'
+  PRODUCT_SHA: ca82b8de27ccb2bc0aebd6eb33ddfa3d339619fd
+  MUNDO_X_SHA: 763ee5e4e23576d177820f65ca6a48ad727f18b1
+  APP_ID: com.reversewindows.android.prime.smp.r110.inputsmp
+  APK_VERSION: 0.3.88-perf-test.16
+  APK_VERSION_CODE: '135'
   ANDROID_ABI: arm64-v8a
 
 jobs:
@@ -97,6 +97,7 @@ jobs:
               expanded_blocks largest_block_instructions block_instruction_limit \
               long_block_instruction_limit long_blocks_executed largest_long_block_instructions \
               long_block_cache_hits long_block_deadline_deferrals \
+              boot_streaming_sse_triplet_steps secondary_ether_short_grants irq12_lapic_delivered \
               max_pio_batch_elements peak_raw_read_blocks; do
             grep -aFq "$field" "$elf"
             printf '%s\n' "$field" >> "$out/native-telemetry-fields.txt"
