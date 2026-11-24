@@ -1,0 +1,33 @@
+name: Resolve observed Windows 19045 kernel addresses using Microsoft public symbols
+
+on:
+  push:
+    branches: [ci/prime-r110-windows-19045-public-symbols]
+    paths:
+      - .github/workflows/prime-r110-windows-19045-public-symbols.yml
+      - .github/benchmarks/prime-iso-arm64/public-pdb-offsets.py
+
+permissions:
+  contents: read
+
+jobs:
+  kernel-symbol-names:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Resolve symbol names for the five observed kernel routines
+        shell: bash
+        run: |
+          set -euo pipefail
+          pdb='ntkrnlmp.pdb'
+          version='68A17FAF3012B7846079AEECDBE0A5831'
+          curl --fail --silent --show-error --location --max-time 150 --max-filesize 67108864 \
+            "https://msdl.microsoft.com/download/symbols/$pdb/$version/$pdb" -o "$RUNNER_TEMP/$pdb"
+          python3 .github/benchmarks/prime-iso-arm64/public-pdb-offsets.py "$RUNNER_TEMP/$pdb" | tee "$RUNNER_TEMP/kernel-symbols.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-19045-2006-observed-kernel-symbols
+          path: ${{ runner.temp }}/kernel-symbols.json
