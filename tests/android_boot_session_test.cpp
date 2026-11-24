@@ -85,7 +85,9 @@ void verify_ram_profile() {
   }
   const auto prime = Session::ram_profile(4096 * mib, 256 * mib, false, true);
   const auto report = Session::check_hardware({}, -1, 0, {}, prime);
-  require(counter(report, "ram_clock_hz") == 4'500'000'000'000ULL, "RAM clock in hardware preflight");
+  require(counter(report, "ram_clock_hz") == 4'800'000'000ULL &&
+              counter(report, "ram_data_transfers_per_second") == 9'600'000'000ULL,
+          "Hardware preflight must distinguish the DDR5 clock and transfer rate");
   require(counter(report, "usable_bytes") == Session::kPrimeRamBytes &&
               counter(report, "address_space_bytes") == prime.physical_bytes &&
               counter(report, "resident_ceiling_bytes") == prime_ceiling &&
@@ -110,7 +112,10 @@ void verify_ram_profile() {
   require(counter(direct.diagnostic(false), "resident_budget_bytes") == prime_ceiling,
           "An explicit Prime session profile must also honor the fixed ceiling");
   Session live({}, 0, Session::BootSource::SelfTest, -1, 0, phone);
-  require(counter(live.diagnostic(), "ram_clock_hz") == 4'500'000'000'000ULL, "RAM clock in live telemetry");
+  const auto ram_diagnostic = live.diagnostic();
+  require(counter(ram_diagnostic, "ram_clock_hz") == 4'800'000'000ULL &&
+              counter(ram_diagnostic, "ram_data_transfers_per_second") == 9'600'000'000ULL,
+          "Live RAM telemetry must show the DDR5 profile");
   const auto used = counter(live.diagnostic(), "resident_bytes");
   live.sample_ram_pressure(768 * mib - used, 256 * mib, false);
   require(!live.maintain_ram_budget() &&
@@ -1307,8 +1312,8 @@ void verify_active_guest_clock(const std::filesystem::path& path) {
                   {}, {}, {}, Session::kPrimeCpuTopology, true, Session::kPrimeCpuClock);
   const auto initial = session.diagnostic(false);
   require(initial.find("\"clock_source\":\"guest-cycles\"") != std::string::npos &&
-              counter(initial, "guest_tsc_hz") == 4'581'817'600ULL,
-          "Firmware must start with the deterministic clock and the reference TSC rate");
+              counter(initial, "guest_tsc_hz") == 6'500'000'000ULL,
+          "Firmware must start with the deterministic clock and the 6.5 GHz guest TSC");
   for (unsigned slice = 0; slice < 1024 && !session.is_stopped(); ++slice) {
     const auto deadline = cosmic_pc::PcMachine::RunClock::now() + std::chrono::milliseconds(8);
     if (session.step(32, deadline) == Session::Step::Fault)
@@ -1321,8 +1326,8 @@ void verify_active_guest_clock(const std::filesystem::path& path) {
   constexpr std::uint64_t second = 1'000'000'000, hz = cosmic_pc::PcMachine::kVirtualCyclesPerSecond;
   const auto elapsed = counter(result, "active_clock_elapsed_ns");
   const auto ticks = counter(result, "active_clock_ticks");
-  require(counter(result, "guest_tsc_hz") == 4'581'817'600ULL,
-          "The Android TSC must keep the reference rate across the clock transition");
+  require(counter(result, "guest_tsc_hz") == 6'500'000'000ULL,
+          "The Android TSC must keep its 6.5 GHz rate across the clock transition");
   require(ticks > 0 && ticks == elapsed / second * hz + elapsed % second * hz / second,
           "Active clock ticks must follow the declared oscillator rate");
   std::cout << "PRIME_ANDROID_ACTIVE_CLOCK_PASS deterministic_firmware=1 long64=1 ticks=" << ticks << '\n';
@@ -1570,7 +1575,7 @@ int main(int argc, char** argv) {
       frame = capture_cells(session);
       progress = session.diagnostic();
       require(progress.find("\"clock_source\":\"host-active-monotonic\"") != std::string::npos &&
-                  counter(progress, "active_clock_ticks") > 0 && counter(progress, "guest_tsc_hz") == 4'581'817'600ULL,
+                  counter(progress, "active_clock_ticks") > 0 && counter(progress, "guest_tsc_hz") == 6'500'000'000ULL,
               "A protected32 ISO must activate the Prime clock without entering long mode");
       require(progress.find("\"cpuid_vendor\":\"GenuineIntel\"") != std::string::npos,
               "ISO startup did not select the Windows x64 processor profile");
@@ -1586,8 +1591,12 @@ int main(int argc, char** argv) {
         const auto begin = live.find(field);
         require(begin != std::string::npos, "Missing storage device in live telemetry");
         const auto entry = live.substr(begin, live.find('}', begin) - begin);
-        require(counter(entry, "clock_hz") == 4'500'000'000'000ULL && counter(entry, "clock_cycles") > 0,
+        require(counter(entry, "clock_hz") == 33'333'333ULL && counter(entry, "clock_cycles") > 0,
                 "ATA and both QSSDs must expose their active clocks");
+        if (std::string_view(field) != "\"ata\":{")
+          require(counter(entry, "sequential_read_reference_bytes_per_second") == 14'900'000'000ULL &&
+                      counter(entry, "sequential_write_reference_bytes_per_second") == 14'000'000'000ULL,
+                  "Both QSSD diagnostics must distinguish the NVMe reference from the ATA timebase");
       }
       require(live.size() < progress.size() && live.find("\"boot_profile\":") == std::string::npos &&
                   live.find("\"status\":\"waiting_key\"") != std::string::npos &&

@@ -47,7 +47,7 @@ class AndroidBootSession final {
   static constexpr unsigned kMaxVideoWidth = 960, kMaxVideoHeight = 720;
   static constexpr RamProfile kDefaultRamProfile{2048ULL * 1024 * 1024, 256ULL * 1024 * 1024};
   static constexpr cosmic_pc::CpuTopology kPrimeCpuTopology{8, 2};
-  static constexpr auto kPrimeCpuClock = PcMotherboardC06::CpuClock::Twentyfold;
+  static constexpr auto kPrimeCpuClock = PcMotherboardC06::CpuClock::Prime6_5GHz;
   static constexpr auto kEngineTargetHz = cosmic_pc::ether_arm64::kExecutionTargetHz;
   static constexpr auto kMaxEngineWindow = std::chrono::milliseconds(8);
   static_assert(kEngineTargetHz % 1'000'000'000 == 0);
@@ -484,8 +484,6 @@ class AndroidBootSession final {
                                      : std::chrono::nanoseconds::zero();
   }
 
-  void set_experimental_tsc(bool enabled) { board_->set_experimental_tsc(enabled); }
-
   // The owner calls this between execution windows, after parallel readers join.
   // Changing measurement mode preserves all accumulated counters and timings.
   void set_backing_read_timing_enabled(bool enabled) noexcept {
@@ -641,9 +639,9 @@ class AndroidBootSession final {
       out << "{\"logical_bytes\":" << stats.logical_bytes
           << ",\"physical_bytes\":" << stats.physical_bytes
           << ",\"commits\":" << stats.commits << ",\"initial_commits\":" << initial_disk_commits_
-          << ",\"generation\":" << disk_->generation()
-          << ",\"clock_hz\":" << disk_->clock_hz()
-          << ",\"clock_cycles\":" << board_->device_clock_cycles(disk_->clock_hz()) << '}';
+          << ",\"generation\":" << disk_->generation();
+      write_qssd_clock(out, *disk_);
+      out << '}';
     } else {
       out << "null";
     }
@@ -651,10 +649,9 @@ class AndroidBootSession final {
       const auto stats = data_disk_->stats();
       const auto activity = board_->attached_data_ata()->counters();
       out << ",\"data_disk\":{\"logical_bytes\":" << stats.logical_bytes
-          << ",\"physical_bytes\":" << stats.physical_bytes << ",\"commits\":" << stats.commits
-          << ",\"clock_hz\":" << data_disk_->clock_hz()
-          << ",\"clock_cycles\":" << board_->device_clock_cycles(data_disk_->clock_hz())
-          << ",\"ata_identify_data_transfers\":" << activity.identify_data_transfers
+          << ",\"physical_bytes\":" << stats.physical_bytes << ",\"commits\":" << stats.commits;
+      write_qssd_clock(out, *data_disk_);
+      out << ",\"ata_identify_data_transfers\":" << activity.identify_data_transfers
           << ",\"ata_last_command_cycle\":" << activity.last_command_cycle
           << ",\"ata_read_sectors\":" << activity.read_sectors
           << ",\"ata_write_sectors\":" << activity.write_sectors << ",\"qssd_parallel_io\":";
@@ -1088,6 +1085,13 @@ class AndroidBootSession final {
     return info;
   }
 
+  void write_qssd_clock(std::ostream& out, const QssdDisk& disk) const {
+    out << ",\"clock_hz\":" << disk.clock_hz()
+        << ",\"clock_cycles\":" << board_->device_clock_cycles(disk.clock_hz())
+        << ",\"sequential_read_reference_bytes_per_second\":" << QssdDisk::kSequentialReadReferenceBytesPerSecond
+        << ",\"sequential_write_reference_bytes_per_second\":" << QssdDisk::kSequentialWriteReferenceBytesPerSecond;
+  }
+
   static void write_ram_profile(std::ostream& out, const cosmic_pc::PcMachine& pc,
                                 const SpillInfo& spill, const RamPressure* pressure = nullptr) {
     const auto metrics = pc.cpu.memory.metrics();
@@ -1104,6 +1108,7 @@ class AndroidBootSession final {
         << ",\"quantum_state_bytes\":" << pc.cpu.memory.quantum_state_bytes()
         << ",\"usable_bytes\":" << usable
         << ",\"ram_clock_hz\":" << PcMotherboardC06::kRamClockHz
+        << ",\"ram_data_transfers_per_second\":" << PcMotherboardC06::kRamDataTransfersPerSecond
         << ",\"resident_ceiling_bytes\":" << resident_limit(pc.cpu.memory.size())
         << ",\"resident_budget_bytes\":" << metrics.budget_bytes
         << ",\"backing_budget_bytes\":" << metrics.budget_bytes

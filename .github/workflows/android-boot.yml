@@ -370,6 +370,9 @@ jobs:
 
           report = json.loads(pathlib.Path(sys.argv[1]).read_text())
           ram = report["ram_profile"]
+          assert report["cpu_topology"]["guest_tsc_hz"] == 6_500_000_000
+          assert ram["ram_clock_hz"] == 4_800_000_000
+          assert ram["ram_data_transfers_per_second"] == 9_600_000_000
           assert ram["memory_backend"] == "ether-state-ram", ram
           quantum_probe = report["quantum_ram_probe"]
           assert quantum_probe["passed"], quantum_probe
@@ -421,7 +424,7 @@ jobs:
           assert cpu_us is None or cpu_us > 0
           thermal = snapshot["android_thermal_status"]
           assert thermal is None or 0 <= thermal <= 6
-          assert snapshot["cpu_topology"]["guest_tsc_hz"] == 4_581_817_600
+          assert snapshot["cpu_topology"]["guest_tsc_hz"] == 6_500_000_000
           host = snapshot["host_cpu"]
           assert host["hint_threads"] == 0, "Android hints must close when the guest stops"
           if host["readable_policies"]:
@@ -523,6 +526,10 @@ jobs:
           assert report["iso_bytes"] == Path(sys.argv[2]).stat().st_size
           assert report["disk"]["logical_bytes"] == 64 * 1024**3 and report["disk"]["initial_commits"] == 0
           assert report["data_disk"]["logical_bytes"] == 8 << 50 and report["data_disk"]["physical_bytes"] == 64
+          for disk in (report["disk"], report["data_disk"]):
+              assert disk["clock_hz"] == 33_333_333, disk
+              assert disk["sequential_read_reference_bytes_per_second"] == 14_900_000_000, disk
+              assert disk["sequential_write_reference_bytes_per_second"] == 14_000_000_000, disk
           assert report["guest_gpu"]["logical_vram_bytes"] == 120_000_000_000
           assert report["ata"]["identify_data_transfers"] == 1
           assert report["boot_progress"]["handed_off"] and report["boot_profile"]["checkpoint_interval_steps"] == 50_000_000
@@ -538,12 +545,13 @@ jobs:
           assert timing["diagnostic_save_interval_ms"] == 5_000
           topology = report["cpu_topology"]
           assert (topology["cores"], topology["threads_per_core"], topology["logical_processors"]) == (8, 2, 16)
-          assert topology["guest_tsc_hz"] == 4_581_817_600
+          assert topology["guest_tsc_hz"] == 6_500_000_000
           assert report["irq"]["clock_source"] == "host-active-monotonic" and report["irq"]["active_clock_ticks"] > 0
           assert report["ram_profile"]["usable_bytes"] == 64 << 30, report["ram_profile"]
           assert report["ram_profile"]["memory_backend"] == "ether-state-ram", report["ram_profile"]
-          assert report["ram_profile"]["ram_clock_hz"] == 4_500_000_000_000
           ram = report["ram_profile"]
+          assert ram["ram_clock_hz"] == 4_800_000_000
+          assert ram["ram_data_transfers_per_second"] == 9_600_000_000
           assert ram["resident_ceiling_bytes"] == 256 << 20, ram
           assert ram["resident_working_set_bytes"] <= ram["resident_budget_bytes"] <= ram["resident_ceiling_bytes"], ram
           ether = report["ether_arm64"]
@@ -558,30 +566,10 @@ jobs:
                 f"max_retired_in_one_window={timing['peak_slice_steps_completed']}")
           print("PRIME_ANDROID_ISO_PICKER_PASS boot=el-torito ram_gib=64 qssd_boot_gib=64 qssd_data_pib=8",
                 f"protected32_tsc_hz={topology['guest_tsc_hz']}")
+          print(f"PRIME_ANDROID_COMPONENT_CLOCKS_PASS tsc_hz={topology['guest_tsc_hz']} "
+                f"ddr5_ck_hz={ram['ram_clock_hz']} ddr5_transfers_s={ram['ram_data_transfers_per_second']} "
+                f"qssd_clock_hz={report['disk']['clock_hz']}")
           PY
-          python3 tests/android_rgb_console.py settings
-          for rate in 4500000000000 4581817600; do
-            tap_visible resource-id "$ANDROID_APP_ID:id/vm_experimental_clock" down
-            live="$RUNNER_TEMP/reverse-windows-$ANDROID_ABI/iso-clock-$rate.json"
-            for attempt in {1..20}; do
-              if adb exec-out run-as "$ANDROID_APP_ID" cat files/ultimo-diagnostico.json > "$live" &&
-                  grep -Fq "\"guest_tsc_hz\":$rate}" "$live"; then
-                break
-              fi
-              sleep 1
-            done
-            python3 - "$snapshot" "$live" "$rate" <<'PY'
-          import json, sys
-          from pathlib import Path
-          before, after = [json.loads(Path(path).read_text()) for path in sys.argv[1:3]]
-          assert after["cpu_topology"]["guest_tsc_hz"] == int(sys.argv[3])
-          assert after["ether_execution"]["target_virtual_cycles_per_second"] == 4_500_000_000_000
-          assert after["source"] == "iso" and after["status"] == "waiting_key"
-          assert after["boot_progress"]["session_steps"] == before["boot_progress"]["session_steps"] > 0
-          assert after["irq"]["active_clock_elapsed_ns"] == before["irq"]["active_clock_elapsed_ns"]
-          print("PRIME_ANDROID_LIVE_CLOCK_PASS same_session=1 guest_tsc_hz=" + sys.argv[3])
-          PY
-          done
           # A second optical guest reads the actual PS/2 packets from the Android controls.
           as --32 tests/rgb_pointer_guest.S -o "$RUNNER_TEMP/rgb-pointer.o"
           objcopy -O binary -j .text "$RUNNER_TEMP/rgb-pointer.o" "$RUNNER_TEMP/rgb-pointer.bin"

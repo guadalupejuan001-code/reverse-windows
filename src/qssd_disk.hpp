@@ -4,8 +4,8 @@
 // Records contain literal guest bytes (or exact zero/pattern/reference encodings).
 // No simulated quantum hardware or arbitrary compression promises.
 #include "block_disk.hpp"
+#include "prime_pci_clock.h"
 #include "smp_workers.hpp"
-#include "qssd/device_clock.hpp"
 #include "qssd/state_bus.hpp"
 #include <algorithm>
 #include <array>
@@ -39,6 +39,9 @@ class QssdDisk final : public BlockDisk {
   static constexpr std::uint64_t kSectorSize = 512, kBlockSize = 4096;
   static constexpr std::uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
   static constexpr std::uint64_t kMaxLogicalBytes = 8ULL << 50;
+  // Published sequential figures for the desktop WD_BLACK SN8100 reference.
+  static constexpr std::uint64_t kSequentialReadReferenceBytesPerSecond = 14'900'000'000;
+  static constexpr std::uint64_t kSequentialWriteReferenceBytesPerSecond = 14'000'000'000;
   static constexpr std::size_t kMaxTransactionBlocks = 128;
   static constexpr std::size_t kMaxTransactionBytes = kMaxTransactionBlocks * kBlockSize;
   static constexpr std::size_t kMaxBulkTransactionBlocks = 2048;
@@ -1023,7 +1026,7 @@ class QssdDisk final : public BlockDisk {
   QssdDisk& operator=(const QssdDisk&)=delete;
   std::uint64_t bytes() const noexcept override {return capacity_;}
   std::uint64_t sectors() const noexcept override {return capacity_/kSectorSize;}
-  std::uint64_t clock_hz() const noexcept override {return qssd::device_clock_hz;}
+  std::uint64_t clock_hz() const noexcept override {return RW_PRIME_IDE_CLOCK_HZ;}
   Stats stats() const {
     const auto v=states_.snapshot();
     return {capacity_,v->value->end,v->value->commits,v->value->raw,

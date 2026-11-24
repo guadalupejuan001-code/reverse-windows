@@ -195,7 +195,10 @@ final class VmTelemetry extends LinearLayout {
         metric(10, etherRam ? "Páginas con estado Éter" : "Tablas de páginas",
                 count(number(ram, "page_state_vectors")));
         metric(11, "Proceso Android (PSS)", pssKiB > 0 ? units(pssKiB, KIB, "MiB", 1) : UNKNOWN);
-        metric(12, "Reloj de la RAM virtual", frequency(number(ram, "ram_clock_hz")));
+        long transfers = number(ram, "ram_data_transfers_per_second");
+        String ramClock = frequency(number(ram, "ram_clock_hz"));
+        metric(12, transfers >= 0 ? "RAM DDR5 virtual · CK y transferencias" : "Reloj de la RAM virtual",
+                transfers >= 0 ? ramClock + " · " + units(transfers, 1_000_000, "MT/s", 0) : ramClock);
         JSONObject pressure = ram == null ? null : ram.optJSONObject("access_pressure");
         if (pressure == null) { showRows(13); return; }
         metric(13, "Escrituras que necesitaron espacio", count(number(pressure, "forced_reclaims")));
@@ -279,7 +282,7 @@ final class VmTelemetry extends LinearLayout {
         metric(3, "Bloques encadenados en paralelo", count(number(topology, "parallel_register_continuations")));
         metric(4, "vCPU iniciadas / configuradas", count(number(topology, "started")) + " / "
                 + count(number(topology, "logical_processors")));
-        metric(5, "Reloj virtual (TSC)", frequency(number(topology, "guest_tsc_hz")));
+        metric(5, "Reloj TSC del invitado", frequency(number(topology, "guest_tsc_hz")));
         JSONObject host = snapshot.optJSONObject("host_cpu");
         long low = number(host, "min_reported_khz");
         long high = number(host, "max_reported_khz");
@@ -340,6 +343,12 @@ final class VmTelemetry extends LinearLayout {
         }
         if (disk != null && disk.has("clock_hz")) {
             metric(rows++, "Reloj del QSSD virtual", frequency(number(disk, "clock_hz")));
+            long read = number(disk, "sequential_read_reference_bytes_per_second");
+            long write = number(disk, "sequential_write_reference_bytes_per_second");
+            if (read >= 0 && write >= 0) {
+                metric(rows++, "Referencia QSSD secuencial · L/E",
+                        units(read, 1_000_000_000, "GB/s", 1) + " / " + units(write, 1_000_000_000, "GB/s", 1));
+            }
         }
         JSONObject dataDisk = snapshot.optJSONObject("data_disk");
         if (dataDisk != null) {

@@ -30,7 +30,6 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
-import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -93,7 +92,6 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
     private Button bootDisk;
     private Button biosTest;
     private Button pause;
-    private Switch experimentalClock;
     private Button stop;
     private Button evidence;
     private Button hardwareCheck;
@@ -179,9 +177,6 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         evidence=action("Diagnóstico",false,this::showDiagnostic);evidence.setId(R.id.vm_copy_diagnostic);add(body,evidence,5);
         setupPanel=card(body,8);
         controls=card(body,8);
-        experimentalClock=new Switch(this);experimentalClock.setId(R.id.vm_experimental_clock);
-        experimentalClock.setText("Reloj experimental de 4,5 THz");experimentalClock.setTextColor(TEXT);
-        experimentalClock.setOnClickListener(v->worker.setExperimentalClock(experimentalClock.isChecked()));add(controls,experimentalClock,0);
         primaryActions=row(controls);
         pause=action("Pausar",false,()->{console.release();worker.setRunning(!running);});
         stop=action("Apagar",false,this::confirmStop);pair(primaryActions,pause,stop);
@@ -422,7 +417,6 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
 
     private void start(int bootSource, boolean debug) {
         if (session || pending) return;
-        experimentalClock.setChecked(false);
         pending = true;
         fault = false;
         terminal = false;
@@ -860,7 +854,6 @@ public final class MainActivity extends Activity implements VmWorker.Listener, G
         biosTest.setEnabled(setup);
         hardwareCheck.setEnabled(setup);
         controls.setVisibility(session ? View.VISIBLE : View.GONE);
-        experimentalClock.setEnabled(session && !pending && !fault && !terminal);
         pause.setText(running ? "Pausar" : "Reanudar");
         pause.setEnabled(session && !pending && !fault && !terminal);
         stop.setEnabled(session && !pending);

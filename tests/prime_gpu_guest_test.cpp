@@ -866,7 +866,7 @@ void verify_quantum_vram(const std::filesystem::path& volume) {
   require(reopened.read(last, &value, 1) == reverse_windows::GpuVram::Result::Complete && value == 0x68,
           "the checkpoint at the last logical byte did not survive reset");
   std::cout << "PRIME_QUANTUM_VRAM_PASS power_tick=0 logical_bytes=" << RWGPU_LOGICAL_BYTES
-            << " clock_hz=" << RW_PRIME_COMPONENT_HZ << " bell_xx=1 bell_zz=1 bell_z=0 checkpoint=1\n";
+            << " clock_hz=" << RW_PRIME_GPU_CLOCK_HZ << " bell_xx=1 bell_zz=1 bell_z=0 checkpoint=1\n";
 }
 
 void verify_quantum_state_restart(const std::filesystem::path& volume) {

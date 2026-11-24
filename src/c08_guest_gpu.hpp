@@ -214,10 +214,10 @@ class GuestGpuC08 {
     const auto parallel = parallel_io_stats();
     const auto cycles = clock_ ? clock_() : 0;
     out << "{\"logical_vram_bytes\":" << GpuVram::kBytes
-        << ",\"virtual_clock_hz\":" << RW_PRIME_COMPONENT_HZ
+        << ",\"virtual_clock_hz\":" << RW_PRIME_GPU_CLOCK_HZ
         << ",\"power_on_tick\":" << power_on_tick_
         << ",\"clock_cycles\":" << cycles
-        << ",\"vram_clock_hz\":" << RW_PRIME_COMPONENT_HZ
+        << ",\"vram_clock_hz\":" << RW_PRIME_GPU_CLOCK_HZ
         << ",\"vram_clock_cycles\":" << cycles
         << ",\"qssd_ready\":" << (memory_.backing_ready() ? "true" : "false")
         << ",\"quantum_vram\":{\"logical_bytes\":" << GpuVram::kBytes

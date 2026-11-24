@@ -32,13 +32,14 @@ class PcMotherboardC06 {
  public:
   using Clock = cosmic_pc::PcMachine::RunClock;
   using ClockSource = std::function<Clock::time_point()>;
-  enum class CpuClock : unsigned { Standard = 1, Double = 2, Twentyfold = 20, Experimental4_5THz };
-  static constexpr std::uint64_t kExperimentalTscHz = RW_PRIME_COMPONENT_HZ;
+  enum class CpuClock : unsigned { Standard = 1, Double = 2, Twentyfold = 20, Experimental4_5THz, Prime6_5GHz };
+  static constexpr std::uint64_t kExperimentalTscHz = 4'500'000'000'000ULL;
+  static constexpr std::uint64_t kPrimeTscHz = 6'500'000'000ULL;
   static_assert(kExperimentalTscHz % cosmic_pc::Cpu::kTscTicksPerCycle == 0);
-  static constexpr std::uint64_t kRamClockHz = RW_PRIME_COMPONENT_HZ;
-  static_assert(kRamClockHz % 1'000'000'000 == 0);
-  static_assert(cosmic_pc::ether_arm64::kExecutionTargetHz == RW_PRIME_COMPONENT_HZ);
-  static_assert(qssd::device_clock_hz == RW_PRIME_COMPONENT_HZ);
+  static_assert(kPrimeTscHz % cosmic_pc::Cpu::kTscTicksPerCycle == 0);
+  static constexpr std::uint64_t kRamClockHz = RW_PRIME_DDR5_CLOCK_HZ;
+  static constexpr std::uint64_t kRamDataTransfersPerSecond = RW_PRIME_DDR5_TRANSFERS_PER_SECOND;
+  static_assert(kRamDataTransfersPerSecond == 2 * kRamClockHz);
   enum class ClockStart { Immediate, Guest32Or64 };
   static constexpr std::uint64_t kLocalApic=cosmic_pc::PcMachine::kLocalApicAddress,
       kIoApic=cosmic_pc::PcMachine::kIoApicAddress;
@@ -206,6 +207,7 @@ class PcMotherboardC06 {
   cosmic_pc::PcMachine& pc_;
   const unsigned cpu_clock_ratio_;
   const std::uint64_t firmware_cycles_per_second_;
+  const std::uint64_t reference_tsc_cycles_per_second_;
   std::uint64_t tsc_cycles_per_second_;
   unsigned cpu_cycle_phase_ = 0;
   std::uint64_t cpu_cycles_ = 0;
@@ -514,11 +516,13 @@ class PcMotherboardC06 {
       const auto dev=selected_pci_device();
       if (offset >= RW_PRIME_PCI_CLOCK_HZ && offset < RW_PRIME_PCI_CLOCK_CYCLES + 8 &&
           (dev == 0 || (dev == 2 && ide_present()) || (dev == GuestGpuC08::pci_device && gpu_))) {
+        const auto hz = dev == 0 ? kRamClockHz :
+            dev == 2 ? AtaC07::kControllerClockHz : RW_PRIME_GPU_CLOCK_HZ;
         if (offset == RW_PRIME_PCI_CLOCK_CYCLES) {
           sync_active_clock();
-          pci_clock_samples_[dev] = device_clock_cycles(RW_PRIME_COMPONENT_HZ);
+          pci_clock_samples_[dev] = device_clock_cycles(hz);
         }
-        const auto value = offset < RW_PRIME_PCI_CLOCK_CYCLES ? RW_PRIME_COMPONENT_HZ : pci_clock_samples_[dev];
+        const auto value = offset < RW_PRIME_PCI_CLOCK_CYCLES ? hz : pci_clock_samples_[dev];
         return std::uint32_t(value >> ((offset & 7U) * 8)) & part_mask(width);
       }
       if (gpu_ && dev==GuestGpuC08::pci_device) {
@@ -732,8 +736,10 @@ class PcMotherboardC06 {
         const bool gate=(speaker_control_&1)!=0;
         const bool out=pit2_.mode==0 ? !pit2_.enabled :
             !gate||!pit2_.enabled||pit2_.counter>pit2_.reload/2;
-        // The refresh divider changes state every 2^26 RAM cycles (~14.9 us).
-        const bool refresh = (ram_clock_cycles() & (1ULL << 26)) != 0;
+        // Preserve the legacy refresh toggle (~14.9 us per edge) independently
+        // of the RAM interface clock presented by the host bridge.
+        constexpr std::uint64_t refresh_phase_units_per_second = 4'500'000'000'000ULL;
+        const bool refresh = (device_clock_cycles(refresh_phase_units_per_second) & (1ULL << 26)) != 0;
         return speaker_control_|(out?0x20U:0U)|(refresh?0x10U:0U);
       }
       case 0x70:return cmos_index_;
@@ -2094,15 +2100,19 @@ class PcMotherboardC06 {
                             bool experimental_mixed_smp=false, std::shared_ptr<SmpWorkers> workers={},
                             CpuClock cpu_clock=CpuClock::Standard)
       :pc_(machine), cpu_clock_ratio_(static_cast<unsigned>(
-           cpu_clock == CpuClock::Experimental4_5THz ? CpuClock::Twentyfold : cpu_clock)),
+           cpu_clock == CpuClock::Experimental4_5THz || cpu_clock == CpuClock::Prime6_5GHz
+               ? CpuClock::Twentyfold : cpu_clock)),
        firmware_cycles_per_second_(std::uint64_t(cosmic_pc::PcMachine::kVirtualCyclesPerSecond) * cpu_clock_ratio_),
+       reference_tsc_cycles_per_second_(cpu_clock == CpuClock::Prime6_5GHz
+           ? kPrimeTscHz / cosmic_pc::Cpu::kTscTicksPerCycle : firmware_cycles_per_second_),
        tsc_cycles_per_second_(cpu_clock == CpuClock::Experimental4_5THz
-           ? kExperimentalTscHz / cosmic_pc::Cpu::kTscTicksPerCycle : firmware_cycles_per_second_),
+           ? kExperimentalTscHz / cosmic_pc::Cpu::kTscTicksPerCycle : reference_tsc_cycles_per_second_),
        processor_count_(topology.logical_processors()),
        experimental_mixed_smp_(experimental_mixed_smp), workers_(std::move(workers)) {
     if (!topology.valid()) throw std::invalid_argument("Invalid virtual processor topology");
     if (cpu_clock != CpuClock::Standard && cpu_clock != CpuClock::Double &&
-        cpu_clock != CpuClock::Twentyfold && cpu_clock != CpuClock::Experimental4_5THz)
+        cpu_clock != CpuClock::Twentyfold && cpu_clock != CpuClock::Experimental4_5THz &&
+        cpu_clock != CpuClock::Prime6_5GHz)
       throw std::invalid_argument("Invalid virtual CPU clock ratio");
     prior_topology_ = pc_.cpu.topology();
     prior_apic_id_ = pc_.cpu.apic_id();
@@ -2132,7 +2142,7 @@ class PcMotherboardC06 {
         std::move(optical),optical_bytes,[this](){signal_isa_irq(15);});
     if(!graphics_vram.empty())gpu_=std::make_unique<GuestGpuC08>(
         pc_,graphics_vram,[this](auto address,auto data){return signal_pci_msi(address,data);},workers_,
-        [this]{return device_clock_cycles(RW_PRIME_COMPONENT_HZ);});
+        [this]{return device_clock_cycles(RW_PRIME_GPU_CLOCK_HZ);});
     // The machine must be booted/mounted first. ACPI goes into reserved BIOS
     // memory and is never presented by E820 as allocatable guest RAM.
     prior_in_=pc_.cpu.in_hook;prior_out_=pc_.cpu.out_hook;
@@ -2364,7 +2374,7 @@ class PcMotherboardC06 {
     sync_active_clock();
     if (enabled) attach_cpu_clock();
     tsc_cycles_per_second_ = enabled ? kExperimentalTscHz / cosmic_pc::Cpu::kTscTicksPerCycle
-                                     : firmware_cycles_per_second_;
+                                     : reference_tsc_cycles_per_second_;
   }
   std::uint64_t guest_tsc_hz() const noexcept {
     return tsc_cycles_per_second_ * cosmic_pc::Cpu::kTscTicksPerCycle;

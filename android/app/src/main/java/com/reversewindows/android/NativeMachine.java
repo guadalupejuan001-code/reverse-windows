@@ -80,7 +80,6 @@ final class NativeMachine {
     static native long engineTargetHz();
     static native long engineDelayNs(long handle);
     static native long step(long handle, long hostBudgetNs);
-    static native void setExperimentalClock(long handle, boolean enabled);
     static native void setBackingReadTiming(long handle, boolean enabled);
     static native int[] cpuThreadIds(long handle);
     private static native boolean sampleRamPressure(long handle, long available, long threshold,

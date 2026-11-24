@@ -417,8 +417,8 @@ void test_raw_controller_clock(const std::string& path) {
   read_ide_config(code,0x48,0x9608);
   read_ide_config(code,0x4c,0x960c);
   ins(code,{0xf4});program(pc,code);
-  need(pc.cpu.read64(0xa000 + 129*2) == 0 && pc.cpu.read64(0x9600) == 4'500'000'000'000ULL,
-       "The PCI ATA controller must expose its own 4.5 THz clock with an unclocked raw disk");
+  need(pc.cpu.read64(0xa000 + 129*2) == 0 && pc.cpu.read64(0x9600) == 33'333'333ULL,
+       "The PCI ATA controller must expose its 33 MHz clock with an unclocked raw disk");
   need(pc.cpu.read64(0x9608) > 0,"The ATA oscillator must advance in firmware");
   const auto raw_command = board.attached_ata()->counters().last_command_cycle;
   need(raw_command > 0 && raw_command < pc.cpu.read64(0x9608),
@@ -426,10 +426,10 @@ void test_raw_controller_clock(const std::string& path) {
   pc.reset();
   need(board.device_clock_cycles(board.ata_clock_hz()) == 0,"Machine reset must restart the ATA clock");
 
-  // Resolve a single edge, including wrap, below the platform clock's 1 ns resolution.
+  // Resolve a single controller edge, including counter wrap.
   std::uint64_t cycle = UINT64_MAX;
   AtaC07 ata(disk,{},AtaC07::Unit::Master,[&](std::uint64_t hz) {
-    need(hz == 4'500'000'000'000ULL,"SRST must use the controller oscillator");
+    need(hz == 33'333'333ULL,"SRST must use the controller oscillator");
     return cycle;
   });
   ata.output(AtaC07::kControl,1,4);
@@ -477,7 +477,7 @@ void test_max_data_disk(const std::string& boot_path,const std::string& data_pat
          "Guest IDENTIFY truncated the 8 PiB sector count");
     need(pc.cpu.read64(0xa400+100*2)==boot.sectors(),
          "Guest device selection reported the data capacity on the boot drive");
-    constexpr std::uint64_t qssd_hz = 4'500'000'000'000ULL;
+    constexpr std::uint64_t qssd_hz = 33'333'333ULL;
     need(pc.cpu.read64(0xa000 + 129*2) == qssd_hz && pc.cpu.read64(0xa400 + 129*2) == qssd_hz,
          "Both QSSD devices must report the full 64-bit clock in ATA IDENTIFY");
     const auto data_ticks = pc.cpu.read64(0xa000 + 133*2);
@@ -526,18 +526,27 @@ void test_max_data_disk(const std::string& boot_path,const std::string& data_pat
     const auto ata_first = pc.cpu.read64(0x9618);
     const auto second = read_ticks(std::chrono::seconds(1));
     const auto ata_second = pc.cpu.read64(0x9618);
-    need(second - first == qssd_hz, "One active guest second must advance 4.5 trillion QSSD cycles");
-    need(ata_second - ata_first == 4'500'000'000'000ULL && pc.cpu.read32(0x9610) == (ata_first >> 32),
-         "PCI must latch all 64 bits and count exactly 4.5 trillion ATA cycles per active second");
+    need(second - first == qssd_hz, "One active guest second must advance exactly one QSSD clock second");
+    need(ata_second - ata_first == qssd_hz && pc.cpu.read32(0x9610) == (ata_first >> 32),
+         "PCI must latch all 64 bits and count exactly one ATA clock second");
     now += std::chrono::hours(1);  // VM paused between runs.
     board.set_experimental_tsc(true);
-    need(read_ticks(std::chrono::nanoseconds(1)) - second == 4500,
+    const auto after_resume = read_ticks(std::chrono::nanoseconds(31));
+    need(after_resume - second == 1,
          "QSSD time must exclude the pause and keep its rate across a CPU clock change");
-    const auto ata_delta = pc.cpu.read64(0x9618) - ata_second;
-    need(ata_delta == 4500 && pc.cpu.read32(0x9610) == (ata_second >> 32),
+    const auto ata_after_resume = pc.cpu.read64(0x9618);
+    need(ata_after_resume - ata_second == 1 && pc.cpu.read32(0x9610) == (ata_second >> 32),
          "The ATA clock must exclude paused time and remain independent of the CPU rate");
+    constexpr auto long_interval = std::chrono::seconds(130);
+    const auto later = read_ticks(long_interval);
+    const auto ata_later = pc.cpu.read64(0x9618);
+    need(later - after_resume == qssd_hz * long_interval.count() &&
+         ata_later - ata_after_resume == qssd_hz * long_interval.count() &&
+         (ata_later >> 32) != (ata_after_resume >> 32) &&
+         pc.cpu.read32(0x9610) == (ata_after_resume >> 32),
+         "The latched ATA high dword must remain stable across a low-dword wrap");
     std::cout << "C07_ATA_CLOCK_PASS active_second_cycles=" << ata_second - ata_first
-              << " active_nanosecond_cycles=" << ata_delta << "\n";
+              << " active_31_nanosecond_cycles=" << ata_after_resume - ata_second << " latched_wrap=1\n";
   }
   QssdDisk reopened(data_path,QssdDisk::Access::ReadOnly);
   need(reopened.read(last_sector,1,read.data())&&read==payload,

@@ -640,8 +640,8 @@ void pci_acpi_cmos_guest(){
   need(pc.cpu.read32(0x9000)==0x00011b36,
        "real x86 guest PCI CF8/CFC failed to read host bridge ID");
   const auto guest_pci_id=pc.cpu.read32(0x9000);
-  need(pc.cpu.read64(0x9014)==4'500'000'000'000ULL,
-       "x86 guest must discover the full 64-bit RAM clock in the host bridge");
+  need(pc.cpu.read64(0x9014)==4'800'000'000ULL,
+       "x86 guest must discover the full 64-bit DDR5-9600 I/O clock in the host bridge");
   need(pc.cpu.read32(0x9004)==0xffffffffU,
        "nonexistent PCI device must read all ones");
   need(pc.cpu.memory[0x9008]==2,"guest CMOS status B does not indicate BCD 24-hour");
