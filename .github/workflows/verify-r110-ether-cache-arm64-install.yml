@@ -1,17 +1,17 @@
-name: Verify Prime R110 LSL ARM64 APK installation
+name: Verify Prime R110 reference clock ARM64 APK installation
 
 on:
   push:
-    branches: [ci/prime-r110-lsl-arm64-install]
+    branches: [ci/prime-r110-normal-tsc-arm64-install]
     paths: [.github/workflows/verify-r110-ether-cache-arm64-install.yml]
   workflow_dispatch:
     inputs:
       build_run_id:
-        description: GitHub Actions run ID of the selected .9 build
+        description: GitHub Actions run ID of the selected .10 build
         required: true
         type: string
       build_artifact_id:
-        description: GitHub Actions artifact ID of the selected .9 ARM64 release
+        description: GitHub Actions artifact ID of the selected .10 ARM64 release
         required: true
         type: string
       build_artifact_digest:
@@ -32,18 +32,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      APP_ID: com.reversewindows.android.prime.smp.r110.lslperf
-      SOURCE_SHA: 170cbf72e6ffcd8e0631d5ff28a20c68cea7849b
+      APP_ID: com.reversewindows.android.prime.smp.r110.normaltsc
+      SOURCE_SHA: 2f687be5b1c62fb077132959b07412d3eab2be31
       MUNDO_X_SHA: 751e3ae245da5d0e2fda09b3696a2e5353f7020f
-      APK_VERSION_NAME: 0.3.88-perf-test.9
-      APK_VERSION_CODE: '128'
-      APK_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.9-170cbf72e6ff-arm64-v8a-release.apk
-      BUILD_ARTIFACT_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.9-170cbf72e6ff-ARM64
-      # Pin the verified .9 build values before pushing this branch.
-      BUILD_RUN_ID: ${{ inputs.build_run_id || '45299615141' }}
-      BUILD_ARTIFACT_ID: ${{ inputs.build_artifact_id || '14878242099' }}
-      BUILD_ARTIFACT_DIGEST: ${{ inputs.build_artifact_digest || 'sha256:6dfcbe2e5a9973d6b4a108ddd24e599d37498e77ae54ac7ab6f4ab87cd73b83c' }}
-      EXPECTED_APK_SHA256: ${{ inputs.apk_sha256 || '056c11d7f806ca42e5e746d7b75697ca0b8d97ad8d88572895ddc8a0f837567e' }}
+      APK_VERSION_NAME: 0.3.88-perf-test.10
+      APK_VERSION_CODE: '129'
+      APK_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.10-2f687be5b1c6-arm64-v8a-release.apk
+      BUILD_ARTIFACT_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.10-2f687be5b1c6-ARM64
+      BUILD_RUN_ID: ${{ inputs.build_run_id || '45322028563' }}
+      BUILD_ARTIFACT_ID: ${{ inputs.build_artifact_id || '14888625994' }}
+      BUILD_ARTIFACT_DIGEST: ${{ inputs.build_artifact_digest || 'sha256:2bd299a548785c1e8345c4ab3330b131fd7e8c6466394568b63da63b4461e747' }}
+      EXPECTED_APK_SHA256: ${{ inputs.apk_sha256 || '3b148a682ead0e5c65285f4f9f2d6c61ca74da54ba73a2b5af4ab0a80cda0ccd' }}
     steps:
       - name: Authenticate the selected build artifact record
         env:
@@ -306,6 +305,8 @@ jobs:
               irq = report['irq']
               assert type(irq['irq64_bulk_frames']) is int and 0 <= irq['irq64_bulk_frames'] <= irq['delivered'], irq
               topology = report['cpu_topology']
+              assert topology['guest_tsc_hz'] == 4_581_817_600, topology
+              assert report['ether_execution']['target_virtual_cycles_per_second'] == 4_500_000_000_000
               crc32c_retired = topology['crc32c_retired']
               assert type(crc32c_retired) is int and crc32c_retired == 0, crc32c_retired
               lsl_retired = topology['lsl_retired']
@@ -405,6 +406,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: prime-r110-arm64-lsl-bridge-install-170cbf72e6ff
+          name: prime-r110-arm64-normal-tsc-bridge-install-2f687be5b1c6
           path: ${{ runner.temp }}/r110-install-evidence
           if-no-files-found: warn
