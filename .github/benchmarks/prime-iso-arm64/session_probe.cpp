@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -125,6 +126,16 @@ int main(int argc, char** argv) {
     struct Close { int fd; ~Close() { ::close(fd); } } optical{fd};
     Session session(run_dir / "system.rqvd", 64, Session::BootSource::Iso, fd, 5550497792ULL,
         ram, ram_cache, run_dir / "vram.rqvd", {}, Session::kPrimeCpuTopology, true, Session::kPrimeCpuClock);
+    if (const char* normal_tsc = std::getenv("PRIME_REPLAY_NORMAL_TSC")) {
+      if (std::string_view(normal_tsc) != "1")
+        throw std::invalid_argument("PRIME_REPLAY_NORMAL_TSC must be unset or 1");
+      session.set_experimental_tsc(false);
+      constexpr std::uint64_t expected_hz = 4'581'817'600ULL;
+      const auto expected_field = "\"guest_tsc_hz\":" + std::to_string(expected_hz) + '}';
+      if (session.session_steps() != 0 || session.diagnostic(false).find(expected_field) == std::string::npos)
+        throw std::runtime_error("Normal guest TSC was not applied before the first instruction");
+      std::cout << "PRIME_REPLAY_TSC hz=" << expected_hz << " guest_steps=0\n" << std::flush;
+    }
 #if defined(MUNDO_X_PC_EXCEPTION_EVENTS)
     const auto exceptions = std::make_unique<ExceptionReplay>();
 #endif

@@ -1,8 +1,8 @@
-name: Prime R110 ARM64 guest exception replay
+name: Prime R110 ARM64 normal guest-clock replay
 
 on:
   push:
-    branches: [ci/prime-r110-arm64-irql-trace]
+    branches: [ci/prime-r110-arm64-normal-tsc-replay]
     paths:
       - .github/benchmarks/prime-iso-arm64/**
       - .github/workflows/prime-r110-real-iso-arm64-irql-trace.yml
@@ -13,14 +13,15 @@ permissions:
 env:
   AVAILABLE_MIB: '749'
   THRESHOLD_MIB: '128'
-  STOP_TARGET: '20000000000'
-  PROBE_TIMEOUT_SECONDS: '4800'
+  STOP_TARGET: '30000000000'
+  PROBE_TIMEOUT_SECONDS: '6900'
   EXCEPTION_REPLAY_POST_NMI_STEPS: '500000000'
+  PRIME_REPLAY_NORMAL_TSC: '1'
 
 jobs:
   exception-replay:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 100
+    timeout-minutes: 135
     steps:
       - uses: actions/checkout@v7
         with:
@@ -87,11 +88,23 @@ jobs:
           nohup bash "$bench/run-combined-role.sh" reference < /dev/null > "$evidence/reference-driver.log" 2>&1 &
           echo "$!" > "$RUNNER_TEMP/reference.pid"
           python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/reference-progress" 11500000000
+          grep -qx 'PRIME_REPLAY_TSC hz=4581817600 guest_steps=0' "$evidence/reference.stdout"
       - name: Upload the 11.5B observation
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-irql-trace-11-5b
+          name: prime-r110-arm64-normal-tsc-11-5b
           path: ${{ runner.temp }}/reference-progress/
+      - name: Observe the same 20B comparison point before extending the run
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/reference-20b" 20000000000
+      - name: Upload the 20B comparison point or the earlier stop
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-normal-tsc-20b
+          path: ${{ runner.temp }}/reference-20b/
       - name: Wait for the first delivered NMI capture
         id: nmi
         shell: bash
@@ -115,7 +128,7 @@ jobs:
         if: steps.nmi.outputs.captured == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-irql-trace-first-nmi
+          name: prime-r110-arm64-normal-tsc-first-nmi
           path: ${{ runner.temp }}/first-nmi/
           if-no-files-found: error
       - name: Verify the bounded replay finished and archived its trace
@@ -136,6 +149,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-irql-trace-final
+          name: prime-r110-arm64-normal-tsc-final
           path: ${{ runner.temp }}/evidence/
           if-no-files-found: warn
