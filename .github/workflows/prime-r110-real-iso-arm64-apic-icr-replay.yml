@@ -1,8 +1,8 @@
-name: Prime R110 ARM64 Windows Setup observation up to 30B
+name: Prime R110 ARM64 single-vCPU Windows boot control
 
 on:
   push:
-    branches: [ci/prime-r110-arm64-windows-setup-replay]
+    branches: [ci/prime-r110-arm64-uniprocessor-replay]
     paths:
       - .github/benchmarks/prime-iso-arm64/apic-icr-replay-targets.json
       - .github/benchmarks/prime-iso-arm64/session_probe.cpp
@@ -65,7 +65,7 @@ jobs:
           cc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -o "$RUNNER_TEMP/verified_iso.so" \
             "$bench/verified_iso.c" -lcurl -pthread
           sha256sum "$RUNNER_TEMP"/build-*/session_probe "$RUNNER_TEMP/verified_iso.so" > "$evidence/native-sha256.txt"
-      - name: Start the pinned APK engine and observe 11.5B
+      - name: Start the pinned APK engine with one vCPU and observe 11.5B
         shell: bash
         run: |
           set -euo pipefail
@@ -90,7 +90,7 @@ jobs:
       - name: Upload the 11.5B observation
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-windows-setup-11-5b-target
+          name: prime-r110-arm64-uniprocessor-11-5b-target
           path: ${{ runner.temp }}/reference-progress/
       - name: Observe the same session at 18B
         shell: bash
@@ -101,7 +101,7 @@ jobs:
       - name: Upload the 18B observation
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-windows-setup-18b-target
+          name: prime-r110-arm64-uniprocessor-18b-target
           path: ${{ runner.temp }}/18b-checkpoint/
       - name: Observe the same session at 20B
         shell: bash
@@ -112,7 +112,7 @@ jobs:
       - name: Upload the 20B observation
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-windows-setup-20b-target
+          name: prime-r110-arm64-uniprocessor-20b-target
           path: ${{ runner.temp }}/20b-checkpoint/
       - name: Observe the same session at 23B
         shell: bash
@@ -123,7 +123,7 @@ jobs:
       - name: Upload the 23B observation
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-windows-setup-23b-target
+          name: prime-r110-arm64-uniprocessor-23b-target
           path: ${{ runner.temp }}/23b-checkpoint/
       - name: Observe the same session at 26B
         shell: bash
@@ -134,7 +134,7 @@ jobs:
       - name: Upload the 26B observation
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-windows-setup-26b-target
+          name: prime-r110-arm64-uniprocessor-26b-target
           path: ${{ runner.temp }}/26b-checkpoint/
       - name: Record the terminal state after a fault, 30B steps or 115 minutes
         shell: bash
@@ -153,56 +153,34 @@ jobs:
             sleep 20
           done
           if [[ -s "$evidence/reference.stdout" ]]; then tail -n1 "$evidence/reference.stdout"; fi
-          python3 - "$evidence/reference-fault.json" <<'PY'
+          python3 - "$evidence/reference-session.json" <<'PY'
           import json
           from pathlib import Path
           import sys
 
-          terminal = Path(sys.argv[1])
-          fault = json.loads(terminal.read_text()).get("cpu_fault") or {}
-          rejection = fault.get("icr_low_rejection")
-          if rejection is None:
-              if "physical=0xfee00300" in fault.get("message", ""):
-                  raise SystemExit("The ICR low failure reproduced without the attempted payload")
-              print("No ICR low rejection recorded at this terminal state")
-          else:
-              if rejection.get("source_apic_id") != fault.get("apic_id"):
-                  raise SystemExit("The ICR rejection source does not match the faulting vCPU")
-              detail = json.dumps(rejection, indent=2) + "\n"
-              terminal.with_name("reference-icr-low-rejection.json").write_text(detail)
-              print(detail, end="")
-          session = json.loads(terminal.with_name("reference-session.json").read_text())
+          source = Path(sys.argv[1])
+          session = json.loads(source.read_text())
           topology = session["cpu_topology"]
-          lsl_count = topology["lsl_retired"]
-          lsl_by_vcpu = [cpu["lsl_retired"] for cpu in topology["execution_by_logical_processor"]]
-          if lsl_count != sum(lsl_by_vcpu):
-              raise SystemExit("The aggregate LSL count differs from the per-vCPU counts")
-          message = fault.get("message", "")
-          repeated_lsl_stop = "opcode=0f03" in message and "two-byte opcode is not implemented" in message
-          proof = {
+          if any(topology[key] != 1 for key in ("sockets", "cores", "threads_per_core", "logical_processors", "started")):
+              raise SystemExit("The probe did not hold the one-vCPU topology")
+          evidence = {
               "guest_steps": session["boot_progress"]["session_steps"],
-              "lsl_retired": lsl_count,
-              "lsl_by_vcpu": lsl_by_vcpu,
-              "previous_lsl_fault_reproduced": repeated_lsl_stop,
+              "cpu_topology": topology,
               "lapic_nmi_delivered": session["irq"]["lapic_nmi_delivered"],
-              "lapic_nmi_last_delivery": session["irq"].get("lapic_nmi_last_delivery"),
+              "ata_commands": session["ata"]["commands"],
               "windows_ready": session["machine"]["windows_ready"],
-              "terminal_status": session["status"],
+              "status": session["status"],
               "cpu_fault": session.get("cpu_fault"),
           }
-          detail = json.dumps(proof, indent=2) + "\n"
-          terminal.with_name("reference-lsl-evidence.json").write_text(detail)
+          detail = json.dumps(evidence, indent=2) + "\n"
+          source.with_name("reference-uniprocessor-evidence.json").write_text(detail)
           print(detail, end="")
-          if repeated_lsl_stop:
-              raise SystemExit("The previous unimplemented LSL fault reproduced")
-          if lsl_count == 0:
-              raise SystemExit("No guest LSL retirement was observed before this terminal state")
           PY
           test "$(cat "$RUNNER_TEMP/reference.exit")" = 0
       - name: Preserve late per-vCPU execution and IRQ evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: prime-r110-arm64-windows-setup-raw-final
+          name: prime-r110-arm64-uniprocessor-raw-final
           path: ${{ runner.temp }}/evidence/
           if-no-files-found: warn
