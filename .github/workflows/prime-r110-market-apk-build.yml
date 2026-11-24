@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 env:
-  PRODUCT_SHA: 52359d97e9e332b3cfb4cbfb60a8e922b4d15876
-  MUNDO_X_SHA: fef665433ed075173cfb95f4603608321d26ba78
+  PRODUCT_SHA: 7d125dffc2258dcd0c5588d75b908d8282a33eb0
+  MUNDO_X_SHA: eebb1fae5bda517e5b0294ee5044df0e4f5058dd
   APP_ID: com.reversewindows.android.prime.smp.r110.wideblocks
   APK_VERSION: 0.3.88-perf-test.13
   APK_VERSION_CODE: '132'
