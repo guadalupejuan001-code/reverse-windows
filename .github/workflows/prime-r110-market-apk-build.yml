@@ -9,11 +9,11 @@ permissions:
   contents: read
 
 env:
-  PRODUCT_SHA: df836d5d938d70e605a1ae0f672b2a0fc83c6ba3
+  PRODUCT_SHA: ba461db7915da262e17b86e55da316a39dbe8995
   MUNDO_X_SHA: 99dc645b80b23212f8e59603fa029caca3a07145
   APP_ID: com.reversewindows.android.prime.smp.r110.boottrace
-  APK_VERSION: 0.3.88-perf-test.18
-  APK_VERSION_CODE: '137'
+  APK_VERSION: 0.3.88-perf-test.19
+  APK_VERSION_CODE: '138'
   ANDROID_ABI: arm64-v8a
 
 jobs:
