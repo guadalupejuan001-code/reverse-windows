@@ -1,19 +1,19 @@
-name: Prime R110 wide blocks ARM64 APK
+name: Prime R110 Ether 8192 ARM64 APK
 
 on:
   push:
-    branches: [ci/prime-r110-wideblocks-apk-build]
+    branches: [ci/prime-r110-ether8192-apk-build]
     paths: [.github/workflows/prime-r110-market-apk-build.yml]
 
 permissions:
   contents: read
 
 env:
-  PRODUCT_SHA: 7d125dffc2258dcd0c5588d75b908d8282a33eb0
-  MUNDO_X_SHA: eebb1fae5bda517e5b0294ee5044df0e4f5058dd
-  APP_ID: com.reversewindows.android.prime.smp.r110.wideblocks
-  APK_VERSION: 0.3.88-perf-test.13
-  APK_VERSION_CODE: '132'
+  PRODUCT_SHA: e9b3b4963964feb8a90e150b7a940f4c86e94092
+  MUNDO_X_SHA: 278d4cfef02cbfccb015042ea176596a49e61de1
+  APP_ID: com.reversewindows.android.prime.smp.r110.ether8192
+  APK_VERSION: 0.3.88-perf-test.14
+  APK_VERSION_CODE: '133'
   ANDROID_ABI: arm64-v8a
 
 jobs:
@@ -95,8 +95,10 @@ jobs:
           for field in guest_tsc_hz ram_data_transfers_per_second \
               sequential_read_reference_bytes_per_second sequential_write_reference_bytes_per_second \
               expanded_blocks largest_block_instructions block_instruction_limit \
+              long_block_instruction_limit long_blocks_executed largest_long_block_instructions \
               max_pio_batch_elements peak_raw_read_blocks; do
             grep -aFq "$field" "$elf"
+            printf '%s\n' "$field" >> "$out/native-telemetry-fields.txt"
           done
           readelf -h -lW "$elf" > "$out/native-elf.txt"
           grep -Fq AArch64 "$out/native-elf.txt"
