@@ -1,17 +1,17 @@
-name: Verify Prime R110 vector and debug ARM64 APK installation
+name: Verify Prime R110 LSL ARM64 APK installation
 
 on:
   push:
-    branches: [ci/prime-r110-vector-debug-arm64-install]
+    branches: [ci/prime-r110-lsl-arm64-install]
     paths: [.github/workflows/verify-r110-ether-cache-arm64-install.yml]
   workflow_dispatch:
     inputs:
       build_run_id:
-        description: GitHub Actions run ID of the selected .8 build
+        description: GitHub Actions run ID of the selected .9 build
         required: true
         type: string
       build_artifact_id:
-        description: GitHub Actions artifact ID of the selected .8 ARM64 release
+        description: GitHub Actions artifact ID of the selected .9 ARM64 release
         required: true
         type: string
       build_artifact_digest:
@@ -32,18 +32,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      APP_ID: com.reversewindows.android.prime.smp.r110.vectorstepperf
-      SOURCE_SHA: b236ec8fd6b6b1c88b941289df6a503b77230020
-      MUNDO_X_SHA: f71c46f3637639e3c6d259af8e5cf3deccb45a6f
-      APK_VERSION_NAME: 0.3.88-perf-test.8
-      APK_VERSION_CODE: '127'
-      APK_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.8-b236ec8fd6b6-arm64-v8a-release.apk
-      BUILD_ARTIFACT_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.8-b236ec8fd6b6-ARM64
-      # Pin the verified .8 build values before pushing this branch.
-      BUILD_RUN_ID: ${{ inputs.build_run_id || '45255433682' }}
-      BUILD_ARTIFACT_ID: ${{ inputs.build_artifact_id || '14857362386' }}
-      BUILD_ARTIFACT_DIGEST: ${{ inputs.build_artifact_digest || 'sha256:0c58a7733821a763d59a5067b9f5983506cd18fba2300d31c18faf6d5854cad1' }}
-      EXPECTED_APK_SHA256: ${{ inputs.apk_sha256 || '373267e940409d7baca8a6af092e5362330e78935cf6a3f8038b2d7550338075' }}
+      APP_ID: com.reversewindows.android.prime.smp.r110.lslperf
+      SOURCE_SHA: 170cbf72e6ffcd8e0631d5ff28a20c68cea7849b
+      MUNDO_X_SHA: 751e3ae245da5d0e2fda09b3696a2e5353f7020f
+      APK_VERSION_NAME: 0.3.88-perf-test.9
+      APK_VERSION_CODE: '128'
+      APK_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.9-170cbf72e6ff-arm64-v8a-release.apk
+      BUILD_ARTIFACT_NAME: REVERSE-Windows-Prime-0.3.88-perf-test.9-170cbf72e6ff-ARM64
+      # Pin the verified .9 build values before pushing this branch.
+      BUILD_RUN_ID: ${{ inputs.build_run_id || '45299615141' }}
+      BUILD_ARTIFACT_ID: ${{ inputs.build_artifact_id || '14878242099' }}
+      BUILD_ARTIFACT_DIGEST: ${{ inputs.build_artifact_digest || 'sha256:6dfcbe2e5a9973d6b4a108ddd24e599d37498e77ae54ac7ab6f4ab87cd73b83c' }}
+      EXPECTED_APK_SHA256: ${{ inputs.apk_sha256 || '056c11d7f806ca42e5e746d7b75697ca0b8d97ad8d88572895ddc8a0f837567e' }}
     steps:
       - name: Authenticate the selected build artifact record
         env:
@@ -308,6 +308,8 @@ jobs:
               topology = report['cpu_topology']
               crc32c_retired = topology['crc32c_retired']
               assert type(crc32c_retired) is int and crc32c_retired == 0, crc32c_retired
+              lsl_retired = topology['lsl_retired']
+              assert type(lsl_retired) is int and lsl_retired == 0, lsl_retired
               for key in ('threaded_pause_yields', 'threaded_pause_turn_steps', 'threaded_pause_admissions'):
                   assert type(topology[key]) is int and topology[key] >= 0, (key, topology[key])
               verify_tsc_access(topology['tsc_access'])
@@ -319,6 +321,7 @@ jobs:
                   assert re.fullmatch(r'[0-9a-fA-F]{16}', entry['cr3_hex']), entry
                   assert 0 <= entry['cs'] <= 0xffff and 0 <= entry['flags'] <= 0xffffffff, entry
                   assert 0 <= entry['ether_arm64_steps'] <= entry['steps'], entry
+                  assert type(entry['lsl_retired']) is int and entry['lsl_retired'] == 0, entry
                   verify_tsc_access(entry['tsc_access'])
               assert [p['steps'] for p in positions] == topology['steps_by_logical_processor']
               assert [p['ether_arm64_steps'] for p in positions] == topology['ether_arm64_steps_by_logical_processor']
@@ -329,7 +332,7 @@ jobs:
                   machine['instructions']), (bsp, machine)
               print(f'PRIME_BOOT_DIAGNOSTIC_SCHEMA_PASS source={source} status={status} '
                     f'ram_add_guest_steps={ram_add} encode_deflate_bypassed={deflate_bypassed} '
-                    f'processors={len(positions)}')
+                    f'processors={len(positions)} lsl_retired={lsl_retired}')
               return report
 
           settings()
@@ -402,6 +405,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: prime-r110-arm64-bridge-install-b236ec8fd6b6
+          name: prime-r110-arm64-lsl-bridge-install-170cbf72e6ff
           path: ${{ runner.temp }}/r110-install-evidence
           if-no-files-found: warn
