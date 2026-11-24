@@ -30,7 +30,14 @@ inline void write_ether_arm64(std::ostream& out, const cosmic_pc::Cpu& cpu) {
       << ",\"executed_blocks\":" << stats.blocks << ",\"guest_steps\":" << stats.steps
       << ",\"expanded_blocks\":" << stats.expanded_blocks
       << ",\"largest_block_instructions\":" << stats.largest_block_instructions
-      << ",\"block_instruction_limit\":" << cosmic_pc::ether_arm64::Block::kMaxInstructions
+      << ",\"block_instruction_limit\":" << cosmic_pc::ether_arm64::LongBlock::kMaxInstructions
+      << ",\"ordinary_block_instruction_limit\":" << cosmic_pc::ether_arm64::Block::kMaxInstructions
+      << ",\"long_block_instruction_limit\":" << cosmic_pc::ether_arm64::LongBlock::kMaxInstructions
+      << ",\"long_blocks_executed\":" << stats.long_blocks_executed
+      << ",\"largest_long_block_instructions\":" << stats.largest_long_block_instructions
+      << ",\"long_block_steps\":" << stats.long_block_steps
+      << ",\"long_block_compile_attempts\":" << stats.long_block_compile_attempts
+      << ",\"long_block_rejections\":" << stats.long_block_rejections
       << ",\"protected32_guest_steps\":" << stats.protected32_steps
       << ",\"invalidated\":" << stats.invalidated << ",\"data_fallbacks\":" << stats.data_fallbacks
       << ",\"compiled_evictions\":" << stats.compiled_evictions

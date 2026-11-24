@@ -244,6 +244,7 @@ class PcMotherboardC06 {
   unsigned clock_polls_=0;
   bool active_clock_enabled_=false,active_clock_running_=false,clock_attached_=false;
   bool target_projection_hook_ = false;
+  bool ether_long_block_hook_ = false;
   bool timestamp_hook_attached_=false;
   ClockStart clock_start_ = ClockStart::Immediate;
   bool waiting_for_guest_mode_ = false;
@@ -2248,6 +2249,7 @@ class PcMotherboardC06 {
     pc_.cpu.mmio_write32_hook=std::move(prior_mmio_write32_);
     pc_.device_step_hook=std::move(prior_tick_);
     if (target_projection_hook_) pc_.register_projection_limit_hook = {};
+    if (ether_long_block_hook_) pc_.ether_long_block_grant_hook = {};
     pc_.device_batch_limit_hook=std::move(prior_batch_limit_);
     pc_.device_batch_advance_hook=std::move(prior_batch_advance_);
     pc_.device_idle_advance_hook=std::move(prior_idle_advance_);
@@ -2380,6 +2382,17 @@ class PcMotherboardC06 {
       return pc_.cpu.flag(cosmic_pc::Cpu::IF) ? batch_limit(requested) : requested;
     };
     target_projection_hook_ = true;
+    if (!pc_.ether_long_block_grant_hook) {
+      pc_.ether_long_block_grant_hook = [this] {
+        // With IF clear and a lone runnable BSP, this register-only body
+        // cannot observe device changes. NMI and parked wakes retain priority.
+        return active_clock_running_ && !powered_off_ && !pc_.cpu.flag(cosmic_pc::Cpu::IF) &&
+            !deliverable_lapic_nmi(bsp()) && wake_pending_.none() && !parked_needs_short_grant() &&
+            !secondary_can_run() && !(keyboard_ && keyboard_->needs_irq()) && !aux_irq() &&
+            pc_.cpu.x87_ferr_asserted() == ferr_was_asserted_;
+      };
+      ether_long_block_hook_ = true;
+    }
   }
   // Android serializes this with run(). Preserve the counter, including per-vCPU
   // IA32_TSC offsets. Only subsequent elapsed time accrues at the chosen rate.
