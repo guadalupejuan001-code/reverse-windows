@@ -1,0 +1,220 @@
+name: Prime R110 .19 ARM64 official ISO 8/64 GiB control
+
+on:
+  push:
+    branches: [ci/prime-r110-arm64-perf19-ram-ab]
+    paths:
+      - .github/benchmarks/prime-iso-arm64/**
+      - .github/workflows/prime-r110-real-iso-arm64-perf19-ram-ab.yml
+
+permissions:
+  contents: read
+
+env:
+  AVAILABLE_MIB: '749'
+  THRESHOLD_MIB: '128'
+  STOP_TARGET: '200000000000'
+  PROBE_TIMEOUT_SECONDS: '7200'
+
+jobs:
+  exception-replay:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 137
+    strategy:
+      fail-fast: false
+      matrix:
+        ram_gib: [8, 64]
+    env:
+      R110_GUEST_RAM_GIB: ${{ matrix.ram_gib }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify pins and run native architectural gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          product="$RUNNER_TEMP/product-reference"
+          pins="$bench/irql-replay-targets.json"
+          mkdir -p "$evidence"
+          python3 "$bench/resolve-combined.py" "$pins" --reference-only-allowed > "$RUNNER_TEMP/base.tsv"
+          read -r _ product_sha core_sha < "$RUNNER_TEMP/base.tsv"
+          diagnostic_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["reference"]["diagnostic_mundo_x_sha"])' "$pins")
+          cp "$pins" "$evidence/targets.json"
+          bash "$bench/checkout-exception-replay.sh" "$product" "$product_sha" "$core_sha" "$diagnostic_sha" "$evidence"
+          printf 'reference\t%s\t%s\n' "$product_sha" "$diagnostic_sha" > "$RUNNER_TEMP/targets.tsv"
+
+          sudo apt-get update -qq
+          packages=(ninja-build libcurl4-openssl-dev zlib1g-dev
+                    libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri)
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${packages[@]}"
+          gate="$RUNNER_TEMP/gate-reference"
+          cmake -S "$product" -B "$gate" -G Ninja -DBUILD_TESTING=ON -DREVERSE_WINDOWS_GLES_GUEST=OFF \
+            -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG -DMUNDO_X_PC_EXCEPTION_EVENTS=1'
+          cmake --build "$gate" --parallel 2 --target reverse_windows_c09r_cpu_features \
+            reverse_windows_x86_system64_test reverse_windows_smp_guest_test
+          ctest --test-dir "$gate" --no-tests=error --verbose \
+            -R '^reverse_windows_(c09r_real_cpu_cx16_prefetchw|x86_system64|smp_guest)$' | tee "$evidence/reference-native-gates.log"
+          grep -q 'X86_EXCEPTION_EVENTS_PASS' "$evidence/reference-native-gates.log"
+          grep -q 'X86_LSL_PASS' "$evidence/reference-native-gates.log"
+          grep -q 'SMP_LAPIC_NMI_PRIORITY_PASS' "$evidence/reference-native-gates.log"
+          grep -q 'WINDOWS_X64_TRAP_FLAG_PASS' "$evidence/reference-native-gates.log"
+          grep -q 'WINDOWS_X64_CRC32C_PASS' "$evidence/reference-native-gates.log"
+          cmake -S "$bench" -B "$RUNNER_TEMP/build-reference" -G Ninja \
+            -DREVERSE_WINDOWS_SOURCE="$product" -DREVERSE_WINDOWS_EXCEPTION_REPLAY=ON \
+            -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
+          cmake --build "$RUNNER_TEMP/build-reference" --parallel 2 --target session_probe
+          cc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -o "$RUNNER_TEMP/verified_iso.so" \
+            "$bench/verified_iso.c" -lcurl -pthread
+          sha256sum "$RUNNER_TEMP/build-reference/session_probe" "$RUNNER_TEMP/verified_iso.so" > "$evidence/native-sha256.txt"
+      - name: Boot the official Windows media and verify the RAM configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          evidence="$RUNNER_TEMP/evidence"
+          python3 - <<'PY' > "$RUNNER_TEMP/probe-cpu"
+          import os
+          cpus = sorted(os.sched_getaffinity(0))[:2]
+          if len(cpus) < 2:
+              raise SystemExit("At least two host CPUs are required for this SMP probe")
+          print(",".join(map(str, cpus)))
+          PY
+          {
+            uname -m
+            lscpu
+            c++ --version
+            printf 'CPU affinity %s\n' "$(cat "$RUNNER_TEMP/probe-cpu")"
+          } > "$evidence/runner.txt"
+          nohup bash "$bench/run-combined-role.sh" reference < /dev/null > "$evidence/reference-driver.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/reference.pid"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/8-5b-checkpoint" 8500000000
+          python3 - "$RUNNER_TEMP/8-5b-checkpoint/reference-progress.json" "$R110_GUEST_RAM_GIB" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1]) as stream:
+              record = json.load(stream)
+          samples = record["checkpoints"]
+          if not record["observed"] or not samples:
+              raise SystemExit("The ISO run did not reach the first requested comparison point")
+          ram = samples[0]["ram"]
+          logical = int(sys.argv[2]) << 30
+          cap = 256 << 20
+          if (ram["usable_bytes"] != logical or ram["address_space_bytes"] <= logical or
+              ram["resident_ceiling_bytes"] != cap or ram["backing_budget_bytes"] != cap):
+              raise SystemExit(f"Unexpected comparison RAM configuration: {ram}")
+          PY
+      - name: Upload the 8.5B observation and verified RAM configuration
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf19-${{ matrix.ram_gib }}gib-8-5b
+          path: ${{ runner.temp }}/8-5b-checkpoint/
+      - name: Observe the same live session at 11.5B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/reference-progress" 11500000000
+      - name: Upload the 11.5B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf19-${{ matrix.ram_gib }}gib-11-5b
+          path: ${{ runner.temp }}/reference-progress/
+      - name: Watch for the first NMI before 23B
+        id: nmi
+        shell: bash
+        run: |
+          set -euo pipefail
+          session="$RUNNER_TEMP/session-reference"
+          evidence="$RUNNER_TEMP/evidence"
+          pid=$(cat "$RUNNER_TEMP/reference.pid")
+          while [[ ! -s "$session/exceptions-first-nmi.json" && ! -f "$RUNNER_TEMP/reference.exit" ]]; do
+            if [[ -s "$session/milestones.jsonl" ]] &&
+              grep -q '"target_steps":23000000000,' "$session/milestones.jsonl"; then
+              break
+            fi
+            kill -0 "$pid"
+            if [[ -s "$evidence/reference.stdout" ]]; then tail -n1 "$evidence/reference.stdout"; fi
+            sleep 8
+          done
+          if [[ -s "$session/exceptions-first-nmi.json" ]]; then
+            mkdir -p "$RUNNER_TEMP/first-nmi"
+            cp "$session/exceptions-first-nmi.json" "$session/first-nmi-session.json" "$RUNNER_TEMP/first-nmi/"
+            if [[ -s "$session/first-nmi.ppm" ]]; then cp "$session/first-nmi.ppm" "$RUNNER_TEMP/first-nmi/"; fi
+            echo 'captured=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload the exceptions through the first NMI
+        if: steps.nmi.outputs.captured == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf19-${{ matrix.ram_gib }}gib-first-nmi
+          path: ${{ runner.temp }}/first-nmi/
+          if-no-files-found: error
+      - name: Observe the same session at 23B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/23b-checkpoint" 23000000000
+      - name: Upload the 23B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf19-${{ matrix.ram_gib }}gib-23b
+          path: ${{ runner.temp }}/23b-checkpoint/
+      - name: Observe the same session at 26B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/26b-checkpoint" 26000000000
+      - name: Upload the 26B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf19-${{ matrix.ram_gib }}gib-26b
+          path: ${{ runner.temp }}/26b-checkpoint/
+      - name: Observe the same session at 30B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/30b-checkpoint" 30000000000
+      - name: Upload the 30B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf19-${{ matrix.ram_gib }}gib-30b
+          path: ${{ runner.temp }}/30b-checkpoint/
+      - name: Observe the same session at 40B
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$GITHUB_WORKSPACE/.github/benchmarks/prime-iso-arm64"
+          python3 "$bench/late-smp-progress.py" "$RUNNER_TEMP" "$RUNNER_TEMP/40b-checkpoint" 40000000000
+      - name: Upload the 40B observation
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf19-${{ matrix.ram_gib }}gib-40b
+          path: ${{ runner.temp }}/40b-checkpoint/
+      - name: Verify the bounded replay finished and archived its trace
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/evidence"
+          pid=$(cat "$RUNNER_TEMP/reference.pid")
+          while [[ ! -f "$RUNNER_TEMP/reference.exit" ]]; do
+            kill -0 "$pid"
+            if [[ -s "$evidence/reference.stdout" ]]; then tail -n1 "$evidence/reference.stdout"; fi
+            sleep 8
+          done
+          if [[ -s "$evidence/reference.stdout" ]]; then tail -n1 "$evidence/reference.stdout"; fi
+          test -s "$evidence/reference-exceptions-terminal.json"
+          test "$(cat "$RUNNER_TEMP/reference.exit")" = 0
+      - name: Preserve the terminal architectural exception evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: prime-r110-arm64-perf19-${{ matrix.ram_gib }}gib-final
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn

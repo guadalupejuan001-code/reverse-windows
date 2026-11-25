@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -119,7 +120,16 @@ int main(int argc, char** argv) {
     const auto ram_cache = run_dir / "ram";
     if (!std::filesystem::create_directory(ram_cache))
       throw std::runtime_error("Could not create temporary RAM backing directory");
-    const auto ram = Session::ram_profile(available, threshold, false, true);
+    auto ram = Session::ram_profile(available, threshold, false, true);
+    if (const auto* configured = std::getenv("R110_GUEST_RAM_GIB")) {
+      const std::string_view choice(configured);
+      if (choice != "8" && choice != "64")
+        throw std::invalid_argument("The diagnostic run accepts 8 or 64 GiB of guest RAM");
+      const auto guest_bytes = (choice == "8" ? 8ULL : 64ULL) << 30;
+      ram.physical_bytes = cosmic_pc::PcMachine::high_ram_address_space(guest_bytes, true);
+      if (ram.backing_bytes != Session::kPrimeResidentCeilingBytes)
+        throw std::runtime_error("Expected the original Prime 256 MiB backing budget");
+    }
     const int fd = ::open(argv[1], O_CLOEXEC | O_RDONLY);
     if (fd < 0) throw std::runtime_error("Could not open the read-only optical image");
     struct Close { int fd; ~Close() { ::close(fd); } } optical{fd};
@@ -152,9 +162,10 @@ int main(int argc, char** argv) {
       if (point <= target)
         milestone_steps.insert(std::lower_bound(milestone_steps.begin(), milestone_steps.end(), point), point);
     }
-    constexpr std::array<std::uint64_t, 8> frame_checkpoints{
-        11'500'000'000ULL, post_popfq_checkpoint, post_crc32c_checkpoint, 16'500'000'000ULL,
-        18'000'000'000ULL, 20'000'000'000ULL, 23'000'000'000ULL, 26'000'000'000ULL};
+    constexpr std::array<std::uint64_t, 11> frame_checkpoints{
+        8'500'000'000ULL, 11'500'000'000ULL, post_popfq_checkpoint, post_crc32c_checkpoint,
+        16'500'000'000ULL, 18'000'000'000ULL, 20'000'000'000ULL, 23'000'000'000ULL,
+        26'000'000'000ULL, 30'000'000'000ULL, 40'000'000'000ULL};
     std::size_t next_milestone = 0;
     std::array<std::uint8_t, 4000> text{};
     const auto start = Clock::now();
