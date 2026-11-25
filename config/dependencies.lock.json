@@ -6,10 +6,10 @@
     {
       "key": "mundo_x",
       "repository": "guadalupejuan001-code/mundo-X",
-      "commit": "99dc645b80b23212f8e59603fa029caca3a07145",
+      "commit": "22b595db855211ef5001f63147b27c692a098418",
       "checkout": "deps/mundo-X",
       "role": "canonical-Mundo-X-Ether-boot-and-state-RAM",
-      "status": "candidate-r110-state-ram-zero-fill",
+      "status": "candidate-prime19-deterministic-cpuid-cache",
       "required_paths": [
         "pc-android/native/pc_machine.hpp",
         "pc-android/native/pc_video.hpp",
@@ -86,6 +86,7 @@
         "pc-android/native/tests/x86_group6_0f00_test.cpp",
         "pc-android/native/tests/x86_protected_real_transition_test.cpp",
         "pc-android/native/tests/x86_cpu_profile_test.cpp",
+        "pc-android/native/tests/x86_cpuid_cache_test.cpp",
         "pc-android/native/tests/x86_lock_rmw_test.cpp",
         "pc-android/native/tests/x86_sse_fp32_test.cpp",
         "pc-android/native/tests/x86_sse2_packed_oracle_test.cpp",
